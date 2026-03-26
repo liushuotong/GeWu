@@ -32,15 +32,21 @@ pub fn list_available_agents() -> Vec<AgentConfig> {
     ]
 }
 
-pub async fn create_agent(name: &str, provider: Arc<dyn LlmProvider>, pool: SqlitePool, session_id: String) -> Result<Agent> {
+pub async fn create_agent(
+    name: &str,
+    provider: Arc<dyn LlmProvider>,
+    pool: SqlitePool,
+    session_id: String,
+    additional_tools: Vec<Box<dyn Tool>>,
+) -> Result<Agent> {
     let working_directory = std::env::current_dir()?;
 
     // Initialize persistent memory
     let memory = SqliteMemory::new(pool.clone(), session_id).await?;
 
-    match name {
+    let mut tools: Vec<Box<dyn Tool>> = match name {
         "build" => {
-            let tools: Vec<Box<dyn Tool>> = vec![
+            vec![
                 Box::new(TaskTool::new(provider.clone(), pool.clone())),
                 Box::new(ReadFileTool {
                     working_directory: working_directory.clone(),
@@ -67,17 +73,10 @@ pub async fn create_agent(name: &str, provider: Arc<dyn LlmProvider>, pool: Sqli
                 }),
                 Box::new(CodeSearchTool),
                 Box::new(WebSearchTool),
-            ];
-
-            Agent::builder()
-                .llm(provider)
-                .with_tools(tools)
-                .memory(Box::new(memory))
-                .system_prompt(include_str!("prompts/build.txt"))
-                .build()
+            ]
         }
         "explore" => {
-            let tools: Vec<Box<dyn Tool>> = vec![
+            vec![
                 Box::new(ReadFileTool {
                     working_directory: working_directory.clone(),
                 }),
@@ -97,17 +96,10 @@ pub async fn create_agent(name: &str, provider: Arc<dyn LlmProvider>, pool: Sqli
                 }),
                 Box::new(CodeSearchTool),
                 Box::new(WebSearchTool),
-            ];
-
-            Agent::builder()
-                .llm(provider)
-                .with_tools(tools)
-                .memory(Box::new(memory))
-                .system_prompt(include_str!("prompts/explore.txt"))
-                .build()
+            ]
         }
         "general" => {
-            let tools: Vec<Box<dyn Tool>> = vec![
+            vec![
                 Box::new(TaskTool::new(provider.clone(), pool.clone())),
                 Box::new(ReadFileTool {
                     working_directory: working_directory.clone(),
@@ -134,15 +126,33 @@ pub async fn create_agent(name: &str, provider: Arc<dyn LlmProvider>, pool: Sqli
                 }),
                 Box::new(CodeSearchTool),
                 Box::new(WebSearchTool),
-            ];
-
-            Agent::builder()
-                .llm(provider)
-                .with_tools(tools)
-                .memory(Box::new(memory))
-                .system_prompt(include_str!("prompts/general.txt"))
-                .build()
+            ]
         }
-        _ => Err(anyhow!("Unknown agent type: {}", name)),
+        _ => return Err(anyhow!("Unknown agent type: {}", name)),
+    };
+    
+    // Add additional tools
+    tools.extend(additional_tools);
+
+    match name {
+        "build" => Agent::builder()
+            .llm(provider)
+            .with_tools(tools)
+            .memory(Box::new(memory))
+            .system_prompt(include_str!("prompts/build.txt"))
+            .build(),
+        "explore" => Agent::builder()
+            .llm(provider)
+            .with_tools(tools)
+            .memory(Box::new(memory))
+            .system_prompt(include_str!("prompts/explore.txt"))
+            .build(),
+        "general" => Agent::builder()
+            .llm(provider)
+            .with_tools(tools)
+            .memory(Box::new(memory))
+            .system_prompt(include_str!("prompts/general.txt"))
+            .build(),
+        _ => unreachable!(),
     }
 }

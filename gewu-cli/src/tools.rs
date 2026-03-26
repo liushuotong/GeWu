@@ -75,8 +75,13 @@ impl Tool for TaskTool {
 
         info!("Spawning sub-agent '{}' for task: {} (session: {})", input.subagent_type, input.description, session_id);
 
-        let mut agent = crate::registry::create_agent(&input.subagent_type, self.provider.clone(), self.pool.clone(), session_id.clone()).await
-            .map_err(|e| format!("Failed to create agent: {}", e))?;
+        let mut agent = crate::registry::create_agent(
+            &input.subagent_type, 
+            self.provider.clone(), 
+            self.pool.clone(), 
+            session_id.clone(),
+            Vec::new() // Sub-agents do not inherit MCP tools by default
+        ).await.map_err(|e| format!("Failed to create agent: {}", e))?;
 
         // Run the agent and accumulate the response
         let mut stream = Box::pin(agent.ask(&input.prompt));

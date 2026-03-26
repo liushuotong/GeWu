@@ -1,5 +1,6 @@
 mod registry;
 mod tools;
+mod mcp_loader;
 
 use anyhow::{Result, Context};
 use clap::Parser;
@@ -9,6 +10,49 @@ use tracing::{info, error, Level};
 use std::env;
 use uuid::Uuid;
 use sqlx::sqlite::SqlitePoolOptions;
+use gewu_core::types::AgentEvent;
+use futures::StreamExt;
+use std::io::Write;
+
+async fn run_agent(agent: &mut gewu_core::Agent, prompt: &str) -> Result<()> {
+    let mut stream = Box::pin(agent.ask(prompt));
+    while let Some(event_result) = stream.next().await {
+        match event_result {
+            Ok(event) => match event {
+                AgentEvent::ContentDelta { delta } => {
+                    print!("{}", delta);
+                    std::io::stdout().flush()?;
+                }
+                AgentEvent::ReasoningDelta { delta: _ } => {
+                    // Optional: print reasoning in a different color or format
+                    // For now, just print it? Or maybe ignore/log it?
+                    // Let's print it in a dim color if we had terminal colors
+                    // print!("{}", delta); 
+                }
+                AgentEvent::ToolStart { tool, input } => {
+                     println!("\n[Tool Start: {}] Input: {}", tool, input);
+                }
+                AgentEvent::ToolFinish { tool, output } => {
+                     // Truncate output if too long
+                     let display_output = if output.len() > 200 {
+                         format!("{}...", &output[..200])
+                     } else {
+                         output
+                     };
+                     println!("\n[Tool Finish: {}] Output: {}", tool, display_output);
+                }
+                AgentEvent::Finish { .. } => {
+                    println!(); // Newline at end
+                }
+                AgentEvent::Error { error } => {
+                    error!("Error from agent: {}", error);
+                }
+            },
+            Err(e) => error!("Stream error: {}", e),
+        }
+    }
+    Ok(())
+}
 
 #[derive(Parser)]
 #[command(name = "gewu-cli")]
@@ -46,50 +90,10 @@ struct Cli {
     /// Path to SQLite database file
     #[arg(long)]
     db_path: Option<String>,
-}
 
-use gewu_core::types::AgentEvent;
-use futures::StreamExt;
-use std::io::Write;
-
-async fn run_agent(agent: &mut gewu_core::Agent, prompt: &str) -> Result<()> {
-    let mut stream = Box::pin(agent.ask(prompt));
-    while let Some(event_result) = stream.next().await {
-        match event_result {
-            Ok(event) => match event {
-                AgentEvent::ContentDelta { delta } => {
-                    print!("{}", delta);
-                    std::io::stdout().flush()?;
-                }
-                AgentEvent::ReasoningDelta { delta } => {
-                    // Optional: print reasoning in a different color or format
-                    // For now, just print it? Or maybe ignore/log it?
-                    // Let's print it in a dim color if we had terminal colors
-                    // print!("{}", delta); 
-                }
-                AgentEvent::ToolStart { tool, input } => {
-                     println!("\n[Tool Start: {}] Input: {}", tool, input);
-                }
-                AgentEvent::ToolFinish { tool, output } => {
-                     // Truncate output if too long
-                     let display_output = if output.len() > 200 {
-                         format!("{}...", &output[..200])
-                     } else {
-                         output
-                     };
-                     println!("\n[Tool Finish: {}] Output: {}", tool, display_output);
-                }
-                AgentEvent::Finish { .. } => {
-                    println!(); // Newline at end
-                }
-                AgentEvent::Error { error } => {
-                    error!("Error from agent: {}", error);
-                }
-            },
-            Err(e) => error!("Stream error: {}", e),
-        }
-    }
-    Ok(())
+    /// Path to MCP configuration file
+    #[arg(long)]
+    config: Option<String>,
 }
 
 #[tokio::main]
@@ -170,9 +174,12 @@ async fn main() -> Result<()> {
     // Determine Session ID
     let session_id = cli.session_id.unwrap_or_else(|| Uuid::new_v4().to_string());
     println!("Session ID: {}", session_id);
+    
+    // Load MCP tools
+    let mcp_tools = mcp_loader::load_mcp_tools(cli.config.clone()).await?;
 
     // Create Agent
-    let mut agent = registry::create_agent(&cli.agent, provider, pool, session_id).await?;
+    let mut agent = registry::create_agent(&cli.agent, provider, pool, session_id, mcp_tools).await?;
     info!("Initialized agent: {}", cli.agent);
 
     // Initial Prompt handling

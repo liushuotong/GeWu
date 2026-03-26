@@ -5,6 +5,7 @@ pub mod grep;
 pub mod list;
 pub mod search;
 pub mod web_fetch;
+pub mod mcp;
 
 pub use bash::BashTool;
 pub use fs::{ReadFileTool, WriteFileTool, EditFileTool, GlobTool};
