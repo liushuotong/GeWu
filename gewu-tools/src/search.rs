@@ -69,6 +69,8 @@ impl Tool for CodeSearchTool {
 
         let res = client
             .post("https://mcp.exa.ai/mcp")
+            .header("Accept", "application/json, text/event-stream")
+            .header("Content-Type", "application/json")
             .json(&body)
             .send()
             .await
@@ -81,27 +83,42 @@ impl Tool for CodeSearchTool {
         // The response is SSE (text/event-stream)
         // We parse the stream to find the result content
         let mut stream = res.bytes_stream();
+        let mut buffer = String::new();
+        let mut results = String::new();
+
         while let Some(item) = stream.next().await {
             let chunk = item.map_err(into_tool_error)?;
             let text = String::from_utf8_lossy(&chunk);
-            for line in text.lines() {
+            buffer.push_str(&text);
+
+            while let Some(idx) = buffer.find('\n') {
+                let line = buffer[..idx].to_string();
+                buffer = buffer[idx + 1..].to_string();
+
                 if line.starts_with("data: ") {
                     let data_str = &line[6..];
                     if let Ok(val) = serde_json::from_str::<Value>(data_str) {
-                        if let Some(content) = val
+                         if let Some(content) = val
                             .get("result")
                             .and_then(|r| r.get("content"))
                             .and_then(|c| c.as_array())
                         {
-                            if let Some(first) = content.first() {
-                                if let Some(text) = first.get("text").and_then(|t| t.as_str()) {
-                                    return Ok(text.to_string());
+                            for item in content {
+                                if let Some(text) = item.get("text").and_then(|t| t.as_str()) {
+                                    if !results.is_empty() {
+                                        results.push_str("\n\n---\n\n");
+                                    }
+                                    results.push_str(text);
                                 }
                             }
                         }
                     }
                 }
             }
+        }
+
+        if !results.is_empty() {
+            return Ok(results);
         }
 
         Ok("No results found.".to_string())
@@ -162,6 +179,8 @@ impl Tool for WebSearchTool {
 
         let res = client
             .post("https://mcp.exa.ai/mcp")
+            .header("Accept", "application/json, text/event-stream")
+            .header("Content-Type", "application/json")
             .json(&body)
             .send()
             .await
@@ -172,27 +191,42 @@ impl Tool for WebSearchTool {
         }
 
         let mut stream = res.bytes_stream();
+        let mut buffer = String::new();
+        let mut results = String::new();
+
         while let Some(item) = stream.next().await {
             let chunk = item.map_err(into_tool_error)?;
             let text = String::from_utf8_lossy(&chunk);
-            for line in text.lines() {
+            buffer.push_str(&text);
+
+            while let Some(idx) = buffer.find('\n') {
+                let line = buffer[..idx].to_string();
+                buffer = buffer[idx + 1..].to_string();
+
                 if line.starts_with("data: ") {
                     let data_str = &line[6..];
                     if let Ok(val) = serde_json::from_str::<Value>(data_str) {
-                        if let Some(content) = val
+                         if let Some(content) = val
                             .get("result")
                             .and_then(|r| r.get("content"))
                             .and_then(|c| c.as_array())
                         {
-                            if let Some(first) = content.first() {
-                                if let Some(text) = first.get("text").and_then(|t| t.as_str()) {
-                                    return Ok(text.to_string());
+                            for item in content {
+                                if let Some(text) = item.get("text").and_then(|t| t.as_str()) {
+                                    if !results.is_empty() {
+                                        results.push_str("\n\n---\n\n");
+                                    }
+                                    results.push_str(text);
                                 }
                             }
                         }
                     }
                 }
             }
+        }
+
+        if !results.is_empty() {
+            return Ok(results);
         }
 
         Ok("No results found.".to_string())
