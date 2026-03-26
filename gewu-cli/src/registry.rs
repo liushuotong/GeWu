@@ -56,6 +56,7 @@ pub async fn create_agent(name: &str, provider: Arc<dyn LlmProvider>, pool: Sqli
                 }),
                 Box::new(BashTool {
                     working_directory: working_directory.clone(),
+                    safe_mode: false,
                 }),
                 Box::new(GrepTool {
                     working_directory: working_directory.clone(),
@@ -85,6 +86,7 @@ pub async fn create_agent(name: &str, provider: Arc<dyn LlmProvider>, pool: Sqli
                 }),
                 Box::new(BashTool {
                     working_directory: working_directory.clone(),
+                    safe_mode: true,
                 }),
                 Box::new(GrepTool {
                     working_directory: working_directory.clone(),
@@ -121,6 +123,7 @@ pub async fn create_agent(name: &str, provider: Arc<dyn LlmProvider>, pool: Sqli
                 }),
                 Box::new(BashTool {
                     working_directory: working_directory.clone(),
+                    safe_mode: false,
                 }),
                 Box::new(GrepTool {
                     working_directory: working_directory.clone(),

@@ -161,6 +161,44 @@ pub fn glob(pattern: &str) -> Result<Vec<PathBuf>> {
     Ok(paths)
 }
 
+/// Finds files matching a glob pattern, respecting .gitignore files.
+pub fn glob_with_gitignore(root: impl AsRef<Path>, pattern: &str) -> Result<Vec<PathBuf>> {
+    let root = root.as_ref();
+    let walker = ignore::WalkBuilder::new(root)
+        .hidden(false) // Allow hidden files unless in .gitignore
+        .git_ignore(true)
+        .build();
+
+    let glob_pattern = glob::Pattern::new(pattern)
+        .with_context(|| format!("Invalid glob pattern: {}", pattern))?;
+
+    let mut matches = Vec::new();
+
+    for result in walker {
+        match result {
+            Ok(entry) => {
+                let path = entry.path();
+                if path.is_file() {
+                    // Compute path relative to root to match against the pattern
+                    if let Ok(relative_path) = path.strip_prefix(root) {
+                        // glob::Pattern matches against the string representation
+                        //We need to handle the case where the pattern assumes the root is the current directory
+                        if glob_pattern.matches_path(relative_path) {
+                            matches.push(path.to_path_buf());
+                        }
+                    }
+                }
+            }
+            Err(_err) => {
+                // We might want to log this but for now just ignore/continue
+                // eprintln!("Error walking directory: {}", err);
+            }
+        }
+    }
+
+    Ok(matches)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

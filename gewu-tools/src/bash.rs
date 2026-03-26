@@ -7,6 +7,7 @@ use anyhow::{Context, Result};
 
 pub struct BashTool {
     pub working_directory: PathBuf,
+    pub safe_mode: bool,
 }
 
 #[async_trait]
@@ -44,6 +45,25 @@ impl Tool for BashTool {
         let args_val: Value = serde_json::from_str(args).map_err(|e| anyhow::anyhow!(e))?;
         let command_str = args_val["command"].as_str().ok_or_else(|| anyhow::anyhow!("command is required"))?;
         let timeout_ms = args_val["timeout"].as_u64().unwrap_or(120000); // Default 2 minutes
+        
+        if self.safe_mode {
+            let trimmed = command_str.trim();
+            let first_word = trimmed.split_whitespace().next().unwrap_or("");
+            // Allowed commands in safe mode (mostly read-only or harmless)
+            let allowed = [
+                "ls", "cat", "grep", "rg", "find", "pwd", "echo", "wc", "head", "tail", 
+                "whoami", "date", "git", "printf", "sort", "uniq", "diff"
+            ];
+            
+            if !allowed.contains(&first_word) {
+                 return Ok(format!("Command '{}' is not allowed in safe mode. Allowed commands: {:?}", first_word, allowed));
+            }
+            
+            // Check for chaining characters that might execute hidden commands
+            if trimmed.contains(';') || trimmed.contains("&&") || trimmed.contains("||") {
+                 return Ok("Complex command chaining (;, &&, ||) is not allowed in safe mode.".to_string());
+            }
+        }
         
         // Resolve working directory
         let work_dir = if let Some(wd) = args_val["workdir"].as_str() {
@@ -117,7 +137,7 @@ mod tests {
     async fn test_bash_tool_echo() -> Result<()> {
         let dir = tempdir()?;
         let working_dir = dir.path().to_path_buf();
-        let tool = BashTool { working_directory: working_dir.clone() };
+        let tool = BashTool { working_directory: working_dir.clone(), safe_mode: false };
         let args = json!({
             "command": "echo Hello world"
         });
@@ -131,7 +151,7 @@ mod tests {
     async fn test_bash_tool_timeout() -> Result<()> {
         let dir = tempdir()?;
         let working_dir = dir.path().to_path_buf();
-        let tool = BashTool { working_directory: working_dir.clone() };
+        let tool = BashTool { working_directory: working_dir.clone(), safe_mode: false };
         let args = json!({
             "command": "sleep 2; echo done",
             "timeout": 500
@@ -146,7 +166,7 @@ mod tests {
     async fn test_bash_tool_file_create() -> Result<()> {
         let dir = tempdir()?;
         let working_dir = dir.path().to_path_buf();
-        let tool = BashTool { working_directory: working_dir.clone() };
+        let tool = BashTool { working_directory: working_dir.clone(), safe_mode: false };
         
         let args = json!({
             "command": "echo 'Bash content' > test_bash.txt"
@@ -165,7 +185,7 @@ mod tests {
         let sub_dir = working_dir.join("sub");
         fs::create_dir(&sub_dir).await?;
 
-        let tool = BashTool { working_directory: working_dir.clone() };
+        let tool = BashTool { working_directory: working_dir.clone(), safe_mode: false };
         
         let args = json!({
             "command": "pwd",
@@ -175,6 +195,36 @@ mod tests {
         let output = tool.call(&args.to_string()).await.map_err(|e| anyhow::anyhow!(e.to_string()))?;
         // output should contain 'sub'
         assert!(output.contains("sub"));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_bash_tool_safe_mode() -> Result<()> {
+        let dir = tempdir()?;
+        let working_dir = dir.path().to_path_buf();
+        let tool = BashTool { working_directory: working_dir.clone(), safe_mode: true };
+        
+        // Allowed command
+        let args = json!({
+            "command": "echo hello"
+        });
+        let output = tool.call(&args.to_string()).await.map_err(|e| anyhow::anyhow!(e.to_string()))?;
+        assert_eq!(output.trim(), "hello");
+
+        // Disallowed command
+        let args = json!({
+            "command": "rm -rf /"
+        });
+        let output = tool.call(&args.to_string()).await.map_err(|e| anyhow::anyhow!(e.to_string()))?;
+        assert!(output.contains("not allowed in safe mode"));
+
+        // Chaining attempt
+        let args = json!({
+            "command": "echo hello; rm -rf /"
+        });
+        let output = tool.call(&args.to_string()).await.map_err(|e| anyhow::anyhow!(e.to_string()))?;
+        assert!(output.contains("not allowed in safe mode"));
+        
         Ok(())
     }
 }

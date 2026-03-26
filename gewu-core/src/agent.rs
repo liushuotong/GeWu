@@ -62,6 +62,8 @@ impl Agent {
         self.memory.add_message(Message::User { content: user_message.to_string() }).await;
         
         let mut turn = 0;
+        let mut recent_tool_calls: Vec<(String, String)> = Vec::new();
+
         loop {
             // Check for compaction at the start of each turn
             if self.compact_if_needed().await? {
@@ -96,6 +98,17 @@ impl Agent {
                             let tool_name = call.function.name;
                             let args = call.function.arguments;
                             let call_id = call.id;
+
+                            // Doom loop detection
+                            let current_call = (tool_name.clone(), args.clone());
+                            recent_tool_calls.push(current_call.clone());
+                            if recent_tool_calls.len() > 3 {
+                                recent_tool_calls.remove(0);
+                            }
+
+                            if recent_tool_calls.len() == 3 && recent_tool_calls.iter().all(|x| x == &current_call) {
+                                return Ok(format!("Doom loop detected: Tool '{}' called 3 times repeatedly with identical arguments. Stopping.", tool_name));
+                            }
 
                             let tool = self.tools.iter().find(|t| t.name() == tool_name);
                             

@@ -6,7 +6,7 @@
 //! - `EditFileTool`: Modifies existing files by replacing text.
 //! - `GlobTool`: Finds files using glob patterns.
 
-use crate::fs_utils::{resolve_safe_path, read_text, write, glob, into_tool_error};
+use crate::fs_utils::{resolve_safe_path, read_text, write, glob_with_gitignore, into_tool_error};
 use gewu_core::traits::Tool;
 use anyhow::Result;
 use async_trait::async_trait;
@@ -261,11 +261,8 @@ impl Tool for GlobTool {
             self.working_directory.clone()
         };
 
-        // Construct full pattern rooted in search directory
-        let full_pattern_path = search_dir.join(pattern);
-        let full_pattern = full_pattern_path.to_string_lossy();
-
-        let paths = glob(&full_pattern).map_err(into_tool_error)?;
+        // Search using glob_with_gitignore which respects .gitignore
+        let paths = glob_with_gitignore(&search_dir, pattern).map_err(into_tool_error)?;
 
         let paths_str: Vec<String> = paths
             .into_iter()
@@ -463,6 +460,39 @@ mod tests {
         // It should find nothing because results outside working_dir are filtered
         assert!(files.is_empty());
 
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_glob_tool_gitignore() -> Result<()> {
+        let dir = tempdir()?;
+        let working_dir = dir.path().to_path_buf();
+        let keep_file = dir.path().join("keep_me.txt");
+        let ignore_file = dir.path().join("ignore_me.txt");
+        let gitignore = dir.path().join(".ignore");
+        
+        fs::write(&keep_file, "keep").await?;
+        fs::write(&ignore_file, "ignore").await?;
+        fs::write(&gitignore, "ignore_me.txt").await?;
+
+        // Create the tool instance
+        let tool = GlobTool { working_directory: working_dir.clone() };
+        let args = json!({
+            "pattern": "*.txt"
+        });
+
+        // Run the tool
+        let output = tool.call(&args.to_string()).await.map_err(|e| anyhow::anyhow!(e.to_string()))?;
+        let files: Vec<String> = serde_json::from_str(&output)?;
+
+        // Paths in output are absolute
+        let s_keep = keep_file.to_string_lossy().to_string();
+        let s_ignore = ignore_file.to_string_lossy().to_string();
+        
+        // Assertions
+        assert!(files.contains(&s_keep), "Should contain keep_me.txt");
+        assert!(!files.contains(&s_ignore), "Should NOT contain ignore_me.txt");
+        
         Ok(())
     }
 }
