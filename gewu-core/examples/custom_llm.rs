@@ -1,4 +1,4 @@
-use gewu_core::{Agent, agent::AgentBuilder};
+use gewu_core::agent::AgentBuilder;
 use gewu_providers::OpenAIProvider;
 use gewu_tools::BashTool;
 use std::sync::Arc;
@@ -21,6 +21,7 @@ async fn main() -> Result<()> {
     
     let bash_tool = Box::new(BashTool {
         working_directory: env::current_dir()?,
+        safe_mode: false,
     });
 
     let mut agent = AgentBuilder::default()
@@ -34,9 +35,15 @@ async fn main() -> Result<()> {
         println!("No CUSTOM_LLM_KEY/URL set, skipping actual network call.");
         return Ok(());
     }
-
-    let response = agent.ask("Hello, who are you?").await?;
-    println!("Response: {}", response);
+    
+    use futures::StreamExt;
+    let mut stream = Box::pin(agent.ask("Hello, who are you?"));
+    while let Some(event) = stream.next().await {
+        if let Ok(gewu_core::types::AgentEvent::ContentDelta { delta }) = event {
+             print!("{}", delta);
+        }
+    }
+    println!();
 
     Ok(())
 }

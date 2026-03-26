@@ -1,10 +1,12 @@
 use gewu_core::agent::AgentBuilder;
 use gewu_core::traits::{LlmProvider, Tool};
-use gewu_core::types::{Message, ToolCall, FunctionCall};
+use gewu_core::types::{Message, ToolCall, FunctionCall, ProviderEvent, AgentEvent};
 use async_trait::async_trait;
 use std::sync::{Arc, Mutex};
 use std::error::Error;
 use serde_json::Value;
+use futures::stream::BoxStream;
+use futures::StreamExt;
 
 struct MockLlm {
     responses: Arc<Mutex<Vec<Message>>>,
@@ -19,12 +21,34 @@ impl Error for MockError {}
 
 #[async_trait]
 impl LlmProvider for MockLlm {
-    async fn generate_response(&self, _messages: &[Message], _tools: &[Box<dyn Tool>]) -> Result<Message, Box<dyn Error + Send + Sync>> {
+    async fn stream_response<'a>(
+        &'a self,
+        _messages: &[Message],
+        _tools: &[Box<dyn Tool>],
+    ) -> Result<BoxStream<'a, Result<ProviderEvent, Box<dyn Error + Send + Sync>>>, Box<dyn Error + Send + Sync>> {
         let mut responses = self.responses.lock().unwrap();
         if responses.is_empty() {
              return Err(Box::new(MockError("No more mock responses".to_string())));
         }
-        Ok(responses.remove(0))
+        let response = responses.remove(0);
+        
+        let s = async_stream::try_stream! {
+            match response {
+                Message::Assistant { content, tool_calls } => {
+                    if let Some(c) = content {
+                        yield ProviderEvent::ContentDelta { delta: c };
+                    }
+                    if let Some(calls) = tool_calls {
+                        for call in calls {
+                            yield ProviderEvent::ToolCallStart { id: call.id.clone(), name: call.function.name };
+                            yield ProviderEvent::ToolCallDelta { id: call.id, delta: call.function.arguments };
+                        }
+                    }
+                }
+                _ => {}
+            }
+        };
+        Ok(Box::pin(s))
     }
 }
 
@@ -77,6 +101,15 @@ async fn test_agent_loop() {
         .build()
         .unwrap();
         
-    let result = agent.ask("Do something").await.unwrap();
+    let mut stream = Box::pin(agent.ask("Do something"));
+    let mut result = String::new();
+    while let Some(event) = stream.next().await {
+        if let Ok(AgentEvent::ContentDelta { delta }) = event {
+             result.push_str(&delta);
+        } else if let Ok(AgentEvent::Finish { response }) = event {
+             result = response;
+        }
+    }
+    
     assert_eq!(result, "Done: Tool output");
 }

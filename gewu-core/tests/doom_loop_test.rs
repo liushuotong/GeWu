@@ -1,27 +1,25 @@
 use gewu_core::traits::{LlmProvider, Tool};
-use gewu_core::types::{Message, ToolCall};
+use gewu_core::types::{Message, ProviderEvent, AgentEvent};
 use gewu_core::Agent;
 use async_trait::async_trait;
 use serde_json::Value;
 use std::sync::Arc;
 use serde_json::json;
+use futures::stream::BoxStream;
+use futures::StreamExt;
+use std::error::Error;
 
 struct MockLlmProvider;
 
 #[async_trait]
 impl LlmProvider for MockLlmProvider {
-    async fn generate_response(
-        &self,
+    async fn stream_response<'a>(
+        &'a self,
         messages: &[Message],
         _tools: &[Box<dyn Tool>],
-    ) -> Result<Message, Box<dyn std::error::Error + Send + Sync>> {
-        // Simple logic: If we see < 3 tool calls, output another one.
-        // If we see >= 3, maybe we stop? No, we want to trigger the detection.
-        
-        // Count tool responses in history
+    ) -> Result<BoxStream<'a, Result<ProviderEvent, Box<dyn Error + Send + Sync>>>, Box<dyn Error + Send + Sync>> {
         let tool_response_count = messages.iter().filter(|m| matches!(m, Message::Tool { .. })).count();
 
-        // If we have seen 3 tool outputs (0, 1, 2), the NEXT call (3) should trigger doom loop.
         // 0 -> call 0
         // output 0
         // 1 -> call 1
@@ -31,23 +29,21 @@ impl LlmProvider for MockLlmProvider {
         // 3 -> call 3 (doom loop triggers HERE)
 
         if tool_response_count >= 5 {
-             return Ok(Message::Assistant {
-                 content: Some("Done".to_string()),
-                 tool_calls: None
-             });
+             let s = async_stream::try_stream! {
+                 yield ProviderEvent::ContentDelta { delta: "Done".to_string() };
+                 yield ProviderEvent::Finish { reason: Some("stop".to_string()) };
+             };
+             return Ok(Box::pin(s));
         }
         
-        Ok(Message::Assistant {
-            content: None,
-            tool_calls: Some(vec![ToolCall {
-                id: format!("call_{}", tool_response_count),
-                r#type: "function".to_string(),
-                function: gewu_core::types::FunctionCall {
-                    name: "test_tool".to_string(),
-                    arguments: "{}".to_string(),
-                }
-            }])
-        })
+        // Return a tool call
+        let call_id = format!("call_{}", tool_response_count);
+        let s = async_stream::try_stream! {
+            yield ProviderEvent::ToolCallStart { id: call_id.clone(), name: "test_tool".to_string() };
+            yield ProviderEvent::ToolCallDelta { id: call_id, delta: "{}".to_string() };
+            yield ProviderEvent::Finish { reason: Some("tool_calls".to_string()) };
+        };
+        Ok(Box::pin(s))
     }
 }
 
@@ -72,9 +68,25 @@ async fn test_doom_loop_detection() {
         .unwrap();
 
     let mut agent = agent;
-    let response = agent.ask("Trigger doom loop").await.unwrap();
+    let mut stream = Box::pin(agent.ask("Trigger doom loop"));
+    let mut response_text = String::new();
+    let mut error_text = String::new();
+
+    while let Some(event_result) = stream.next().await {
+        match event_result {
+            Ok(event) => {
+                match event {
+                    AgentEvent::ContentDelta { delta } => response_text.push_str(&delta),
+                    AgentEvent::Finish { response } => response_text = response,
+                    AgentEvent::Error { error } => error_text = error,
+                    _ => {}
+                }
+            }
+            Err(e) => panic!("Stream error: {}", e),
+        }
+    }
     
     // We expect the agent to stop early with the doom loop message
-    assert!(response.contains("Doom loop detected"), "Response was: {}", response);
-    assert!(response.contains("Stopping"), "Response was: {}", response);
+    assert!(error_text.contains("Doom loop detected"), "Error was: {}", error_text);
+    assert!(error_text.contains("Stopping"), "Error was: {}", error_text);
 }

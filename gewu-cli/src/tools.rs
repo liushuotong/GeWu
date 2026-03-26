@@ -78,9 +78,31 @@ impl Tool for TaskTool {
         let mut agent = crate::registry::create_agent(&input.subagent_type, self.provider.clone(), self.pool.clone(), session_id.clone()).await
             .map_err(|e| format!("Failed to create agent: {}", e))?;
 
-        // Run the agent
-        let result = agent.ask(&input.prompt).await
-            .map_err(|e| format!("Agent execution failed: {}", e))?;
+        // Run the agent and accumulate the response
+        let mut stream = Box::pin(agent.ask(&input.prompt));
+        let mut result = String::new();
+        use futures::StreamExt;
+        use gewu_core::types::AgentEvent;
+
+        while let Some(event_result) = stream.next().await {
+            match event_result {
+                Ok(event) => {
+                    match event {
+                        AgentEvent::ContentDelta { delta } => {
+                            result.push_str(&delta);
+                        }
+                        AgentEvent::Finish { response } => {
+                            result = response;
+                        }
+                         AgentEvent::Error { error } => {
+                            return Err(format!("Agent execution failed: {}", error).into());
+                        }
+                        _ => {}
+                    }
+                }
+                Err(e) => return Err(format!("Agent stream failed: {}", e).into()),
+            }
+        }
 
         Ok(format!(
             "task_id: {}\n\n<task_result>\n{}\n</task_result>",

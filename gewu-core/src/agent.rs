@@ -1,9 +1,10 @@
 use crate::traits::{LlmProvider, Tool, Memory};
-use crate::types::Message;
+use crate::types::{Message, AgentEvent, ProviderEvent, ToolCall, FunctionCall};
 use crate::compaction::{self, is_overflow, estimate_message_tokens};
 use std::sync::Arc;
 use anyhow::{Result, Context};
 use tracing::info;
+use futures::{Stream, StreamExt};
 
 pub struct Agent {
     llm: Arc<dyn LlmProvider>,
@@ -51,90 +52,148 @@ impl Agent {
         }
     }
 
-    /// Sends a message to the agent and gets a response.
+
+    /// Sends a message to the agent and gets a response stream.
     /// This method maintains the conversation history.
-    pub async fn ask(&mut self, user_message: &str) -> Result<String> {
-        // Ensure system prompt is the first message if history is empty
-        if self.memory.messages().is_empty() && !self.system_prompt.is_empty() {
-             self.memory.add_message(Message::System { content: self.system_prompt.clone() }).await;
-        }
-
-        self.memory.add_message(Message::User { content: user_message.to_string() }).await;
-        
-        let mut turn = 0;
-        let mut recent_tool_calls: Vec<(String, String)> = Vec::new();
-
-        loop {
-            // Check for compaction at the start of each turn
-            if self.compact_if_needed().await? {
-                info!("History compacted.");
-                // After compaction, history is modified (summarized).
-                // We continue the loop with the summarized history.
+    pub fn ask<'a>(
+        &'a mut self,
+        user_message: &'a str,
+    ) -> impl Stream<Item = Result<AgentEvent>> + 'a {
+        async_stream::try_stream! {
+            // Ensure system prompt is the first message if history is empty
+            if self.memory.messages().is_empty() && !self.system_prompt.is_empty() {
+                 self.memory.add_message(Message::System { content: self.system_prompt.clone() }).await;
             }
-
-            if turn >= self.max_turns {
-                return Ok("Max turns reached without final answer.".to_string());
-            }
-            turn += 1;
-
-            // Prune old tool outputs before generating response
-            compaction::prune(self.memory.messages_mut());
-
-            let response = self.llm.generate_response(self.memory.messages(), &self.tools).await
-                .map_err(|e| anyhow::anyhow!(e))?;
+    
+            self.memory.add_message(Message::User { content: user_message.to_string() }).await;
             
-            self.memory.add_message(response.clone()).await;
+            let mut turn = 0;
+            let mut recent_tool_calls: Vec<(String, String)> = Vec::new();
+    
+            loop {
+                // Check for compaction at the start of each turn
+                if self.compact_if_needed().await? {
+                    info!("History compacted.");
+                }
+    
+                if turn >= self.max_turns {
+                    yield AgentEvent::Error { error: "Max turns reached without final answer.".to_string() };
+                    break;
+                }
+                turn += 1;
+    
+                // Prune old tool outputs before generating response
+                compaction::prune(self.memory.messages_mut());
+    
+                let mut current_content = String::new();
+                let mut current_tool_calls: Vec<ToolCall> = Vec::new();
 
-            match response {
-                Message::Assistant { content, tool_calls } => {
-                    if let Some(calls) = tool_calls {
-                        if calls.is_empty() {
-                            return Ok(content.unwrap_or_default());
+                // Call LLM provider
+                // We must use a block to limit the borrow of `self` for stream_response
+                // We clone the Arc<LlmProvider> to avoid borrowing self while iterating the stream
+                let provider = self.llm.clone();
+                let messages = self.memory.messages().to_vec(); // Clone messages
+                
+                let mut stream = provider.stream_response(&messages, &self.tools).await
+                    .map_err(|e| anyhow::anyhow!(e))?;
+
+                while let Some(event_result) = stream.next().await {
+                    let event = event_result.map_err(|e| anyhow::anyhow!(e))?;
+                    
+                    match event {
+                        ProviderEvent::ContentDelta { delta } => {
+                            current_content.push_str(&delta);
+                            yield AgentEvent::ContentDelta { delta };
                         }
-
-                        info!("Agent requested {} tool calls", calls.len());
-
-                        for call in calls {
-                            let tool_name = call.function.name;
-                            let args = call.function.arguments;
-                            let call_id = call.id;
-
-                            // Doom loop detection
-                            let current_call = (tool_name.clone(), args.clone());
-                            recent_tool_calls.push(current_call.clone());
-                            if recent_tool_calls.len() > 3 {
-                                recent_tool_calls.remove(0);
-                            }
-
-                            if recent_tool_calls.len() == 3 && recent_tool_calls.iter().all(|x| x == &current_call) {
-                                return Ok(format!("Doom loop detected: Tool '{}' called 3 times repeatedly with identical arguments. Stopping.", tool_name));
-                            }
-
-                            let tool = self.tools.iter().find(|t| t.name() == tool_name);
-                            
-                            let result_content = if let Some(t) = tool {
-                                info!("Executing tool: {}", tool_name);
-                                match t.call(&args).await {
-                                    Ok(res) => res,
-                                    Err(e) => format!("Error executing tool: {}", e),
-                                }
-                            } else {
-                                format!("Tool not found: {}", tool_name)
-                            };
-
-                            self.memory.add_message(Message::Tool {
-                                tool_call_id: call_id,
-                                content: result_content,
-                            }).await;
+                        ProviderEvent::ReasoningDelta { delta } => {
+                            yield AgentEvent::ReasoningDelta { delta };
                         }
-                    } else {
-                        return Ok(content.unwrap_or_default());
+                        ProviderEvent::ToolCallStart { id, name } => {
+                            current_tool_calls.push(ToolCall {
+                                id,
+                                r#type: "function".to_string(),
+                                function: FunctionCall {
+                                    name,
+                                    arguments: String::new(),
+                                },
+                            });
+                        }
+                        ProviderEvent::ToolCallDelta { id, delta } => {
+                            if let Some(tc) = current_tool_calls.iter_mut().find(|tc| tc.id == id) {
+                                tc.function.arguments.push_str(&delta);
+                            }
+                        }
+                        ProviderEvent::Finish { .. } => {
+                            // Provider stream finished.
+                        }
+                        ProviderEvent::Error { error } => {
+                            yield AgentEvent::Error { error };
+                            return; // Stop stream
+                        }
                     }
                 }
-                _ => return Err(anyhow::anyhow!("Unexpected response type from LLM")),
+                
+                // Add assistant message to history
+                let assistant_msg = Message::Assistant {
+                    content: if current_content.is_empty() { None } else { Some(current_content.clone()) },
+                    tool_calls: if current_tool_calls.is_empty() { None } else { Some(current_tool_calls.clone()) },
+                };
+                self.memory.add_message(assistant_msg).await;
+
+                // Handle tool calls
+                if current_tool_calls.is_empty() {
+                    // No tools called, we are done
+                    yield AgentEvent::Finish { response: current_content };
+                    break;
+                }
+
+                info!("Agent requested {} tool calls", current_tool_calls.len());
+
+                for call in current_tool_calls {
+                    let tool_name = call.function.name.clone();
+                    let args = call.function.arguments.clone();
+                    let call_id = call.id;
+
+                    // Doom loop detection
+                    let current_call_sig = (tool_name.clone(), args.clone());
+                    recent_tool_calls.push(current_call_sig.clone());
+                    if recent_tool_calls.len() > 3 {
+                        recent_tool_calls.remove(0);
+                    }
+
+                    if recent_tool_calls.len() == 3 && recent_tool_calls.iter().all(|x| x == &current_call_sig) {
+                         let error_msg = format!("Doom loop detected: Tool '{}' called 3 times repeatedly with identical arguments. Stopping.", tool_name);
+                         yield AgentEvent::Error { error: error_msg };
+                         return;
+                    }
+
+                    yield AgentEvent::ToolStart { tool: tool_name.clone(), input: args.clone() };
+
+                    let tool = self.tools.iter().find(|t| t.name() == tool_name);
+                    
+                    let result_content = if let Some(t) = tool {
+                        info!("Executing tool: {}", tool_name);
+                        match t.call(&args).await {
+                            Ok(res) => res,
+                            Err(e) => format!("Error executing tool: {}", e),
+                        }
+                    } else {
+                        format!("Tool not found: {}", tool_name)
+                    };
+
+                    yield AgentEvent::ToolFinish { tool: tool_name.clone(), output: result_content.clone() };
+
+                    self.memory.add_message(Message::Tool {
+                        tool_call_id: call_id,
+                        content: result_content,
+                    }).await;
+                }
+                
+                // Continue loop for next turn
             }
         }
     }
+
 
     /// Checks if the current history exceeds the token limit and triggers summarization.
     async fn compact_if_needed(&mut self) -> Result<bool> {
@@ -184,13 +243,17 @@ When constructing the summary, try to stick to this template:
         });
 
         // Call LLM for summary
-        let summary_msg = self.llm.generate_response(&request_messages, &[]).await
+        let provider = self.llm.clone();
+        let mut stream = provider.stream_response(&request_messages, &[]).await
             .map_err(|e| anyhow::anyhow!("Compaction failed: {}", e))?;
 
-        let summary_text = match summary_msg {
-            Message::Assistant { content, .. } => content.unwrap_or_default(),
-            _ => return Err(anyhow::anyhow!("Unexpected summary response type")),
-        };
+        let mut summary_text = String::new();
+        while let Some(event_result) = stream.next().await {
+            let event = event_result.map_err(|e| anyhow::anyhow!("Compaction stream error: {}", e))?;
+            if let ProviderEvent::ContentDelta { delta } = event {
+                summary_text.push_str(&delta);
+            }
+        }
 
         if summary_text.is_empty() {
             return Ok(false);

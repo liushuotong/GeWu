@@ -1,9 +1,11 @@
 use gewu_core::agent::AgentBuilder;
 use gewu_core::traits::{LlmProvider, Tool};
-use gewu_core::types::Message;
+use gewu_core::types::{Message, ProviderEvent, AgentEvent};
 use async_trait::async_trait;
 use std::sync::{Arc, Mutex};
 use std::error::Error;
+use futures::stream::BoxStream;
+use futures::StreamExt;
 
 struct MockLlm {
     responses: Arc<Mutex<Vec<Message>>>,
@@ -18,24 +20,45 @@ impl Error for MockError {}
 
 #[async_trait]
 impl LlmProvider for MockLlm {
-    async fn generate_response(&self, messages: &[Message], _tools: &[Box<dyn Tool>]) -> Result<Message, Box<dyn Error + Send + Sync>> {
+    async fn stream_response<'a>(
+        &'a self,
+        messages: &[Message],
+        _tools: &[Box<dyn Tool>],
+    ) -> Result<BoxStream<'a, Result<ProviderEvent, Box<dyn Error + Send + Sync>>>, Box<dyn Error + Send + Sync>> {
         // Check if this is a summary request
         let last_msg = messages.last().unwrap();
         if let Message::User { content } = last_msg {
             if content.contains("Provide a detailed prompt for continuing") {
-                return Ok(Message::Assistant {
-                    content: Some("## Goal\nTest compaction\n## Accomplished\nNothing yet".to_string()),
-                    tool_calls: None,
-                });
+                let s = async_stream::try_stream! {
+                    yield ProviderEvent::ContentDelta { delta: "## Goal\nTest compaction\n## Accomplished\nNothing yet".to_string() };
+                };
+                return Ok(Box::pin(s));
             }
         }
 
         let mut responses = self.responses.lock().unwrap();
-        if responses.is_empty() {
+        let response = if responses.is_empty() {
              // Fallback default response
-             return Ok(Message::Assistant { content: Some("Default response".to_string()), tool_calls: None });
-        }
-        Ok(responses.remove(0))
+             Message::Assistant { content: Some("Default response".to_string()), tool_calls: None }
+        } else {
+             responses.remove(0)
+        };
+        
+        // Convert Message to Stream events
+        let s = async_stream::try_stream! {
+            if let Message::Assistant { content, tool_calls } = response {
+                if let Some(c) = content {
+                    yield ProviderEvent::ContentDelta { delta: c };
+                }
+                if let Some(calls) = tool_calls {
+                     for call in calls {
+                         yield ProviderEvent::ToolCallStart { id: call.id.clone(), name: call.function.name };
+                         yield ProviderEvent::ToolCallDelta { id: call.id, delta: call.function.arguments };
+                     }
+                }
+            }
+        };
+        Ok(Box::pin(s))
     }
 }
 
@@ -62,13 +85,24 @@ async fn test_compaction_trigger() {
         .build()
         .unwrap();
 
+    agent.reset().await; // Ensure system prompt is in history
+
     // Fill history with junk to exceed 100 tokens
     // 1 token ~ 4 chars. 100 tokens ~ 400 chars.
     let long_text = "A".repeat(500); 
-    agent.memory.add_message(Message::User { content: long_text });
+    agent.memory.add_message(Message::User { content: long_text }).await;
 
     // This call should trigger compaction because history > 100
-    let response = agent.ask("Hello").await.unwrap();
+    let mut stream = Box::pin(agent.ask("Hello"));
+    let mut response = String::new();
+    while let Some(event) = stream.next().await {
+        if let Ok(AgentEvent::ContentDelta { delta }) = event {
+            response.push_str(&delta);
+        } else if let Ok(AgentEvent::Finish { response: r }) = event {
+             response = r;
+        }
+    }
+    drop(stream); // Release borrow
     
     assert_eq!(response, "I am ready.");
 

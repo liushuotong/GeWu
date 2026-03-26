@@ -48,6 +48,50 @@ struct Cli {
     db_path: Option<String>,
 }
 
+use gewu_core::types::AgentEvent;
+use futures::StreamExt;
+use std::io::Write;
+
+async fn run_agent(agent: &mut gewu_core::Agent, prompt: &str) -> Result<()> {
+    let mut stream = Box::pin(agent.ask(prompt));
+    while let Some(event_result) = stream.next().await {
+        match event_result {
+            Ok(event) => match event {
+                AgentEvent::ContentDelta { delta } => {
+                    print!("{}", delta);
+                    std::io::stdout().flush()?;
+                }
+                AgentEvent::ReasoningDelta { delta } => {
+                    // Optional: print reasoning in a different color or format
+                    // For now, just print it? Or maybe ignore/log it?
+                    // Let's print it in a dim color if we had terminal colors
+                    // print!("{}", delta); 
+                }
+                AgentEvent::ToolStart { tool, input } => {
+                     println!("\n[Tool Start: {}] Input: {}", tool, input);
+                }
+                AgentEvent::ToolFinish { tool, output } => {
+                     // Truncate output if too long
+                     let display_output = if output.len() > 200 {
+                         format!("{}...", &output[..200])
+                     } else {
+                         output
+                     };
+                     println!("\n[Tool Finish: {}] Output: {}", tool, display_output);
+                }
+                AgentEvent::Finish { .. } => {
+                    println!(); // Newline at end
+                }
+                AgentEvent::Error { error } => {
+                    error!("Error from agent: {}", error);
+                }
+            },
+            Err(e) => error!("Stream error: {}", e),
+        }
+    }
+    Ok(())
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
     // Load .env file
@@ -136,9 +180,8 @@ async fn main() -> Result<()> {
         let prompt = prompt_parts.join(" ");
         if !prompt.is_empty() {
             println!("> {}", prompt);
-            match agent.ask(&prompt).await {
-                Ok(response) => println!("{}", response),
-                Err(e) => error!("Error: {}", e),
+            if let Err(e) = run_agent(&mut agent, &prompt).await {
+                error!("Error: {}", e);
             }
         }
     }
@@ -164,9 +207,8 @@ async fn main() -> Result<()> {
             break;
         }
 
-        match agent.ask(input).await {
-            Ok(response) => println!("{}", response),
-            Err(e) => error!("Error processing message: {}", e),
+        if let Err(e) = run_agent(&mut agent, input).await {
+            error!("Error processing message: {}", e);
         }
     }
 

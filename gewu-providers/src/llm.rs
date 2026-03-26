@@ -1,5 +1,5 @@
 use gewu_core::traits::{LlmProvider, Tool};
-use gewu_core::types::{Message, ToolCall, FunctionCall};
+use gewu_core::types::{Message, ProviderEvent};
 use anyhow::Result;
 use async_trait::async_trait;
 use async_openai::{
@@ -13,6 +13,8 @@ use async_openai::{
     },
 };
 use std::error::Error;
+use futures::StreamExt;
+use futures::stream::BoxStream;
 
 pub struct OpenAIProvider {
     client: Client<async_openai::config::OpenAIConfig>,
@@ -41,11 +43,11 @@ impl OpenAIProvider {
 
 #[async_trait]
 impl LlmProvider for OpenAIProvider {
-    async fn generate_response(
-        &self,
+    async fn stream_response<'a>(
+        &'a self,
         messages: &[Message],
         tools: &[Box<dyn Tool>],
-    ) -> Result<Message, Box<dyn Error + Send + Sync>> {
+    ) -> Result<BoxStream<'a, Result<ProviderEvent, Box<dyn Error + Send + Sync>>>, Box<dyn Error + Send + Sync>> {
         let mut openai_messages: Vec<ChatCompletionRequestMessage> = Vec::new();
         
         for msg in messages {
@@ -125,31 +127,71 @@ impl LlmProvider for OpenAIProvider {
         let request = request_builder.build()
             .map_err(|e| Box::new(e) as Box<dyn Error + Send + Sync>)?;
 
-        let response = self.client.chat().create(request).await
+        let mut stream = self.client.chat().create_stream(request).await
             .map_err(|e| Box::new(e) as Box<dyn Error + Send + Sync>)?;
-            
-        let choice = response.choices.first()
-            .ok_or_else(|| Box::<dyn Error + Send + Sync>::from("No response choices"))?;
-            
-        let msg = &choice.message;
-        
-        let tool_calls = if let Some(calls) = &msg.tool_calls {
-            Some(calls.iter().map(|c| ToolCall {
-                id: c.id.clone(),
-                r#type: "function".to_string(),
-                function: FunctionCall {
-                    name: c.function.name.clone(),
-                    arguments: c.function.arguments.clone(),
-                },
-            }).collect())
-        } else {
-            None
+
+        let s = async_stream::try_stream! {
+            let mut tool_map: Vec<String> = Vec::new();
+
+            while let Some(result) = stream.next().await {
+                let response = result.map_err(|e| Box::new(e) as Box<dyn Error + Send + Sync>)?;
+                if let Some(choice) = response.choices.first() {
+                    let delta = &choice.delta;
+                    
+                    if let Some(content) = &delta.content {
+                        if !content.is_empty() {
+                            yield ProviderEvent::ContentDelta { delta: content.clone() };
+                        }
+                    }
+                    
+                    if let Some(tool_calls) = &delta.tool_calls {
+                        for tool_call in tool_calls {
+                            let index = tool_call.index as usize;
+                            
+                            if let Some(id) = &tool_call.id {
+                                if index >= tool_map.len() {
+                                    tool_map.resize(index + 1, String::new());
+                                }
+                                tool_map[index] = id.clone();
+                                
+                                let name = tool_call.function.as_ref().map(|f| f.name.clone().unwrap_or_default()).unwrap_or_default();
+                                
+                                yield ProviderEvent::ToolCallStart {
+                                    id: id.clone(),
+                                    name,
+                                };
+                            }
+                            
+                            if let Some(function) = &tool_call.function {
+                                if let Some(args) = &function.arguments {
+                                    if !args.is_empty() {
+                                        let id = if index < tool_map.len() {
+                                            tool_map[index].clone()
+                                        } else {
+                                            String::new() 
+                                        };
+                                        
+                                        yield ProviderEvent::ToolCallDelta {
+                                            id,
+                                            delta: args.clone()
+                                        };
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    
+                    if let Some(reason) = &choice.finish_reason {
+                        // Some providers send empty string as finish reason in middle
+                         // But usually finish_reason is null until end.
+                         // async-openai Option<FinishReason> (enum)
+                        yield ProviderEvent::Finish { reason: Some(format!("{:?}", reason)) };
+                    }
+                }
+            }
         };
 
-        Ok(Message::Assistant {
-            content: msg.content.clone(),
-            tool_calls,
-        })
+        Ok(Box::pin(s))
     }
 }
 

@@ -16,6 +16,7 @@ async fn main() -> Result<()> {
     let provider = Arc::new(provider);
     let bash_tool: Box<dyn gewu_core::traits::Tool> = Box::new(BashTool {
         working_directory: std::env::current_dir()?,
+        safe_mode: false,
     });
 
     let mut agent = AgentBuilder::default()
@@ -31,8 +32,26 @@ async fn main() -> Result<()> {
     }
 
     println!("Agent: Asking 'List the files in the current directory'");
-    let response = agent.ask("List the files in the current directory").await?;
-    println!("Response: {}", response);
+    
+    use futures::StreamExt;
+    use gewu_core::types::AgentEvent;
+    
+    let mut stream = Box::pin(agent.ask("List the files in the current directory"));
+    let mut final_response = String::new();
+
+    while let Some(event) = stream.next().await {
+        match event? {
+            AgentEvent::ContentDelta { delta } => {
+                print!("{}", delta);
+                final_response.push_str(&delta);
+            }
+            AgentEvent::Finish { response } => {
+                final_response = response;
+            }
+            _ => {}
+        }
+    }
+    println!("\nFinal Response: {}", final_response);
 
     Ok(())
 }

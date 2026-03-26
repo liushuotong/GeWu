@@ -1,7 +1,8 @@
-use crate::types::Message;
+use crate::types::{Message, ProviderEvent};
 use async_trait::async_trait;
 use serde_json::Value;
 use std::error::Error;
+use futures::stream::BoxStream;
 
 #[async_trait]
 pub trait Tool: Send + Sync {
@@ -13,11 +14,11 @@ pub trait Tool: Send + Sync {
 
 #[async_trait]
 pub trait LlmProvider: Send + Sync {
-    async fn generate_response(
-        &self,
+    async fn stream_response<'a>(
+        &'a self,
         messages: &[Message],
         tools: &[Box<dyn Tool>],
-    ) -> Result<Message, Box<dyn Error + Send + Sync>>;
+    ) -> Result<BoxStream<'a, Result<ProviderEvent, Box<dyn Error + Send + Sync>>>, Box<dyn Error + Send + Sync>>;
 }
 
 #[async_trait]
