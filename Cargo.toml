@@ -1,0 +1,8 @@
+[workspace]
+members = ["gewu-cli",
+    "gewu-core",
+    "gewu-providers",
+    "gewu-tools",
+]
+exclude = ["opencode"]
+resolver = "2"
