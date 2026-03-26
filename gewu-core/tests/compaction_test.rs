@@ -65,7 +65,7 @@ async fn test_compaction_trigger() {
     // Fill history with junk to exceed 100 tokens
     // 1 token ~ 4 chars. 100 tokens ~ 400 chars.
     let long_text = "A".repeat(500); 
-    agent.history.push(Message::User { content: long_text });
+    agent.memory.add_message(Message::User { content: long_text });
 
     // This call should trigger compaction because history > 100
     let response = agent.ask("Hello").await.unwrap();
@@ -78,9 +78,9 @@ async fn test_compaction_trigger() {
     // 3. User ("Hello")
     // 4. Assistant ("I am ready.")
     
-    assert_eq!(agent.history.len(), 4);
+    assert_eq!(agent.memory.messages().len(), 4);
     
-    match &agent.history[1] {
+    match &agent.memory.messages()[1] {
         Message::Assistant { content, .. } => {
             let text = content.as_ref().unwrap();
             assert!(text.contains("Summary of previous conversation"));

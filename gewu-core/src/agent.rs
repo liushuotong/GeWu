@@ -1,4 +1,4 @@
-use crate::traits::{LlmProvider, Tool};
+use crate::traits::{LlmProvider, Tool, Memory};
 use crate::types::Message;
 use crate::compaction::{self, is_overflow, estimate_message_tokens};
 use std::sync::Arc;
@@ -10,8 +10,8 @@ pub struct Agent {
     tools: Vec<Box<dyn Tool>>,
     system_prompt: String,
     max_turns: usize,
-    // History is now stateful
-    pub history: Vec<Message>,
+    // Memory is now stateful
+    pub memory: Box<dyn Memory>,
     // Context limit for compaction (default 128k for modern models, but configurable)
     pub context_limit: usize,
 }
@@ -21,6 +21,7 @@ pub struct AgentBuilder {
     tools: Vec<Box<dyn Tool>>,
     system_prompt: String,
     max_turns: usize,
+    memory: Option<Box<dyn Memory>>,
     context_limit: usize,
 }
 
@@ -31,17 +32,22 @@ impl Default for AgentBuilder {
             tools: Vec::new(),
             system_prompt: String::new(),
             max_turns: 10,
+            memory: None,
             context_limit: 128_000,
         }
     }
 }
 
 impl Agent {
+    pub fn builder() -> AgentBuilder {
+        AgentBuilder::default()
+    }
+
     /// Resets the conversation history, preserving the system prompt.
     pub fn reset(&mut self) {
-        self.history.clear();
+        self.memory.clear();
         if !self.system_prompt.is_empty() {
-             self.history.push(Message::System { content: self.system_prompt.clone() });
+             self.memory.add_message(Message::System { content: self.system_prompt.clone() });
         }
     }
 
@@ -49,11 +55,11 @@ impl Agent {
     /// This method maintains the conversation history.
     pub async fn ask(&mut self, user_message: &str) -> Result<String> {
         // Ensure system prompt is the first message if history is empty
-        if self.history.is_empty() && !self.system_prompt.is_empty() {
-             self.history.push(Message::System { content: self.system_prompt.clone() });
+        if self.memory.messages().is_empty() && !self.system_prompt.is_empty() {
+             self.memory.add_message(Message::System { content: self.system_prompt.clone() });
         }
 
-        self.history.push(Message::User { content: user_message.to_string() });
+        self.memory.add_message(Message::User { content: user_message.to_string() });
         
         let mut turn = 0;
         loop {
@@ -70,12 +76,12 @@ impl Agent {
             turn += 1;
 
             // Prune old tool outputs before generating response
-            compaction::prune(&mut self.history);
+            compaction::prune(self.memory.messages_mut());
 
-            let response = self.llm.generate_response(&self.history, &self.tools).await
+            let response = self.llm.generate_response(self.memory.messages(), &self.tools).await
                 .map_err(|e| anyhow::anyhow!(e))?;
             
-            self.history.push(response.clone());
+            self.memory.add_message(response.clone());
 
             match response {
                 Message::Assistant { content, tool_calls } => {
@@ -103,7 +109,7 @@ impl Agent {
                                 format!("Tool not found: {}", tool_name)
                             };
 
-                            self.history.push(Message::Tool {
+                            self.memory.add_message(Message::Tool {
                                 tool_call_id: call_id,
                                 content: result_content,
                             });
@@ -120,7 +126,7 @@ impl Agent {
     /// Checks if the current history exceeds the token limit and triggers summarization.
     async fn compact_if_needed(&mut self) -> Result<bool> {
         let mut total_tokens: usize = 0;
-        for msg in &self.history {
+        for msg in self.memory.messages() {
             total_tokens += estimate_message_tokens(msg);
         }
 
@@ -159,7 +165,7 @@ When constructing the summary, try to stick to this template:
 ---";
 
         // Prepare messages for summarization
-        let mut request_messages = self.history.clone();
+        let mut request_messages = self.memory.messages().to_vec();
         request_messages.push(Message::User {
             content: prompt.to_string(),
         });
@@ -180,7 +186,7 @@ When constructing the summary, try to stick to this template:
         let mut new_history = Vec::new();
 
         // Preserve system prompt
-        if let Some(sys_msg) = self.history.iter().find(|m| matches!(m, Message::System { .. })) {
+        if let Some(sys_msg) = self.memory.messages().iter().find(|m| matches!(m, Message::System { .. })) {
             new_history.push(sys_msg.clone());
         }
 
@@ -193,11 +199,11 @@ When constructing the summary, try to stick to this template:
         // Replay logic: Find the last user message
         // We only replay if it's not the one that triggered the overflow directly?
         // Actually, we want to ensure the agent remembers what the user *just* asked.
-        if let Some(last_user_msg) = self.history.iter().rev().find(|m| matches!(m, Message::User { .. })) {
+        if let Some(last_user_msg) = self.memory.messages().iter().rev().find(|m| matches!(m, Message::User { .. })) {
             new_history.push(last_user_msg.clone());
         }
 
-        self.history = new_history;
+        self.memory.replace(new_history);
         Ok(true)
     }
 }
@@ -228,6 +234,11 @@ impl AgentBuilder {
         self
     }
     
+    pub fn memory(mut self, memory: Box<dyn Memory>) -> Self {
+        self.memory = Some(memory);
+        self
+    }
+    
     pub fn build(self) -> Result<Agent> {
         let llm = self.llm.context("LLM provider is required")?;
         let mut agent = Agent {
@@ -235,12 +246,12 @@ impl AgentBuilder {
             tools: self.tools,
             system_prompt: self.system_prompt.clone(),
             max_turns: self.max_turns,
-            history: Vec::new(),
+            memory: self.memory.unwrap_or_else(|| Box::new(Vec::new())),
             context_limit: self.context_limit,
         };
         // Initialize history with system prompt
         if !agent.system_prompt.is_empty() {
-             agent.history.push(Message::System { content: agent.system_prompt.clone() });
+             agent.memory.add_message(Message::System { content: agent.system_prompt.clone() });
         }
         Ok(agent)
     }

@@ -19,9 +19,11 @@ async fn main() -> Result<()> {
     // Initialize the provider with the custom endpoint
     let provider = Arc::new(OpenAIProvider::new_with_endpoint(&api_key, &base_url, &model));
     
-    let bash_tool = Box::new(BashTool);
+    let bash_tool = Box::new(BashTool {
+        working_directory: env::current_dir()?,
+    });
 
-    let agent = AgentBuilder::default()
+    let mut agent = AgentBuilder::default()
         .llm(provider)
         .with_tools(vec![bash_tool])
         .system_prompt("You are a helpful assistant.")
