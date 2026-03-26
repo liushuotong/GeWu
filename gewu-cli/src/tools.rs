@@ -6,9 +6,12 @@ use serde_json::{json, Value};
 use std::sync::Arc;
 use std::error::Error;
 use tracing::info;
+use sqlx::SqlitePool;
+use uuid::Uuid;
 
 pub struct TaskTool {
     pub provider: Arc<dyn LlmProvider>,
+    pub pool: SqlitePool,
     description: String,
 }
 
@@ -22,9 +25,9 @@ struct TaskArgs {
 }
 
 impl TaskTool {
-    pub fn new(provider: Arc<dyn LlmProvider>) -> Self {
+    pub fn new(provider: Arc<dyn LlmProvider>, pool: SqlitePool) -> Self {
         let description = Self::generate_description();
-        Self { provider, description }
+        Self { provider, pool, description }
     }
 
     fn generate_description() -> String {
@@ -68,14 +71,11 @@ impl Tool for TaskTool {
     async fn call(&self, args: &str) -> Result<String, Box<dyn Error + Send + Sync>> {
         let input: TaskArgs = serde_json::from_str(args)?;
         
-        // TODO: Handle task_id for resumption. For now, we always create a fresh agent.
-        if input.task_id.is_some() {
-            // Log warning or just proceed?
-        }
+        let session_id = input.task_id.unwrap_or_else(|| Uuid::new_v4().to_string());
 
-        info!("Spawning sub-agent '{}' for task: {}", input.subagent_type, input.description);
+        info!("Spawning sub-agent '{}' for task: {} (session: {})", input.subagent_type, input.description, session_id);
 
-        let mut agent = crate::registry::create_agent(&input.subagent_type, self.provider.clone())
+        let mut agent = crate::registry::create_agent(&input.subagent_type, self.provider.clone(), self.pool.clone(), session_id.clone()).await
             .map_err(|e| format!("Failed to create agent: {}", e))?;
 
         // Run the agent
@@ -83,8 +83,8 @@ impl Tool for TaskTool {
             .map_err(|e| format!("Agent execution failed: {}", e))?;
 
         Ok(format!(
-            "task_id: {} (stateless-mock-id)\n\n<task_result>\n{}\n</task_result>",
-            "stateless-session", result
+            "task_id: {}\n\n<task_result>\n{}\n</task_result>",
+            session_id, result
         ))
     }
 }

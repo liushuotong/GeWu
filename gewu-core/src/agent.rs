@@ -44,10 +44,10 @@ impl Agent {
     }
 
     /// Resets the conversation history, preserving the system prompt.
-    pub fn reset(&mut self) {
-        self.memory.clear();
+    pub async fn reset(&mut self) {
+        self.memory.clear().await;
         if !self.system_prompt.is_empty() {
-             self.memory.add_message(Message::System { content: self.system_prompt.clone() });
+             self.memory.add_message(Message::System { content: self.system_prompt.clone() }).await;
         }
     }
 
@@ -56,10 +56,10 @@ impl Agent {
     pub async fn ask(&mut self, user_message: &str) -> Result<String> {
         // Ensure system prompt is the first message if history is empty
         if self.memory.messages().is_empty() && !self.system_prompt.is_empty() {
-             self.memory.add_message(Message::System { content: self.system_prompt.clone() });
+             self.memory.add_message(Message::System { content: self.system_prompt.clone() }).await;
         }
 
-        self.memory.add_message(Message::User { content: user_message.to_string() });
+        self.memory.add_message(Message::User { content: user_message.to_string() }).await;
         
         let mut turn = 0;
         loop {
@@ -81,7 +81,7 @@ impl Agent {
             let response = self.llm.generate_response(self.memory.messages(), &self.tools).await
                 .map_err(|e| anyhow::anyhow!(e))?;
             
-            self.memory.add_message(response.clone());
+            self.memory.add_message(response.clone()).await;
 
             match response {
                 Message::Assistant { content, tool_calls } => {
@@ -112,7 +112,7 @@ impl Agent {
                             self.memory.add_message(Message::Tool {
                                 tool_call_id: call_id,
                                 content: result_content,
-                            });
+                            }).await;
                         }
                     } else {
                         return Ok(content.unwrap_or_default());
@@ -203,7 +203,7 @@ When constructing the summary, try to stick to this template:
             new_history.push(last_user_msg.clone());
         }
 
-        self.memory.replace(new_history);
+        self.memory.replace(new_history).await;
         Ok(true)
     }
 }
@@ -241,7 +241,7 @@ impl AgentBuilder {
     
     pub fn build(self) -> Result<Agent> {
         let llm = self.llm.context("LLM provider is required")?;
-        let mut agent = Agent {
+        let agent = Agent {
             llm,
             tools: self.tools,
             system_prompt: self.system_prompt.clone(),
@@ -249,10 +249,9 @@ impl AgentBuilder {
             memory: self.memory.unwrap_or_else(|| Box::new(Vec::new())),
             context_limit: self.context_limit,
         };
-        // Initialize history with system prompt
-        if !agent.system_prompt.is_empty() {
-             agent.memory.add_message(Message::System { content: agent.system_prompt.clone() });
-        }
+        // Removed initial synchronous add_message call.
+        // It will be handled in reset() or ask() or should be pre-seeded.
+        // Since we removed it, we rely on ask() to add system prompt if empty.
         Ok(agent)
     }
 }

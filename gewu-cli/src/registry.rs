@@ -7,6 +7,8 @@ use gewu_tools::{
     WebFetchTool, WebSearchTool, WriteFileTool,
 };
 use std::sync::Arc;
+use gewu_storage::SqliteMemory;
+use sqlx::SqlitePool;
 
 pub struct AgentConfig {
     pub name: String,
@@ -30,13 +32,16 @@ pub fn list_available_agents() -> Vec<AgentConfig> {
     ]
 }
 
-pub fn create_agent(name: &str, provider: Arc<dyn LlmProvider>) -> Result<Agent> {
+pub async fn create_agent(name: &str, provider: Arc<dyn LlmProvider>, pool: SqlitePool, session_id: String) -> Result<Agent> {
     let working_directory = std::env::current_dir()?;
+
+    // Initialize persistent memory
+    let memory = SqliteMemory::new(pool.clone(), session_id).await?;
 
     match name {
         "build" => {
             let tools: Vec<Box<dyn Tool>> = vec![
-                Box::new(TaskTool::new(provider.clone())),
+                Box::new(TaskTool::new(provider.clone(), pool.clone())),
                 Box::new(ReadFileTool {
                     working_directory: working_directory.clone(),
                 }),
@@ -66,6 +71,7 @@ pub fn create_agent(name: &str, provider: Arc<dyn LlmProvider>) -> Result<Agent>
             Agent::builder()
                 .llm(provider)
                 .with_tools(tools)
+                .memory(Box::new(memory))
                 .system_prompt(include_str!("prompts/build.txt"))
                 .build()
         }
@@ -94,12 +100,13 @@ pub fn create_agent(name: &str, provider: Arc<dyn LlmProvider>) -> Result<Agent>
             Agent::builder()
                 .llm(provider)
                 .with_tools(tools)
+                .memory(Box::new(memory))
                 .system_prompt(include_str!("prompts/explore.txt"))
                 .build()
         }
         "general" => {
             let tools: Vec<Box<dyn Tool>> = vec![
-                Box::new(TaskTool::new(provider.clone())),
+                Box::new(TaskTool::new(provider.clone(), pool.clone())),
                 Box::new(ReadFileTool {
                     working_directory: working_directory.clone(),
                 }),
@@ -129,6 +136,7 @@ pub fn create_agent(name: &str, provider: Arc<dyn LlmProvider>) -> Result<Agent>
             Agent::builder()
                 .llm(provider)
                 .with_tools(tools)
+                .memory(Box::new(memory))
                 .system_prompt(include_str!("prompts/general.txt"))
                 .build()
         }

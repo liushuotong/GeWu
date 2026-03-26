@@ -1,7 +1,7 @@
 [workspace]
 members = ["gewu-cli",
     "gewu-core",
-    "gewu-providers",
+    "gewu-providers", "gewu-storage",
     "gewu-tools",
 ]
 exclude = ["opencode"]

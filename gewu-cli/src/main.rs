@@ -1,12 +1,14 @@
 mod registry;
 mod tools;
 
-use anyhow::Result;
+use anyhow::{Result, Context};
 use clap::Parser;
 use gewu_providers::OpenAIProvider;
 use std::sync::Arc;
 use tracing::{info, error, Level};
 use std::env;
+use uuid::Uuid;
+use sqlx::sqlite::SqlitePoolOptions;
 
 #[derive(Parser)]
 #[command(name = "gewu-cli")]
@@ -36,6 +38,14 @@ struct Cli {
     /// List available agents
     #[arg(long)]
     list_agents: bool,
+
+    /// Session ID for persistent memory (optional, generated if not provided)
+    #[arg(long)]
+    session_id: Option<String>,
+
+    /// Path to SQLite database file
+    #[arg(long)]
+    db_path: Option<String>,
 }
 
 #[tokio::main]
@@ -88,8 +98,37 @@ async fn main() -> Result<()> {
         Arc::new(OpenAIProvider::new(&api_key, &cli.model))
     };
 
+    // Initialize SQLite Pool
+    let db_path = if let Some(path) = cli.db_path {
+        path
+    } else {
+        let home_dir = dirs::home_dir()
+            .context("Failed to determine home directory. Please provide --db-path explicitly.")?;
+        let gewu_dir = home_dir.join(".gewu");
+        
+        // Ensure .gewu directory exists
+        if !gewu_dir.exists() {
+            std::fs::create_dir_all(&gewu_dir)
+                .context("Failed to create .gewu directory")?;
+        }
+        
+        gewu_dir.join("gewu.db").to_string_lossy().to_string()
+    };
+
+    info!("Using database: {}", db_path);
+    let db_url = format!("sqlite://{}?mode=rwc", db_path);
+
+    let pool = SqlitePoolOptions::new()
+        .connect(&db_url)
+        .await
+        .context("Failed to connect to SQLite database")?;
+
+    // Determine Session ID
+    let session_id = cli.session_id.unwrap_or_else(|| Uuid::new_v4().to_string());
+    println!("Session ID: {}", session_id);
+
     // Create Agent
-    let mut agent = registry::create_agent(&cli.agent, provider)?;
+    let mut agent = registry::create_agent(&cli.agent, provider, pool, session_id).await?;
     info!("Initialized agent: {}", cli.agent);
 
     // Initial Prompt handling
