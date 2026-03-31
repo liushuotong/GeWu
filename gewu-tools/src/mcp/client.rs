@@ -87,7 +87,7 @@ impl McpClient {
 
     async fn connect_sse(url: &str) -> Result<Self> {
         let client = reqwest::Client::new();
-        let mut response = client.get(url)
+        let response = client.get(url)
             .header("Accept", "text/event-stream")
             .send()
             .await

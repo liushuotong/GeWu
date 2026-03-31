@@ -30,3 +30,27 @@ You can interact with GeWu agents directly using the CLI:
 ```bash
 cargo run --bin gewu-cli -- --help
 ```
+
+### Configuration
+
+The CLI uses a JSON config file to configure the LLM provider. By default, it looks for `config.json` in the project root, or `~/.gewu/config.json`.
+
+**Config file location priority:**
+1. `--llm-config <path>` CLI argument
+2. `config.json` in project root (if exists)
+3. `~/.gewu/config.json` (if exists)
+
+**Example `config.json`:**
+```json
+{
+  "endpoint": "https://api.openai.com/v1",
+  "api_key": "sk-...",
+  "model": "gpt-4"
+}
+```
+
+**Configuration priority (highest to lowest):**
+1. CLI arguments (`--endpoint`, `--api-key`, `--model`)
+2. Environment variables (`OPENAI_ENDPOINT`, `OPENAI_API_KEY`, `OPENAI_MODEL`)
+3. Config file
+4. Defaults (none - all values must be provided)

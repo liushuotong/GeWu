@@ -1,3 +1,4 @@
+mod config;
 mod registry;
 mod tools;
 mod mcp_loader;
@@ -13,6 +14,8 @@ use sqlx::sqlite::SqlitePoolOptions;
 use gewu_core::types::AgentEvent;
 use futures::StreamExt;
 use std::io::Write;
+
+
 
 async fn run_agent(agent: &mut gewu_core::Agent, prompt: &str) -> Result<()> {
     let mut stream = Box::pin(agent.ask(prompt));
@@ -67,9 +70,18 @@ struct Cli {
     #[arg(long, env = "OPENAI_BASE_URL")]
     base_url: Option<String>,
 
+    /// OpenAI API Key
+    #[arg(long, env = "OPENAI_API_KEY")]
+    api_key: Option<String>,
+
+    /// OpenAI Endpoint URL
+    #[arg(long, env = "OPENAI_ENDPOINT")]
+    endpoint: Option<String>,
+
     /// Custom Model Name
-    #[arg(long, short, env = "OPENAI_MODEL", default_value = "minimax-m2.5")]
-    model: String,
+    #[arg(long, short, env = "OPENAI_MODEL")]
+    model: Option<String>,
+
 
     /// Initial Agent (default: build)
     #[arg(long, default_value = "build")]
@@ -94,6 +106,10 @@ struct Cli {
     /// Path to MCP configuration file
     #[arg(long)]
     config: Option<String>,
+
+    /// Path to LLM configuration file
+    #[arg(long)]
+    llm_config: Option<String>,
 }
 
 #[tokio::main]
@@ -127,23 +143,42 @@ async fn main() -> Result<()> {
         
     tracing::subscriber::set_global_default(subscriber)?;
 
-    // Configure Environment for LLM (Internal/Legacy Defaults)
-    let api_key = env::var("OPENAI_API_KEY").unwrap_or_else(|_| "sk-Ie7Kric4qcPEHli7GRYv39GmCFGuBZkewduwm6ZTE1LKrrx8".to_string());
-    
-    let base_url = if let Some(url) = cli.base_url {
-        Some(url)
-    } else if let Ok(url) = env::var("OPENAI_BASE_URL") {
-        Some(url)
+    let loaded_config = config::LoadedConfig::load(cli.llm_config.as_deref())?;
+
+    if let Some(path) = &loaded_config.path {
+        info!("Loaded config from: {}", path.display());
     } else {
-        // Default internal endpoint
-        Some("http://10.28.0.22:30530/v1".to_string())
-    };
+        info!("No config file found");
+    }
+
+    let file_config = &loaded_config.config;
+
+    let api_key = cli.api_key
+        .or_else(|| env::var("OPENAI_API_KEY").ok())
+        .or(file_config.api_key.clone())
+        .context("OPENAI_API_KEY not provided. Set via --api-key, OPENAI_API_KEY env var, or config.json")?;
+
+    let endpoint = cli.endpoint
+        .or_else(|| env::var("OPENAI_ENDPOINT").ok())
+        .or(cli.base_url.clone())
+        .or_else(|| env::var("OPENAI_BASE_URL").ok())
+        .or(file_config.endpoint.clone())
+        .context("Endpoint not provided. Set via --endpoint, --base-url, OPENAI_ENDPOINT/OPENAI_BASE_URL env var, or config.json")?;
+
+    let model = cli.model
+        .or_else(|| env::var("OPENAI_MODEL").ok())
+        .or(file_config.model.clone())
+        .unwrap_or_else(|| "gpt-5.3-codex".to_string());
+
+    info!("Using model: {}", model);
+
+    let base_url = Some(endpoint);
 
     // Initialize Provider
     let provider = if let Some(url) = base_url {
-        Arc::new(OpenAIProvider::new_with_endpoint(&api_key, &url, &cli.model))
+        Arc::new(OpenAIProvider::new_with_endpoint(&api_key, &url, &model))
     } else {
-        Arc::new(OpenAIProvider::new(&api_key, &cli.model))
+        Arc::new(OpenAIProvider::new(&api_key, &model))
     };
 
     // Initialize SQLite Pool

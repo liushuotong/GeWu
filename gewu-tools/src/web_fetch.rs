@@ -17,7 +17,7 @@ pub struct WebFetchTool;
 #[async_trait]
 impl Tool for WebFetchTool {
     fn name(&self) -> &str {
-        "web_fetch"
+        "webfetch"
     }
 
     fn description(&self) -> &str {
@@ -45,8 +45,14 @@ impl Tool for WebFetchTool {
 
     async fn call(&self, args: &str) -> Result<String, Box<dyn Error + Send + Sync>> {
         let args_val: Value = serde_json::from_str(args).map_err(into_tool_error)?;
-        let url = args_val["url"].as_str().ok_or_else(|| anyhow::anyhow!("url is required")).map_err(into_tool_error)?;
+        let mut url = args_val["url"].as_str().ok_or_else(|| anyhow::anyhow!("url is required")).map_err(into_tool_error)?.to_string();
         let format = args_val["format"].as_str().unwrap_or("markdown");
+
+        if url.starts_with("http://") && !url.contains("127.0.0.1") && !url.contains("localhost") {
+            url = url.replacen("http://", "https://", 1);
+        } else if !url.starts_with("http://") && !url.starts_with("https://") {
+            url = format!("https://{}", url);
+        }
 
         let client = reqwest::Client::builder()
             .timeout(Duration::from_secs(30))
@@ -65,7 +71,7 @@ impl Tool for WebFetchTool {
 
         match format {
             "html" => Ok(html),
-            "text" | "markdown" | _ => {
+            _ => {
                 // Convert HTML to Markdown for better LLM readability
                 // html2md is a crate that does this conversion
                 let markdown = html2md::parse_html(&html);
