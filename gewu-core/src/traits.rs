@@ -26,6 +26,8 @@ pub trait LlmProvider: Send + Sync {
         messages: &[Message],
         tools: &[Arc<dyn Tool>],
     ) -> Result<BoxStream<'a, Result<ProviderEvent, Box<dyn Error + Send + Sync>>>, Box<dyn Error + Send + Sync>>;
+
+    async fn list_models(&self) -> Result<Vec<String>, Box<dyn Error + Send + Sync>>;
 }
 
 #[async_trait]

@@ -235,6 +235,13 @@ impl LlmProvider for OpenAIProvider {
 
         Ok(parsed_stream)
     }
+
+    async fn list_models(&self) -> Result<Vec<String>, Box<dyn Error + Send + Sync>> {
+        let models = self.client.models();
+        let response = models.list().await
+            .map_err(|e| Box::new(e) as Box<dyn Error + Send + Sync>)?;
+        Ok(response.data.into_iter().map(|m| m.id).collect())
+    }
 }
 
 #[cfg(test)]

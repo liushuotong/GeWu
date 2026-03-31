@@ -75,5 +75,6 @@ If both `.json` and `.jsonc` exist in the same location, `.json` takes precedenc
 
 - `--llm-config <PATH>`: Load configuration from a specific file (overrides default search path).
 - `--list-agents`: List available agent types.
+- `--list-models`: List available models from the configured provider.
 - `--session-id <ID>`: Resume a specific session.
 - `--db-path <PATH>`: Use a custom database file.

@@ -6,8 +6,9 @@ mod mcp_loader;
 use anyhow::{Result, Context};
 use clap::Parser;
 use gewu_providers::OpenAIProvider;
+use gewu_core::traits::LlmProvider;
 use std::sync::Arc;
-use tracing::{info, error, Level};
+use tracing::{info, error};
 use std::env;
 use uuid::Uuid;
 use sqlx::sqlite::SqlitePoolOptions;
@@ -101,6 +102,10 @@ struct Cli {
     #[arg(long)]
     list_agents: bool,
 
+    /// List available models from the provider
+    #[arg(long)]
+    list_models: bool,
+
     /// Session ID for persistent memory (optional, generated if not provided)
     #[arg(long)]
     session_id: Option<String>,
@@ -118,8 +123,24 @@ struct Cli {
 async fn main() -> Result<()> {
     // Load .env file
     dotenvy::dotenv().ok();
-    
+
     let cli = Cli::parse();
+
+    // Initialize logging
+    let log_level = match cli.log_level.to_lowercase().as_str() {
+        "error" => tracing::Level::ERROR,
+        "warn" => tracing::Level::WARN,
+        "info" => tracing::Level::INFO,
+        "debug" => tracing::Level::DEBUG,
+        "trace" => tracing::Level::TRACE,
+        _ => tracing::Level::INFO,
+    };
+
+    let subscriber = tracing_subscriber::fmt()
+        .with_max_level(log_level)
+        .finish();
+
+    tracing::subscriber::set_global_default(subscriber)?;
 
     if cli.list_agents {
         println!("Available Agents:");
@@ -128,22 +149,6 @@ async fn main() -> Result<()> {
         }
         return Ok(());
     }
-
-    // Initialize logging
-    let log_level = match cli.log_level.to_lowercase().as_str() {
-        "error" => Level::ERROR,
-        "warn" => Level::WARN,
-        "info" => Level::INFO,
-        "debug" => Level::DEBUG,
-        "trace" => Level::TRACE,
-        _ => Level::INFO,
-    };
-    
-    let subscriber = tracing_subscriber::fmt()
-        .with_max_level(log_level)
-        .finish();
-        
-    tracing::subscriber::set_global_default(subscriber)?;
 
     let loaded_config = config::LoadedConfig::load(cli.llm_config.as_deref())?;
 
@@ -166,6 +171,22 @@ async fn main() -> Result<()> {
         .or_else(|| env::var("OPENAI_BASE_URL").ok())
         .or(file_config.endpoint.clone())
         .context("Endpoint not provided. Set via --endpoint, --base-url, OPENAI_ENDPOINT/OPENAI_BASE_URL env var, or config.json")?;
+
+    if cli.list_models {
+        let provider = OpenAIProvider::new_with_endpoint(&api_key, &endpoint, "dummy");
+        match provider.list_models().await {
+            Ok(models) => {
+                println!("Available Models:");
+                for model in models {
+                    println!("  - {}", model);
+                }
+            }
+            Err(e) => {
+                eprintln!("Error listing models: {}", e);
+            }
+        }
+        return Ok(());
+    }
 
     let model = cli.model
         .or_else(|| env::var("OPENAI_MODEL").ok())
