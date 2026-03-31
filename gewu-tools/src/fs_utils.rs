@@ -54,6 +54,10 @@ pub fn resolve_safe_path(root: impl AsRef<Path>, user_path: impl AsRef<Path>) ->
     // If user_path is absolute, it must start with root.
     // If it is relative, we join it to root.
     let joined = if user_path.is_absolute() {
+        let user_path_ref: &Path = user_path.as_ref();
+        if user_path_ref == Path::new("/") {
+            return Ok(root.join(".").into());
+        }
         user_path.to_path_buf()
     } else {
         root.join(user_path)

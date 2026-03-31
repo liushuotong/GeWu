@@ -83,6 +83,14 @@ impl Tool for BatchTool {
             let registry = self.registry.clone();
             let allowed = allowed_tools.clone();
 
+            if tool_name.is_empty() {
+                let tool_name_clone = tool_name.clone();
+                join_set.spawn(async move {
+                    (tool_name_clone, Err("Empty tool name".into()))
+                });
+                continue;
+            }
+
             join_set.spawn(async move {
                 let result = async {
                     if DISALLOWED.contains(&tool_name.as_str()) {

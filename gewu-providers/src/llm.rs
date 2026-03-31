@@ -181,6 +181,10 @@ impl ResponseParser for OpenAIProvider {
 
                                 let name = tool_call.function.as_ref().map(|f| f.name.clone().unwrap_or_default()).unwrap_or_default();
 
+                                if name.is_empty() {
+                                    continue;
+                                }
+
                                 yield ProviderEvent::ToolCallStart {
                                     id: id.clone(),
                                     name,

@@ -168,6 +168,12 @@ impl Agent {
                          return;
                     }
 
+                    if tool_name.is_empty() {
+                         let error_msg = "Tool name is empty, skipping execution".to_string();
+                         yield AgentEvent::Error { error: error_msg };
+                         continue;
+                    }
+
                     yield AgentEvent::ToolStart { tool: tool_name.clone(), input: args.clone() };
 
                     let tool = self.tools.iter().find(|t| t.name() == tool_name);
