@@ -109,10 +109,6 @@ struct Cli {
     #[arg(long)]
     db_path: Option<String>,
 
-    /// Path to MCP configuration file
-    #[arg(long)]
-    config: Option<String>,
-
     /// Path to LLM configuration file
     #[arg(long)]
     llm_config: Option<String>,
@@ -217,7 +213,7 @@ async fn main() -> Result<()> {
     println!("Session ID: {}", session_id);
     
     // Load MCP tools
-    let mcp_tools = mcp_loader::load_mcp_tools(cli.config.clone()).await?;
+    let mcp_tools = mcp_loader::load_mcp_tools(loaded_config.config.mcp_servers).await?;
 
     // Create Agent
     let (mut agent, _registry) = registry::create_agent(&cli.agent, provider, pool, session_id, mcp_tools).await?;
