@@ -163,7 +163,7 @@ impl Tool for BatchTool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::{Arc, Mutex};
+    use std::sync::Arc;
 
     struct MockTool {
         name: String,

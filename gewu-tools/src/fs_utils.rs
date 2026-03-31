@@ -138,6 +138,49 @@ pub fn mime_type(path: impl AsRef<Path>) -> String {
         .to_string()
 }
 
+/// Returns true if the file appears to be binary based on extension and content sampling.
+/// Extension check first, then sample content if needed.
+pub async fn is_binary_file(path: impl AsRef<Path>, file_size: u64) -> Result<bool> {
+    let path = path.as_ref();
+    let ext = path.extension().and_then(|e| e.to_str()).map(|e| e.to_lowercase());
+
+    // Binary extensions list (same as legacy)
+    match ext.as_deref() {
+        Some(
+            ".zip" | ".tar" | ".gz" | ".exe" | ".dll" | ".so" | ".class" | ".jar" | ".war" | ".7z"
+            | ".doc" | ".docx" | ".xls" | ".xlsx" | ".ppt" | ".pptx" | ".odt" | ".ods" | ".odp"
+            | ".bin" | ".dat" | ".obj" | ".o" | ".a" | ".lib" | ".wasm" | ".pyc" | ".pyo",
+        ) => return Ok(true),
+        _ => {}
+    }
+
+    if file_size == 0 {
+        return Ok(false);
+    }
+
+    let fh = tokio::fs::File::open(path).await?;
+    let mut reader = tokio::io::BufReader::new(fh);
+    let sample_size = std::cmp::min(4096, file_size as usize);
+    let mut bytes = vec![0u8; sample_size];
+    let result = tokio::io::AsyncReadExt::read(&mut reader, &mut bytes).await?;
+    if result == 0 {
+        return Ok(false);
+    }
+
+    let mut non_printable_count = 0;
+    for i in 0..result {
+        if bytes[i] == 0 {
+            return Ok(true);
+        }
+        if bytes[i] < 9 || (bytes[i] > 13 && bytes[i] < 32) {
+            non_printable_count += 1;
+        }
+    }
+
+    // If >30% non-printable characters, consider it binary
+    Ok(non_printable_count as f64 / result as f64 > 0.3)
+}
+
 /// Searches for a file or directory by walking up from `start_dir`.
 pub async fn find_up(name: impl AsRef<Path>, start_dir: impl AsRef<Path>) -> Option<PathBuf> {
     let mut current = start_dir.as_ref().to_path_buf();

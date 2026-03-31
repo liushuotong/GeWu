@@ -6,13 +6,21 @@
 //! - `EditFileTool`: Modifies existing files by replacing text.
 //! - `GlobTool`: Finds files using glob patterns.
 
-use crate::fs_utils::{resolve_safe_path, read_text, write, glob_with_gitignore, into_tool_error};
+use crate::fs_utils::{resolve_safe_path, read_text, read_bytes, write, glob_with_gitignore, into_tool_error, is_binary_file, mime_type};
 use gewu_core::traits::Tool;
 use anyhow::Result;
 use async_trait::async_trait;
 use serde_json::{Value, json};
 use std::path::PathBuf;
 use std::error::Error;
+use tokio::io::BufReader;
+use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64};
+
+const DEFAULT_READ_LIMIT: usize = 2000;
+const MAX_LINE_LENGTH: usize = 2000;
+const MAX_LINE_SUFFIX: &str = "... (line truncated to 2000 chars)";
+const MAX_BYTES: usize = 50 * 1024;
+const MAX_BYTES_LABEL: &str = "50 KB";
 
 /// Tool for reading files or listing directories.
 pub struct ReadFileTool {
@@ -53,53 +61,203 @@ impl Tool for ReadFileTool {
     async fn call(&self, args: &str) -> Result<String, Box<dyn Error + Send + Sync>> {
         let args_val: Value = serde_json::from_str(args).map_err(into_tool_error)?;
         let file_path_str = args_val["filePath"].as_str().ok_or_else(|| anyhow::anyhow!("filePath is required")).map_err(into_tool_error)?;
-        let limit = args_val["limit"].as_u64().unwrap_or(2000) as usize;
-        let offset = args_val["offset"].as_u64().unwrap_or(1) as usize;
 
         let file_path = resolve_safe_path(&self.working_directory, file_path_str).map_err(into_tool_error)?;
 
-        // Check if it's a directory
-        if tokio::fs::metadata(&file_path).await.map_err(into_tool_error)?.is_dir() {
-            let mut entries = tokio::fs::read_dir(&file_path).await.map_err(into_tool_error)?;
-            let mut lines = Vec::new();
-            while let Ok(Some(entry)) = entries.next_entry().await {
-                let path = entry.path();
-                let name = path.file_name().unwrap_or_default().to_string_lossy();
-                if path.is_dir() {
-                    lines.push(format!("{}/", name));
-                } else {
-                    lines.push(name.to_string());
+        let metadata = tokio::fs::metadata(&file_path).await;
+
+        if metadata.is_err() {
+            let parent = file_path.parent().unwrap_or(file_path.as_path());
+            let basename = file_path.file_name()
+                .and_then(|n| n.to_str())
+                .and_then(|n| n.rsplit('.').next()) // Remove extension for fuzzy matching
+                .unwrap_or("");
+
+            if tokio::fs::metadata(parent).await.is_ok() {
+                let mut suggestions: Vec<String> = Vec::new();
+                let mut dir_stream = tokio::fs::read_dir(parent).await.map_err(into_tool_error)?;
+
+                while let Some(entry) = dir_stream.next_entry().await.map_err(into_tool_error)? {
+                    let name = entry.file_name().to_string_lossy().to_string();
+                    let name_lower = name.to_lowercase();
+                    let base_lower = basename.to_lowercase();
+                    if name_lower.contains(&base_lower) || base_lower.contains(&name_lower) {
+                        suggestions.push(name);
+                    }
+                    if suggestions.len() >= 3 {
+                        break;
+                    }
+                }
+
+                if !suggestions.is_empty() {
+                    return Err(anyhow::anyhow!(
+                        "File not found: {}\n\nDid you mean one of these?\n{}",
+                        file_path_str,
+                        suggestions.join("\n")
+                    ).into());
                 }
             }
-            lines.sort();
-            return Ok(lines.join("\n"));
+
+            return Err(anyhow::anyhow!("File not found: {}", file_path_str).into());
         }
 
-        let content = read_text(&file_path).await.map_err(into_tool_error)?;
-        let lines: Vec<&str> = content.lines().collect();
-        
-        if offset > lines.len() {
-            return Ok(String::new());
-        }
+        let meta = metadata.unwrap();
 
-        let start_index = if offset > 0 { offset - 1 } else { 0 };
-        let end_index = (start_index + limit).min(lines.len());
-        
-        let result_lines: Vec<String> = lines[start_index..end_index]
-            .iter()
-            .enumerate()
-            .map(|(i, line)| {
-                let line_num = start_index + i + 1;
-                let truncated_line = if line.len() > 2000 {
-                    format!("{}... (truncated)", &line[..2000])
+        if meta.is_dir() {
+            let mut entries: Vec<String> = Vec::new();
+            let mut dir_stream = tokio::fs::read_dir(&file_path).await.map_err(into_tool_error)?;
+
+            while let Some(entry) = dir_stream.next_entry().await.map_err(into_tool_error)? {
+                let path = entry.path();
+                let name = entry.file_name().to_string_lossy().to_string();
+
+                if path.is_symlink() {
+                    let sym_meta = tokio::fs::symlink_metadata(&path).await.ok();
+                    if sym_meta.as_ref().is_some_and(|m| m.is_dir()) {
+                        entries.push(format!("{}/", name));
+                        continue;
+                    }
+                }
+
+                if path.is_dir() {
+                    entries.push(format!("{}/", name));
                 } else {
-                    line.to_string()
-                };
-                format!("{}: {}", line_num, truncated_line)
-            })
+                    entries.push(name);
+                }
+            }
+
+            entries.sort();
+
+            let limit = args_val["limit"].as_u64().unwrap_or(DEFAULT_READ_LIMIT as u64) as usize;
+            let offset = args_val["offset"].as_u64().unwrap_or(1) as usize;
+            let start = offset.saturating_sub(1);
+            let sliced: Vec<&str> = entries.iter().skip(start).take(limit).map(|s| s.as_str()).collect();
+            let truncated = start + sliced.len() < entries.len();
+
+            let output = if truncated {
+                format!(
+                    "<path>{}</path>\n<type>directory</type>\n<entries>\n{}\n</entries>\n\n(Showing {} of {} entries. Use 'offset' parameter to read beyond entry {})",
+                    file_path_str,
+                    sliced.join("\n"),
+                    sliced.len(),
+                    entries.len(),
+                    offset + sliced.len()
+                )
+            } else {
+                format!(
+                    "<path>{}</path>\n<type>directory</type>\n<entries>\n{}\n</entries>\n\n({} entries)",
+                    file_path_str,
+                    sliced.join("\n"),
+                    entries.len()
+                )
+            };
+
+            return Ok(output);
+        }
+
+        let mime = mime_type(&file_path);
+        let is_image = mime.starts_with("image/") && mime != "image/svg+xml" && mime != "image/vnd.fastbidsheet";
+        let is_pdf = mime == "application/pdf";
+
+        if is_image || is_pdf {
+            let data = read_bytes(&file_path).await.map_err(into_tool_error)?;
+            let encoded = BASE64.encode(&data);
+            let msg = if is_image { "Image" } else { "PDF" };
+            let result = json!({
+                "type": "media",
+                "mime": mime,
+                "data": encoded,
+                "message": format!("{} read successfully", msg)
+            });
+            return Ok(result.to_string());
+        }
+
+        let is_binary = is_binary_file(&file_path, meta.len()).await.map_err(into_tool_error)?;
+        if is_binary {
+            return Err(anyhow::anyhow!("Cannot read binary file: {}", file_path_str).into());
+        }
+
+        let limit = args_val["limit"].as_u64().unwrap_or(DEFAULT_READ_LIMIT as u64) as usize;
+        let offset = args_val["offset"].as_u64().unwrap_or(1) as usize;
+        let start = offset.saturating_sub(1);
+
+        let file = tokio::fs::File::open(&file_path).await.map_err(into_tool_error)?;
+        let reader = BufReader::new(file);
+        let mut lines: Vec<String> = Vec::new();
+        let mut total_lines: usize = 0;
+        let mut bytes: usize = 0;
+        let mut truncated_by_bytes = false;
+        let mut has_more_lines = false;
+
+        let mut reader = reader;
+        let mut line_iter = tokio::io::AsyncBufReadExt::lines(&mut reader);
+
+        while let Some(text) = line_iter.next_line().await.map_err(into_tool_error)? {
+            total_lines += 1;
+            if total_lines <= start {
+                continue;
+            }
+
+            if lines.len() >= limit {
+                has_more_lines = true;
+                continue;
+            }
+
+            let truncated_line = if text.len() > MAX_LINE_LENGTH {
+                format!("{}{}", &text[..MAX_LINE_LENGTH], MAX_LINE_SUFFIX)
+            } else {
+                text.clone()
+            };
+
+            let line_size = truncated_line.len() + 1;
+            if bytes + line_size > MAX_BYTES {
+                truncated_by_bytes = true;
+                has_more_lines = true;
+                break;
+            }
+
+            lines.push(truncated_line);
+            bytes += line_size;
+        }
+
+        if total_lines < offset && !(total_lines == 0 && offset == 1) {
+            return Err(anyhow::anyhow!(
+                "Offset {} is out of range for this file ({} lines)",
+                offset,
+                total_lines
+            ).into());
+        }
+
+        let content: Vec<String> = lines.iter().enumerate()
+            .map(|(i, line)| format!("{}: {}", start + i + 1, line))
             .collect();
 
-        Ok(result_lines.join("\n"))
+        let total_lines_count = total_lines;
+        let last_read_line = offset + lines.len() - 1;
+        let next_offset = last_read_line + 1;
+        let has_more_lines = has_more_lines || truncated_by_bytes;
+
+        let mut output = format!(
+            "<path>{}</path>\n<type>file</type>\n<content>\n{}\n</content>",
+            file_path_str,
+            content.join("\n")
+        );
+
+        if truncated_by_bytes {
+            output.push_str(&format!(
+                "\n\n(Output capped at {}. Showing lines {}-{}. Use offset={} to continue.)",
+                MAX_BYTES_LABEL, offset, last_read_line, next_offset
+            ));
+        } else if has_more_lines {
+            output.push_str(&format!(
+                "\n\n(Showing lines {}-{} of {}. Use offset={} to continue.)",
+                offset, last_read_line, total_lines_count, next_offset
+            ));
+        } else {
+            output.push_str(&format!("\n\n(End of file - total {} lines)", total_lines_count));
+        }
+
+        Ok(output)
     }
 }
 
@@ -300,7 +458,10 @@ mod tests {
         });
 
         let output = tool.call(&args.to_string()).await.map_err(|e| anyhow::anyhow!(e.to_string()))?;
-        assert_eq!(output, "1: Hello from file");
+        assert!(output.contains("<path>"));
+        assert!(output.contains("<type>file</type>"));
+        assert!(output.contains("1: Hello from file"));
+        assert!(output.contains("(End of file - total 1 lines)"));
         Ok(())
     }
 
@@ -493,6 +654,94 @@ mod tests {
         assert!(files.contains(&s_keep), "Should contain keep_me.txt");
         assert!(!files.contains(&s_ignore), "Should NOT contain ignore_me.txt");
         
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_read_file_tool_directory() -> Result<()> {
+        let dir = tempdir()?;
+        let working_dir = dir.path().to_path_buf();
+        let subdir = dir.path().join("subdir");
+        tokio::fs::create_dir(&subdir).await?;
+        fs::write(&dir.path().join("file1.txt"), "content1").await?;
+        fs::write(&dir.path().join("file2.txt"), "content2").await?;
+        fs::write(&subdir.join("nested.txt"), "nested").await?;
+
+        let tool = ReadFileTool { working_directory: working_dir.clone() };
+        let args = json!({
+            "filePath": dir.path().to_str().unwrap()
+        });
+
+        let output = tool.call(&args.to_string()).await.map_err(|e| anyhow::anyhow!(e.to_string()))?;
+        assert!(output.contains("<path>"));
+        assert!(output.contains("<type>directory</type>"));
+        assert!(output.contains("<entries>"));
+        assert!(output.contains("file1.txt"));
+        assert!(output.contains("file2.txt"));
+        assert!(output.contains("subdir/"));
+        assert!(output.contains("(3 entries)"));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_read_file_tool_not_found() -> Result<()> {
+        let dir = tempdir()?;
+        let working_dir = dir.path().to_path_buf();
+        fs::write(&dir.path().join("similar.txt"), "content").await?;
+
+        let tool = ReadFileTool { working_directory: working_dir.clone() };
+        let args = json!({
+            "filePath": dir.path().join("similr.txt").to_str().unwrap()
+        });
+
+        let result = tool.call(&args.to_string()).await;
+        assert!(result.is_err());
+        let err = result.unwrap_err().to_string();
+        eprintln!("ERROR: {}", err);
+        assert!(err.contains("Did you mean"));
+        assert!(err.contains("similar.txt"));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_read_file_tool_offset_limit() -> Result<()> {
+        let dir = tempdir()?;
+        let working_dir = dir.path().to_path_buf();
+        let file_path = dir.path().join("multiline.txt");
+        let content: String = (1..=10).map(|i| format!("Line {}\n", i)).collect();
+        fs::write(&file_path, content).await?;
+
+        let tool = ReadFileTool { working_directory: working_dir };
+        let args = json!({
+            "filePath": file_path.to_str().unwrap(),
+            "offset": 3,
+            "limit": 4
+        });
+
+        let output = tool.call(&args.to_string()).await.map_err(|e| anyhow::anyhow!(e.to_string()))?;
+        assert!(output.contains("3: Line 3"));
+        assert!(output.contains("6: Line 6"));
+        assert!(output.contains("Showing lines 3-6 of 10"));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_read_file_tool_truncated_bytes() -> Result<()> {
+        let dir = tempdir()?;
+        let working_dir = dir.path().to_path_buf();
+        let file_path = dir.path().join("large.txt");
+        let line = "x".repeat(100);
+        let content = line.clone() + "\n";
+        let repeated: String = content.repeat(600);
+        fs::write(&file_path, repeated).await?;
+
+        let tool = ReadFileTool { working_directory: working_dir };
+        let args = json!({
+            "filePath": file_path.to_str().unwrap()
+        });
+
+        let output = tool.call(&args.to_string()).await.map_err(|e| anyhow::anyhow!(e.to_string()))?;
+        assert!(output.contains("Output capped at 50 KB"));
         Ok(())
     }
 }
