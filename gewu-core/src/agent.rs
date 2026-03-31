@@ -3,7 +3,7 @@ use crate::types::{Message, AgentEvent, ProviderEvent, ToolCall, FunctionCall};
 use crate::compaction::{self, is_overflow, estimate_message_tokens};
 use std::sync::Arc;
 use anyhow::{Result, Context};
-use tracing::info;
+use tracing::{info, debug};
 use futures::{Stream, StreamExt};
 
 pub struct Agent {
@@ -93,7 +93,8 @@ impl Agent {
                 // We clone the Arc<LlmProvider> to avoid borrowing self while iterating the stream
                 let provider = self.llm.clone();
                 let messages = self.memory.messages().to_vec(); // Clone messages
-                
+                debug!("LLM request messages: {:?}", messages);
+
                 let mut stream = provider.stream_response(&messages, &self.tools).await
                     .map_err(|e| anyhow::anyhow!(e))?;
 
