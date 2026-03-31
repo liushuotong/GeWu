@@ -1,6 +1,7 @@
-use crate::traits::{LlmProvider, Tool, Memory};
+use crate::traits::{LlmProvider, Tool, Memory, ToolRegistry};
 use crate::types::{Message, AgentEvent, ProviderEvent, ToolCall, FunctionCall};
 use crate::compaction::{self, is_overflow, estimate_message_tokens};
+use async_trait::async_trait;
 use std::sync::Arc;
 use anyhow::{Result, Context};
 use tracing::{info, debug};
@@ -8,18 +9,16 @@ use futures::{Stream, StreamExt};
 
 pub struct Agent {
     llm: Arc<dyn LlmProvider>,
-    tools: Vec<Box<dyn Tool>>,
+    tools: Vec<Arc<dyn Tool>>,
     system_prompt: String,
     max_turns: usize,
-    // Memory is now stateful
     pub memory: Box<dyn Memory>,
-    // Context limit for compaction (default 128k for modern models, but configurable)
     pub context_limit: usize,
 }
 
 pub struct AgentBuilder {
     llm: Option<Arc<dyn LlmProvider>>,
-    tools: Vec<Box<dyn Tool>>,
+    tools: Vec<Arc<dyn Tool>>,
     system_prompt: String,
     max_turns: usize,
     memory: Option<Box<dyn Memory>>,
@@ -89,13 +88,14 @@ impl Agent {
                 let mut current_tool_calls: Vec<ToolCall> = Vec::new();
 
                 // Call LLM provider
-                // We must use a block to limit the borrow of `self` for stream_response
-                // We clone the Arc<LlmProvider> to avoid borrowing self while iterating the stream
+                // We clone tools to avoid borrowing self while iterating the stream
                 let provider = self.llm.clone();
                 let messages = self.memory.messages().to_vec(); // Clone messages
                 debug!("LLM request messages: {:?}", messages);
 
-                let mut stream = provider.stream_response(&messages, &self.tools).await
+                // Clone tools for the LLM call
+                let tools_clone = self.tools.clone();
+                let mut stream = provider.stream_response(&messages, &tools_clone).await
                     .map_err(|e| anyhow::anyhow!(e))?;
 
                 while let Some(event_result) = stream.next().await {
@@ -285,13 +285,28 @@ When constructing the summary, try to stick to this template:
     }
 }
 
+#[async_trait]
+impl ToolRegistry for Agent {
+    async fn execute(&self, name: &str, args: &str) -> Result<String, Box<dyn std::error::Error + Send + Sync>> {
+        let tool = self.tools.iter().find(|t| t.name() == name);
+        match tool {
+            Some(t) => t.call(args).await,
+            None => Err(format!("Tool not found: {}", name).into()),
+        }
+    }
+
+    fn list_tools(&self) -> Vec<String> {
+        self.tools.iter().map(|t| t.name().to_string()).collect()
+    }
+}
+
 impl AgentBuilder {
     pub fn llm(mut self, llm: Arc<dyn LlmProvider>) -> Self {
         self.llm = Some(llm);
         self
     }
     
-    pub fn with_tools(mut self, tools: Vec<Box<dyn Tool>>) -> Self {
+    pub fn with_tools(mut self, tools: Vec<Arc<dyn Tool>>) -> Self {
         self.tools = tools;
         self
     }
@@ -320,7 +335,7 @@ impl AgentBuilder {
         let llm = self.llm.context("LLM provider is required")?;
         let agent = Agent {
             llm,
-            tools: self.tools,
+            tools: self.tools.clone(),
             system_prompt: self.system_prompt.clone(),
             max_turns: self.max_turns,
             memory: self.memory.unwrap_or_else(|| Box::new(Vec::new())),

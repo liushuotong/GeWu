@@ -2,6 +2,7 @@ use crate::types::{Message, ProviderEvent};
 use async_trait::async_trait;
 use serde_json::Value;
 use std::error::Error;
+use std::sync::Arc;
 use futures::stream::BoxStream;
 
 #[async_trait]
@@ -13,11 +14,17 @@ pub trait Tool: Send + Sync {
 }
 
 #[async_trait]
+pub trait ToolRegistry: Send + Sync {
+    async fn execute(&self, name: &str, args: &str) -> Result<String, Box<dyn Error + Send + Sync>>;
+    fn list_tools(&self) -> Vec<String>;
+}
+
+#[async_trait]
 pub trait LlmProvider: Send + Sync {
     async fn stream_response<'a>(
         &'a self,
         messages: &[Message],
-        tools: &[Box<dyn Tool>],
+        tools: &[Arc<dyn Tool>],
     ) -> Result<BoxStream<'a, Result<ProviderEvent, Box<dyn Error + Send + Sync>>>, Box<dyn Error + Send + Sync>>;
 }
 
@@ -26,9 +33,7 @@ pub trait Memory: Send + Sync {
     fn messages(&self) -> &[Message];
     async fn add_message(&mut self, message: Message);
     async fn clear(&mut self);
-    // Expose mutable slice for in-place modifications (like pruning)
     fn messages_mut(&mut self) -> &mut [Message];
-    // Replace entire history (for compaction/summarization)
     async fn replace(&mut self, messages: Vec<Message>);
 }
 
@@ -54,3 +59,4 @@ impl Memory for Vec<Message> {
         *self = messages;
     }
 }
+

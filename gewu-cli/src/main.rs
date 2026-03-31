@@ -220,7 +220,7 @@ async fn main() -> Result<()> {
     let mcp_tools = mcp_loader::load_mcp_tools(cli.config.clone()).await?;
 
     // Create Agent
-    let mut agent = registry::create_agent(&cli.agent, provider, pool, session_id, mcp_tools).await?;
+    let (mut agent, _registry) = registry::create_agent(&cli.agent, provider, pool, session_id, mcp_tools).await?;
     info!("Initialized agent: {}", cli.agent);
 
     // Initial Prompt handling

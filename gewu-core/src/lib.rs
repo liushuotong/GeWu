@@ -4,5 +4,5 @@ pub mod types;
 pub mod compaction;
 
 pub use agent::Agent;
-pub use traits::{LlmProvider, Tool};
+pub use traits::{LlmProvider, Tool, ToolRegistry};
 pub use types::Message;

@@ -16,7 +16,7 @@ impl LlmProvider for MockLlmProvider {
     async fn stream_response<'a>(
         &'a self,
         messages: &[Message],
-        _tools: &[Box<dyn Tool>],
+        _tools: &[Arc<dyn Tool>],
     ) -> Result<BoxStream<'a, Result<ProviderEvent, Box<dyn Error + Send + Sync>>>, Box<dyn Error + Send + Sync>> {
         let tool_response_count = messages.iter().filter(|m| matches!(m, Message::Tool { .. })).count();
 
@@ -63,7 +63,7 @@ impl Tool for TestTool {
 async fn test_doom_loop_detection() {
     let agent = Agent::builder()
         .llm(Arc::new(MockLlmProvider))
-        .with_tools(vec![Box::new(TestTool)])
+        .with_tools(vec![Arc::new(TestTool) as Arc<dyn Tool>])
         .build()
         .unwrap();
 

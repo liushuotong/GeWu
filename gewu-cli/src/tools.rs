@@ -75,7 +75,7 @@ impl Tool for TaskTool {
 
         info!("Spawning sub-agent '{}' for task: {} (session: {})", input.subagent_type, input.description, session_id);
 
-        let mut agent = crate::registry::create_agent(
+        let (mut agent, _registry) = crate::registry::create_agent(
             &input.subagent_type, 
             self.provider.clone(), 
             self.pool.clone(), 

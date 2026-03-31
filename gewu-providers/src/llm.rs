@@ -13,6 +13,7 @@ use async_openai::{
     },
 };
 use std::error::Error;
+use std::sync::Arc;
 use futures::StreamExt;
 use futures::stream::BoxStream;
 
@@ -46,7 +47,7 @@ impl LlmProvider for OpenAIProvider {
     async fn stream_response<'a>(
         &'a self,
         messages: &[Message],
-        tools: &[Box<dyn Tool>],
+        tools: &[Arc<dyn Tool>],
     ) -> Result<BoxStream<'a, Result<ProviderEvent, Box<dyn Error + Send + Sync>>>, Box<dyn Error + Send + Sync>> {
         let mut openai_messages: Vec<ChatCompletionRequestMessage> = Vec::new();
         

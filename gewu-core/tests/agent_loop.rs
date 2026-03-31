@@ -24,7 +24,7 @@ impl LlmProvider for MockLlm {
     async fn stream_response<'a>(
         &'a self,
         _messages: &[Message],
-        _tools: &[Box<dyn Tool>],
+        _tools: &[Arc<dyn Tool>],
     ) -> Result<BoxStream<'a, Result<ProviderEvent, Box<dyn Error + Send + Sync>>>, Box<dyn Error + Send + Sync>> {
         let mut responses = self.responses.lock().unwrap();
         if responses.is_empty() {
@@ -92,7 +92,7 @@ async fn test_agent_loop() {
         responses: Arc::new(Mutex::new(responses)),
     });
     
-    let tool = Box::new(MockTool);
+    let tool: Arc<dyn Tool> = Arc::new(MockTool);
     
     let mut agent = AgentBuilder::default()
         .llm(llm)

@@ -23,7 +23,7 @@ impl LlmProvider for MockLlm {
     async fn stream_response<'a>(
         &'a self,
         messages: &[Message],
-        _tools: &[Box<dyn Tool>],
+        _tools: &[Arc<dyn Tool>],
     ) -> Result<BoxStream<'a, Result<ProviderEvent, Box<dyn Error + Send + Sync>>>, Box<dyn Error + Send + Sync>> {
         // Check if this is a summary request
         let last_msg = messages.last().unwrap();

@@ -1,14 +1,15 @@
 use crate::tools::TaskTool;
 use anyhow::{anyhow, Result};
-use gewu_core::traits::{LlmProvider, Tool};
+use gewu_core::traits::{LlmProvider, Tool, ToolRegistry};
 use gewu_core::Agent;
 use gewu_tools::{
-    BashTool, CodeSearchTool, EditFileTool, GlobTool, GrepTool, ListTool, ReadFileTool,
-    WebFetchTool, WebSearchTool, WriteFileTool,
+    BashTool, BatchTool, CodeSearchTool, EditFileTool, GlobTool, GrepTool, ListTool, ReadFileTool,
+    WebFetchTool, WebSearchTool, WriteFileTool, TodoWriteTool, TodoReadTool, TodoItem,
 };
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use gewu_storage::SqliteMemory;
 use sqlx::SqlitePool;
+use async_trait::async_trait;
 
 pub struct AgentConfig {
     pub name: String,
@@ -32,17 +33,39 @@ pub fn list_available_agents() -> Vec<AgentConfig> {
     ]
 }
 
+struct ToolRegistryImpl {
+    tools: Arc<Vec<Arc<dyn Tool>>>,
+}
+
+#[async_trait]
+impl ToolRegistry for ToolRegistryImpl {
+    async fn execute(&self, name: &str, args: &str) -> Result<String, Box<dyn std::error::Error + Send + Sync>> {
+        let tool = self.tools.iter().find(|t| t.name() == name);
+        match tool {
+            Some(t) => t.call(args).await,
+            None => Err(format!("Tool not found: {}", name).into()),
+        }
+    }
+
+    fn list_tools(&self) -> Vec<String> {
+        self.tools.iter().map(|t| t.name().to_string()).collect()
+    }
+}
+
 pub async fn create_agent(
     name: &str,
     provider: Arc<dyn LlmProvider>,
     pool: SqlitePool,
     session_id: String,
     additional_tools: Vec<Box<dyn Tool>>,
-) -> Result<Agent> {
+) -> Result<(Agent, Arc<dyn ToolRegistry>)> {
     let working_directory = std::env::current_dir()?;
 
     // Initialize persistent memory
     let memory = SqliteMemory::new(pool.clone(), session_id).await?;
+
+    // Shared in-memory todo list for this agent session
+    let todos = Arc::new(Mutex::new(Vec::<TodoItem>::new()));
 
     let mut tools: Vec<Box<dyn Tool>> = match name {
         "build" => {
@@ -73,6 +96,8 @@ pub async fn create_agent(
                 }),
                 Box::new(CodeSearchTool),
                 Box::new(WebSearchTool),
+                Box::new(TodoWriteTool::new(todos.clone())),
+                Box::new(TodoReadTool::new(todos.clone())),
             ]
         }
         "explore" => {
@@ -126,6 +151,8 @@ pub async fn create_agent(
                 }),
                 Box::new(CodeSearchTool),
                 Box::new(WebSearchTool),
+                Box::new(TodoWriteTool::new(todos.clone())),
+                Box::new(TodoReadTool::new(todos.clone())),
             ]
         }
         _ => return Err(anyhow!("Unknown agent type: {}", name)),
@@ -134,25 +161,37 @@ pub async fn create_agent(
     // Add additional tools
     tools.extend(additional_tools);
 
-    match name {
+    // Convert Box<dyn Tool> to Arc<dyn Tool> for both registry and agent
+    let tools_arc: Vec<Arc<dyn Tool>> = tools.into_iter().map(|t| Arc::from(t)).collect();
+    let tools_for_registry = Arc::new(tools_arc.clone());
+    let registry: Arc<dyn ToolRegistry> = Arc::new(ToolRegistryImpl { tools: tools_for_registry });
+
+    // Create BatchTool and prepend it
+    let batch_tool: Arc<dyn Tool> = Arc::new(BatchTool::new(registry.clone()));
+    let mut all_tools = vec![batch_tool];
+    all_tools.extend(tools_arc);
+
+    let agent = match name {
         "build" => Agent::builder()
             .llm(provider)
-            .with_tools(tools)
+            .with_tools(all_tools)
             .memory(Box::new(memory))
             .system_prompt(include_str!("prompts/build.txt"))
-            .build(),
+            .build()?,
         "explore" => Agent::builder()
             .llm(provider)
-            .with_tools(tools)
+            .with_tools(all_tools)
             .memory(Box::new(memory))
             .system_prompt(include_str!("prompts/explore.txt"))
-            .build(),
+            .build()?,
         "general" => Agent::builder()
             .llm(provider)
-            .with_tools(tools)
+            .with_tools(all_tools)
             .memory(Box::new(memory))
             .system_prompt(include_str!("prompts/general.txt"))
-            .build(),
-        _ => unreachable!(),
-    }
+            .build()?,
+        _ => return Err(anyhow!("Unknown agent type: {}", name)),
+    };
+
+    Ok((agent, registry))
 }

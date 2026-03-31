@@ -19,7 +19,7 @@ async fn main() -> Result<()> {
     // Initialize the provider with the custom endpoint
     let provider = Arc::new(OpenAIProvider::new_with_endpoint(&api_key, &base_url, &model));
     
-    let bash_tool = Box::new(BashTool {
+    let bash_tool: Arc<dyn gewu_core::traits::Tool> = Arc::new(BashTool {
         working_directory: env::current_dir()?,
         safe_mode: false,
     });

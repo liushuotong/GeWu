@@ -14,7 +14,7 @@ async fn main() -> Result<()> {
     
     let provider = OpenAIProvider::new_with_endpoint(&api_key, ENDPOINT, "minimax-m2.5");
     let provider = Arc::new(provider);
-    let bash_tool: Box<dyn gewu_core::traits::Tool> = Box::new(BashTool {
+    let bash_tool: Arc<dyn gewu_core::traits::Tool> = Arc::new(BashTool {
         working_directory: std::env::current_dir()?,
         safe_mode: false,
     });
