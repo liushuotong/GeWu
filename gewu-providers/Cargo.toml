@@ -9,6 +9,6 @@ anyhow = "1.0"
 async-trait = "0.1"
 futures = "0.3"
 thiserror = "2.0"
-async-openai = "0.23"
+async-openai = { version = "0.34", features = ["_api", "chat-completion"] }
 tokio = { version = "1", features = ["full"] }
 async-stream = "0.3.6"

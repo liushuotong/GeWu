@@ -4,12 +4,12 @@ use anyhow::Result;
 use async_trait::async_trait;
 use async_openai::{
     Client,
-    types::{
+    types::chat::{
         CreateChatCompletionRequestArgs, ChatCompletionRequestMessage,
         ChatCompletionRequestSystemMessageArgs, ChatCompletionRequestUserMessageArgs,
         ChatCompletionRequestAssistantMessageArgs, ChatCompletionRequestToolMessageArgs,
-        ChatCompletionTool, ChatCompletionToolArgs, ChatCompletionToolType,
-        FunctionObjectArgs, ChatCompletionMessageToolCall, FunctionCall as OpenAIFunctionCall,
+        ChatCompletionTools,
+        FunctionObjectArgs, ChatCompletionMessageToolCalls, FunctionCall as OpenAIFunctionCall,
     },
 };
 use std::error::Error;
@@ -72,15 +72,14 @@ impl LlmProvider for OpenAIProvider {
                         builder.content(c.clone());
                     }
                     if let Some(calls) = tool_calls {
-                        let openai_calls: Vec<ChatCompletionMessageToolCall> = calls.iter().map(|tc| {
-                            ChatCompletionMessageToolCall {
+                        let openai_calls: Vec<ChatCompletionMessageToolCalls> = calls.iter().map(|tc| {
+                            ChatCompletionMessageToolCalls::Function(async_openai::types::chat::ChatCompletionMessageToolCall {
                                 id: tc.id.clone(),
-                                r#type: ChatCompletionToolType::Function,
                                 function: OpenAIFunctionCall {
                                     name: tc.function.name.clone(),
                                     arguments: tc.function.arguments.clone(),
                                 },
-                            }
+                            })
                         }).collect();
                         builder.tool_calls(openai_calls);
                     }
@@ -98,7 +97,7 @@ impl LlmProvider for OpenAIProvider {
             }
         }
 
-        let mut openai_tools: Vec<ChatCompletionTool> = Vec::new();
+        let mut openai_tools: Vec<ChatCompletionTools> = Vec::new();
         for tool in tools {
             let function = FunctionObjectArgs::default()
                 .name(tool.name())
@@ -107,11 +106,11 @@ impl LlmProvider for OpenAIProvider {
                 .build()
                 .map_err(|e| Box::new(e) as Box<dyn Error + Send + Sync>)?;
                 
-            let t = ChatCompletionToolArgs::default()
-                .r#type(ChatCompletionToolType::Function)
-                .function(function)
-                .build()
-                .map_err(|e| Box::new(e) as Box<dyn Error + Send + Sync>)?;
+            let t = ChatCompletionTools::Function(
+                async_openai::types::chat::ChatCompletionTool {
+                    function,
+                }
+            );
             openai_tools.push(t);
         }
         
@@ -182,9 +181,6 @@ impl LlmProvider for OpenAIProvider {
                     }
                     
                     if let Some(reason) = &choice.finish_reason {
-                        // Some providers send empty string as finish reason in middle
-                         // But usually finish_reason is null until end.
-                         // async-openai Option<FinishReason> (enum)
                         yield ProviderEvent::Finish { reason: Some(format!("{:?}", reason)) };
                     }
                 }

@@ -17,26 +17,26 @@ use std::io::Write;
 
 
 
+const DIM_GRAY: &str = "\x1b[90m";
+const RESET: &str = "\x1b[0m";
+
 async fn run_agent(agent: &mut gewu_core::Agent, prompt: &str) -> Result<()> {
     let mut stream = Box::pin(agent.ask(prompt));
+    let mut reasoning = String::new();
+    let mut content = String::new();
     while let Some(event_result) = stream.next().await {
         match event_result {
             Ok(event) => match event {
                 AgentEvent::ContentDelta { delta } => {
-                    print!("{}", delta);
-                    std::io::stdout().flush()?;
+                    content.push_str(&delta);
                 }
-                AgentEvent::ReasoningDelta { delta: _ } => {
-                    // Optional: print reasoning in a different color or format
-                    // For now, just print it? Or maybe ignore/log it?
-                    // Let's print it in a dim color if we had terminal colors
-                    // print!("{}", delta); 
+                AgentEvent::ReasoningDelta { delta } => {
+                    reasoning.push_str(&delta);
                 }
                 AgentEvent::ToolStart { tool, input } => {
                      println!("\n[Tool Start: {}] Input: {}", tool, input);
                 }
                 AgentEvent::ToolFinish { tool, output } => {
-                     // Truncate output if too long
                      let display_output = if output.len() > 200 {
                          format!("{}...", &output[..200])
                      } else {
@@ -45,7 +45,13 @@ async fn run_agent(agent: &mut gewu_core::Agent, prompt: &str) -> Result<()> {
                      println!("\n[Tool Finish: {}] Output: {}", tool, display_output);
                 }
                 AgentEvent::Finish { .. } => {
-                    println!(); // Newline at end
+                    if !reasoning.is_empty() {
+                        print!("{}{}[thinking]{} {}", DIM_GRAY, RESET, RESET, reasoning);
+                        std::io::stdout().flush()?;
+                    }
+                    print!("{}", content);
+                    std::io::stdout().flush()?;
+                    println!();
                 }
                 AgentEvent::Error { error } => {
                     error!("Error from agent: {}", error);
