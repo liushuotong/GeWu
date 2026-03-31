@@ -1,2 +1,3 @@
 pub mod llm;
-pub use llm::OpenAIProvider;
+
+pub use llm::{OpenAIProvider, RequestBuilder, ResponseParser};
