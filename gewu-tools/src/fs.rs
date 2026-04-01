@@ -1,10 +1,26 @@
 //! Filesystem Tools
 //!
-//! This module implements tools for interacting with the local filesystem:
-//! - `ReadFileTool`: Reads content from files or lists directories.
-//! - `WriteFileTool`: Writes content to files (overwriting).
-//! - `EditFileTool`: Modifies existing files by replacing text.
-//! - `GlobTool`: Finds files using glob patterns.
+//! This module implements tools for interacting with the local filesystem.
+//! All file operations are restricted to a configured working directory
+//! for security.
+//!
+//! # Security
+//!
+//! All file paths are resolved through [`resolve_safe_path`](crate::fs_utils::resolve_safe_path)
+//! which prevents directory traversal attacks. Paths cannot escape the
+//! configured working directory.
+//!
+//! # Available Tools
+//!
+//! - [`ReadFileTool`] - Reads content from files or lists directories
+//! - [`WriteFileTool`] - Writes content to files (overwrites existing)
+//! - [`EditFileTool`] - Modifies existing files by replacing text
+//! - [`GlobTool`] - Finds files using glob patterns, respects .gitignore
+//!
+//! # Media Handling
+//!
+//! Image and PDF files are returned as base64-encoded data URIs with
+//! the format `{"type":"media","mime":"<type>","data":"<base64>","message":"..."}`.
 
 use crate::fs_utils::{
     glob_with_gitignore, into_tool_error, is_binary_file, mime_type, parse_empty_args, read_bytes,
@@ -26,7 +42,24 @@ const MAX_BYTES: usize = 50 * 1024;
 const MAX_BYTES_LABEL: &str = "50 KB";
 
 /// Tool for reading files or listing directories.
+///
+/// # Capabilities
+///
+/// - **Files**: Reads text files with line numbering and pagination
+/// - **Binary detection**: Refuses to read binary files
+/// - **Images/PDFs**: Returns as base64-encoded data URIs for vision models
+/// - **Directories**: Lists directory contents with type indicators
+/// - **Fuzzy matching**: Suggests similar files when a file is not found
+///
+/// # Output Format
+///
+/// File output includes:
+/// - `<path>`: The file path
+/// - `<type>`: "file" or "directory"
+/// - `<content>`: Line-numbered file content
+/// - Truncation indicators for large files
 pub struct ReadFileTool {
+    /// The root directory for file operations. All paths are resolved relative to this.
     pub working_directory: PathBuf,
 }
 
@@ -61,6 +94,25 @@ impl Tool for ReadFileTool {
         })
     }
 
+    /// Reads a file or lists a directory.
+    ///
+    /// # Arguments
+    ///
+    /// * `filePath` - Path to the file or directory
+    /// * `limit` - Maximum lines to read (default: 2000)
+    /// * `offset` - Starting line number, 1-indexed (default: 1)
+    ///
+    /// # Returns
+    ///
+    /// For files: `<path>`, `<type>file</type>`, `<content>` with line numbers
+    /// For directories: `<path>`, `<type>directory</type>`, `<entries>`
+    /// For images/PDFs: JSON media payload with base64 data
+    ///
+    /// # Errors
+    ///
+    /// - File not found (with fuzzy matching suggestions)
+    /// - Binary file attempted to be read
+    /// - Offset out of range
     async fn call(&self, args: &str) -> Result<String, Box<dyn Error + Send + Sync>> {
         if args.trim().is_empty() {
             return Err(anyhow::anyhow!(
@@ -92,7 +144,7 @@ impl Tool for ReadFileTool {
             let basename = file_path
                 .file_name()
                 .and_then(|n| n.to_str())
-                .and_then(|n| n.rsplit('.').next()) // Remove extension for fuzzy matching
+                .and_then(|n| n.rsplit('.').next())
                 .unwrap_or("");
 
             if tokio::fs::metadata(parent).await.is_ok() {
@@ -308,7 +360,11 @@ impl Tool for ReadFileTool {
 }
 
 /// Tool for writing files.
+///
+/// Creates new files or overwrites existing files with new content.
+/// The file path must be within the configured working directory.
 pub struct WriteFileTool {
+    /// The root directory for file operations.
     pub working_directory: PathBuf,
 }
 
@@ -339,6 +395,16 @@ impl Tool for WriteFileTool {
         })
     }
 
+    /// Writes content to a file.
+    ///
+    /// # Arguments
+    ///
+    /// * `filePath` - Absolute path to the file (must be within working directory)
+    /// * `content` - The content to write
+    ///
+    /// # Returns
+    ///
+    /// Success message with the file path.
     async fn call(&self, args: &str) -> Result<String, Box<dyn Error + Send + Sync>> {
         if args.trim().is_empty() {
             return Err(anyhow::anyhow!(
@@ -374,7 +440,12 @@ impl Tool for WriteFileTool {
 }
 
 /// Tool for editing files by replacing text.
+///
+/// Finds and replaces text in existing files. By default, only performs
+/// a single replacement and errors if multiple matches are found (use
+/// `replaceAll: true` to replace all occurrences).
 pub struct EditFileTool {
+    /// The root directory for file operations.
     pub working_directory: PathBuf,
 }
 
@@ -413,6 +484,19 @@ impl Tool for EditFileTool {
         })
     }
 
+    /// Edits a file by replacing text.
+    ///
+    /// # Arguments
+    ///
+    /// * `filePath` - Path to the file
+    /// * `oldString` - The exact text to find and replace
+    /// * `newString` - The replacement text
+    /// * `replaceAll` - If true, replace all occurrences (default: false)
+    ///
+    /// # Errors
+    ///
+    /// - `oldString` not found in file
+    /// - Multiple matches found when `replaceAll` is false
     async fn call(&self, args: &str) -> Result<String, Box<dyn Error + Send + Sync>> {
         if args.trim().is_empty() {
             return Err(anyhow::anyhow!(
@@ -475,7 +559,11 @@ impl Tool for EditFileTool {
 }
 
 /// Tool for finding files using glob patterns.
+///
+/// Searches for files matching a glob pattern within the working directory.
+/// Automatically respects `.gitignore` files to exclude ignored files.
 pub struct GlobTool {
+    /// The root directory for file operations.
     pub working_directory: PathBuf,
 }
 
@@ -506,6 +594,20 @@ impl Tool for GlobTool {
         })
     }
 
+    /// Finds files matching a glob pattern.
+    ///
+    /// # Arguments
+    ///
+    /// * `pattern` - Glob pattern (e.g., "**/*.rs", "src/**/*.ts")
+    /// * `path` - Directory to search in (default: working directory)
+    ///
+    /// # Returns
+    ///
+    /// JSON array of matching file paths as strings.
+    ///
+    /// # Gitignore
+    ///
+    /// Files matching patterns in `.gitignore` are automatically excluded.
     async fn call(&self, args: &str) -> Result<String, Box<dyn Error + Send + Sync>> {
         if args.trim().is_empty() {
             return Err(anyhow::anyhow!(
@@ -523,21 +625,17 @@ impl Tool for GlobTool {
             .ok_or_else(|| anyhow::anyhow!("pattern is required"))
             .map_err(into_tool_error)?;
 
-        // Optional path parameter, defaults to current working directory
         let search_dir = if let Some(p) = args_val.get("path").and_then(|v| v.as_str()) {
             resolve_safe_path(&self.working_directory, p).map_err(into_tool_error)?
         } else {
             self.working_directory.clone()
         };
 
-        // Search using glob_with_gitignore which respects .gitignore
         let paths = glob_with_gitignore(&search_dir, pattern).map_err(into_tool_error)?;
 
         let paths_str: Vec<String> = paths
             .into_iter()
             .filter(|p| {
-                // Normalize path to resolve .. and . components to ensure we don't return files outside safe zone
-                // e.g. /app/safe/../secret.txt -> /app/secret.txt which does not start with /app/safe
                 let normalized = crate::fs_utils::normalize_path(p);
                 normalized.starts_with(&self.working_directory)
             })
@@ -612,7 +710,7 @@ mod tests {
         let working_dir = dir.path().to_path_buf();
         let file1 = dir.path().join("a.txt");
         let file2 = dir.path().join("b.txt");
-        let file3 = dir.path().join("c.rs"); // Different extension
+        let file3 = dir.path().join("c.rs");
         fs::write(&file1, "").await?;
         fs::write(&file2, "").await?;
         fs::write(&file3, "").await?;
@@ -620,7 +718,6 @@ mod tests {
         let tool = GlobTool {
             working_directory: working_dir,
         };
-        // Search for .txt files
         let pattern = "*.txt";
         let args = json!({
             "pattern": pattern
@@ -633,7 +730,6 @@ mod tests {
         let files: Vec<String> = serde_json::from_str(&output)?;
 
         assert_eq!(files.len(), 2);
-        // Ordering is not guaranteed by glob/filesystem, so check containment
         let s1 = file1.to_string_lossy().to_string();
         let s2 = file2.to_string_lossy().to_string();
         assert!(files.contains(&s1) || files.contains(&s2));
@@ -651,7 +747,6 @@ mod tests {
             working_directory: working_dir,
         };
 
-        // 1. Multiple matches error
         let args_multiple = json!({
             "filePath": file_path.to_str().unwrap(),
             "oldString": "foo",
@@ -667,7 +762,6 @@ mod tests {
                 .contains("Found multiple matches")
         );
 
-        // 2. Replace All
         let args_all = json!({
             "filePath": file_path.to_str().unwrap(),
             "oldString": "foo",
@@ -681,7 +775,6 @@ mod tests {
         let content = fs::read_to_string(&file_path).await?;
         assert_eq!(content, "baz bar baz");
 
-        // 3. Not found error
         let args_not_found = json!({
             "filePath": file_path.to_str().unwrap(),
             "oldString": "foo",
@@ -697,7 +790,6 @@ mod tests {
                 .contains("oldString not found")
         );
 
-        // 4. Single replacement
         fs::write(&file_path, "one two three").await?;
         let args_single = json!({
             "filePath": file_path.to_str().unwrap(),
@@ -721,11 +813,9 @@ mod tests {
         let working_dir = dir.path().join("safe_zone");
         tokio::fs::create_dir(&working_dir).await?;
 
-        // Create a secret file outside
         let secret_path = dir.path().join("secret.txt");
         tokio::fs::write(&secret_path, "secret data").await?;
 
-        // 1. ReadFileTool traversal
         let read_tool = ReadFileTool {
             working_directory: working_dir.clone(),
         };
@@ -734,9 +824,7 @@ mod tests {
         });
         let result_read = read_tool.call(&args_read.to_string()).await;
         assert!(result_read.is_err());
-        // assert!(result_read.unwrap_err().to_string().contains("Path traversal detected"));
 
-        // 2. WriteFileTool traversal
         let write_tool = WriteFileTool {
             working_directory: working_dir.clone(),
         };
@@ -747,7 +835,6 @@ mod tests {
         let result_write = write_tool.call(&args_write.to_string()).await;
         assert!(result_write.is_err());
 
-        // 3. EditFileTool traversal
         let edit_tool = EditFileTool {
             working_directory: working_dir.clone(),
         };
@@ -760,11 +847,9 @@ mod tests {
         let result_edit = edit_tool.call(&args_edit.to_string()).await;
         assert!(result_edit.is_err());
 
-        // 4. GlobTool traversal attempt
         let glob_tool = GlobTool {
             working_directory: working_dir.clone(),
         };
-        // Search for the secret file using relative path
         let args_glob = json!({
             "pattern": "../secret.txt"
         });
@@ -773,7 +858,6 @@ mod tests {
             .await
             .map_err(|e| anyhow::anyhow!(e.to_string()))?;
         let files: Vec<String> = serde_json::from_str(&result_glob)?;
-        // It should find nothing because results outside working_dir are filtered
         assert!(files.is_empty());
 
         Ok(())
@@ -791,7 +875,6 @@ mod tests {
         fs::write(&ignore_file, "ignore").await?;
         fs::write(&gitignore, "ignore_me.txt").await?;
 
-        // Create the tool instance
         let tool = GlobTool {
             working_directory: working_dir.clone(),
         };
@@ -799,18 +882,15 @@ mod tests {
             "pattern": "*.txt"
         });
 
-        // Run the tool
         let output = tool
             .call(&args.to_string())
             .await
             .map_err(|e| anyhow::anyhow!(e.to_string()))?;
         let files: Vec<String> = serde_json::from_str(&output)?;
 
-        // Paths in output are absolute
         let s_keep = keep_file.to_string_lossy().to_string();
         let s_ignore = ignore_file.to_string_lossy().to_string();
 
-        // Assertions
         assert!(files.contains(&s_keep), "Should contain keep_me.txt");
         assert!(
             !files.contains(&s_ignore),

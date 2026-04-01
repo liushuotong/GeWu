@@ -1,3 +1,26 @@
+//! OpenAI-compatible LLM provider implementation.
+//!
+//! This module provides an implementation of the [`LlmProvider`] trait
+//! for OpenAI-compatible APIs. It supports both direct OpenAI API calls
+//! and custom endpoints (e.g., for proxies or self-hosted models).
+//!
+//! # Features
+//!
+//! - Streaming responses via Server-Sent Events (SSE)
+//! - Tool/function calling support
+//! - Multi-modal content handling (images, audio, video, files)
+//! - Automatic capability detection based on model name
+//! - Reasoning content support (for models like o1)
+//!
+//! # Architecture
+//!
+//! The provider consists of several components:
+//!
+//! - [`OpenAIProvider`] - Main provider implementation
+//! - [`RequestBuilder`] - Trait for building API requests
+//! - [`ResponseParser`] - Trait for parsing streaming responses
+//! - [`ToolCallAggregator`] - Handles fragmented tool call streaming
+
 use async_openai::Client;
 use async_openai::types::chat::{
     ChatCompletionMessageToolCall, ChatCompletionMessageToolCallChunk,
@@ -18,7 +41,18 @@ use serde_json::Value;
 use std::error::Error;
 use std::sync::Arc;
 
+/// Trait for building API requests from GeWu types.
+///
+/// Implement this trait to create custom request formats for different
+/// OpenAI-compatible APIs. The default implementation handles the
+/// standard OpenAI request format.
 pub trait RequestBuilder: Send + Sync {
+    /// Builds a chat completion request.
+    ///
+    /// # Arguments
+    ///
+    /// * `messages` - The conversation messages to send.
+    /// * `tools` - The available tools for function calling.
     fn build(
         &self,
         messages: &[Message],
@@ -26,13 +60,52 @@ pub trait RequestBuilder: Send + Sync {
     ) -> Result<CreateChatCompletionRequest, Box<dyn Error + Send + Sync>>;
 }
 
+/// Trait for parsing streaming responses into provider events.
+///
+/// Implement this trait to handle different response formats from
+/// OpenAI-compatible APIs.
 pub trait ResponseParser: Send + Sync {
+    /// Parses a streaming response into a stream of provider events.
+    ///
+    /// # Arguments
+    ///
+    /// * `stream` - The raw response stream from the API.
     fn parse_stream(
         &self,
         stream: ChatCompletionResponseStream,
     ) -> BoxStream<'static, Result<ProviderEvent, Box<dyn Error + Send + Sync>>>;
 }
 
+/// OpenAI-compatible LLM provider.
+///
+/// This provider works with:
+/// - OpenAI's official API
+/// - OpenAI-compatible proxies
+/// - Self-hosted models with OpenAI-compatible endpoints
+///
+/// # Model Capabilities
+///
+/// The provider automatically detects capabilities based on model name:
+/// - **GPT-4o**: text + image input, PDF support
+/// - **GPT-4-turbo**: text + image input, PDF support
+/// - **GPT-3.5-turbo**: text-only
+/// - **Other models**: text-only (conservative default)
+///
+/// # Example
+///
+/// ```ignore
+/// use gewu_providers::OpenAIProvider;
+///
+/// // Direct OpenAI API
+/// let provider = OpenAIProvider::new("api-key", "gpt-4");
+///
+/// // With custom endpoint (proxy)
+/// let provider = OpenAIProvider::new_with_endpoint(
+///     "api-key",
+///     "https://my-proxy.com/v1",
+///     "gpt-4"
+/// );
+/// ```
 pub struct OpenAIProvider {
     client: Client<async_openai::config::OpenAIConfig>,
     model: String,
@@ -40,6 +113,12 @@ pub struct OpenAIProvider {
 }
 
 impl OpenAIProvider {
+    /// Creates a new provider for the official OpenAI API.
+    ///
+    /// # Arguments
+    ///
+    /// * `api_key` - Your OpenAI API key.
+    /// * `model` - The model to use (e.g., "gpt-4", "gpt-4-turbo").
     pub fn new(api_key: &str, model: &str) -> Self {
         let config = async_openai::config::OpenAIConfig::new().with_api_key(api_key);
         let capabilities = Self::default_capabilities_for_model(model);
@@ -50,6 +129,16 @@ impl OpenAIProvider {
         }
     }
 
+    /// Creates a new provider with a custom endpoint.
+    ///
+    /// Use this for proxies, caching servers, or self-hosted models
+    /// that are OpenAI-compatible.
+    ///
+    /// # Arguments
+    ///
+    /// * `api_key` - Your API key (may be ignored by some endpoints).
+    /// * `base_url` - The base URL of the API (e.g., "https://api.openai.com/v1").
+    /// * `model` - The model identifier expected by the endpoint.
     pub fn new_with_endpoint(api_key: &str, base_url: &str, model: &str) -> Self {
         let config = async_openai::config::OpenAIConfig::new()
             .with_api_key(api_key)
@@ -62,6 +151,10 @@ impl OpenAIProvider {
         }
     }
 
+    /// Determines capabilities based on model name.
+    ///
+    /// This is a heuristic based on common model naming patterns.
+    /// For accurate capability settings, use a custom provider implementation.
     fn default_capabilities_for_model(model: &str) -> Capabilities {
         let model_lower = model.to_lowercase();
         if model_lower.contains("gpt-4o") {
@@ -135,6 +228,10 @@ impl OpenAIProvider {
         }
     }
 
+    /// Converts a [`ContentPart`] to an OpenAI API content part.
+    ///
+    /// Non-text content (image, audio, video, file) is converted to data URIs
+    /// (base64-encoded inline data) for API compatibility.
     fn convert_content_part(
         &self,
         part: &ContentPart,
@@ -183,6 +280,7 @@ impl OpenAIProvider {
         }
     }
 
+    /// Checks if a content part type is supported by the current model.
     fn modality_supported(&self, part: &ContentPart) -> bool {
         match part {
             ContentPart::Text { .. } => true,
@@ -199,6 +297,10 @@ impl OpenAIProvider {
         }
     }
 
+    /// Converts a [`Message`] to OpenAI API message format.
+    ///
+    /// Tool messages may produce multiple API messages: one for the tool result
+    /// and optionally an additional user message for media attachments.
     fn convert_message(
         &self,
         msg: &Message,
@@ -302,6 +404,7 @@ impl OpenAIProvider {
         }
     }
 
+    /// Converts tool definitions to OpenAI tools format.
     fn convert_tools(
         &self,
         tools: &[Arc<dyn Tool>],
@@ -349,6 +452,12 @@ impl RequestBuilder for OpenAIProvider {
     }
 }
 
+/// Internal state for tracking tool call argument streaming.
+///
+/// The OpenAI API may stream tool call arguments in multiple chunks.
+/// This struct tracks the state of each in-progress tool call to properly
+/// reassemble the arguments and emit events when both the ID and
+/// arguments are available.
 #[derive(Debug, Default, Clone)]
 struct ToolCallState {
     id: Option<String>,
@@ -359,12 +468,27 @@ struct ToolCallState {
     finalized: bool,
 }
 
+/// Aggregates fragmented tool call events from streaming responses.
+///
+/// When the LLM generates tool calls, the API may stream:
+/// 1. The tool call ID
+/// 2. The function name
+/// 3. The arguments (potentially in many small chunks)
+///
+/// This aggregator buffers arguments until:
+/// - The tool call ID is received (required before emitting events)
+/// - A valid JSON object is complete (to avoid emitting malformed arguments)
 #[derive(Default)]
 struct ToolCallAggregator {
     states: Vec<ToolCallState>,
 }
 
 impl ToolCallAggregator {
+    /// Processes a single tool call chunk from the stream.
+    ///
+    /// May emit multiple [`ProviderEvent`] events:
+    /// - [`ProviderEvent::ToolCallStart`] when both ID and name are available
+    /// - [`ProviderEvent::ToolCallDelta`] when new argument content arrives
     fn process_chunk(&mut self, chunk: &ChatCompletionMessageToolCallChunk) -> Vec<ProviderEvent> {
         let mut events = Vec::new();
         let index = chunk.index as usize;
@@ -416,6 +540,7 @@ impl ToolCallAggregator {
         events
     }
 
+    /// Emits pending argument deltas to the events vector.
     fn emit_pending_arguments(
         state: &mut ToolCallState,
         id: &str,
@@ -438,6 +563,7 @@ impl ToolCallAggregator {
         });
     }
 
+    /// Marks the state as finalized when a complete JSON object is buffered.
     fn update_finalized_flag(state: &mut ToolCallState) {
         if state.finalized {
             return;
@@ -601,7 +727,6 @@ mod tests {
     fn tool_call_arguments_buffer_until_id_arrives() {
         let mut aggregator = ToolCallAggregator::default();
 
-        // Model streams arguments before providing the tool_call_id
         assert!(
             aggregator
                 .process_chunk(&make_chunk(0, None, Some("demo_tool"), Some("{\"foo\":")))

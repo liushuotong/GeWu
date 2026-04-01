@@ -1,3 +1,42 @@
+//! Agent implementation for the GeWu framework.
+//!
+//! The [`Agent`] is the core runtime that orchestrates conversation flow,
+//! tool execution, and context management. It follows a loop-based model
+//! where it processes user input, calls the LLM, handles tool executions,
+//! and continues until a final response is generated.
+//!
+//! # Agent Loop
+//!
+//! The [`ask`](Agent::ask) method implements the main agent loop:
+//!
+//! 1. **System prompt setup**: If no conversation history exists, add system prompt
+//! 2. **Add user message**: Add the user's input to history
+//! 3. **Compaction check**: If history exceeds token limit, summarize older messages
+//! 4. **LLM request**: Send conversation to LLM with available tools
+//! 5. **Stream response**: Yield content/reasoning deltas as they arrive
+//! 6. **Tool execution**: For each tool call, execute the tool and add result to history
+//! 7. **Repeat**: Continue from step 3 until LLM produces a final response
+//!
+//! # Doom Loop Detection
+//!
+//! To prevent infinite loops of identical tool calls, the agent tracks the
+//! last 3 tool calls. If the same tool is called 3 times in a row with
+//! identical arguments, execution is stopped with an error.
+//!
+//! # Example
+//!
+//! ```ignore
+//! use gewu_core::Agent;
+//! use gewu_providers::OpenAIProvider;
+//!
+//! let provider = OpenAIProvider::new(&api_key, "gpt-4");
+//! let agent = Agent::builder()
+//!     .llm(Arc::new(provider))
+//!     .with_tools(vec![...])
+//!     .system_prompt("You are a helpful assistant.")
+//!     .build()?;
+//! ```
+
 use crate::compaction::{self, estimate_message_tokens, is_overflow};
 use crate::traits::{LlmProvider, Memory, Tool, ToolRegistry};
 use crate::types::{AgentEvent, ContentPart, FunctionCall, Message, ProviderEvent, ToolCall};
@@ -8,6 +47,16 @@ use serde::Deserialize;
 use std::sync::Arc;
 use tracing::{debug, info};
 
+/// The main agent runtime that processes requests and manages conversation flow.
+///
+/// The agent holds:
+/// - An LLM provider for generating responses
+/// - A collection of available tools
+/// - A system prompt for agent behavior
+/// - Optional max turns limit
+/// - A memory backend for conversation history
+///
+/// Use [`Agent::builder`] to construct an Agent instance.
 pub struct Agent {
     llm: Arc<dyn LlmProvider>,
     tools: Vec<Arc<dyn Tool>>,
@@ -17,6 +66,29 @@ pub struct Agent {
     pub context_limit: usize,
 }
 
+/// Builder for constructing an [`Agent`] instance.
+///
+/// Follows the builder pattern to allow flexible configuration:
+/// - LLM provider (required)
+/// - Tools (optional, defaults to empty)
+/// - System prompt (optional, defaults to empty)
+/// - Max turns (optional)
+/// - Memory backend (optional, defaults to in-memory Vec)
+/// - Context limit (optional, defaults to 128,000 tokens)
+///
+/// # Example
+///
+/// ```
+/// use gewu_core::Agent;
+///
+/// let agent = Agent::builder()
+///     .llm(my_provider)
+///     .with_tools(vec![my_tool])
+///     .system_prompt("You are a helpful coding assistant.")
+///     .max_turns(Some(10))
+///     .memory(Box::new(vec![]))
+///     .build()?;
+/// ```
 pub struct AgentBuilder {
     llm: Option<Arc<dyn LlmProvider>>,
     tools: Vec<Arc<dyn Tool>>,
@@ -40,11 +112,16 @@ impl Default for AgentBuilder {
 }
 
 impl Agent {
+    /// Creates a new builder for constructing an Agent.
     pub fn builder() -> AgentBuilder {
         AgentBuilder::default()
     }
 
     /// Resets the conversation history, preserving the system prompt.
+    ///
+    /// Clears all messages from memory and re-adds the system prompt if
+    /// one was configured. This is useful for starting a fresh conversation
+    /// while maintaining the same agent configuration.
     pub async fn reset(&mut self) {
         self.memory.clear().await;
         if !self.system_prompt.is_empty() {
@@ -57,13 +134,42 @@ impl Agent {
     }
 
     /// Sends a message to the agent and gets a response stream.
-    /// This method maintains the conversation history.
+    ///
+    /// This is the main entry point for interacting with the agent. The method
+    /// returns a stream of [`AgentEvent`]s that represent the progress of the
+    /// agent's execution. The caller should iterate over the stream to receive
+    /// content deltas, tool execution events, and the final response.
+    ///
+    /// # Arguments
+    ///
+    /// * `user_message` - The message to send to the agent.
+    ///
+    /// # Returns
+    ///
+    /// A stream of [`AgentEvent`] objects. The stream will emit:
+    ///
+    /// - [`AgentEvent::ContentDelta`] - Text content as it arrives
+    /// - [`AgentEvent::ReasoningDelta`] - Reasoning/thinking content as it arrives
+    /// - [`AgentEvent::ToolStart`] - When a tool execution begins
+    /// - [`AgentEvent::ToolFinish`] - When a tool execution completes
+    /// - [`AgentEvent::Finish`] - When the agent has produced a final response
+    /// - [`AgentEvent::Error`] - If an error occurs
+    ///
+    /// # Loop Behavior
+    ///
+    /// Each call to `ask` executes one full turn:
+    ///
+    /// 1. Adds user message to history
+    /// 2. Checks for context overflow, triggers compaction if needed
+    /// 3. Calls LLM with current history and tools
+    /// 4. Streams response events
+    /// 5. Executes any requested tools and adds results to history
+    /// 6. Yields final response when LLM indicates completion
     pub fn ask<'a>(
         &'a mut self,
         user_message: &'a str,
     ) -> impl Stream<Item = Result<AgentEvent>> + 'a {
         async_stream::try_stream! {
-            // Ensure system prompt is the first message if history is empty
             if self.memory.messages().is_empty() && !self.system_prompt.is_empty() {
                  self.memory.add_message(Message::System { content: self.system_prompt.clone() }).await;
             }
@@ -74,7 +180,6 @@ impl Agent {
             let mut recent_tool_calls: Vec<(String, String)> = Vec::new();
 
             loop {
-                // Check for compaction at the start of each turn
                 if self.compact_if_needed().await? {
                     info!("History compacted.");
                 }
@@ -87,19 +192,15 @@ impl Agent {
                 }
                 turn += 1;
 
-                // Prune old tool outputs before generating response
                 compaction::prune(self.memory.messages_mut());
 
                 let mut current_content = String::new();
                 let mut current_tool_calls: Vec<ToolCall> = Vec::new();
 
-                // Call LLM provider
-                // We clone tools to avoid borrowing self while iterating the stream
                 let provider = self.llm.clone();
-                let messages = self.memory.messages().to_vec(); // Clone messages
+                let messages = self.memory.messages().to_vec();
                 debug!("LLM request messages: {:?}", messages);
 
-                // Clone tools for the LLM call
                 let tools_clone = self.tools.clone();
                 let mut stream = provider.stream_response(&messages, &tools_clone).await
                     .map_err(|e| anyhow::anyhow!(e))?;
@@ -131,25 +232,21 @@ impl Agent {
                             }
                         }
                         ProviderEvent::Finish { .. } => {
-                            // Provider stream finished.
                         }
                         ProviderEvent::Error { error } => {
                             yield AgentEvent::Error { error };
-                            return; // Stop stream
+                            return;
                         }
                     }
                 }
 
-                // Add assistant message to history
                 let assistant_msg = Message::Assistant {
                     content: if current_content.is_empty() { None } else { Some(current_content.clone()) },
                     tool_calls: if current_tool_calls.is_empty() { None } else { Some(current_tool_calls.clone()) },
                 };
                 self.memory.add_message(assistant_msg).await;
 
-                // Handle tool calls
                 if current_tool_calls.is_empty() {
-                    // No tools called, we are done
                     yield AgentEvent::Finish { response: current_content };
                     break;
                 }
@@ -161,7 +258,6 @@ impl Agent {
                     let args = call.function.arguments.clone();
                     let call_id = call.id;
 
-                    // Doom loop detection
                     let current_call_sig = (tool_name.clone(), args.clone());
                     recent_tool_calls.push(current_call_sig.clone());
                     if recent_tool_calls.len() > 3 {
@@ -204,13 +300,41 @@ impl Agent {
                         media: media_parts,
                     }).await;
                 }
-
-                // Continue loop for next turn
             }
         }
     }
 
     /// Checks if the current history exceeds the token limit and triggers summarization.
+    ///
+    /// When the estimated token count of the conversation history exceeds the
+    /// configured context limit (minus a buffer), this method uses the LLM to
+    /// create a summary of the conversation. The summary replaces the old
+    /// messages while preserving:
+    ///
+    /// - The system prompt (if any)
+    /// - The summary message
+    /// - The last user message (to maintain context about what the user just asked)
+    ///
+    /// # Summary Format
+    ///
+    /// The generated summary follows a structured template:
+    ///
+    /// ```markdown
+    /// ## Goal
+    /// [What goal(s) is the user trying to accomplish?]
+    ///
+    /// ## Instructions
+    /// [What important instructions did the user give you]
+    ///
+    /// ## Discoveries
+    /// [What notable things were learned]
+    ///
+    /// ## Accomplished
+    /// [What work has been completed]
+    ///
+    /// ## Relevant files / directories
+    /// [Files that have been read, edited, or created]
+    /// ```
     async fn compact_if_needed(&mut self) -> Result<bool> {
         let mut total_tokens: usize = 0;
         for msg in self.memory.messages() {
@@ -251,7 +375,6 @@ When constructing the summary, try to stick to this template:
 [Construct a structured list of relevant files that have been read, edited, or created that pertain to the task at hand. If all the files in a directory are relevant, include the path to the directory.]
 ---";
 
-        // Prepare messages for summarization
         let mut request_messages = self.memory.messages().to_vec();
         request_messages.push(Message::User {
             content: vec![ContentPart::Text {
@@ -259,7 +382,6 @@ When constructing the summary, try to stick to this template:
             }],
         });
 
-        // Call LLM for summary
         let provider = self.llm.clone();
         let mut stream = provider
             .stream_response(&request_messages, &[])
@@ -281,7 +403,6 @@ When constructing the summary, try to stick to this template:
 
         let mut new_history = Vec::new();
 
-        // Preserve system prompt
         if let Some(sys_msg) = self
             .memory
             .messages()
@@ -291,7 +412,6 @@ When constructing the summary, try to stick to this template:
             new_history.push(sys_msg.clone());
         }
 
-        // Add Summary
         new_history.push(Message::Assistant {
             content: Some(format!(
                 "Summary of previous conversation:\n{}",
@@ -300,9 +420,6 @@ When constructing the summary, try to stick to this template:
             tool_calls: None,
         });
 
-        // Replay logic: Find the last user message
-        // We only replay if it's not the one that triggered the overflow directly?
-        // Actually, we want to ensure the agent remembers what the user *just* asked.
         if let Some(last_user_msg) = self
             .memory
             .messages()
@@ -338,36 +455,65 @@ impl ToolRegistry for Agent {
 }
 
 impl AgentBuilder {
+    /// Sets the LLM provider for the agent.
+    ///
+    /// This is a required field - the agent cannot function without an LLM provider.
     pub fn llm(mut self, llm: Arc<dyn LlmProvider>) -> Self {
         self.llm = Some(llm);
         self
     }
 
+    /// Sets the tools available to the agent.
+    ///
+    /// Tools are how the agent interacts with the outside world. The agent
+    /// can call any of these tools during its execution.
     pub fn with_tools(mut self, tools: Vec<Arc<dyn Tool>>) -> Self {
         self.tools = tools;
         self
     }
 
+    /// Sets the system prompt for the agent.
+    ///
+    /// The system prompt is added to the conversation when it is empty and
+    /// provides instructions that guide the agent's behavior.
     pub fn system_prompt(mut self, prompt: &str) -> Self {
         self.system_prompt = prompt.to_string();
         self
     }
 
+    /// Sets the maximum number of turns the agent can execute.
+    ///
+    /// A "turn" is one LLM call. If set, the agent will stop after the
+    /// specified number of turns and return an error.
     pub fn max_turns(mut self, max_turns: Option<usize>) -> Self {
         self.max_turns = max_turns;
         self
     }
 
+    /// Sets the context limit for the agent.
+    ///
+    /// This is the maximum number of tokens the agent will allow in the
+    /// conversation history before triggering compaction. Defaults to 128,000.
     pub fn context_limit(mut self, limit: usize) -> Self {
         self.context_limit = limit;
         self
     }
 
+    /// Sets the memory backend for conversation history.
+    ///
+    /// If not set, defaults to an in-memory Vec implementation.
+    /// Use [`SqliteMemory`](https://docs.rs/gewu-storage/latest/gewu_storage/struct.SqliteMemory.html)
+    /// for persistent storage across sessions.
     pub fn memory(mut self, memory: Box<dyn Memory>) -> Self {
         self.memory = Some(memory);
         self
     }
 
+    /// Builds the [`Agent`] instance.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the LLM provider is not set.
     pub fn build(self) -> Result<Agent> {
         let llm = self.llm.context("LLM provider is required")?;
         let agent = Agent {
@@ -378,9 +524,6 @@ impl AgentBuilder {
             memory: self.memory.unwrap_or_else(|| Box::new(Vec::new())),
             context_limit: self.context_limit,
         };
-        // Removed initial synchronous add_message call.
-        // It will be handled in reset() or ask() or should be pre-seeded.
-        // Since we removed it, we rely on ask() to add system prompt if empty.
         Ok(agent)
     }
 }
@@ -395,6 +538,20 @@ struct MediaPayload {
     message: Option<String>,
 }
 
+/// Extracts media parts from a tool result string.
+///
+/// Some tools (particularly file reading tools) can return media in addition
+/// to text content. This function parses JSON tool results that contain a
+/// `type: "media"` field and extracts the contained media parts.
+///
+/// # Arguments
+///
+/// * `content` - A JSON string that may contain a media payload.
+///
+/// # Returns
+///
+/// A vector of [`ContentPart`] objects extracted from the media payload,
+/// or an empty vector if the content is not a media payload.
 fn extract_media_parts(content: &str) -> Vec<ContentPart> {
     let parsed: MediaPayload = match serde_json::from_str(content) {
         Ok(value) => value,

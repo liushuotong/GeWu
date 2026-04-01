@@ -1,3 +1,48 @@
+//! SQLite-based persistent memory storage for GeWu.
+//!
+//! This module provides [`SqliteMemory`], a [`Memory`] implementation that
+//! persists conversation history to a SQLite database. This enables
+//! multi-session support where the agent can resume conversations across
+//! process restarts.
+//!
+//! # Database Schema
+//!
+//! The `memory_messages` table stores serialized messages:
+//!
+//! ```sql
+//! CREATE TABLE memory_messages (
+//!     id INTEGER PRIMARY KEY AUTOINCREMENT,
+//!     session_id TEXT NOT NULL,
+//!     content TEXT NOT NULL,
+//!     created_at INTEGER DEFAULT (unixepoch())
+//! )
+//! ```
+//!
+//! - `session_id`: Groups messages into conversation sessions
+//! - `content`: JSON-serialized [`Message`] object
+//! - `created_at`: Unix timestamp for ordering
+//!
+//! # Usage
+//!
+//! ```ignore
+//! use gewu_storage::SqliteMemory;
+//! use sqlx::sqlite::SqlitePoolOptions;
+//!
+//! let pool = SqlitePoolOptions::new()
+//!     .connect("sqlite:./gewu.db?mode=rwc")
+//!     .await
+//!     .unwrap();
+//!
+//! let mut memory = SqliteMemory::new(pool, "session-123")
+//!     .await
+//!     .unwrap();
+//! ```
+//!
+//! # Concurrency
+//!
+//! SqliteMemory maintains an in-memory cache of messages for fast access
+//! during a session. writes are immediately persisted to the database.
+
 use anyhow::{Context, Result};
 use async_trait::async_trait;
 use gewu_core::traits::Memory;
@@ -5,6 +50,22 @@ use gewu_core::types::Message;
 use sqlx::{Row, sqlite::SqlitePool};
 use tracing::{error, info};
 
+/// SQLite-backed implementation of [`Memory`] for persistent storage.
+///
+/// SqliteMemory stores conversation messages in a SQLite database, allowing
+/// conversations to persist across process restarts. Each instance is
+/// associated with a session ID, enabling multiple concurrent conversations.
+///
+/// The implementation uses a dual-storage approach:
+/// - In-memory cache for fast reads during the session
+/// - SQLite database for durability and cross-session persistence
+///
+/// # Type Requirements
+///
+/// Requires `sqlx` with the `sqlite` feature enabled:
+/// ```toml
+/// sqlx = { version = "0.7", features = ["runtime-tokio", "sqlite"] }
+/// ```
 pub struct SqliteMemory {
     pool: SqlitePool,
     session_id: String,
@@ -12,13 +73,23 @@ pub struct SqliteMemory {
 }
 
 impl SqliteMemory {
-    /// Creates a new `SqliteMemory` instance.
+    /// Creates a new `SqliteMemory` instance for a given session.
     ///
     /// This function:
-    /// 1. Ensures the `memory_messages` table exists.
-    /// 2. Loads any existing messages for the given `session_id`.
+    /// 1. Ensures the `memory_messages` table exists in the database
+    /// 2. Creates an index on `session_id` for efficient queries
+    /// 3. Loads any existing messages for the given `session_id`
+    ///
+    /// # Arguments
+    ///
+    /// * `pool` - A SQLx SQLite connection pool
+    /// * `session_id` - Unique identifier for this conversation session
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if database operations fail (table creation,
+    /// index creation, or loading messages).
     pub async fn new(pool: SqlitePool, session_id: String) -> Result<Self> {
-        // Create table if not exists
         sqlx::query(
             r#"
             CREATE TABLE IF NOT EXISTS memory_messages (
@@ -33,7 +104,6 @@ impl SqliteMemory {
         .await
         .context("Failed to create memory_messages table")?;
 
-        // Create index for session_id
         sqlx::query(
             "CREATE INDEX IF NOT EXISTS idx_memory_messages_session_id ON memory_messages(session_id)"
         )
@@ -41,7 +111,6 @@ impl SqliteMemory {
         .await
         .context("Failed to create index on session_id")?;
 
-        // Load existing messages
         let rows =
             sqlx::query("SELECT content FROM memory_messages WHERE session_id = ? ORDER BY id ASC")
                 .bind(&session_id)
@@ -81,17 +150,20 @@ impl Memory for SqliteMemory {
         &mut self.messages
     }
 
+    /// Adds a message to both the in-memory cache and the database.
+    ///
+    /// The message is:
+    /// 1. Added to the in-memory vector immediately
+    /// 2. Asynchronously persisted to SQLite
+    ///
+    /// If serialization fails, the in-memory cache is updated but
+    /// the database write fails silently (logged as error).
     async fn add_message(&mut self, message: Message) {
-        // 1. Update in-memory cache
         self.messages.push(message.clone());
 
-        // 2. Async persist to DB
         let session_id = self.session_id.clone();
         let pool = self.pool.clone();
 
-        // We spawn this task or await it?
-        // The trait is async, so we can await it.
-        // It's safer to await to ensure durability.
         let content = match serde_json::to_string(&message) {
             Ok(s) => s,
             Err(e) => {
@@ -111,6 +183,7 @@ impl Memory for SqliteMemory {
         }
     }
 
+    /// Clears all messages for this session from memory and database.
     async fn clear(&mut self) {
         self.messages.clear();
         if let Err(e) = sqlx::query("DELETE FROM memory_messages WHERE session_id = ?")
@@ -122,10 +195,20 @@ impl Memory for SqliteMemory {
         }
     }
 
+    /// Replaces all messages with a new set.
+    ///
+    /// This is used by the agent's compaction logic to replace the
+    /// full conversation history with a summarized version. The operation
+    /// is transactional:
+    ///
+    /// 1. Deletes all existing messages for this session
+    /// 2. Inserts all messages from the new vector
+    ///
+    /// If an error occurs mid-transaction, changes are rolled back
+    /// and an error is logged.
     async fn replace(&mut self, messages: Vec<Message>) {
         self.messages = messages.clone();
 
-        // Transactional replacement
         let mut tx = match self.pool.begin().await {
             Ok(tx) => tx,
             Err(e) => {
@@ -148,7 +231,7 @@ impl Memory for SqliteMemory {
                 Ok(s) => s,
                 Err(e) => {
                     error!("Failed to serialize message in replace: {}", e);
-                    continue; // Or abort transaction?
+                    continue;
                 }
             };
 
@@ -160,7 +243,6 @@ impl Memory for SqliteMemory {
                     .await
             {
                 error!("Failed to insert message in replace: {}", e);
-                // Should rollback here technically, but let's just log for now
                 return;
             }
         }
@@ -183,7 +265,6 @@ mod tests {
 
         let session_id = "test_1".to_string();
 
-        // 1. Create and add
         let mut mem1 = SqliteMemory::new(pool.clone(), session_id.clone()).await?;
         let msg = Message::User {
             content: vec![ContentPart::Text {
@@ -193,7 +274,6 @@ mod tests {
         mem1.add_message(msg).await;
         assert_eq!(mem1.messages().len(), 1);
 
-        // 2. Load from same DB
         let mem2 = SqliteMemory::new(pool.clone(), session_id.clone()).await?;
         assert_eq!(mem2.messages().len(), 1);
         match &mem2.messages()[0] {

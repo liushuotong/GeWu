@@ -1,3 +1,24 @@
+//! Bash command execution tool.
+//!
+//! This module provides the [`BashTool`] which allows the agent to execute
+//! bash commands. It supports both full shell access and a restricted
+//! "safe mode" that only allows predefined read-only commands.
+//!
+//! # Safety Features
+//!
+//! - **Safe mode**: Optional whitelist of allowed commands (ls, cat, grep, etc.)
+//! - **Command chaining prevention**: Blocks `;`, `&&`, `||` operators in safe mode
+//! - **Working directory restriction**: Commands run in a specified directory
+//! - **Timeout**: Configurable timeout prevents hanging commands
+//!
+//! # Tool Definition
+//!
+//! - **Name**: `bash`
+//! - **Parameters**:
+//!   - `command` (required): The bash command to execute
+//!   - `timeout` (optional): Timeout in milliseconds (default: 120000)
+//!   - `workdir` (optional): Working directory for the command
+
 use anyhow::{Context, Result};
 use async_trait::async_trait;
 use gewu_core::traits::Tool;
@@ -5,8 +26,39 @@ use serde_json::{Value, json};
 use std::error::Error;
 use std::path::PathBuf;
 
+/// Tool for executing bash commands.
+///
+/// BashTool provides shell command execution capabilities to the agent.
+/// It can be configured with safe mode to restrict available commands.
+///
+/// # Safe Mode
+///
+/// When `safe_mode` is enabled, only a limited set of read-only commands
+/// are allowed:
+/// - `ls`, `cat`, `grep`, `rg`, `find`, `pwd`, `echo`, `wc`, `head`, `tail`
+/// - `whoami`, `date`, `git`, `printf`, `sort`, `uniq`, `diff`
+///
+/// Command chaining with `;`, `&&`, `||` is also blocked in safe mode.
+///
+/// # Path Safety
+///
+/// The tool resolves paths relative to `working_directory` and prevents
+/// directory traversal attacks. See [`resolve_safe_path`](super::fs_utils::resolve_safe_path).
+///
+/// # Example
+///
+/// ```ignore
+/// let tool = BashTool {
+///     working_directory: PathBuf::from("/home/user/project"),
+///     safe_mode: false,
+/// };
+///
+/// let result = tool.call(r#"{"command": "ls -la", "timeout": 30000}"#).await;
+/// ```
 pub struct BashTool {
+    /// The directory to execute commands in.
     pub working_directory: PathBuf,
+    /// If true, only allow predefined read-only commands.
     pub safe_mode: bool,
 }
 
@@ -41,17 +93,35 @@ impl Tool for BashTool {
         })
     }
 
+    /// Executes a bash command.
+    ///
+    /// # Arguments
+    ///
+    /// JSON string containing:
+    /// - `command` (required): The bash command to execute
+    /// - `timeout` (optional): Milliseconds before command times out (default: 120000)
+    /// - `workdir` (optional): Override working directory
+    ///
+    /// # Returns
+    ///
+    /// Returns stdout and stderr combined, or an error message if
+    /// the command was blocked, not found, or timed out.
+    ///
+    /// # Safety Checks
+    ///
+    /// In safe mode:
+    /// - First word must be in the allowed command whitelist
+    /// - Command chaining characters (`;`, `&&`, `||`) are blocked
     async fn call(&self, args: &str) -> Result<String, Box<dyn Error + Send + Sync>> {
         let args_val: Value = serde_json::from_str(args).map_err(|e| anyhow::anyhow!(e))?;
         let command_str = args_val["command"]
             .as_str()
             .ok_or_else(|| anyhow::anyhow!("command is required"))?;
-        let timeout_ms = args_val["timeout"].as_u64().unwrap_or(120000); // Default 2 minutes
+        let timeout_ms = args_val["timeout"].as_u64().unwrap_or(120000);
 
         if self.safe_mode {
             let trimmed = command_str.trim();
             let first_word = trimmed.split_whitespace().next().unwrap_or("");
-            // Allowed commands in safe mode (mostly read-only or harmless)
             let allowed = [
                 "ls", "cat", "grep", "rg", "find", "pwd", "echo", "wc", "head", "tail", "whoami",
                 "date", "git", "printf", "sort", "uniq", "diff",
@@ -64,7 +134,6 @@ impl Tool for BashTool {
                 ));
             }
 
-            // Check for chaining characters that might execute hidden commands
             if trimmed.contains(';') || trimmed.contains("&&") || trimmed.contains("||") {
                 return Ok(
                     "Complex command chaining (;, &&, ||) is not allowed in safe mode.".to_string(),
@@ -72,7 +141,6 @@ impl Tool for BashTool {
             }
         }
 
-        // Resolve working directory
         let work_dir = if let Some(wd) = args_val["workdir"].as_str() {
             crate::fs_utils::resolve_safe_path(&self.working_directory, wd)
                 .map_err(|e| anyhow::anyhow!(e))?
@@ -93,9 +161,6 @@ impl Tool for BashTool {
             .spawn()
             .context("Failed to spawn bash command")
             .map_err(|e| anyhow::anyhow!(e))?;
-
-        // We can't use child_process.wait_with_output() directly with timeout easily because wait_with_output takes ownership.
-        // But we can wrap it.
 
         let output_result = tokio::time::timeout(
             std::time::Duration::from_millis(timeout_ms),
@@ -132,7 +197,6 @@ impl Tool for BashTool {
                 Ok(result)
             }
             Err(_) => {
-                // Timeout
                 Ok(format!("Command timed out after {} ms.", timeout_ms))
             }
         }
@@ -230,7 +294,6 @@ mod tests {
             .call(&args.to_string())
             .await
             .map_err(|e| anyhow::anyhow!(e.to_string()))?;
-        // output should contain 'sub'
         assert!(output.contains("sub"));
         Ok(())
     }
@@ -244,7 +307,6 @@ mod tests {
             safe_mode: true,
         };
 
-        // Allowed command
         let args = json!({
             "command": "echo hello"
         });
@@ -254,7 +316,6 @@ mod tests {
             .map_err(|e| anyhow::anyhow!(e.to_string()))?;
         assert_eq!(output.trim(), "hello");
 
-        // Disallowed command
         let args = json!({
             "command": "rm -rf /"
         });
@@ -264,7 +325,6 @@ mod tests {
             .map_err(|e| anyhow::anyhow!(e.to_string()))?;
         assert!(output.contains("not allowed in safe mode"));
 
-        // Chaining attempt
         let args = json!({
             "command": "echo hello; rm -rf /"
         });

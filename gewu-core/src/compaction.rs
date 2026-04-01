@@ -1,13 +1,68 @@
+//! History compaction and token management.
+//!
+//! This module provides functionality for managing conversation history size:
+//!
+//! - [`estimate_tokens`] - Rough token estimation for text
+//! - [`estimate_message_tokens`] - Token estimation for complete messages
+//! - [`is_overflow`] - Determines if history exceeds the token limit
+//! - [`prune`] - Removes old tool outputs to free up context space
+//!
+//! # Token Estimation
+//!
+//! Token estimation is intentionally simplified: `text.len() / 4`. This is a
+//! rough approximation where each token is assumed to be ~4 characters.
+//! For binary media data (base64), the same approximation is used.
+//!
+//! # Compaction vs Pruning
+//!
+//! GeWu uses two strategies to manage context size:
+//!
+//! - **Pruning** ([`prune`]): Fast, in-memory cleanup that removes tool output
+//!   content from old messages. Keeps the structure but replaces long outputs
+//!   with "[Output pruned]". Triggered on every agent turn.
+//!
+//! - **Compaction** ([`Agent::compact_if_needed`](super::agent::Agent::compact_if_needed)):
+//!   Full summarization that uses the LLM to create a summary of the entire
+//!   conversation history. Only triggered when history exceeds context limit.
+
 use crate::types::{ContentPart, Message};
 
 const PRUNE_PROTECT_THRESHOLD: usize = 40_000;
 const PRUNE_MINIMUM_SAVINGS: usize = 20_000;
 const COMPACTION_BUFFER: usize = 20_000;
 
+/// Estimates the number of tokens in a text string.
+///
+/// Uses a simple approximation: `text.len() / 4`. This assumes average
+/// token length of ~4 characters, which is a reasonable approximation
+/// for English text. Note that actual tokenizers (like tiktoken) may
+/// produce different counts.
 pub fn estimate_tokens(text: &str) -> usize {
     text.len() / 4
 }
 
+/// Determines if the current token count exceeds the context limit.
+///
+/// Returns `true` if compaction should be considered. A buffer of
+/// [`COMPACTION_BUFFER`] tokens is reserved to ensure some working space
+/// remains after compaction.
+///
+/// # Arguments
+///
+/// * `total_tokens` - The estimated total tokens in the conversation history.
+/// * `limit_context` - The maximum context window size (e.g., 128,000 for GPT-4).
+///
+/// # Examples
+///
+/// ```
+/// use gewu_core::compaction::is_overflow;
+///
+/// // With an 8k context limit and 120k tokens, overflow is true
+/// assert!(is_overflow(120_000, 128_000));
+///
+/// // With an 8k context limit and 100k tokens, overflow is false
+/// assert!(!is_overflow(100_000, 128_000));
+/// ```
 pub fn is_overflow(total_tokens: usize, limit_context: usize) -> bool {
     if limit_context == 0 {
         return false;
@@ -30,6 +85,13 @@ fn estimate_content_tokens(content: &[ContentPart]) -> usize {
         .sum()
 }
 
+/// Estimates the token count for a complete message.
+///
+/// Token estimation varies by message type:
+/// - **System**: Simple text length
+/// - **User**: Sum of all content parts (text + media data)
+/// - **Assistant**: Text content plus function names and arguments from tool calls
+/// - **Tool**: Original content plus any additional media parts
 pub fn estimate_message_tokens(msg: &Message) -> usize {
     match msg {
         Message::System { content } => estimate_tokens(content),
@@ -55,17 +117,38 @@ pub fn estimate_message_tokens(msg: &Message) -> usize {
     }
 }
 
-/// Prunes session history by clearing tool outputs from older messages.
+/// Prunes tool outputs from older messages to free context space.
 ///
-/// Returns the number of tokens saved.
+/// This function walks backwards through the message history, skipping the
+/// most recent 2 turns (to keep recent context), and marks old tool outputs
+/// for pruning once the total tool output size exceeds [`PRUNE_PROTECT_THRESHOLD`].
+///
+/// A message starting with "Summary:" is treated as a compaction summary
+/// and stops the pruning process (preserving the summarized history intact).
+///
+/// # Arguments
+///
+/// * `messages` - The message history to prune (modified in place).
+///
+/// # Returns
+///
+/// The number of tokens saved by pruning, or 0 if pruning was not performed
+/// (either not enough savings or pruning threshold not reached).
+///
+/// # Pruning Behavior
+///
+/// 1. Iterates backwards from the second-to-last message
+/// 2. Skips the 2 most recent turns (user/assistant pairs)
+/// 3. Accumulates tool output tokens until exceeding `PRUNE_PROTECT_THRESHOLD`
+/// 4. Once threshold exceeded, marks those messages for pruning
+/// 5. Only actually prunes if total savings exceed `PRUNE_MINIMUM_SAVINGS`
+/// 6. Replaces tool content with "[Output pruned]" and clears media
 pub fn prune(messages: &mut [Message]) -> usize {
     let mut total_tool_tokens = 0;
     let mut pruned_tokens = 0;
     let mut to_prune = Vec::new();
     let mut turns = 0;
 
-    // We iterate backwards to accumulate token count of tool outputs
-    // We skip the last 2 turns (user/assistant pair usually) to keep context fresh.
     for (i, msg) in messages.iter().enumerate().rev() {
         if let Message::User { .. } = msg {
             turns += 1;
@@ -75,7 +158,6 @@ pub fn prune(messages: &mut [Message]) -> usize {
             continue;
         }
 
-        // Check if message is a summary (heuristic for now, check if system/assistant says "Summary")
         if let Message::Assistant {
             content: Some(c), ..
         } = msg
@@ -99,7 +181,6 @@ pub fn prune(messages: &mut [Message]) -> usize {
     if pruned_tokens > PRUNE_MINIMUM_SAVINGS {
         for idx in to_prune {
             if let Message::Tool { content, media, .. } = &mut messages[idx] {
-                // Clear output to save space
                 *content = "[Output pruned]".to_string();
                 media.clear();
             }

@@ -1,29 +1,67 @@
+//! Core type definitions for the GeWu agent framework.
+//!
+//! This module provides the fundamental data structures used throughout GeWu:
+//! - [`Message`] - Conversation messages with different roles (system, user, assistant, tool)
+//! - [`ContentPart`] - Content within messages (text, images, audio, video, files)
+//! - [`FunctionCall`] / [`ToolCall`] - Tool invocation structures
+//! - [`ProviderEvent`] - Events emitted by LLM providers during streaming
+//! - [`AgentEvent`] - Events emitted by the agent during agent execution
+//! - [`Capabilities`] - Model capabilities for input/output modalities
+
 use serde::{Deserialize, Serialize};
 
+/// Represents a function call within a tool call.
+///
+/// Contains the name of the function to invoke and its arguments as a JSON string.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct FunctionCall {
+    /// The name of the function to call.
     pub name: String,
+    /// The arguments to pass to the function, encoded as a JSON string.
     pub arguments: String,
 }
 
+/// Represents a tool call from the LLM.
+///
+/// Tool calls are how the agent requests execution of tools like bash, file operations, etc.
+/// Each tool call has a unique ID (assigned by the LLM provider), a type (always "function"),
+/// and the actual function to call with its arguments.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ToolCall {
+    /// A unique identifier for this tool call, assigned by the LLM provider.
+    /// This ID is used to match tool responses with tool call requests.
     pub id: String,
+    /// The type of tool call. Currently always "function".
     pub r#type: String,
+    /// The function to call and its arguments.
     pub function: FunctionCall,
 }
 
+/// Content part of a message, supporting various media types.
+///
+/// ContentPart represents the actual content within a message. It can be plain text,
+/// or media types like images, audio, video, or generic files. Media types include
+/// both the data (typically base64-encoded) and the MIME type.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "lowercase")]
 pub enum ContentPart {
+    /// Plain text content.
     Text { text: String },
+    /// An image with base64-encoded data and MIME type (e.g., "image/png").
     Image { data: String, mime_type: String },
+    /// An audio file with base64-encoded data and MIME type (e.g., "audio/mp3").
     Audio { data: String, mime_type: String },
+    /// A video file with base64-encoded data and MIME type (e.g., "video/mp4").
     Video { data: String, mime_type: String },
+    /// A generic file with base64-encoded data and MIME type.
     File { data: String, mime_type: String },
 }
 
 impl ContentPart {
+    /// Returns the MIME type of this content part.
+    ///
+    /// For text content, returns "text/plain". For media types, returns the
+    /// specific MIME type of that media.
     pub fn mime_type(&self) -> String {
         match self {
             ContentPart::Text { .. } => "text/plain".to_string(),
@@ -35,70 +73,134 @@ impl ContentPart {
     }
 }
 
+/// Describes the capabilities of an LLM model.
+///
+/// Capabilities indicate what input and output modalities a model supports.
+/// This is used to determine how to handle content (e.g., whether to send
+/// images directly or convert them to text descriptions).
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct Capabilities {
+    /// Input capabilities - what the model can accept.
     pub input: InputCapabilities,
+    /// Output capabilities - what the model can produce.
     pub output: OutputCapabilities,
 }
 
+/// Input capabilities for a model.
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct InputCapabilities {
+    /// Whether the model accepts text input.
     pub text: bool,
+    /// Whether the model accepts image input.
     pub image: bool,
+    /// Whether the model accepts audio input.
     pub audio: bool,
+    /// Whether the model accepts video input.
     pub video: bool,
+    /// Whether the model accepts PDF input.
     pub pdf: bool,
 }
 
+/// Output capabilities for a model.
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct OutputCapabilities {
+    /// Whether the model can produce text output.
     pub text: bool,
+    /// Whether the model can produce image output.
     pub image: bool,
+    /// Whether the model can produce audio output.
     pub audio: bool,
+    /// Whether the model can produce video output.
     pub video: bool,
+    /// Whether the model can produce PDF output.
     pub pdf: bool,
 }
 
+/// Events emitted by the LLM provider during streaming responses.
+///
+/// ProviderEvent represents the raw events that come from the LLM provider
+/// during a streaming response. These are then transformed into AgentEvent
+/// for consumption by the agent runtime.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum ProviderEvent {
+    /// A delta of reasoning content (e.g., chain-of-thought) from the model.
     ReasoningDelta { delta: String },
+    /// A delta of content (text response) from the model.
     ContentDelta { delta: String },
+    /// The start of a tool call, providing the tool call ID and function name.
     ToolCallStart { id: String, name: String },
+    /// A delta of tool call arguments. Arguments are streamed separately
+    /// and may arrive in multiple chunks.
     ToolCallDelta { id: String, delta: String },
+    /// The provider has finished generating the response.
     Finish { reason: Option<String> },
+    /// An error occurred during streaming.
     Error { error: String },
 }
 
+/// Events emitted by the agent during execution.
+///
+/// AgentEvent represents the high-level events that the agent runtime
+/// produces as it processes a request. These events are consumed by
+/// the CLI or other frontends to display progress and results.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum AgentEvent {
+    /// A delta of reasoning content from the model.
     ReasoningDelta { delta: String },
+    /// A delta of text content from the model.
     ContentDelta { delta: String },
+    /// The agent has started executing a tool.
     ToolStart { tool: String, input: String },
+    /// A tool has finished executing.
     ToolFinish { tool: String, output: String },
+    /// The agent has finished with a final response.
     Finish { response: String },
+    /// An error occurred during agent execution.
     Error { error: String },
 }
 
+/// A message in the conversation history.
+///
+/// Message represents a single turn in the conversation. Messages have
+/// different roles that affect how they are processed:
+///
+/// - **System**: Configuration/instructions for the agent. Typically the first message.
+/// - **User**: Input from the human user.
+/// - **Assistant**: Response from the agent. May contain text content and/or tool calls.
+/// - **Tool**: Result from executing a tool. Includes the tool call ID to link it
+///   to the corresponding tool call in the assistant message.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "role", rename_all = "lowercase")]
 pub enum Message {
+    /// A system message, typically used to set agent behavior/instructions.
     System {
+        /// The content of the system message.
         content: String,
     },
+    /// A message from the user.
     User {
+        /// The content parts of the user message.
         content: Vec<ContentPart>,
     },
+    /// A message from the assistant (the agent).
     Assistant {
+        /// The text content of the assistant's response, if any.
         content: Option<String>,
+        /// Tool calls requested by the assistant, if any.
         tool_calls: Option<Vec<ToolCall>>,
     },
+    /// A message containing the result of a tool execution.
     Tool {
+        /// The ID of the tool call this result corresponds to.
         tool_call_id: String,
+        /// The name of the tool that was executed, if known.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         tool_name: Option<String>,
+        /// The result content from the tool execution.
         content: String,
+        /// Any additional media returned by the tool (e.g., images from reading a file).
         #[serde(default, skip_serializing_if = "Vec::is_empty")]
         media: Vec<ContentPart>,
     },
