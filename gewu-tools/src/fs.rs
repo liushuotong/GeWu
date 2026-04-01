@@ -26,6 +26,7 @@ use crate::fs_utils::{
     glob_with_gitignore, into_tool_error, is_binary_file, mime_type, parse_empty_args, read_bytes,
     read_text, resolve_safe_path, write,
 };
+use crate::replacers::smart_replace;
 use anyhow::Result;
 use async_trait::async_trait;
 use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64};
@@ -533,20 +534,8 @@ impl Tool for EditFileTool {
 
         let content = read_text(&file_path).await.map_err(into_tool_error)?;
 
-        let occurrences = content.matches(old_string).count();
-
-        if occurrences == 0 {
-            return Err(anyhow::anyhow!("oldString not found in content").into());
-        }
-
-        let new_content = if replace_all {
-            content.replace(old_string, new_string)
-        } else {
-            if occurrences > 1 {
-                return Err(anyhow::anyhow!("Found multiple matches for oldString. Provide more surrounding lines in oldString to identify the correct match.").into());
-            }
-            content.replacen(old_string, new_string, 1)
-        };
+        let new_content = smart_replace(&content, old_string, new_string, replace_all)
+            .map_err(|e| anyhow::anyhow!("{}", e))?;
 
         write(&file_path, new_content.as_bytes())
             .await

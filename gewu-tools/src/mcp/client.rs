@@ -235,7 +235,9 @@ impl McpClient {
     ) {
         let mut p = pending.lock().await;
         for (_, sender) in p.drain() {
-            let _ = sender.send(Err(anyhow::anyhow!("{}", reason)));
+            if sender.send(Err(anyhow::anyhow!("{}", reason))).is_err() {
+                tracing::debug!("MCP: channel already closed when aborting pending request");
+            }
         }
     }
 
@@ -250,15 +252,21 @@ impl McpClient {
                 let mut pending = pending_requests.lock().await;
                 if let Some(sender) = pending.remove(&id) {
                     if let Some(error) = response.error {
-                        let _ = sender.send(Err(anyhow::anyhow!(
+                        if sender.send(Err(anyhow::anyhow!(
                             "RPC Error {}: {}",
                             error.code,
                             error.message
-                        )));
+                        ))).is_err() {
+                            tracing::warn!("MCP: failed to send RPC error response to channel");
+                        }
                     } else if let Some(result) = response.result {
-                        let _ = sender.send(Ok(result));
+                        if sender.send(Ok(result)).is_err() {
+                            tracing::warn!("MCP: failed to send RPC result to channel");
+                        }
                     } else {
-                        let _ = sender.send(Ok(Value::Null));
+                        if sender.send(Ok(Value::Null)).is_err() {
+                            tracing::warn!("MCP: failed to send RPC null result to channel");
+                        }
                     }
                 }
                 return;
@@ -499,21 +507,25 @@ impl McpClient {
 
         match write_result {
             Ok(Some(msg)) => {
-                // We got the response directly (HttpPost case)
-                // We need to resolve the pending request manually
                 let mut pending = self.pending_requests.lock().await;
                 if let Some(sender) = pending.remove(&id) {
                     if let Ok(response) = serde_json::from_value::<JsonRpcResponse>(msg) {
                         if let Some(error) = response.error {
-                            let _ = sender.send(Err(anyhow::anyhow!(
+                            if sender.send(Err(anyhow::anyhow!(
                                 "RPC Error {}: {}",
                                 error.code,
                                 error.message
-                            )));
+                            ))).is_err() {
+                                tracing::warn!("MCP: failed to send RPC error response to channel");
+                            }
                         } else if let Some(result) = response.result {
-                            let _ = sender.send(Ok(result));
+                            if sender.send(Ok(result)).is_err() {
+                                tracing::warn!("MCP: failed to send RPC result to channel");
+                            }
                         } else {
-                            let _ = sender.send(Ok(Value::Null));
+                            if sender.send(Ok(Value::Null)).is_err() {
+                                tracing::warn!("MCP: failed to send RPC null result to channel");
+                            }
                         }
                     }
                 }

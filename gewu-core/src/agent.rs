@@ -59,7 +59,7 @@ use tracing::{debug, info};
 /// Use [`Agent::builder`] to construct an Agent instance.
 pub struct Agent {
     llm: Arc<dyn LlmProvider>,
-    tools: Vec<Arc<dyn Tool>>,
+    tools: Arc<Vec<Arc<dyn Tool>>>,
     system_prompt: String,
     max_turns: Option<usize>,
     pub memory: Box<dyn Memory>,
@@ -80,18 +80,20 @@ pub struct Agent {
 ///
 /// ```
 /// use gewu_core::Agent;
+/// use std::sync::Arc;
 ///
-/// let agent = Agent::builder()
-///     .llm(my_provider)
-///     .with_tools(vec![my_tool])
-///     .system_prompt("You are a helpful coding assistant.")
-///     .max_turns(Some(10))
-///     .memory(Box::new(vec![]))
-///     .build()?;
+/// // In real usage, provide an actual LLM provider:
+/// // let provider = Arc::new(MyLlmProvider::new());
+/// // let agent = Agent::builder()
+/// //     .llm(provider)
+/// //     .with_tools(vec![])
+/// //     .system_prompt("You are a helpful assistant.")
+/// //     .build()
+/// //     .unwrap();
 /// ```
 pub struct AgentBuilder {
     llm: Option<Arc<dyn LlmProvider>>,
-    tools: Vec<Arc<dyn Tool>>,
+    tools: Arc<Vec<Arc<dyn Tool>>>,
     system_prompt: String,
     max_turns: Option<usize>,
     memory: Option<Box<dyn Memory>>,
@@ -102,7 +104,7 @@ impl Default for AgentBuilder {
     fn default() -> Self {
         AgentBuilder {
             llm: None,
-            tools: Vec::new(),
+            tools: Arc::new(Vec::new()),
             system_prompt: String::new(),
             max_turns: None,
             memory: None,
@@ -202,7 +204,7 @@ impl Agent {
                 debug!("LLM request messages: {:?}", messages);
 
                 let tools_clone = self.tools.clone();
-                let mut stream = provider.stream_response(&messages, &tools_clone).await
+                let mut stream = provider.stream_response(&messages, tools_clone.as_slice()).await
                     .map_err(|e| anyhow::anyhow!(e))?;
 
                 while let Some(event_result) = stream.next().await {
@@ -468,7 +470,7 @@ impl AgentBuilder {
     /// Tools are how the agent interacts with the outside world. The agent
     /// can call any of these tools during its execution.
     pub fn with_tools(mut self, tools: Vec<Arc<dyn Tool>>) -> Self {
-        self.tools = tools;
+        self.tools = Arc::new(tools);
         self
     }
 
@@ -518,7 +520,7 @@ impl AgentBuilder {
         let llm = self.llm.context("LLM provider is required")?;
         let agent = Agent {
             llm,
-            tools: self.tools.clone(),
+            tools: self.tools,
             system_prompt: self.system_prompt.clone(),
             max_turns: self.max_turns,
             memory: self.memory.unwrap_or_else(|| Box::new(Vec::new())),

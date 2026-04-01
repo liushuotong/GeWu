@@ -58,6 +58,7 @@ pub mod fs_utils;
 pub mod grep;
 pub mod list;
 pub mod mcp;
+pub mod replacers;
 pub mod search;
 pub mod todo;
 pub mod web_fetch;
