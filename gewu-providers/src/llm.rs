@@ -4,16 +4,18 @@ use async_openai::types::chat::{
     CreateChatCompletionRequest, CreateChatCompletionRequestArgs, ChatCompletionTools,
     FunctionObjectArgs, ChatCompletionMessageToolCalls, FunctionCall as OpenAIFunctionCall,
     ChatCompletionRequestMessage, ChatCompletionTool, ChatCompletionMessageToolCall,
-    ChatCompletionResponseStream,
+    ChatCompletionResponseStream, ChatCompletionRequestUserMessageContentPart,
+    ChatCompletionRequestMessageContentPartImage, ImageUrl, ChatCompletionMessageToolCallChunk,
 };
 use futures::{StreamExt};
 use futures::stream::BoxStream;
 use gewu_core::traits::{LlmProvider, Tool};
-use gewu_core::types::{Message, ProviderEvent};
+use gewu_core::types::{Message, ProviderEvent, ContentPart};
 use async_trait::async_trait;
 use async_openai::Client;
 use std::error::Error;
 use std::sync::Arc;
+use serde_json::Value;
 
 pub trait RequestBuilder: Send + Sync {
     fn build(
@@ -54,21 +56,48 @@ impl OpenAIProvider {
         }
     }
 
-    fn convert_message(&self, msg: &Message) -> Result<ChatCompletionRequestMessage, Box<dyn Error + Send + Sync>> {
+    fn convert_content_part(&self, part: &ContentPart) -> ChatCompletionRequestUserMessageContentPart {
+        match part {
+            ContentPart::Text { text } => {
+                ChatCompletionRequestUserMessageContentPart::Text(
+                    async_openai::types::chat::ChatCompletionRequestMessageContentPartText {
+                        text: text.clone(),
+                    },
+                )
+            }
+            ContentPart::Image { data, mime_type } => {
+                let url = format!("data:{};base64,{}", mime_type, data);
+                ChatCompletionRequestUserMessageContentPart::ImageUrl(
+                    ChatCompletionRequestMessageContentPartImage {
+                        image_url: ImageUrl {
+                            url: url.into(),
+                            detail: None,
+                        },
+                    },
+                )
+            }
+        }
+    }
+
+    fn convert_message(&self, msg: &Message) -> Result<Vec<ChatCompletionRequestMessage>, Box<dyn Error + Send + Sync>> {
         match msg {
             Message::System { content } => {
                 let m = ChatCompletionRequestSystemMessageArgs::default()
                     .content(content.clone())
                     .build()
                     .map_err(|e| Box::new(e) as Box<dyn Error + Send + Sync>)?;
-                Ok(ChatCompletionRequestMessage::System(m))
+                Ok(vec![ChatCompletionRequestMessage::System(m)])
             }
             Message::User { content } => {
+                let parts: Vec<ChatCompletionRequestUserMessageContentPart> = content
+                    .iter()
+                    .map(|p| self.convert_content_part(p))
+                    .collect();
                 let m = ChatCompletionRequestUserMessageArgs::default()
-                    .content(content.clone())
+                    .content(parts)
                     .build()
                     .map_err(|e| Box::new(e) as Box<dyn Error + Send + Sync>)?;
-                Ok(ChatCompletionRequestMessage::User(m))
+                Ok(vec![ChatCompletionRequestMessage::User(m)])
             }
             Message::Assistant { content, tool_calls } => {
                 let mut builder = ChatCompletionRequestAssistantMessageArgs::default();
@@ -93,15 +122,41 @@ impl OpenAIProvider {
                 let m = builder
                     .build()
                     .map_err(|e| Box::new(e) as Box<dyn Error + Send + Sync>)?;
-                Ok(ChatCompletionRequestMessage::Assistant(m))
+                Ok(vec![ChatCompletionRequestMessage::Assistant(m)])
             }
-            Message::Tool { tool_call_id, content } => {
+            Message::Tool {
+                tool_call_id,
+                tool_name,
+                content,
+                media,
+            } => {
                 let m = ChatCompletionRequestToolMessageArgs::default()
                     .tool_call_id(tool_call_id.clone())
                     .content(content.clone())
                     .build()
                     .map_err(|e| Box::new(e) as Box<dyn Error + Send + Sync>)?;
-                Ok(ChatCompletionRequestMessage::Tool(m))
+                let mut messages = vec![ChatCompletionRequestMessage::Tool(m)];
+
+                if !media.is_empty() {
+                    let mut parts: Vec<ChatCompletionRequestUserMessageContentPart> = Vec::new();
+                    let label = match tool_name {
+                        Some(name) => format!("Tool '{}' returned additional media:", name),
+                        None => "Tool returned additional media:".to_string(),
+                    };
+                    parts.push(ChatCompletionRequestUserMessageContentPart::Text(
+                        async_openai::types::chat::ChatCompletionRequestMessageContentPartText { text: label },
+                    ));
+                    for part in media {
+                        parts.push(self.convert_content_part(part));
+                    }
+                    let extra = ChatCompletionRequestUserMessageArgs::default()
+                        .content(parts)
+                        .build()
+                        .map_err(|e| Box::new(e) as Box<dyn Error + Send + Sync>)?;
+                    messages.push(ChatCompletionRequestMessage::User(extra));
+                }
+
+                Ok(messages)
             }
         }
     }
@@ -129,10 +184,11 @@ impl RequestBuilder for OpenAIProvider {
         messages: &[Message],
         tools: &[Arc<dyn Tool>],
     ) -> Result<CreateChatCompletionRequest, Box<dyn Error + Send + Sync>> {
-        let openai_messages: Vec<ChatCompletionRequestMessage> = messages
-            .iter()
-            .map(|msg| self.convert_message(msg))
-            .collect::<Result<Vec<_>, _>>()?;
+        let mut openai_messages: Vec<ChatCompletionRequestMessage> = Vec::new();
+        for msg in messages {
+            let mut converted = self.convert_message(msg)?;
+            openai_messages.append(&mut converted);
+        }
 
         let openai_tools = self.convert_tools(tools)?;
 
@@ -149,13 +205,117 @@ impl RequestBuilder for OpenAIProvider {
     }
 }
 
+#[derive(Debug, Default, Clone)]
+struct ToolCallState {
+    id: Option<String>,
+    name: Option<String>,
+    argument_buffer: String,
+    sent_len: usize,
+    started: bool,
+    finalized: bool,
+}
+
+#[derive(Default)]
+struct ToolCallAggregator {
+    states: Vec<ToolCallState>,
+}
+
+impl ToolCallAggregator {
+    fn process_chunk(
+        &mut self,
+        chunk: &ChatCompletionMessageToolCallChunk,
+    ) -> Vec<ProviderEvent> {
+        let mut events = Vec::new();
+        let index = chunk.index as usize;
+
+        if index >= self.states.len() {
+            self.states
+                .resize_with(index + 1, ToolCallState::default);
+        }
+
+        let state = &mut self.states[index];
+
+        if let Some(id) = &chunk.id {
+            if !id.is_empty() {
+                state.id = Some(id.clone());
+            }
+        }
+
+        if let Some(function) = &chunk.function {
+            if let Some(name) = &function.name {
+                if !name.is_empty() {
+                    state.name = Some(name.clone());
+                }
+            }
+
+            if let Some(args) = &function.arguments {
+                if !args.is_empty() && !state.finalized {
+                    state.argument_buffer.push_str(args);
+                    Self::update_finalized_flag(state);
+                    if state.started {
+                        if let Some(id) = state.id.clone() {
+                            Self::emit_pending_arguments(state, &id, &mut events);
+                        }
+                    }
+            }
+        }
+        }
+
+        if !state.started {
+            if let (Some(id), Some(name)) = (state.id.clone(), state.name.clone()) {
+                events.push(ProviderEvent::ToolCallStart {
+                    id: id.clone(),
+                    name,
+                });
+                state.started = true;
+
+                Self::emit_pending_arguments(state, &id, &mut events);
+            }
+        }
+
+        events
+    }
+
+    fn emit_pending_arguments(
+        state: &mut ToolCallState,
+        id: &str,
+        events: &mut Vec<ProviderEvent>,
+    ) {
+        let new_len = state.argument_buffer.len();
+        if new_len <= state.sent_len {
+            return;
+        }
+
+        let delta = state.argument_buffer[state.sent_len..new_len].to_string();
+        state.sent_len = new_len;
+        if delta.is_empty() {
+            return;
+        }
+
+        events.push(ProviderEvent::ToolCallDelta {
+            id: id.to_string(),
+            delta,
+        });
+    }
+
+    fn update_finalized_flag(state: &mut ToolCallState) {
+        if state.finalized {
+            return;
+        }
+
+        if serde_json::from_str::<Value>(&state.argument_buffer).is_ok() {
+            state.finalized = true;
+        }
+    }
+}
+
 impl ResponseParser for OpenAIProvider {
     fn parse_stream(
         &self,
         stream: ChatCompletionResponseStream,
     ) -> BoxStream<'static, Result<ProviderEvent, Box<dyn Error + Send + Sync>>> {
         let s = async_stream::try_stream! {
-            let mut tool_map: Vec<String> = Vec::new();
+            let mut tool_aggregator = ToolCallAggregator::default();
 
             let mut stream = stream;
             while let Some(result) = stream.next().await {
@@ -171,41 +331,8 @@ impl ResponseParser for OpenAIProvider {
 
                     if let Some(tool_calls) = &delta.tool_calls {
                         for tool_call in tool_calls {
-                            let index = tool_call.index as usize;
-
-                            if let Some(id) = &tool_call.id {
-                                if index >= tool_map.len() {
-                                    tool_map.resize(index + 1, String::new());
-                                }
-                                tool_map[index] = id.clone();
-
-                                let name = tool_call.function.as_ref().map(|f| f.name.clone().unwrap_or_default()).unwrap_or_default();
-
-                                if name.is_empty() {
-                                    continue;
-                                }
-
-                                yield ProviderEvent::ToolCallStart {
-                                    id: id.clone(),
-                                    name,
-                                };
-                            }
-
-                            if let Some(function) = &tool_call.function {
-                                if let Some(args) = &function.arguments {
-                                    if !args.is_empty() {
-                                        let id = if index < tool_map.len() {
-                                            tool_map[index].clone()
-                                        } else {
-                                            String::new()
-                                        };
-
-                                        yield ProviderEvent::ToolCallDelta {
-                                            id,
-                                            delta: args.clone(),
-                                        };
-                                    }
-                                }
+                            for event in tool_aggregator.process_chunk(tool_call) {
+                                yield event;
                             }
                         }
                     }
@@ -251,6 +378,7 @@ impl LlmProvider for OpenAIProvider {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use async_openai::types::chat::FunctionCallStream;
 
     #[test]
     fn test_new_provider() {
@@ -269,5 +397,102 @@ mod tests {
         let provider = OpenAIProvider::new_with_endpoint(api_key, base_url, model);
 
         assert!(provider.build(&[], &[]).is_ok());
+    }
+
+    #[test]
+    fn convert_message_emits_media_followup() {
+        let provider = OpenAIProvider::new("test-key", "gpt-4");
+        let msg = Message::Tool {
+            tool_call_id: "call_1".to_string(),
+            tool_name: Some("read_file".to_string()),
+            content: "{\"type\":\"media\"}".to_string(),
+            media: vec![
+                ContentPart::Text {
+                    text: "Image read successfully".to_string(),
+                },
+                ContentPart::Image {
+                    data: "ZGF0YQ==".to_string(),
+                    mime_type: "image/png".to_string(),
+                },
+            ],
+        };
+
+        let converted = provider.convert_message(&msg).expect("convert success");
+        assert_eq!(converted.len(), 2);
+        match &converted[0] {
+            ChatCompletionRequestMessage::Tool(tool_msg) => {
+                assert_eq!(tool_msg.tool_call_id.as_str(), "call_1");
+            }
+            _ => panic!("first message should be tool"),
+        }
+        match &converted[1] {
+            ChatCompletionRequestMessage::User(_) => {}
+            _ => panic!("second message should be user"),
+        }
+    }
+
+    fn make_chunk(
+        index: u32,
+        id: Option<&str>,
+        name: Option<&str>,
+        arguments: Option<&str>,
+    ) -> ChatCompletionMessageToolCallChunk {
+        ChatCompletionMessageToolCallChunk {
+            index,
+            id: id.map(|s| s.to_string()),
+            r#type: None,
+            function: Some(FunctionCallStream {
+                name: name.map(|s| s.to_string()),
+                arguments: arguments.map(|s| s.to_string()),
+            }),
+        }
+    }
+
+    #[test]
+    fn tool_call_arguments_buffer_until_id_arrives() {
+        let mut aggregator = ToolCallAggregator::default();
+
+        // Model streams arguments before providing the tool_call_id
+        assert!(aggregator
+            .process_chunk(&make_chunk(0, None, Some("demo_tool"), Some("{\"foo\":")))
+            .is_empty());
+        assert!(aggregator
+            .process_chunk(&make_chunk(0, None, Some("demo_tool"), Some("\"bar\"")))
+            .is_empty());
+
+        let events = aggregator.process_chunk(&make_chunk(0, Some("call_1"), Some("demo_tool"), None));
+        assert_eq!(events.len(), 2);
+        assert!(matches!(events[0], ProviderEvent::ToolCallStart { .. }));
+        assert!(matches!(events[1], ProviderEvent::ToolCallDelta { .. }));
+        if let ProviderEvent::ToolCallDelta { id, delta } = &events[1] {
+            assert_eq!(id, "call_1");
+            assert_eq!(delta, "{\"foo\":\"bar\"");
+        } else {
+            panic!("Expected ToolCallDelta event");
+        }
+
+        let events = aggregator.process_chunk(&make_chunk(0, None, None, Some("\"baz\"}")));
+        assert_eq!(events.len(), 1);
+        if let ProviderEvent::ToolCallDelta { id, delta } = &events[0] {
+            assert_eq!(id, "call_1");
+            assert_eq!(delta, "\"baz\"}");
+        } else {
+            panic!("Expected ToolCallDelta event");
+        }
+    }
+
+    #[test]
+    fn duplicate_arguments_after_completion_are_ignored() {
+        let mut aggregator = ToolCallAggregator::default();
+
+        assert!(aggregator
+            .process_chunk(&make_chunk(0, None, Some("glob"), Some("{\"pattern\":\"*\"}")))
+            .is_empty());
+
+        let events = aggregator.process_chunk(&make_chunk(0, Some("call_42"), Some("glob"), None));
+        assert_eq!(events.len(), 2);
+
+        let events = aggregator.process_chunk(&make_chunk(0, Some("call_42"), Some("glob"), Some("{\"pattern\": \"*\"}")));
+        assert!(events.is_empty(), "Duplicate arguments should not emit new deltas");
     }
 }

@@ -9,8 +9,15 @@ pub struct FunctionCall {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ToolCall {
     pub id: String,
-    pub r#type: String, // usually "function"
+    pub r#type: String,
     pub function: FunctionCall,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "type", rename_all = "lowercase")]
+pub enum ContentPart {
+    Text { text: String },
+    Image { data: String, mime_type: String },
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -27,15 +34,10 @@ pub enum ProviderEvent {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum AgentEvent {
-    // From LLM (pass-through)
     ReasoningDelta { delta: String },
     ContentDelta { delta: String },
-
-    // Tool execution status
     ToolStart { tool: String, input: String },
     ToolFinish { tool: String, output: String },
-
-    // Final result (indicates end of turn)
     Finish { response: String },
     Error { error: String },
 }
@@ -47,7 +49,7 @@ pub enum Message {
         content: String,
     },
     User {
-        content: String,
+        content: Vec<ContentPart>,
     },
     Assistant {
         content: Option<String>,
@@ -55,6 +57,10 @@ pub enum Message {
     },
     Tool {
         tool_call_id: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        tool_name: Option<String>,
         content: String,
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        media: Vec<ContentPart>,
     },
 }

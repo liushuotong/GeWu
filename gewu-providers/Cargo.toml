@@ -12,3 +12,4 @@ thiserror = "2.0"
 async-openai = { version = "0.34", features = ["_api", "chat-completion", "model"] }
 tokio = { version = "1", features = ["full"] }
 async-stream = "0.3.6"
+serde_json = "1.0"

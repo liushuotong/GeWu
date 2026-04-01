@@ -1,11 +1,12 @@
 use crate::traits::{LlmProvider, Tool, Memory, ToolRegistry};
-use crate::types::{Message, AgentEvent, ProviderEvent, ToolCall, FunctionCall};
+use crate::types::{Message, AgentEvent, ProviderEvent, ToolCall, FunctionCall, ContentPart};
 use crate::compaction::{self, is_overflow, estimate_message_tokens};
 use async_trait::async_trait;
 use std::sync::Arc;
 use anyhow::{Result, Context};
 use tracing::{info, debug};
 use futures::{Stream, StreamExt};
+use serde::Deserialize;
 
 pub struct Agent {
     llm: Arc<dyn LlmProvider>,
@@ -64,7 +65,7 @@ impl Agent {
                  self.memory.add_message(Message::System { content: self.system_prompt.clone() }).await;
             }
     
-            self.memory.add_message(Message::User { content: user_message.to_string() }).await;
+            self.memory.add_message(Message::User { content: vec![ContentPart::Text { text: user_message.to_string() }] }).await;
             
             let mut turn = 0;
             let mut recent_tool_calls: Vec<(String, String)> = Vec::new();
@@ -190,9 +191,12 @@ impl Agent {
 
                     yield AgentEvent::ToolFinish { tool: tool_name.clone(), output: result_content.clone() };
 
+                    let media_parts = extract_media_parts(&result_content);
                     self.memory.add_message(Message::Tool {
                         tool_call_id: call_id,
+                        tool_name: Some(tool_name.clone()),
                         content: result_content,
+                        media: media_parts,
                     }).await;
                 }
                 
@@ -246,7 +250,7 @@ When constructing the summary, try to stick to this template:
         // Prepare messages for summarization
         let mut request_messages = self.memory.messages().to_vec();
         request_messages.push(Message::User {
-            content: prompt.to_string(),
+            content: vec![ContentPart::Text { text: prompt.to_string() }],
         });
 
         // Call LLM for summary
@@ -351,5 +355,73 @@ impl AgentBuilder {
         // It will be handled in reset() or ask() or should be pre-seeded.
         // Since we removed it, we rely on ask() to add system prompt if empty.
         Ok(agent)
+    }
+}
+
+#[derive(Deserialize)]
+struct MediaPayload {
+    #[serde(rename = "type")]
+    kind: String,
+    mime: String,
+    data: String,
+    #[serde(default)]
+    message: Option<String>,
+}
+
+fn extract_media_parts(content: &str) -> Vec<ContentPart> {
+    let parsed: MediaPayload = match serde_json::from_str(content) {
+        Ok(value) => value,
+        Err(_) => return Vec::new(),
+    };
+
+    if parsed.kind != "media" {
+        return Vec::new();
+    }
+
+    let mut parts = Vec::new();
+    if let Some(text) = parsed.message {
+        let trimmed = text.trim();
+        if !trimmed.is_empty() {
+            parts.push(ContentPart::Text {
+                text: trimmed.to_string(),
+            });
+        }
+    }
+
+    parts.push(ContentPart::Image {
+        data: parsed.data,
+        mime_type: parsed.mime,
+    });
+
+    parts
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn extract_media_parts_parses_image() {
+        let json = r#"{"type":"media","mime":"image/png","data":"ZmFrZQ==","message":"Image read successfully"}"#;
+        let parts = extract_media_parts(json);
+        assert_eq!(parts.len(), 2);
+        match &parts[0] {
+            ContentPart::Text { text } => assert!(text.contains("Image")),
+            _ => panic!("first part should be text"),
+        }
+        match &parts[1] {
+            ContentPart::Image { mime_type, data } => {
+                assert_eq!(mime_type, "image/png");
+                assert_eq!(data, "ZmFrZQ==");
+            }
+            _ => panic!("second part should be image"),
+        }
+    }
+
+    #[test]
+    fn extract_media_parts_ignores_non_media() {
+        let json = r#"{"type":"text","text":"hello"}"#;
+        let parts = extract_media_parts(json);
+        assert!(parts.is_empty());
     }
 }

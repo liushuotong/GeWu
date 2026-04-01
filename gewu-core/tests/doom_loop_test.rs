@@ -45,6 +45,10 @@ impl LlmProvider for MockLlmProvider {
         };
         Ok(Box::pin(s))
     }
+
+    async fn list_models(&self) -> Result<Vec<String>, Box<dyn Error + Send + Sync>> {
+        Ok(vec!["mock".to_string()])
+    }
 }
 
 struct TestTool;

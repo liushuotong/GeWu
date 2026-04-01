@@ -3,7 +3,7 @@
 //! This tool lists files and directories in a specified path, similar to the `ls` command
 //! but with recursive capabilities.
 
-use crate::fs_utils::{resolve_safe_path, into_tool_error};
+use crate::fs_utils::{resolve_safe_path, into_tool_error, parse_empty_args};
 use gewu_core::traits::Tool;
 use anyhow::Result;
 use ignore::WalkBuilder;
@@ -38,6 +38,11 @@ impl Tool for ListTool {
     }
 
     async fn call(&self, args: &str) -> Result<String, Box<dyn Error + Send + Sync>> {
+        if args.trim().is_empty() {
+            return Err(anyhow::anyhow!(
+                "{}", parse_empty_args("glob", &[("pattern", "string"), ("path", "string (optional)")])
+            ).into());
+        }
         let args_val: Value = serde_json::from_str(args).map_err(into_tool_error)?;
         
         let path_str = args_val["path"].as_str().unwrap_or(".");

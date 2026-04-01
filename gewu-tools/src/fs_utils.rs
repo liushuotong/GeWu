@@ -16,6 +16,18 @@ pub fn into_tool_error(e: impl Into<anyhow::Error>) -> Box<dyn std::error::Error
     Box::new(std::io::Error::new(std::io::ErrorKind::Other, e.into()))
 }
 
+pub fn parse_empty_args(tool_name: &str, required_params: &[(&str, &str)]) -> String {
+    let params: Vec<String> = required_params
+        .iter()
+        .map(|(name, type_)| format!("  - {}: {}", name, type_))
+        .collect();
+    format!(
+        "Arguments are required for {}.\n\nRequired parameters:\n{}",
+        tool_name,
+        params.join("\n")
+    )
+}
+
 /// Normalizes a path by resolving `.` and `..` components lexically.
 /// This does not require the path to exist.
 pub fn normalize_path(path: &Path) -> PathBuf {

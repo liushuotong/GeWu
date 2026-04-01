@@ -168,7 +168,7 @@ impl Memory for SqliteMemory {
 mod tests {
     use super::*;
     use sqlx::sqlite::SqlitePoolOptions;
-    use gewu_core::types::Message;
+use gewu_core::types::{Message, ContentPart};
 
     #[tokio::test]
     async fn test_persistence() -> Result<()> {
@@ -180,7 +180,7 @@ mod tests {
         
         // 1. Create and add
         let mut mem1 = SqliteMemory::new(pool.clone(), session_id.clone()).await?;
-        let msg = Message::User { content: "Hello".to_string() };
+        let msg = Message::User { content: vec![ContentPart::Text { text: "Hello".to_string() }] };
         mem1.add_message(msg).await;
         assert_eq!(mem1.messages().len(), 1);
 
@@ -188,7 +188,13 @@ mod tests {
         let mem2 = SqliteMemory::new(pool.clone(), session_id.clone()).await?;
         assert_eq!(mem2.messages().len(), 1);
         match &mem2.messages()[0] {
-            Message::User { content } => assert_eq!(content, "Hello"),
+            Message::User { content } => {
+                let text = content.iter().find_map(|p| match p {
+                    ContentPart::Text { text } => Some(text.as_str()),
+                    _ => None,
+                }).unwrap_or("");
+                assert_eq!(text, "Hello");
+            }
             _ => panic!("Wrong type"),
         }
         

@@ -25,10 +25,13 @@ impl LlmProvider for MockLlm {
         messages: &[Message],
         _tools: &[Arc<dyn Tool>],
     ) -> Result<BoxStream<'a, Result<ProviderEvent, Box<dyn Error + Send + Sync>>>, Box<dyn Error + Send + Sync>> {
-        // Check if this is a summary request
         let last_msg = messages.last().unwrap();
         if let Message::User { content } = last_msg {
-            if content.contains("Provide a detailed prompt for continuing") {
+            let text = content.iter().find_map(|p| match p {
+                gewu_core::types::ContentPart::Text { text } => Some(text.as_str()),
+                _ => None,
+            }).unwrap_or("");
+            if text.contains("Provide a detailed prompt for continuing") {
                 let s = async_stream::try_stream! {
                     yield ProviderEvent::ContentDelta { delta: "## Goal\nTest compaction\n## Accomplished\nNothing yet".to_string() };
                 };
@@ -60,6 +63,10 @@ impl LlmProvider for MockLlm {
         };
         Ok(Box::pin(s))
     }
+
+    async fn list_models(&self) -> Result<Vec<String>, Box<dyn Error + Send + Sync>> {
+        Ok(vec!["mock".to_string()])
+    }
 }
 
 #[tokio::test]
@@ -90,7 +97,7 @@ async fn test_compaction_trigger() {
     // Fill history with junk to exceed 100 tokens
     // 1 token ~ 4 chars. 100 tokens ~ 400 chars.
     let long_text = "A".repeat(500); 
-    agent.memory.add_message(Message::User { content: long_text }).await;
+    agent.memory.add_message(Message::User { content: vec![gewu_core::types::ContentPart::Text { text: long_text }] }).await;
 
     // This call should trigger compaction because history > 100
     let mut stream = Box::pin(agent.ask("Hello"));

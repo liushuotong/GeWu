@@ -1,33 +1,36 @@
-use crate::types::Message;
+use crate::types::{ContentPart, Message};
 
-// Constants for heuristics
 const PRUNE_PROTECT_THRESHOLD: usize = 40_000;
 const PRUNE_MINIMUM_SAVINGS: usize = 20_000;
 const COMPACTION_BUFFER: usize = 20_000;
 
-// Simplified token estimation: 1 token ~ 4 chars
 pub fn estimate_tokens(text: &str) -> usize {
     text.len() / 4
 }
 
-/// Checks if the current token usage exceeds the model's capacity.
 pub fn is_overflow(total_tokens: usize, limit_context: usize) -> bool {
     if limit_context == 0 {
         return false;
     }
-
-    // Heuristic: reserve buffer or max output tokens
     let reserved = COMPACTION_BUFFER;
     let usable = limit_context.saturating_sub(reserved);
-
     total_tokens >= usable
 }
 
-/// Estimates tokens for a single message.
+fn estimate_content_tokens(content: &[ContentPart]) -> usize {
+    content
+        .iter()
+        .map(|part| match part {
+            ContentPart::Text { text } => estimate_tokens(text),
+            ContentPart::Image { data, .. } => estimate_tokens(data),
+        })
+        .sum()
+}
+
 pub fn estimate_message_tokens(msg: &Message) -> usize {
     match msg {
         Message::System { content } => estimate_tokens(content),
-        Message::User { content } => estimate_tokens(content),
+        Message::User { content } => estimate_content_tokens(content),
         Message::Assistant {
             content,
             tool_calls,
@@ -41,7 +44,11 @@ pub fn estimate_message_tokens(msg: &Message) -> usize {
             }
             count
         }
-        Message::Tool { content, .. } => estimate_tokens(content),
+        Message::Tool { content, media, .. } => {
+            let mut count = estimate_tokens(content);
+            count += estimate_content_tokens(media);
+            count
+        }
     }
 }
 
@@ -75,8 +82,8 @@ pub fn prune(messages: &mut [Message]) -> usize {
             }
         }
 
-        if let Message::Tool { content, .. } = msg {
-            let estimate = estimate_tokens(content);
+        if let Message::Tool { content, media, .. } = msg {
+            let estimate = estimate_tokens(content) + estimate_content_tokens(media);
             total_tool_tokens += estimate;
 
             if total_tool_tokens > PRUNE_PROTECT_THRESHOLD {
@@ -88,9 +95,10 @@ pub fn prune(messages: &mut [Message]) -> usize {
 
     if pruned_tokens > PRUNE_MINIMUM_SAVINGS {
         for idx in to_prune {
-            if let Message::Tool { content, .. } = &mut messages[idx] {
+            if let Message::Tool { content, media, .. } = &mut messages[idx] {
                 // Clear output to save space
                 *content = "[Output pruned]".to_string();
+                media.clear();
             }
         }
         return pruned_tokens;

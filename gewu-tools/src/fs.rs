@@ -6,7 +6,7 @@
 //! - `EditFileTool`: Modifies existing files by replacing text.
 //! - `GlobTool`: Finds files using glob patterns.
 
-use crate::fs_utils::{resolve_safe_path, read_text, read_bytes, write, glob_with_gitignore, into_tool_error, is_binary_file, mime_type};
+use crate::fs_utils::{resolve_safe_path, read_text, read_bytes, write, glob_with_gitignore, into_tool_error, is_binary_file, mime_type, parse_empty_args};
 use gewu_core::traits::Tool;
 use anyhow::Result;
 use async_trait::async_trait;
@@ -59,6 +59,11 @@ impl Tool for ReadFileTool {
     }
 
     async fn call(&self, args: &str) -> Result<String, Box<dyn Error + Send + Sync>> {
+        if args.trim().is_empty() {
+            return Err(anyhow::anyhow!(
+                "{}", parse_empty_args("read_file", &[("filePath", "string"), ("limit", "number (optional)"), ("offset", "number (optional)")])
+            ).into());
+        }
         let args_val: Value = serde_json::from_str(args).map_err(into_tool_error)?;
         let file_path_str = args_val["filePath"].as_str().ok_or_else(|| anyhow::anyhow!("filePath is required")).map_err(into_tool_error)?;
 
@@ -294,6 +299,11 @@ impl Tool for WriteFileTool {
     }
 
     async fn call(&self, args: &str) -> Result<String, Box<dyn Error + Send + Sync>> {
+        if args.trim().is_empty() {
+            return Err(anyhow::anyhow!(
+                "{}", parse_empty_args("write_file", &[("filePath", "string"), ("content", "string")])
+            ).into());
+        }
         let args_val: Value = serde_json::from_str(args).map_err(into_tool_error)?;
         let file_path_str = args_val["filePath"].as_str().ok_or_else(|| anyhow::anyhow!("filePath is required")).map_err(into_tool_error)?;
         let content = args_val["content"].as_str().ok_or_else(|| anyhow::anyhow!("content is required")).map_err(into_tool_error)?;
@@ -346,6 +356,11 @@ impl Tool for EditFileTool {
     }
 
     async fn call(&self, args: &str) -> Result<String, Box<dyn Error + Send + Sync>> {
+        if args.trim().is_empty() {
+            return Err(anyhow::anyhow!(
+                "{}", parse_empty_args("edit_file", &[("filePath", "string"), ("oldString", "string"), ("newString", "string"), ("replaceAll", "boolean (optional)")])
+            ).into());
+        }
         let args_val: Value = serde_json::from_str(args).map_err(into_tool_error)?;
         let file_path_str = args_val["filePath"].as_str().ok_or_else(|| anyhow::anyhow!("filePath is required")).map_err(into_tool_error)?;
         let old_string = args_val["oldString"].as_str().ok_or_else(|| anyhow::anyhow!("oldString is required")).map_err(into_tool_error)?;
@@ -409,6 +424,11 @@ impl Tool for GlobTool {
     }
 
     async fn call(&self, args: &str) -> Result<String, Box<dyn Error + Send + Sync>> {
+        if args.trim().is_empty() {
+            return Err(anyhow::anyhow!(
+                "{}", parse_empty_args("glob", &[("pattern", "string"), ("path", "string (optional)")])
+            ).into());
+        }
         let args_val: Value = serde_json::from_str(args).map_err(into_tool_error)?;
         let pattern = args_val["pattern"].as_str().ok_or_else(|| anyhow::anyhow!("pattern is required")).map_err(into_tool_error)?;
         
