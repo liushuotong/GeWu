@@ -6,13 +6,13 @@
 //! - `WebSearchTool`: Performs general web searches to retrieve external information.
 
 use crate::fs_utils::into_tool_error;
-use gewu_core::traits::Tool;
 use anyhow::Result;
+use async_trait::async_trait;
 use futures_util::StreamExt;
+use gewu_core::traits::Tool;
 use reqwest::Client;
 use serde::Deserialize;
-use serde_json::{json, Value};
-use async_trait::async_trait;
+use serde_json::{Value, json};
 use std::error::Error;
 
 /// Tool for semantic code search.
@@ -98,7 +98,7 @@ impl Tool for CodeSearchTool {
                 if line.starts_with("data: ") {
                     let data_str = &line[6..];
                     if let Ok(val) = serde_json::from_str::<Value>(data_str) {
-                         if let Some(content) = val
+                        if let Some(content) = val
                             .get("result")
                             .and_then(|r| r.get("content"))
                             .and_then(|c| c.as_array())
@@ -206,7 +206,7 @@ impl Tool for WebSearchTool {
                 if line.starts_with("data: ") {
                     let data_str = &line[6..];
                     if let Ok(val) = serde_json::from_str::<Value>(data_str) {
-                         if let Some(content) = val
+                        if let Some(content) = val
                             .get("result")
                             .and_then(|r| r.get("content"))
                             .and_then(|c| c.as_array())

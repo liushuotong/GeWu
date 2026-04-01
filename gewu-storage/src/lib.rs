@@ -1,8 +1,8 @@
+use anyhow::{Context, Result};
+use async_trait::async_trait;
 use gewu_core::traits::Memory;
 use gewu_core::types::Message;
-use async_trait::async_trait;
-use sqlx::{sqlite::SqlitePool, Row};
-use anyhow::{Result, Context};
+use sqlx::{Row, sqlite::SqlitePool};
 use tracing::{error, info};
 
 pub struct SqliteMemory {
@@ -42,21 +42,26 @@ impl SqliteMemory {
         .context("Failed to create index on session_id")?;
 
         // Load existing messages
-        let rows = sqlx::query("SELECT content FROM memory_messages WHERE session_id = ? ORDER BY id ASC")
-            .bind(&session_id)
-            .fetch_all(&pool)
-            .await
-            .context("Failed to load messages from DB")?;
+        let rows =
+            sqlx::query("SELECT content FROM memory_messages WHERE session_id = ? ORDER BY id ASC")
+                .bind(&session_id)
+                .fetch_all(&pool)
+                .await
+                .context("Failed to load messages from DB")?;
 
         let mut messages = Vec::new();
         for row in rows {
             let content: String = row.try_get("content")?;
-            let message: Message = serde_json::from_str(&content)
-                .context("Failed to deserialize message content")?;
+            let message: Message =
+                serde_json::from_str(&content).context("Failed to deserialize message content")?;
             messages.push(message);
         }
 
-        info!("Loaded {} messages for session {}", messages.len(), session_id);
+        info!(
+            "Loaded {} messages for session {}",
+            messages.len(),
+            session_id
+        );
 
         Ok(Self {
             pool,
@@ -83,8 +88,8 @@ impl Memory for SqliteMemory {
         // 2. Async persist to DB
         let session_id = self.session_id.clone();
         let pool = self.pool.clone();
-        
-        // We spawn this task or await it? 
+
+        // We spawn this task or await it?
         // The trait is async, so we can await it.
         // It's safer to await to ensure durability.
         let content = match serde_json::to_string(&message) {
@@ -95,11 +100,12 @@ impl Memory for SqliteMemory {
             }
         };
 
-        if let Err(e) = sqlx::query("INSERT INTO memory_messages (session_id, content) VALUES (?, ?)")
-            .bind(session_id)
-            .bind(content)
-            .execute(&pool)
-            .await 
+        if let Err(e) =
+            sqlx::query("INSERT INTO memory_messages (session_id, content) VALUES (?, ?)")
+                .bind(session_id)
+                .bind(content)
+                .execute(&pool)
+                .await
         {
             error!("Failed to persist message to DB: {}", e);
         }
@@ -133,8 +139,8 @@ impl Memory for SqliteMemory {
             .execute(&mut *tx)
             .await
         {
-             error!("Failed to delete old messages in replace: {}", e);
-             return;
+            error!("Failed to delete old messages in replace: {}", e);
+            return;
         }
 
         for msg in messages {
@@ -146,11 +152,12 @@ impl Memory for SqliteMemory {
                 }
             };
 
-            if let Err(e) = sqlx::query("INSERT INTO memory_messages (session_id, content) VALUES (?, ?)")
-                .bind(&self.session_id)
-                .bind(content)
-                .execute(&mut *tx)
-                .await
+            if let Err(e) =
+                sqlx::query("INSERT INTO memory_messages (session_id, content) VALUES (?, ?)")
+                    .bind(&self.session_id)
+                    .bind(content)
+                    .execute(&mut *tx)
+                    .await
             {
                 error!("Failed to insert message in replace: {}", e);
                 // Should rollback here technically, but let's just log for now
@@ -167,20 +174,22 @@ impl Memory for SqliteMemory {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use gewu_core::types::{ContentPart, Message};
     use sqlx::sqlite::SqlitePoolOptions;
-use gewu_core::types::{Message, ContentPart};
 
     #[tokio::test]
     async fn test_persistence() -> Result<()> {
-        let pool = SqlitePoolOptions::new()
-            .connect("sqlite::memory:")
-            .await?;
+        let pool = SqlitePoolOptions::new().connect("sqlite::memory:").await?;
 
         let session_id = "test_1".to_string();
-        
+
         // 1. Create and add
         let mut mem1 = SqliteMemory::new(pool.clone(), session_id.clone()).await?;
-        let msg = Message::User { content: vec![ContentPart::Text { text: "Hello".to_string() }] };
+        let msg = Message::User {
+            content: vec![ContentPart::Text {
+                text: "Hello".to_string(),
+            }],
+        };
         mem1.add_message(msg).await;
         assert_eq!(mem1.messages().len(), 1);
 
@@ -189,15 +198,18 @@ use gewu_core::types::{Message, ContentPart};
         assert_eq!(mem2.messages().len(), 1);
         match &mem2.messages()[0] {
             Message::User { content } => {
-                let text = content.iter().find_map(|p| match p {
-                    ContentPart::Text { text } => Some(text.as_str()),
-                    _ => None,
-                }).unwrap_or("");
+                let text = content
+                    .iter()
+                    .find_map(|p| match p {
+                        ContentPart::Text { text } => Some(text.as_str()),
+                        _ => None,
+                    })
+                    .unwrap_or("");
                 assert_eq!(text, "Hello");
             }
             _ => panic!("Wrong type"),
         }
-        
+
         Ok(())
     }
 }

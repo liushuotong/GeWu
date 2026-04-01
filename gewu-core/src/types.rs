@@ -18,6 +18,45 @@ pub struct ToolCall {
 pub enum ContentPart {
     Text { text: String },
     Image { data: String, mime_type: String },
+    Audio { data: String, mime_type: String },
+    Video { data: String, mime_type: String },
+    File { data: String, mime_type: String },
+}
+
+impl ContentPart {
+    pub fn mime_type(&self) -> String {
+        match self {
+            ContentPart::Text { .. } => "text/plain".to_string(),
+            ContentPart::Image { mime_type, .. } => mime_type.clone(),
+            ContentPart::Audio { mime_type, .. } => mime_type.clone(),
+            ContentPart::Video { mime_type, .. } => mime_type.clone(),
+            ContentPart::File { mime_type, .. } => mime_type.clone(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct Capabilities {
+    pub input: InputCapabilities,
+    pub output: OutputCapabilities,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct InputCapabilities {
+    pub text: bool,
+    pub image: bool,
+    pub audio: bool,
+    pub video: bool,
+    pub pdf: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct OutputCapabilities {
+    pub text: bool,
+    pub image: bool,
+    pub audio: bool,
+    pub video: bool,
+    pub pdf: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

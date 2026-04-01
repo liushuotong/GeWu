@@ -1,15 +1,15 @@
 use crate::tools::TaskTool;
-use anyhow::{anyhow, Result};
-use gewu_core::traits::{LlmProvider, Tool, ToolRegistry};
+use anyhow::{Result, anyhow};
+use async_trait::async_trait;
 use gewu_core::Agent;
+use gewu_core::traits::{LlmProvider, Tool, ToolRegistry};
+use gewu_storage::SqliteMemory;
 use gewu_tools::{
     BashTool, BatchTool, CodeSearchTool, EditFileTool, GlobTool, GrepTool, ListTool, ReadFileTool,
-    WebFetchTool, WebSearchTool, WriteFileTool, TodoWriteTool, TodoReadTool, TodoItem,
+    TodoItem, TodoReadTool, TodoWriteTool, WebFetchTool, WebSearchTool, WriteFileTool,
 };
-use std::sync::{Arc, Mutex};
-use gewu_storage::SqliteMemory;
 use sqlx::SqlitePool;
-use async_trait::async_trait;
+use std::sync::{Arc, Mutex};
 
 pub struct AgentConfig {
     pub name: String,
@@ -39,7 +39,11 @@ struct ToolRegistryImpl {
 
 #[async_trait]
 impl ToolRegistry for ToolRegistryImpl {
-    async fn execute(&self, name: &str, args: &str) -> Result<String, Box<dyn std::error::Error + Send + Sync>> {
+    async fn execute(
+        &self,
+        name: &str,
+        args: &str,
+    ) -> Result<String, Box<dyn std::error::Error + Send + Sync>> {
         let tool = self.tools.iter().find(|t| t.name() == name);
         match tool {
             Some(t) => t.call(args).await,
@@ -157,14 +161,16 @@ pub async fn create_agent(
         }
         _ => return Err(anyhow!("Unknown agent type: {}", name)),
     };
-    
+
     // Add additional tools
     tools.extend(additional_tools);
 
     // Convert Box<dyn Tool> to Arc<dyn Tool> for both registry and agent
     let tools_arc: Vec<Arc<dyn Tool>> = tools.into_iter().map(|t| Arc::from(t)).collect();
     let tools_for_registry = Arc::new(tools_arc.clone());
-    let registry: Arc<dyn ToolRegistry> = Arc::new(ToolRegistryImpl { tools: tools_for_registry });
+    let registry: Arc<dyn ToolRegistry> = Arc::new(ToolRegistryImpl {
+        tools: tools_for_registry,
+    });
 
     // Create BatchTool and prepend it
     let batch_tool: Arc<dyn Tool> = Arc::new(BatchTool::new(registry.clone()));

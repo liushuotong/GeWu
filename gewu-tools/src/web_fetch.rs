@@ -4,12 +4,12 @@
 //! It supports converting HTML responses into Markdown for easier consumption by the LLM.
 
 use crate::fs_utils::into_tool_error;
-use gewu_core::traits::Tool;
 use anyhow::Result;
 use async_trait::async_trait;
+use gewu_core::traits::Tool;
 use serde_json::{Value, json};
-use std::time::Duration;
 use std::error::Error;
+use std::time::Duration;
 
 /// Tool for fetching web content.
 pub struct WebFetchTool;
@@ -45,7 +45,11 @@ impl Tool for WebFetchTool {
 
     async fn call(&self, args: &str) -> Result<String, Box<dyn Error + Send + Sync>> {
         let args_val: Value = serde_json::from_str(args).map_err(into_tool_error)?;
-        let mut url = args_val["url"].as_str().ok_or_else(|| anyhow::anyhow!("url is required")).map_err(into_tool_error)?.to_string();
+        let mut url = args_val["url"]
+            .as_str()
+            .ok_or_else(|| anyhow::anyhow!("url is required"))
+            .map_err(into_tool_error)?
+            .to_string();
         let format = args_val["format"].as_str().unwrap_or("markdown");
 
         if url.starts_with("http://") && !url.contains("127.0.0.1") && !url.contains("localhost") {
@@ -91,20 +95,25 @@ mod tests {
     #[tokio::test]
     async fn test_web_fetch_tool() -> Result<()> {
         let mut server = mockito::Server::new_async().await;
-        
-        let _m = server.mock("GET", "/hello")
+
+        let _m = server
+            .mock("GET", "/hello")
             .with_status(200)
             .with_header("content-type", "text/html")
             .with_body("<html><body><h1>Hello, World!</h1></body></html>")
-            .create_async().await;
+            .create_async()
+            .await;
 
         let tool = WebFetchTool;
         let url = format!("{}/hello", server.url());
 
         // Test Markdown format (default)
         let args = json!({ "url": url });
-        let output_md = tool.call(&args.to_string()).await.map_err(|e| anyhow::anyhow!(e.to_string()))?;
-        
+        let output_md = tool
+            .call(&args.to_string())
+            .await
+            .map_err(|e| anyhow::anyhow!(e.to_string()))?;
+
         // Assert content is converted
         assert!(output_md.contains("Hello, World!"));
         // The title should be in markdown format, so no HTML tags
@@ -117,16 +126,18 @@ mod tests {
     #[tokio::test]
     async fn test_web_fetch_error() -> Result<()> {
         let mut server = mockito::Server::new_async().await;
-        let _m = server.mock("GET", "/404")
+        let _m = server
+            .mock("GET", "/404")
             .with_status(404)
-            .create_async().await;
+            .create_async()
+            .await;
 
         let tool = WebFetchTool;
         let url = format!("{}/404", server.url());
 
         let args = json!({ "url": url });
         let result = tool.call(&args.to_string()).await;
-        
+
         assert!(result.is_err());
         assert!(result.unwrap_err().to_string().contains("404"));
         Ok(())

@@ -1,22 +1,20 @@
 mod config;
+mod mcp_loader;
 mod registry;
 mod tools;
-mod mcp_loader;
 
-use anyhow::{Result, Context};
+use anyhow::{Context, Result};
 use clap::Parser;
-use gewu_providers::OpenAIProvider;
-use gewu_core::traits::LlmProvider;
-use std::sync::Arc;
-use tracing::{info, error};
-use std::env;
-use uuid::Uuid;
-use sqlx::sqlite::SqlitePoolOptions;
-use gewu_core::types::AgentEvent;
 use futures::StreamExt;
+use gewu_core::traits::LlmProvider;
+use gewu_core::types::AgentEvent;
+use gewu_providers::OpenAIProvider;
+use sqlx::sqlite::SqlitePoolOptions;
+use std::env;
 use std::io::Write;
-
-
+use std::sync::Arc;
+use tracing::{error, info};
+use uuid::Uuid;
 
 const DIM_GRAY: &str = "\x1b[90m";
 const RESET: &str = "\x1b[0m";
@@ -35,15 +33,15 @@ async fn run_agent(agent: &mut gewu_core::Agent, prompt: &str) -> Result<()> {
                     reasoning.push_str(&delta);
                 }
                 AgentEvent::ToolStart { tool, input } => {
-                     println!("\n[Tool Start: {}] Input: {}", tool, input);
+                    println!("\n[Tool Start: {}] Input: {}", tool, input);
                 }
                 AgentEvent::ToolFinish { tool, output } => {
-                     let display_output = if output.len() > 200 {
-                         format!("{}...", &output[..200])
-                     } else {
-                         output
-                     };
-                     println!("\n[Tool Finish: {}] Output: {}", tool, display_output);
+                    let display_output = if output.len() > 200 {
+                        format!("{}...", &output[..200])
+                    } else {
+                        output
+                    };
+                    println!("\n[Tool Finish: {}] Output: {}", tool, display_output);
                 }
                 AgentEvent::Finish { .. } => {
                     if !reasoning.is_empty() {
@@ -88,7 +86,6 @@ struct Cli {
     /// Custom Model Name
     #[arg(long, short, env = "OPENAI_MODEL")]
     model: Option<String>,
-
 
     /// Initial Agent (default: build)
     #[arg(long, default_value = "build")]
@@ -136,9 +133,7 @@ async fn main() -> Result<()> {
         _ => tracing::Level::INFO,
     };
 
-    let subscriber = tracing_subscriber::fmt()
-        .with_max_level(log_level)
-        .finish();
+    let subscriber = tracing_subscriber::fmt().with_max_level(log_level).finish();
 
     tracing::subscriber::set_global_default(subscriber)?;
 
@@ -188,7 +183,8 @@ async fn main() -> Result<()> {
         return Ok(());
     }
 
-    let model = cli.model
+    let model = cli
+        .model
         .or_else(|| env::var("OPENAI_MODEL").ok())
         .or(file_config.model.clone())
         .unwrap_or_else(|| "gpt-5.3-codex".to_string());
@@ -211,13 +207,12 @@ async fn main() -> Result<()> {
         let home_dir = dirs::home_dir()
             .context("Failed to determine home directory. Please provide --db-path explicitly.")?;
         let gewu_dir = home_dir.join(".gewu");
-        
+
         // Ensure .gewu directory exists
         if !gewu_dir.exists() {
-            std::fs::create_dir_all(&gewu_dir)
-                .context("Failed to create .gewu directory")?;
+            std::fs::create_dir_all(&gewu_dir).context("Failed to create .gewu directory")?;
         }
-        
+
         gewu_dir.join("gewu.db").to_string_lossy().to_string()
     };
 
@@ -232,12 +227,13 @@ async fn main() -> Result<()> {
     // Determine Session ID
     let session_id = cli.session_id.unwrap_or_else(|| Uuid::new_v4().to_string());
     println!("Session ID: {}", session_id);
-    
+
     // Load MCP tools
     let mcp_tools = mcp_loader::load_mcp_tools(loaded_config.config.mcp_servers).await?;
 
     // Create Agent
-    let (mut agent, _registry) = registry::create_agent(&cli.agent, provider, pool, session_id, mcp_tools).await?;
+    let (mut agent, _registry) =
+        registry::create_agent(&cli.agent, provider, pool, session_id, mcp_tools).await?;
     info!("Initialized agent: {}", cli.agent);
 
     // Initial Prompt handling

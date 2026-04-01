@@ -6,15 +6,18 @@
 //! - `EditFileTool`: Modifies existing files by replacing text.
 //! - `GlobTool`: Finds files using glob patterns.
 
-use crate::fs_utils::{resolve_safe_path, read_text, read_bytes, write, glob_with_gitignore, into_tool_error, is_binary_file, mime_type, parse_empty_args};
-use gewu_core::traits::Tool;
+use crate::fs_utils::{
+    glob_with_gitignore, into_tool_error, is_binary_file, mime_type, parse_empty_args, read_bytes,
+    read_text, resolve_safe_path, write,
+};
 use anyhow::Result;
 use async_trait::async_trait;
-use serde_json::{Value, json};
-use std::path::PathBuf;
-use std::error::Error;
-use tokio::io::BufReader;
 use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64};
+use gewu_core::traits::Tool;
+use serde_json::{Value, json};
+use std::error::Error;
+use std::path::PathBuf;
+use tokio::io::BufReader;
 
 const DEFAULT_READ_LIMIT: usize = 2000;
 const MAX_LINE_LENGTH: usize = 2000;
@@ -61,19 +64,33 @@ impl Tool for ReadFileTool {
     async fn call(&self, args: &str) -> Result<String, Box<dyn Error + Send + Sync>> {
         if args.trim().is_empty() {
             return Err(anyhow::anyhow!(
-                "{}", parse_empty_args("read_file", &[("filePath", "string"), ("limit", "number (optional)"), ("offset", "number (optional)")])
-            ).into());
+                "{}",
+                parse_empty_args(
+                    "read_file",
+                    &[
+                        ("filePath", "string"),
+                        ("limit", "number (optional)"),
+                        ("offset", "number (optional)")
+                    ]
+                )
+            )
+            .into());
         }
         let args_val: Value = serde_json::from_str(args).map_err(into_tool_error)?;
-        let file_path_str = args_val["filePath"].as_str().ok_or_else(|| anyhow::anyhow!("filePath is required")).map_err(into_tool_error)?;
+        let file_path_str = args_val["filePath"]
+            .as_str()
+            .ok_or_else(|| anyhow::anyhow!("filePath is required"))
+            .map_err(into_tool_error)?;
 
-        let file_path = resolve_safe_path(&self.working_directory, file_path_str).map_err(into_tool_error)?;
+        let file_path =
+            resolve_safe_path(&self.working_directory, file_path_str).map_err(into_tool_error)?;
 
         let metadata = tokio::fs::metadata(&file_path).await;
 
         if metadata.is_err() {
             let parent = file_path.parent().unwrap_or(file_path.as_path());
-            let basename = file_path.file_name()
+            let basename = file_path
+                .file_name()
                 .and_then(|n| n.to_str())
                 .and_then(|n| n.rsplit('.').next()) // Remove extension for fuzzy matching
                 .unwrap_or("");
@@ -99,7 +116,8 @@ impl Tool for ReadFileTool {
                         "File not found: {}\n\nDid you mean one of these?\n{}",
                         file_path_str,
                         suggestions.join("\n")
-                    ).into());
+                    )
+                    .into());
                 }
             }
 
@@ -110,7 +128,9 @@ impl Tool for ReadFileTool {
 
         if meta.is_dir() {
             let mut entries: Vec<String> = Vec::new();
-            let mut dir_stream = tokio::fs::read_dir(&file_path).await.map_err(into_tool_error)?;
+            let mut dir_stream = tokio::fs::read_dir(&file_path)
+                .await
+                .map_err(into_tool_error)?;
 
             while let Some(entry) = dir_stream.next_entry().await.map_err(into_tool_error)? {
                 let path = entry.path();
@@ -133,10 +153,17 @@ impl Tool for ReadFileTool {
 
             entries.sort();
 
-            let limit = args_val["limit"].as_u64().unwrap_or(DEFAULT_READ_LIMIT as u64) as usize;
+            let limit = args_val["limit"]
+                .as_u64()
+                .unwrap_or(DEFAULT_READ_LIMIT as u64) as usize;
             let offset = args_val["offset"].as_u64().unwrap_or(1) as usize;
             let start = offset.saturating_sub(1);
-            let sliced: Vec<&str> = entries.iter().skip(start).take(limit).map(|s| s.as_str()).collect();
+            let sliced: Vec<&str> = entries
+                .iter()
+                .skip(start)
+                .take(limit)
+                .map(|s| s.as_str())
+                .collect();
             let truncated = start + sliced.len() < entries.len();
 
             let output = if truncated {
@@ -161,7 +188,9 @@ impl Tool for ReadFileTool {
         }
 
         let mime = mime_type(&file_path);
-        let is_image = mime.starts_with("image/") && mime != "image/svg+xml" && mime != "image/vnd.fastbidsheet";
+        let is_image = mime.starts_with("image/")
+            && mime != "image/svg+xml"
+            && mime != "image/vnd.fastbidsheet";
         let is_pdf = mime == "application/pdf";
 
         if is_image || is_pdf {
@@ -177,16 +206,22 @@ impl Tool for ReadFileTool {
             return Ok(result.to_string());
         }
 
-        let is_binary = is_binary_file(&file_path, meta.len()).await.map_err(into_tool_error)?;
+        let is_binary = is_binary_file(&file_path, meta.len())
+            .await
+            .map_err(into_tool_error)?;
         if is_binary {
             return Err(anyhow::anyhow!("Cannot read binary file: {}", file_path_str).into());
         }
 
-        let limit = args_val["limit"].as_u64().unwrap_or(DEFAULT_READ_LIMIT as u64) as usize;
+        let limit = args_val["limit"]
+            .as_u64()
+            .unwrap_or(DEFAULT_READ_LIMIT as u64) as usize;
         let offset = args_val["offset"].as_u64().unwrap_or(1) as usize;
         let start = offset.saturating_sub(1);
 
-        let file = tokio::fs::File::open(&file_path).await.map_err(into_tool_error)?;
+        let file = tokio::fs::File::open(&file_path)
+            .await
+            .map_err(into_tool_error)?;
         let reader = BufReader::new(file);
         let mut lines: Vec<String> = Vec::new();
         let mut total_lines: usize = 0;
@@ -230,10 +265,13 @@ impl Tool for ReadFileTool {
                 "Offset {} is out of range for this file ({} lines)",
                 offset,
                 total_lines
-            ).into());
+            )
+            .into());
         }
 
-        let content: Vec<String> = lines.iter().enumerate()
+        let content: Vec<String> = lines
+            .iter()
+            .enumerate()
             .map(|(i, line)| format!("{}: {}", start + i + 1, line))
             .collect();
 
@@ -259,7 +297,10 @@ impl Tool for ReadFileTool {
                 offset, last_read_line, total_lines_count, next_offset
             ));
         } else {
-            output.push_str(&format!("\n\n(End of file - total {} lines)", total_lines_count));
+            output.push_str(&format!(
+                "\n\n(End of file - total {} lines)",
+                total_lines_count
+            ));
         }
 
         Ok(output)
@@ -301,17 +342,34 @@ impl Tool for WriteFileTool {
     async fn call(&self, args: &str) -> Result<String, Box<dyn Error + Send + Sync>> {
         if args.trim().is_empty() {
             return Err(anyhow::anyhow!(
-                "{}", parse_empty_args("write_file", &[("filePath", "string"), ("content", "string")])
-            ).into());
+                "{}",
+                parse_empty_args(
+                    "write_file",
+                    &[("filePath", "string"), ("content", "string")]
+                )
+            )
+            .into());
         }
         let args_val: Value = serde_json::from_str(args).map_err(into_tool_error)?;
-        let file_path_str = args_val["filePath"].as_str().ok_or_else(|| anyhow::anyhow!("filePath is required")).map_err(into_tool_error)?;
-        let content = args_val["content"].as_str().ok_or_else(|| anyhow::anyhow!("content is required")).map_err(into_tool_error)?;
+        let file_path_str = args_val["filePath"]
+            .as_str()
+            .ok_or_else(|| anyhow::anyhow!("filePath is required"))
+            .map_err(into_tool_error)?;
+        let content = args_val["content"]
+            .as_str()
+            .ok_or_else(|| anyhow::anyhow!("content is required"))
+            .map_err(into_tool_error)?;
 
-        let file_path = resolve_safe_path(&self.working_directory, file_path_str).map_err(into_tool_error)?;
-        
-        write(&file_path, content.as_bytes()).await.map_err(into_tool_error)?;
-        Ok(format!("Successfully wrote to {}", file_path.to_string_lossy()))
+        let file_path =
+            resolve_safe_path(&self.working_directory, file_path_str).map_err(into_tool_error)?;
+
+        write(&file_path, content.as_bytes())
+            .await
+            .map_err(into_tool_error)?;
+        Ok(format!(
+            "Successfully wrote to {}",
+            file_path.to_string_lossy()
+        ))
     }
 }
 
@@ -358,19 +416,39 @@ impl Tool for EditFileTool {
     async fn call(&self, args: &str) -> Result<String, Box<dyn Error + Send + Sync>> {
         if args.trim().is_empty() {
             return Err(anyhow::anyhow!(
-                "{}", parse_empty_args("edit_file", &[("filePath", "string"), ("oldString", "string"), ("newString", "string"), ("replaceAll", "boolean (optional)")])
-            ).into());
+                "{}",
+                parse_empty_args(
+                    "edit_file",
+                    &[
+                        ("filePath", "string"),
+                        ("oldString", "string"),
+                        ("newString", "string"),
+                        ("replaceAll", "boolean (optional)")
+                    ]
+                )
+            )
+            .into());
         }
         let args_val: Value = serde_json::from_str(args).map_err(into_tool_error)?;
-        let file_path_str = args_val["filePath"].as_str().ok_or_else(|| anyhow::anyhow!("filePath is required")).map_err(into_tool_error)?;
-        let old_string = args_val["oldString"].as_str().ok_or_else(|| anyhow::anyhow!("oldString is required")).map_err(into_tool_error)?;
-        let new_string = args_val["newString"].as_str().ok_or_else(|| anyhow::anyhow!("newString is required")).map_err(into_tool_error)?;
+        let file_path_str = args_val["filePath"]
+            .as_str()
+            .ok_or_else(|| anyhow::anyhow!("filePath is required"))
+            .map_err(into_tool_error)?;
+        let old_string = args_val["oldString"]
+            .as_str()
+            .ok_or_else(|| anyhow::anyhow!("oldString is required"))
+            .map_err(into_tool_error)?;
+        let new_string = args_val["newString"]
+            .as_str()
+            .ok_or_else(|| anyhow::anyhow!("newString is required"))
+            .map_err(into_tool_error)?;
         let replace_all = args_val["replaceAll"].as_bool().unwrap_or(false);
 
-        let file_path = resolve_safe_path(&self.working_directory, file_path_str).map_err(into_tool_error)?;
+        let file_path =
+            resolve_safe_path(&self.working_directory, file_path_str).map_err(into_tool_error)?;
 
         let content = read_text(&file_path).await.map_err(into_tool_error)?;
-        
+
         let occurrences = content.matches(old_string).count();
 
         if occurrences == 0 {
@@ -386,8 +464,13 @@ impl Tool for EditFileTool {
             content.replacen(old_string, new_string, 1)
         };
 
-        write(&file_path, new_content.as_bytes()).await.map_err(into_tool_error)?;
-        Ok(format!("Successfully modified {}", file_path.to_string_lossy()))
+        write(&file_path, new_content.as_bytes())
+            .await
+            .map_err(into_tool_error)?;
+        Ok(format!(
+            "Successfully modified {}",
+            file_path.to_string_lossy()
+        ))
     }
 }
 
@@ -426,12 +509,20 @@ impl Tool for GlobTool {
     async fn call(&self, args: &str) -> Result<String, Box<dyn Error + Send + Sync>> {
         if args.trim().is_empty() {
             return Err(anyhow::anyhow!(
-                "{}", parse_empty_args("glob", &[("pattern", "string"), ("path", "string (optional)")])
-            ).into());
+                "{}",
+                parse_empty_args(
+                    "glob",
+                    &[("pattern", "string"), ("path", "string (optional)")]
+                )
+            )
+            .into());
         }
         let args_val: Value = serde_json::from_str(args).map_err(into_tool_error)?;
-        let pattern = args_val["pattern"].as_str().ok_or_else(|| anyhow::anyhow!("pattern is required")).map_err(into_tool_error)?;
-        
+        let pattern = args_val["pattern"]
+            .as_str()
+            .ok_or_else(|| anyhow::anyhow!("pattern is required"))
+            .map_err(into_tool_error)?;
+
         // Optional path parameter, defaults to current working directory
         let search_dir = if let Some(p) = args_val.get("path").and_then(|v| v.as_str()) {
             resolve_safe_path(&self.working_directory, p).map_err(into_tool_error)?
@@ -472,12 +563,17 @@ mod tests {
         let file_path = dir.path().join("test_read.txt");
         fs::write(&file_path, "Hello from file").await?;
 
-        let tool = ReadFileTool { working_directory: working_dir };
+        let tool = ReadFileTool {
+            working_directory: working_dir,
+        };
         let args = json!({
             "filePath": file_path.to_str().unwrap()
         });
 
-        let output = tool.call(&args.to_string()).await.map_err(|e| anyhow::anyhow!(e.to_string()))?;
+        let output = tool
+            .call(&args.to_string())
+            .await
+            .map_err(|e| anyhow::anyhow!(e.to_string()))?;
         assert!(output.contains("<path>"));
         assert!(output.contains("<type>file</type>"));
         assert!(output.contains("1: Hello from file"));
@@ -491,13 +587,18 @@ mod tests {
         let working_dir = dir.path().to_path_buf();
         let file_path = dir.path().join("test_write.txt");
 
-        let tool = WriteFileTool { working_directory: working_dir };
+        let tool = WriteFileTool {
+            working_directory: working_dir,
+        };
         let args = json!({
             "filePath": file_path.to_str().unwrap(),
             "content": "Hello written"
         });
 
-        let output = tool.call(&args.to_string()).await.map_err(|e| anyhow::anyhow!(e.to_string()))?;
+        let output = tool
+            .call(&args.to_string())
+            .await
+            .map_err(|e| anyhow::anyhow!(e.to_string()))?;
         assert!(output.contains("Successfully wrote"));
 
         let content = fs::read_to_string(&file_path).await?;
@@ -516,14 +617,19 @@ mod tests {
         fs::write(&file2, "").await?;
         fs::write(&file3, "").await?;
 
-        let tool = GlobTool { working_directory: working_dir };
+        let tool = GlobTool {
+            working_directory: working_dir,
+        };
         // Search for .txt files
         let pattern = "*.txt";
         let args = json!({
             "pattern": pattern
         });
 
-        let output = tool.call(&args.to_string()).await.map_err(|e| anyhow::anyhow!(e.to_string()))?;
+        let output = tool
+            .call(&args.to_string())
+            .await
+            .map_err(|e| anyhow::anyhow!(e.to_string()))?;
         let files: Vec<String> = serde_json::from_str(&output)?;
 
         assert_eq!(files.len(), 2);
@@ -541,7 +647,9 @@ mod tests {
         let file_path = dir.path().join("test_edit.txt");
         fs::write(&file_path, "foo bar foo").await?;
 
-        let tool = EditFileTool { working_directory: working_dir };
+        let tool = EditFileTool {
+            working_directory: working_dir,
+        };
 
         // 1. Multiple matches error
         let args_multiple = json!({
@@ -552,7 +660,12 @@ mod tests {
         });
         let result = tool.call(&args_multiple.to_string()).await;
         assert!(result.is_err());
-        assert!(result.unwrap_err().to_string().contains("Found multiple matches"));
+        assert!(
+            result
+                .unwrap_err()
+                .to_string()
+                .contains("Found multiple matches")
+        );
 
         // 2. Replace All
         let args_all = json!({
@@ -561,7 +674,10 @@ mod tests {
             "newString": "baz",
             "replaceAll": true
         });
-        let _ = tool.call(&args_all.to_string()).await.map_err(|e| anyhow::anyhow!(e.to_string()))?;
+        let _ = tool
+            .call(&args_all.to_string())
+            .await
+            .map_err(|e| anyhow::anyhow!(e.to_string()))?;
         let content = fs::read_to_string(&file_path).await?;
         assert_eq!(content, "baz bar baz");
 
@@ -574,7 +690,12 @@ mod tests {
         });
         let result = tool.call(&args_not_found.to_string()).await;
         assert!(result.is_err());
-        assert!(result.unwrap_err().to_string().contains("oldString not found"));
+        assert!(
+            result
+                .unwrap_err()
+                .to_string()
+                .contains("oldString not found")
+        );
 
         // 4. Single replacement
         fs::write(&file_path, "one two three").await?;
@@ -584,7 +705,10 @@ mod tests {
             "newString": "2",
             "replaceAll": false
         });
-        let _ = tool.call(&args_single.to_string()).await.map_err(|e| anyhow::anyhow!(e.to_string()))?;
+        let _ = tool
+            .call(&args_single.to_string())
+            .await
+            .map_err(|e| anyhow::anyhow!(e.to_string()))?;
         let content = fs::read_to_string(&file_path).await?;
         assert_eq!(content, "one 2 three");
 
@@ -596,13 +720,15 @@ mod tests {
         let dir = tempdir()?;
         let working_dir = dir.path().join("safe_zone");
         tokio::fs::create_dir(&working_dir).await?;
-        
+
         // Create a secret file outside
         let secret_path = dir.path().join("secret.txt");
         tokio::fs::write(&secret_path, "secret data").await?;
-        
+
         // 1. ReadFileTool traversal
-        let read_tool = ReadFileTool { working_directory: working_dir.clone() };
+        let read_tool = ReadFileTool {
+            working_directory: working_dir.clone(),
+        };
         let args_read = json!({
             "filePath": "../secret.txt"
         });
@@ -611,7 +737,9 @@ mod tests {
         // assert!(result_read.unwrap_err().to_string().contains("Path traversal detected"));
 
         // 2. WriteFileTool traversal
-        let write_tool = WriteFileTool { working_directory: working_dir.clone() };
+        let write_tool = WriteFileTool {
+            working_directory: working_dir.clone(),
+        };
         let args_write = json!({
             "filePath": "../hacker.txt",
             "content": "hacked"
@@ -620,7 +748,9 @@ mod tests {
         assert!(result_write.is_err());
 
         // 3. EditFileTool traversal
-        let edit_tool = EditFileTool { working_directory: working_dir.clone() };
+        let edit_tool = EditFileTool {
+            working_directory: working_dir.clone(),
+        };
         let args_edit = json!({
             "filePath": "../secret.txt",
             "oldString": "secret",
@@ -629,14 +759,19 @@ mod tests {
         });
         let result_edit = edit_tool.call(&args_edit.to_string()).await;
         assert!(result_edit.is_err());
-        
+
         // 4. GlobTool traversal attempt
-        let glob_tool = GlobTool { working_directory: working_dir.clone() };
+        let glob_tool = GlobTool {
+            working_directory: working_dir.clone(),
+        };
         // Search for the secret file using relative path
         let args_glob = json!({
             "pattern": "../secret.txt"
         });
-        let result_glob = glob_tool.call(&args_glob.to_string()).await.map_err(|e| anyhow::anyhow!(e.to_string()))?;
+        let result_glob = glob_tool
+            .call(&args_glob.to_string())
+            .await
+            .map_err(|e| anyhow::anyhow!(e.to_string()))?;
         let files: Vec<String> = serde_json::from_str(&result_glob)?;
         // It should find nothing because results outside working_dir are filtered
         assert!(files.is_empty());
@@ -651,29 +786,37 @@ mod tests {
         let keep_file = dir.path().join("keep_me.txt");
         let ignore_file = dir.path().join("ignore_me.txt");
         let gitignore = dir.path().join(".ignore");
-        
+
         fs::write(&keep_file, "keep").await?;
         fs::write(&ignore_file, "ignore").await?;
         fs::write(&gitignore, "ignore_me.txt").await?;
 
         // Create the tool instance
-        let tool = GlobTool { working_directory: working_dir.clone() };
+        let tool = GlobTool {
+            working_directory: working_dir.clone(),
+        };
         let args = json!({
             "pattern": "*.txt"
         });
 
         // Run the tool
-        let output = tool.call(&args.to_string()).await.map_err(|e| anyhow::anyhow!(e.to_string()))?;
+        let output = tool
+            .call(&args.to_string())
+            .await
+            .map_err(|e| anyhow::anyhow!(e.to_string()))?;
         let files: Vec<String> = serde_json::from_str(&output)?;
 
         // Paths in output are absolute
         let s_keep = keep_file.to_string_lossy().to_string();
         let s_ignore = ignore_file.to_string_lossy().to_string();
-        
+
         // Assertions
         assert!(files.contains(&s_keep), "Should contain keep_me.txt");
-        assert!(!files.contains(&s_ignore), "Should NOT contain ignore_me.txt");
-        
+        assert!(
+            !files.contains(&s_ignore),
+            "Should NOT contain ignore_me.txt"
+        );
+
         Ok(())
     }
 
@@ -687,12 +830,17 @@ mod tests {
         fs::write(&dir.path().join("file2.txt"), "content2").await?;
         fs::write(&subdir.join("nested.txt"), "nested").await?;
 
-        let tool = ReadFileTool { working_directory: working_dir.clone() };
+        let tool = ReadFileTool {
+            working_directory: working_dir.clone(),
+        };
         let args = json!({
             "filePath": dir.path().to_str().unwrap()
         });
 
-        let output = tool.call(&args.to_string()).await.map_err(|e| anyhow::anyhow!(e.to_string()))?;
+        let output = tool
+            .call(&args.to_string())
+            .await
+            .map_err(|e| anyhow::anyhow!(e.to_string()))?;
         assert!(output.contains("<path>"));
         assert!(output.contains("<type>directory</type>"));
         assert!(output.contains("<entries>"));
@@ -709,7 +857,9 @@ mod tests {
         let working_dir = dir.path().to_path_buf();
         fs::write(&dir.path().join("similar.txt"), "content").await?;
 
-        let tool = ReadFileTool { working_directory: working_dir.clone() };
+        let tool = ReadFileTool {
+            working_directory: working_dir.clone(),
+        };
         let args = json!({
             "filePath": dir.path().join("similr.txt").to_str().unwrap()
         });
@@ -731,14 +881,19 @@ mod tests {
         let content: String = (1..=10).map(|i| format!("Line {}\n", i)).collect();
         fs::write(&file_path, content).await?;
 
-        let tool = ReadFileTool { working_directory: working_dir };
+        let tool = ReadFileTool {
+            working_directory: working_dir,
+        };
         let args = json!({
             "filePath": file_path.to_str().unwrap(),
             "offset": 3,
             "limit": 4
         });
 
-        let output = tool.call(&args.to_string()).await.map_err(|e| anyhow::anyhow!(e.to_string()))?;
+        let output = tool
+            .call(&args.to_string())
+            .await
+            .map_err(|e| anyhow::anyhow!(e.to_string()))?;
         assert!(output.contains("3: Line 3"));
         assert!(output.contains("6: Line 6"));
         assert!(output.contains("Showing lines 3-6 of 10"));
@@ -755,12 +910,17 @@ mod tests {
         let repeated: String = content.repeat(600);
         fs::write(&file_path, repeated).await?;
 
-        let tool = ReadFileTool { working_directory: working_dir };
+        let tool = ReadFileTool {
+            working_directory: working_dir,
+        };
         let args = json!({
             "filePath": file_path.to_str().unwrap()
         });
 
-        let output = tool.call(&args.to_string()).await.map_err(|e| anyhow::anyhow!(e.to_string()))?;
+        let output = tool
+            .call(&args.to_string())
+            .await
+            .map_err(|e| anyhow::anyhow!(e.to_string()))?;
         assert!(output.contains("Output capped at 50 KB"));
         Ok(())
     }

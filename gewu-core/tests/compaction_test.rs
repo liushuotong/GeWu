@@ -1,11 +1,11 @@
+use async_trait::async_trait;
+use futures::StreamExt;
+use futures::stream::BoxStream;
 use gewu_core::agent::AgentBuilder;
 use gewu_core::traits::{LlmProvider, Tool};
-use gewu_core::types::{Message, ProviderEvent, AgentEvent};
-use async_trait::async_trait;
-use std::sync::{Arc, Mutex};
+use gewu_core::types::{AgentEvent, Message, ProviderEvent};
 use std::error::Error;
-use futures::stream::BoxStream;
-use futures::StreamExt;
+use std::sync::{Arc, Mutex};
 
 struct MockLlm {
     responses: Arc<Mutex<Vec<Message>>>,
@@ -14,7 +14,9 @@ struct MockLlm {
 #[derive(Debug)]
 struct MockError(String);
 impl std::fmt::Display for MockError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result { write!(f, "{}", self.0) }
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}", self.0)
+    }
 }
 impl Error for MockError {}
 
@@ -24,13 +26,19 @@ impl LlmProvider for MockLlm {
         &'a self,
         messages: &[Message],
         _tools: &[Arc<dyn Tool>],
-    ) -> Result<BoxStream<'a, Result<ProviderEvent, Box<dyn Error + Send + Sync>>>, Box<dyn Error + Send + Sync>> {
+    ) -> Result<
+        BoxStream<'a, Result<ProviderEvent, Box<dyn Error + Send + Sync>>>,
+        Box<dyn Error + Send + Sync>,
+    > {
         let last_msg = messages.last().unwrap();
         if let Message::User { content } = last_msg {
-            let text = content.iter().find_map(|p| match p {
-                gewu_core::types::ContentPart::Text { text } => Some(text.as_str()),
-                _ => None,
-            }).unwrap_or("");
+            let text = content
+                .iter()
+                .find_map(|p| match p {
+                    gewu_core::types::ContentPart::Text { text } => Some(text.as_str()),
+                    _ => None,
+                })
+                .unwrap_or("");
             if text.contains("Provide a detailed prompt for continuing") {
                 let s = async_stream::try_stream! {
                     yield ProviderEvent::ContentDelta { delta: "## Goal\nTest compaction\n## Accomplished\nNothing yet".to_string() };
@@ -41,12 +49,15 @@ impl LlmProvider for MockLlm {
 
         let mut responses = self.responses.lock().unwrap();
         let response = if responses.is_empty() {
-             // Fallback default response
-             Message::Assistant { content: Some("Default response".to_string()), tool_calls: None }
+            // Fallback default response
+            Message::Assistant {
+                content: Some("Default response".to_string()),
+                tool_calls: None,
+            }
         } else {
-             responses.remove(0)
+            responses.remove(0)
         };
-        
+
         // Convert Message to Stream events
         let s = async_stream::try_stream! {
             if let Message::Assistant { content, tool_calls } = response {
@@ -78,16 +89,16 @@ async fn test_compaction_trigger() {
             tool_calls: None,
         },
     ];
-    
+
     let llm = Arc::new(MockLlm {
         responses: Arc::new(Mutex::new(responses)),
     });
-    
-    // Set a very low limit (e.g., 100 tokens). 
+
+    // Set a very low limit (e.g., 100 tokens).
     // "Hello" is small, but we will pre-fill history.
     let mut agent = AgentBuilder::default()
         .llm(llm)
-        .context_limit(100) 
+        .context_limit(100)
         .system_prompt("System")
         .build()
         .unwrap();
@@ -96,8 +107,13 @@ async fn test_compaction_trigger() {
 
     // Fill history with junk to exceed 100 tokens
     // 1 token ~ 4 chars. 100 tokens ~ 400 chars.
-    let long_text = "A".repeat(500); 
-    agent.memory.add_message(Message::User { content: vec![gewu_core::types::ContentPart::Text { text: long_text }] }).await;
+    let long_text = "A".repeat(500);
+    agent
+        .memory
+        .add_message(Message::User {
+            content: vec![gewu_core::types::ContentPart::Text { text: long_text }],
+        })
+        .await;
 
     // This call should trigger compaction because history > 100
     let mut stream = Box::pin(agent.ask("Hello"));
@@ -106,11 +122,11 @@ async fn test_compaction_trigger() {
         if let Ok(AgentEvent::ContentDelta { delta }) = event {
             response.push_str(&delta);
         } else if let Ok(AgentEvent::Finish { response: r }) = event {
-             response = r;
+            response = r;
         }
     }
     drop(stream); // Release borrow
-    
+
     assert_eq!(response, "I am ready.");
 
     // Verify history structure
@@ -118,15 +134,15 @@ async fn test_compaction_trigger() {
     // 2. Summary (Assistant)
     // 3. User ("Hello")
     // 4. Assistant ("I am ready.")
-    
+
     assert_eq!(agent.memory.messages().len(), 4);
-    
+
     match &agent.memory.messages()[1] {
         Message::Assistant { content, .. } => {
             let text = content.as_ref().unwrap();
             assert!(text.contains("Summary of previous conversation"));
             assert!(text.contains("## Goal"));
-        },
+        }
         _ => panic!("Expected summary message at index 1"),
     }
 }

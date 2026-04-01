@@ -1,12 +1,12 @@
-use crate::traits::{LlmProvider, Tool, Memory, ToolRegistry};
-use crate::types::{Message, AgentEvent, ProviderEvent, ToolCall, FunctionCall, ContentPart};
-use crate::compaction::{self, is_overflow, estimate_message_tokens};
+use crate::compaction::{self, estimate_message_tokens, is_overflow};
+use crate::traits::{LlmProvider, Memory, Tool, ToolRegistry};
+use crate::types::{AgentEvent, ContentPart, FunctionCall, Message, ProviderEvent, ToolCall};
+use anyhow::{Context, Result};
 use async_trait::async_trait;
-use std::sync::Arc;
-use anyhow::{Result, Context};
-use tracing::{info, debug};
 use futures::{Stream, StreamExt};
 use serde::Deserialize;
+use std::sync::Arc;
+use tracing::{debug, info};
 
 pub struct Agent {
     llm: Arc<dyn LlmProvider>,
@@ -48,10 +48,13 @@ impl Agent {
     pub async fn reset(&mut self) {
         self.memory.clear().await;
         if !self.system_prompt.is_empty() {
-             self.memory.add_message(Message::System { content: self.system_prompt.clone() }).await;
+            self.memory
+                .add_message(Message::System {
+                    content: self.system_prompt.clone(),
+                })
+                .await;
         }
     }
-
 
     /// Sends a message to the agent and gets a response stream.
     /// This method maintains the conversation history.
@@ -64,27 +67,27 @@ impl Agent {
             if self.memory.messages().is_empty() && !self.system_prompt.is_empty() {
                  self.memory.add_message(Message::System { content: self.system_prompt.clone() }).await;
             }
-    
+
             self.memory.add_message(Message::User { content: vec![ContentPart::Text { text: user_message.to_string() }] }).await;
-            
+
             let mut turn = 0;
             let mut recent_tool_calls: Vec<(String, String)> = Vec::new();
-    
+
             loop {
                 // Check for compaction at the start of each turn
                 if self.compact_if_needed().await? {
                     info!("History compacted.");
                 }
-    
+
                 if turn >= self.max_turns {
                     yield AgentEvent::Error { error: "Max turns reached without final answer.".to_string() };
                     break;
                 }
                 turn += 1;
-    
+
                 // Prune old tool outputs before generating response
                 compaction::prune(self.memory.messages_mut());
-    
+
                 let mut current_content = String::new();
                 let mut current_tool_calls: Vec<ToolCall> = Vec::new();
 
@@ -101,7 +104,7 @@ impl Agent {
 
                 while let Some(event_result) = stream.next().await {
                     let event = event_result.map_err(|e| anyhow::anyhow!(e))?;
-                    
+
                     match event {
                         ProviderEvent::ContentDelta { delta } => {
                             current_content.push_str(&delta);
@@ -134,7 +137,7 @@ impl Agent {
                         }
                     }
                 }
-                
+
                 // Add assistant message to history
                 let assistant_msg = Message::Assistant {
                     content: if current_content.is_empty() { None } else { Some(current_content.clone()) },
@@ -178,7 +181,7 @@ impl Agent {
                     yield AgentEvent::ToolStart { tool: tool_name.clone(), input: args.clone() };
 
                     let tool = self.tools.iter().find(|t| t.name() == tool_name);
-                    
+
                     let result_content = if let Some(t) = tool {
                         info!("Executing tool: {}", tool_name);
                         match t.call(&args).await {
@@ -199,12 +202,11 @@ impl Agent {
                         media: media_parts,
                     }).await;
                 }
-                
+
                 // Continue loop for next turn
             }
         }
     }
-
 
     /// Checks if the current history exceeds the token limit and triggers summarization.
     async fn compact_if_needed(&mut self) -> Result<bool> {
@@ -250,17 +252,22 @@ When constructing the summary, try to stick to this template:
         // Prepare messages for summarization
         let mut request_messages = self.memory.messages().to_vec();
         request_messages.push(Message::User {
-            content: vec![ContentPart::Text { text: prompt.to_string() }],
+            content: vec![ContentPart::Text {
+                text: prompt.to_string(),
+            }],
         });
 
         // Call LLM for summary
         let provider = self.llm.clone();
-        let mut stream = provider.stream_response(&request_messages, &[]).await
+        let mut stream = provider
+            .stream_response(&request_messages, &[])
+            .await
             .map_err(|e| anyhow::anyhow!("Compaction failed: {}", e))?;
 
         let mut summary_text = String::new();
         while let Some(event_result) = stream.next().await {
-            let event = event_result.map_err(|e| anyhow::anyhow!("Compaction stream error: {}", e))?;
+            let event =
+                event_result.map_err(|e| anyhow::anyhow!("Compaction stream error: {}", e))?;
             if let ProviderEvent::ContentDelta { delta } = event {
                 summary_text.push_str(&delta);
             }
@@ -273,20 +280,34 @@ When constructing the summary, try to stick to this template:
         let mut new_history = Vec::new();
 
         // Preserve system prompt
-        if let Some(sys_msg) = self.memory.messages().iter().find(|m| matches!(m, Message::System { .. })) {
+        if let Some(sys_msg) = self
+            .memory
+            .messages()
+            .iter()
+            .find(|m| matches!(m, Message::System { .. }))
+        {
             new_history.push(sys_msg.clone());
         }
 
         // Add Summary
         new_history.push(Message::Assistant {
-            content: Some(format!("Summary of previous conversation:\n{}", summary_text)),
+            content: Some(format!(
+                "Summary of previous conversation:\n{}",
+                summary_text
+            )),
             tool_calls: None,
         });
 
         // Replay logic: Find the last user message
         // We only replay if it's not the one that triggered the overflow directly?
         // Actually, we want to ensure the agent remembers what the user *just* asked.
-        if let Some(last_user_msg) = self.memory.messages().iter().rev().find(|m| matches!(m, Message::User { .. })) {
+        if let Some(last_user_msg) = self
+            .memory
+            .messages()
+            .iter()
+            .rev()
+            .find(|m| matches!(m, Message::User { .. }))
+        {
             new_history.push(last_user_msg.clone());
         }
 
@@ -297,7 +318,11 @@ When constructing the summary, try to stick to this template:
 
 #[async_trait]
 impl ToolRegistry for Agent {
-    async fn execute(&self, name: &str, args: &str) -> Result<String, Box<dyn std::error::Error + Send + Sync>> {
+    async fn execute(
+        &self,
+        name: &str,
+        args: &str,
+    ) -> Result<String, Box<dyn std::error::Error + Send + Sync>> {
         let tool = self.tools.iter().find(|t| t.name() == name);
         match tool {
             Some(t) => t.call(args).await,
@@ -315,17 +340,17 @@ impl AgentBuilder {
         self.llm = Some(llm);
         self
     }
-    
+
     pub fn with_tools(mut self, tools: Vec<Arc<dyn Tool>>) -> Self {
         self.tools = tools;
         self
     }
-    
+
     pub fn system_prompt(mut self, prompt: &str) -> Self {
         self.system_prompt = prompt.to_string();
         self
     }
-    
+
     pub fn max_turns(mut self, max_turns: usize) -> Self {
         self.max_turns = max_turns;
         self
@@ -335,12 +360,12 @@ impl AgentBuilder {
         self.context_limit = limit;
         self
     }
-    
+
     pub fn memory(mut self, memory: Box<dyn Memory>) -> Self {
         self.memory = Some(memory);
         self
     }
-    
+
     pub fn build(self) -> Result<Agent> {
         let llm = self.llm.context("LLM provider is required")?;
         let agent = Agent {
@@ -388,10 +413,29 @@ fn extract_media_parts(content: &str) -> Vec<ContentPart> {
         }
     }
 
-    parts.push(ContentPart::Image {
-        data: parsed.data,
-        mime_type: parsed.mime,
-    });
+    let mime = parsed.mime.as_str();
+    let content_part = if mime.starts_with("image/") {
+        ContentPart::Image {
+            data: parsed.data,
+            mime_type: parsed.mime,
+        }
+    } else if mime.starts_with("audio/") {
+        ContentPart::Audio {
+            data: parsed.data,
+            mime_type: parsed.mime,
+        }
+    } else if mime.starts_with("video/") {
+        ContentPart::Video {
+            data: parsed.data,
+            mime_type: parsed.mime,
+        }
+    } else {
+        ContentPart::File {
+            data: parsed.data,
+            mime_type: parsed.mime,
+        }
+    };
+    parts.push(content_part);
 
     parts
 }

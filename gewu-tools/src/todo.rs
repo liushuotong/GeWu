@@ -1,11 +1,11 @@
 use crate::fs_utils::into_tool_error;
-use gewu_core::traits::Tool;
 use anyhow::Result;
 use async_trait::async_trait;
+use gewu_core::traits::Tool;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
-use std::sync::{Arc, Mutex};
 use std::error::Error;
+use std::sync::{Arc, Mutex};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TodoItem {
@@ -81,21 +81,28 @@ impl Tool for TodoWriteTool {
 
     async fn call(&self, args: &str) -> Result<String, Box<dyn Error + Send + Sync>> {
         let args_val: Value = serde_json::from_str(args).map_err(into_tool_error)?;
-        let todos_input = args_val["todos"].as_array().ok_or_else(|| anyhow::anyhow!("todos is required")).map_err(into_tool_error)?;
+        let todos_input = args_val["todos"]
+            .as_array()
+            .ok_or_else(|| anyhow::anyhow!("todos is required"))
+            .map_err(into_tool_error)?;
 
-        let todos: Vec<TodoItem> = todos_input.iter().map(|item| {
-            TodoItem {
+        let todos: Vec<TodoItem> = todos_input
+            .iter()
+            .map(|item| TodoItem {
                 id: item["id"].as_str().unwrap_or_default().to_string(),
                 content: item["content"].as_str().unwrap_or_default().to_string(),
                 status: item["status"].as_str().unwrap_or("pending").to_string(),
                 priority: item["priority"].as_u64().map(|p| p as u8),
-            }
-        }).collect();
+            })
+            .collect();
 
         let mut todos_guard = self.todos.lock().map_err(|_| lock_err())?;
         *todos_guard = todos;
 
-        let non_completed = todos_guard.iter().filter(|t| t.status != "completed").count();
+        let non_completed = todos_guard
+            .iter()
+            .filter(|t| t.status != "completed")
+            .count();
         Ok(format!("{} todos", non_completed))
     }
 }
@@ -120,8 +127,15 @@ impl Tool for TodoReadTool {
 
     async fn call(&self, _args: &str) -> Result<String, Box<dyn Error + Send + Sync>> {
         let todos_guard = self.todos.lock().map_err(|_| lock_err())?;
-        let non_completed = todos_guard.iter().filter(|t| t.status != "completed").count();
-        Ok(format!("{} todos\n\n{}", non_completed, serde_json::to_string_pretty(&*todos_guard).map_err(into_tool_error)?))
+        let non_completed = todos_guard
+            .iter()
+            .filter(|t| t.status != "completed")
+            .count();
+        Ok(format!(
+            "{} todos\n\n{}",
+            non_completed,
+            serde_json::to_string_pretty(&*todos_guard).map_err(into_tool_error)?
+        ))
     }
 }
 

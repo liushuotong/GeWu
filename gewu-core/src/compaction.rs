@@ -23,6 +23,9 @@ fn estimate_content_tokens(content: &[ContentPart]) -> usize {
         .map(|part| match part {
             ContentPart::Text { text } => estimate_tokens(text),
             ContentPart::Image { data, .. } => estimate_tokens(data),
+            ContentPart::Audio { data, .. } => estimate_tokens(data),
+            ContentPart::Video { data, .. } => estimate_tokens(data),
+            ContentPart::File { data, .. } => estimate_tokens(data),
         })
         .sum()
 }

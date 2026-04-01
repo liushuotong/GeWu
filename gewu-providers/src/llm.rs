@@ -1,21 +1,22 @@
+use async_openai::Client;
 use async_openai::types::chat::{
-    ChatCompletionRequestSystemMessageArgs, ChatCompletionRequestUserMessageArgs,
-    ChatCompletionRequestAssistantMessageArgs, ChatCompletionRequestToolMessageArgs,
-    CreateChatCompletionRequest, CreateChatCompletionRequestArgs, ChatCompletionTools,
-    FunctionObjectArgs, ChatCompletionMessageToolCalls, FunctionCall as OpenAIFunctionCall,
-    ChatCompletionRequestMessage, ChatCompletionTool, ChatCompletionMessageToolCall,
-    ChatCompletionResponseStream, ChatCompletionRequestUserMessageContentPart,
-    ChatCompletionRequestMessageContentPartImage, ImageUrl, ChatCompletionMessageToolCallChunk,
+    ChatCompletionMessageToolCall, ChatCompletionMessageToolCallChunk,
+    ChatCompletionMessageToolCalls, ChatCompletionRequestAssistantMessageArgs,
+    ChatCompletionRequestMessage, ChatCompletionRequestMessageContentPartImage,
+    ChatCompletionRequestSystemMessageArgs, ChatCompletionRequestToolMessageArgs,
+    ChatCompletionRequestUserMessageArgs, ChatCompletionRequestUserMessageContentPart,
+    ChatCompletionResponseStream, ChatCompletionTool, ChatCompletionTools,
+    CreateChatCompletionRequest, CreateChatCompletionRequestArgs,
+    FunctionCall as OpenAIFunctionCall, FunctionObjectArgs, ImageUrl,
 };
-use futures::{StreamExt};
+use async_trait::async_trait;
+use futures::StreamExt;
 use futures::stream::BoxStream;
 use gewu_core::traits::{LlmProvider, Tool};
-use gewu_core::types::{Message, ProviderEvent, ContentPart};
-use async_trait::async_trait;
-use async_openai::Client;
+use gewu_core::types::{Capabilities, ContentPart, Message, ProviderEvent};
+use serde_json::Value;
 use std::error::Error;
 use std::sync::Arc;
-use serde_json::Value;
 
 pub trait RequestBuilder: Send + Sync {
     fn build(
@@ -35,14 +36,17 @@ pub trait ResponseParser: Send + Sync {
 pub struct OpenAIProvider {
     client: Client<async_openai::config::OpenAIConfig>,
     model: String,
+    capabilities: Capabilities,
 }
 
 impl OpenAIProvider {
     pub fn new(api_key: &str, model: &str) -> Self {
         let config = async_openai::config::OpenAIConfig::new().with_api_key(api_key);
+        let capabilities = Self::default_capabilities_for_model(model);
         Self {
             client: Client::with_config(config),
             model: model.to_string(),
+            capabilities,
         }
     }
 
@@ -50,36 +54,155 @@ impl OpenAIProvider {
         let config = async_openai::config::OpenAIConfig::new()
             .with_api_key(api_key)
             .with_api_base(base_url);
+        let capabilities = Self::default_capabilities_for_model(model);
         Self {
             client: Client::with_config(config),
             model: model.to_string(),
+            capabilities,
         }
     }
 
-    fn convert_content_part(&self, part: &ContentPart) -> ChatCompletionRequestUserMessageContentPart {
-        match part {
-            ContentPart::Text { text } => {
-                ChatCompletionRequestUserMessageContentPart::Text(
-                    async_openai::types::chat::ChatCompletionRequestMessageContentPartText {
-                        text: text.clone(),
-                    },
-                )
+    fn default_capabilities_for_model(model: &str) -> Capabilities {
+        let model_lower = model.to_lowercase();
+        if model_lower.contains("gpt-4o") {
+            Capabilities {
+                input: gewu_core::types::InputCapabilities {
+                    text: true,
+                    image: true,
+                    audio: false,
+                    video: false,
+                    pdf: true,
+                },
+                output: gewu_core::types::OutputCapabilities {
+                    text: true,
+                    image: false,
+                    audio: false,
+                    video: false,
+                    pdf: false,
+                },
             }
+        } else if model_lower.contains("gpt-4-turbo") {
+            Capabilities {
+                input: gewu_core::types::InputCapabilities {
+                    text: true,
+                    image: true,
+                    audio: false,
+                    video: false,
+                    pdf: true,
+                },
+                output: gewu_core::types::OutputCapabilities {
+                    text: true,
+                    image: false,
+                    audio: false,
+                    video: false,
+                    pdf: false,
+                },
+            }
+        } else if model_lower.contains("gpt-3.5-turbo") {
+            Capabilities {
+                input: gewu_core::types::InputCapabilities {
+                    text: true,
+                    image: false,
+                    audio: false,
+                    video: false,
+                    pdf: false,
+                },
+                output: gewu_core::types::OutputCapabilities {
+                    text: true,
+                    image: false,
+                    audio: false,
+                    video: false,
+                    pdf: false,
+                },
+            }
+        } else {
+            Capabilities {
+                input: gewu_core::types::InputCapabilities {
+                    text: true,
+                    image: false,
+                    audio: false,
+                    video: false,
+                    pdf: false,
+                },
+                output: gewu_core::types::OutputCapabilities {
+                    text: true,
+                    image: false,
+                    audio: false,
+                    video: false,
+                    pdf: false,
+                },
+            }
+        }
+    }
+
+    fn convert_content_part(
+        &self,
+        part: &ContentPart,
+    ) -> Option<ChatCompletionRequestUserMessageContentPart> {
+        match part {
+            ContentPart::Text { text } => Some(ChatCompletionRequestUserMessageContentPart::Text(
+                async_openai::types::chat::ChatCompletionRequestMessageContentPartText {
+                    text: text.clone(),
+                },
+            )),
             ContentPart::Image { data, mime_type } => {
                 let url = format!("data:{};base64,{}", mime_type, data);
-                ChatCompletionRequestUserMessageContentPart::ImageUrl(
+                Some(ChatCompletionRequestUserMessageContentPart::ImageUrl(
                     ChatCompletionRequestMessageContentPartImage {
                         image_url: ImageUrl {
                             url: url.into(),
                             detail: None,
                         },
                     },
-                )
+                ))
+            }
+            ContentPart::Audio { data, mime_type } => {
+                let url = format!("data:{};base64,{}", mime_type, data);
+                Some(ChatCompletionRequestUserMessageContentPart::Text(
+                    async_openai::types::chat::ChatCompletionRequestMessageContentPartText {
+                        text: format!("[Audio file: {}]({})", mime_type, url),
+                    },
+                ))
+            }
+            ContentPart::Video { data, mime_type } => {
+                let url = format!("data:{};base64,{}", mime_type, data);
+                Some(ChatCompletionRequestUserMessageContentPart::Text(
+                    async_openai::types::chat::ChatCompletionRequestMessageContentPartText {
+                        text: format!("[Video file: {}]({})", mime_type, url),
+                    },
+                ))
+            }
+            ContentPart::File { data, mime_type } => {
+                let url = format!("data:{};base64,{}", mime_type, data);
+                Some(ChatCompletionRequestUserMessageContentPart::Text(
+                    async_openai::types::chat::ChatCompletionRequestMessageContentPartText {
+                        text: format!("[File: {}]({})", mime_type, url),
+                    },
+                ))
             }
         }
     }
 
-    fn convert_message(&self, msg: &Message) -> Result<Vec<ChatCompletionRequestMessage>, Box<dyn Error + Send + Sync>> {
+    fn modality_supported(&self, part: &ContentPart) -> bool {
+        match part {
+            ContentPart::Text { .. } => true,
+            ContentPart::Image { .. } => self.capabilities.input.image,
+            ContentPart::Audio { .. } => self.capabilities.input.audio,
+            ContentPart::Video { .. } => self.capabilities.input.video,
+            ContentPart::File { mime_type, .. } => {
+                if mime_type == "application/pdf" {
+                    self.capabilities.input.pdf
+                } else {
+                    self.capabilities.input.text
+                }
+            }
+        }
+    }
+
+    fn convert_message(
+        &self,
+        msg: &Message,
+    ) -> Result<Vec<ChatCompletionRequestMessage>, Box<dyn Error + Send + Sync>> {
         match msg {
             Message::System { content } => {
                 let m = ChatCompletionRequestSystemMessageArgs::default()
@@ -91,7 +214,7 @@ impl OpenAIProvider {
             Message::User { content } => {
                 let parts: Vec<ChatCompletionRequestUserMessageContentPart> = content
                     .iter()
-                    .map(|p| self.convert_content_part(p))
+                    .filter_map(|p| self.convert_content_part(p))
                     .collect();
                 let m = ChatCompletionRequestUserMessageArgs::default()
                     .content(parts)
@@ -99,7 +222,10 @@ impl OpenAIProvider {
                     .map_err(|e| Box::new(e) as Box<dyn Error + Send + Sync>)?;
                 Ok(vec![ChatCompletionRequestMessage::User(m)])
             }
-            Message::Assistant { content, tool_calls } => {
+            Message::Assistant {
+                content,
+                tool_calls,
+            } => {
                 let mut builder = ChatCompletionRequestAssistantMessageArgs::default();
                 if let Some(c) = content {
                     builder.content(c.clone());
@@ -108,13 +234,15 @@ impl OpenAIProvider {
                     let openai_calls: Vec<ChatCompletionMessageToolCalls> = calls
                         .iter()
                         .map(|tc| {
-                            ChatCompletionMessageToolCalls::Function(ChatCompletionMessageToolCall {
-                                id: tc.id.clone(),
-                                function: OpenAIFunctionCall {
-                                    name: tc.function.name.clone(),
-                                    arguments: tc.function.arguments.clone(),
+                            ChatCompletionMessageToolCalls::Function(
+                                ChatCompletionMessageToolCall {
+                                    id: tc.id.clone(),
+                                    function: OpenAIFunctionCall {
+                                        name: tc.function.name.clone(),
+                                        arguments: tc.function.arguments.clone(),
+                                    },
                                 },
-                            })
+                            )
                         })
                         .collect();
                     builder.tool_calls(openai_calls);
@@ -144,10 +272,23 @@ impl OpenAIProvider {
                         None => "Tool returned additional media:".to_string(),
                     };
                     parts.push(ChatCompletionRequestUserMessageContentPart::Text(
-                        async_openai::types::chat::ChatCompletionRequestMessageContentPartText { text: label },
+                        async_openai::types::chat::ChatCompletionRequestMessageContentPartText {
+                            text: label,
+                        },
                     ));
                     for part in media {
-                        parts.push(self.convert_content_part(part));
+                        if let Some(converted) = self.convert_content_part(part) {
+                            parts.push(converted);
+                        } else {
+                            let unsupported_label = format!(
+                                "[Unsupported media type: {} - this model does not support {} input]",
+                                part.mime_type(),
+                                part.mime_type()
+                            );
+                            parts.push(ChatCompletionRequestUserMessageContentPart::Text(
+                                async_openai::types::chat::ChatCompletionRequestMessageContentPartText { text: unsupported_label },
+                            ));
+                        }
                     }
                     let extra = ChatCompletionRequestUserMessageArgs::default()
                         .content(parts)
@@ -161,7 +302,10 @@ impl OpenAIProvider {
         }
     }
 
-    fn convert_tools(&self, tools: &[Arc<dyn Tool>]) -> Result<Vec<ChatCompletionTools>, Box<dyn Error + Send + Sync>> {
+    fn convert_tools(
+        &self,
+        tools: &[Arc<dyn Tool>],
+    ) -> Result<Vec<ChatCompletionTools>, Box<dyn Error + Send + Sync>> {
         let mut openai_tools: Vec<ChatCompletionTools> = Vec::new();
         for tool in tools {
             let function = FunctionObjectArgs::default()
@@ -221,16 +365,12 @@ struct ToolCallAggregator {
 }
 
 impl ToolCallAggregator {
-    fn process_chunk(
-        &mut self,
-        chunk: &ChatCompletionMessageToolCallChunk,
-    ) -> Vec<ProviderEvent> {
+    fn process_chunk(&mut self, chunk: &ChatCompletionMessageToolCallChunk) -> Vec<ProviderEvent> {
         let mut events = Vec::new();
         let index = chunk.index as usize;
 
         if index >= self.states.len() {
-            self.states
-                .resize_with(index + 1, ToolCallState::default);
+            self.states.resize_with(index + 1, ToolCallState::default);
         }
 
         let state = &mut self.states[index];
@@ -257,8 +397,8 @@ impl ToolCallAggregator {
                             Self::emit_pending_arguments(state, &id, &mut events);
                         }
                     }
+                }
             }
-        }
         }
 
         if !state.started {
@@ -356,10 +496,17 @@ impl LlmProvider for OpenAIProvider {
         &'a self,
         messages: &[Message],
         tools: &[Arc<dyn Tool>],
-    ) -> Result<BoxStream<'a, Result<ProviderEvent, Box<dyn Error + Send + Sync>>>, Box<dyn Error + Send + Sync>> {
+    ) -> Result<
+        BoxStream<'a, Result<ProviderEvent, Box<dyn Error + Send + Sync>>>,
+        Box<dyn Error + Send + Sync>,
+    > {
         let request = self.build(messages, tools)?;
 
-        let stream = self.client.chat().create_stream(request).await
+        let stream = self
+            .client
+            .chat()
+            .create_stream(request)
+            .await
             .map_err(|e| Box::new(e) as Box<dyn Error + Send + Sync>)?;
 
         let parsed_stream = self.parse_stream(stream);
@@ -369,7 +516,9 @@ impl LlmProvider for OpenAIProvider {
 
     async fn list_models(&self) -> Result<Vec<String>, Box<dyn Error + Send + Sync>> {
         let models = self.client.models();
-        let response = models.list().await
+        let response = models
+            .list()
+            .await
             .map_err(|e| Box::new(e) as Box<dyn Error + Send + Sync>)?;
         Ok(response.data.into_iter().map(|m| m.id).collect())
     }
@@ -453,14 +602,19 @@ mod tests {
         let mut aggregator = ToolCallAggregator::default();
 
         // Model streams arguments before providing the tool_call_id
-        assert!(aggregator
-            .process_chunk(&make_chunk(0, None, Some("demo_tool"), Some("{\"foo\":")))
-            .is_empty());
-        assert!(aggregator
-            .process_chunk(&make_chunk(0, None, Some("demo_tool"), Some("\"bar\"")))
-            .is_empty());
+        assert!(
+            aggregator
+                .process_chunk(&make_chunk(0, None, Some("demo_tool"), Some("{\"foo\":")))
+                .is_empty()
+        );
+        assert!(
+            aggregator
+                .process_chunk(&make_chunk(0, None, Some("demo_tool"), Some("\"bar\"")))
+                .is_empty()
+        );
 
-        let events = aggregator.process_chunk(&make_chunk(0, Some("call_1"), Some("demo_tool"), None));
+        let events =
+            aggregator.process_chunk(&make_chunk(0, Some("call_1"), Some("demo_tool"), None));
         assert_eq!(events.len(), 2);
         assert!(matches!(events[0], ProviderEvent::ToolCallStart { .. }));
         assert!(matches!(events[1], ProviderEvent::ToolCallDelta { .. }));
@@ -485,14 +639,29 @@ mod tests {
     fn duplicate_arguments_after_completion_are_ignored() {
         let mut aggregator = ToolCallAggregator::default();
 
-        assert!(aggregator
-            .process_chunk(&make_chunk(0, None, Some("glob"), Some("{\"pattern\":\"*\"}")))
-            .is_empty());
+        assert!(
+            aggregator
+                .process_chunk(&make_chunk(
+                    0,
+                    None,
+                    Some("glob"),
+                    Some("{\"pattern\":\"*\"}")
+                ))
+                .is_empty()
+        );
 
         let events = aggregator.process_chunk(&make_chunk(0, Some("call_42"), Some("glob"), None));
         assert_eq!(events.len(), 2);
 
-        let events = aggregator.process_chunk(&make_chunk(0, Some("call_42"), Some("glob"), Some("{\"pattern\": \"*\"}")));
-        assert!(events.is_empty(), "Duplicate arguments should not emit new deltas");
+        let events = aggregator.process_chunk(&make_chunk(
+            0,
+            Some("call_42"),
+            Some("glob"),
+            Some("{\"pattern\": \"*\"}"),
+        ));
+        assert!(
+            events.is_empty(),
+            "Duplicate arguments should not emit new deltas"
+        );
     }
 }

@@ -1,7 +1,7 @@
 use anyhow::Result;
 use gewu_core::traits::Tool;
-use gewu_tools::mcp::{McpClient, McpToolWrapper};
 use gewu_tools::mcp::types::McpServerConfig;
+use gewu_tools::mcp::{McpClient, McpToolWrapper};
 use std::collections::HashMap;
 use std::sync::Arc;
 use tokio::sync::Mutex;
@@ -25,7 +25,10 @@ pub async fn load_mcp_tools(
                 let mcp_tools = match client.list_tools().await {
                     Ok(t) => t,
                     Err(e) => {
-                        warn!("Failed to list tools from MCP server '{}': {}", server_name, e);
+                        warn!(
+                            "Failed to list tools from MCP server '{}': {}",
+                            server_name, e
+                        );
                         continue;
                     }
                 };

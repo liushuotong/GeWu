@@ -1,11 +1,11 @@
 use crate::fs_utils::into_tool_error;
-use gewu_core::traits::{Tool, ToolRegistry};
 use anyhow::Result;
 use async_trait::async_trait;
+use gewu_core::traits::{Tool, ToolRegistry};
 use serde::Deserialize;
 use serde_json::{Value, json};
-use std::sync::Arc;
 use std::error::Error;
+use std::sync::Arc;
 use tokio::task::JoinSet;
 
 const DISALLOWED: &[&str] = &["batch", "invalid", "patch"];
@@ -66,11 +66,16 @@ impl Tool for BatchTool {
     async fn call(&self, args: &str) -> Result<String, Box<dyn Error + Send + Sync>> {
         let batch_args: BatchArgs = serde_json::from_str(args).map_err(into_tool_error)?;
 
-        let tool_calls = batch_args.tool_calls.iter().take(MAX_TOOLS).collect::<Vec<_>>();
+        let tool_calls = batch_args
+            .tool_calls
+            .iter()
+            .take(MAX_TOOLS)
+            .collect::<Vec<_>>();
         let discarded = batch_args.tool_calls.len() - tool_calls.len();
 
         let available_tools = self.registry.list_tools();
-        let allowed_tools = available_tools.iter()
+        let allowed_tools = available_tools
+            .iter()
             .filter(|t| !DISALLOWED.contains(&t.as_str()))
             .cloned()
             .collect::<std::collections::HashSet<_>>();
@@ -85,16 +90,18 @@ impl Tool for BatchTool {
 
             if tool_name.is_empty() {
                 let tool_name_clone = tool_name.clone();
-                join_set.spawn(async move {
-                    (tool_name_clone, Err("Empty tool name".into()))
-                });
+                join_set.spawn(async move { (tool_name_clone, Err("Empty tool name".into())) });
                 continue;
             }
 
             join_set.spawn(async move {
                 let result = async {
                     if DISALLOWED.contains(&tool_name.as_str()) {
-                        return Err(format!("Tool '{}' is not allowed in batch. Disallowed tools: {:?}", tool_name, DISALLOWED).into());
+                        return Err(format!(
+                            "Tool '{}' is not allowed in batch. Disallowed tools: {:?}",
+                            tool_name, DISALLOWED
+                        )
+                        .into());
                     }
 
                     if !allowed.contains(&tool_name) {
@@ -102,12 +109,14 @@ impl Tool for BatchTool {
                             "Tool '{}' not in registry. Available tools: {}",
                             tool_name,
                             allowed.iter().cloned().collect::<Vec<_>>().join(", ")
-                        ).into());
+                        )
+                        .into());
                     }
 
                     let params_str = serde_json::to_string(&params).map_err(into_tool_error)?;
                     registry.execute(&tool_name, &params_str).await
-                }.await;
+                }
+                .await;
 
                 (tool_name, result)
             });
@@ -137,9 +146,15 @@ impl Tool for BatchTool {
         let mut output = String::new();
 
         if failed > 0 {
-            output.push_str(&format!("Executed {}/{} tools successfully. {} failed.\n\n", successful, total, failed));
+            output.push_str(&format!(
+                "Executed {}/{} tools successfully. {} failed.\n\n",
+                successful, total, failed
+            ));
         } else {
-            output.push_str(&format!("All {} tools executed successfully.\n\n", successful));
+            output.push_str(&format!(
+                "All {} tools executed successfully.\n\n",
+                successful
+            ));
         }
 
         if !successes.is_empty() {
@@ -157,11 +172,16 @@ impl Tool for BatchTool {
         }
 
         if discarded > 0 {
-            output.push_str(&format!("\nNote: {} tool(s) discarded (max {} allowed)", discarded, MAX_TOOLS));
+            output.push_str(&format!(
+                "\nNote: {} tool(s) discarded (max {} allowed)",
+                discarded, MAX_TOOLS
+            ));
         }
 
         if successful == total {
-            output.push_str("\n\nKeep using the batch tool for optimal performance in your next response!");
+            output.push_str(
+                "\n\nKeep using the batch tool for optimal performance in your next response!",
+            );
         }
 
         Ok(output)
@@ -203,7 +223,11 @@ mod tests {
 
     #[async_trait]
     impl ToolRegistry for MockRegistry {
-        async fn execute(&self, name: &str, args: &str) -> Result<String, Box<dyn Error + Send + Sync>> {
+        async fn execute(
+            &self,
+            name: &str,
+            args: &str,
+        ) -> Result<String, Box<dyn Error + Send + Sync>> {
             let tool = self.tools.iter().find(|t| t.name() == name);
             match tool {
                 Some(t) => t.call(args).await,
@@ -270,9 +294,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_batch_disallowed_tool() {
-        let registry = Arc::new(MockRegistry {
-            tools: vec![],
-        });
+        let registry = Arc::new(MockRegistry { tools: vec![] });
 
         let batch = BatchTool::new(registry);
 
@@ -288,9 +310,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_batch_unknown_tool() {
-        let registry = Arc::new(MockRegistry {
-            tools: vec![],
-        });
+        let registry = Arc::new(MockRegistry { tools: vec![] });
 
         let batch = BatchTool::new(registry);
 

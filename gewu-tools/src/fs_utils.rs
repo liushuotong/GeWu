@@ -158,7 +158,10 @@ pub fn mime_type(path: impl AsRef<Path>) -> String {
 /// Extension check first, then sample content if needed.
 pub async fn is_binary_file(path: impl AsRef<Path>, file_size: u64) -> Result<bool> {
     let path = path.as_ref();
-    let ext = path.extension().and_then(|e| e.to_str()).map(|e| e.to_lowercase());
+    let ext = path
+        .extension()
+        .and_then(|e| e.to_str())
+        .map(|e| e.to_lowercase());
 
     // Binary extensions list (same as legacy)
     match ext.as_deref() {

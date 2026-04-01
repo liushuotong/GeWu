@@ -1,12 +1,12 @@
+use async_trait::async_trait;
+use futures::StreamExt;
+use futures::stream::BoxStream;
 use gewu_core::agent::AgentBuilder;
 use gewu_core::traits::{LlmProvider, Tool};
-use gewu_core::types::{Message, ToolCall, FunctionCall, ProviderEvent, AgentEvent};
-use async_trait::async_trait;
-use std::sync::{Arc, Mutex};
-use std::error::Error;
+use gewu_core::types::{AgentEvent, FunctionCall, Message, ProviderEvent, ToolCall};
 use serde_json::Value;
-use futures::stream::BoxStream;
-use futures::StreamExt;
+use std::error::Error;
+use std::sync::{Arc, Mutex};
 
 struct MockLlm {
     responses: Arc<Mutex<Vec<Message>>>,
@@ -15,7 +15,9 @@ struct MockLlm {
 #[derive(Debug)]
 struct MockError(String);
 impl std::fmt::Display for MockError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result { write!(f, "{}", self.0) }
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}", self.0)
+    }
 }
 impl Error for MockError {}
 
@@ -25,13 +27,16 @@ impl LlmProvider for MockLlm {
         &'a self,
         _messages: &[Message],
         _tools: &[Arc<dyn Tool>],
-    ) -> Result<BoxStream<'a, Result<ProviderEvent, Box<dyn Error + Send + Sync>>>, Box<dyn Error + Send + Sync>> {
+    ) -> Result<
+        BoxStream<'a, Result<ProviderEvent, Box<dyn Error + Send + Sync>>>,
+        Box<dyn Error + Send + Sync>,
+    > {
         let mut responses = self.responses.lock().unwrap();
         if responses.is_empty() {
-             return Err(Box::new(MockError("No more mock responses".to_string())));
+            return Err(Box::new(MockError("No more mock responses".to_string())));
         }
         let response = responses.remove(0);
-        
+
         let s = async_stream::try_stream! {
             match response {
                 Message::Assistant { content, tool_calls } => {
@@ -60,9 +65,15 @@ struct MockTool;
 
 #[async_trait]
 impl Tool for MockTool {
-    fn name(&self) -> &str { "mock_tool" }
-    fn description(&self) -> &str { "Mock tool" }
-    fn parameters_schema(&self) -> Value { serde_json::json!({}) }
+    fn name(&self) -> &str {
+        "mock_tool"
+    }
+    fn description(&self) -> &str {
+        "Mock tool"
+    }
+    fn parameters_schema(&self) -> Value {
+        serde_json::json!({})
+    }
     async fn call(&self, _args: &str) -> Result<String, Box<dyn Error + Send + Sync>> {
         Ok("Tool output".to_string())
     }
@@ -91,29 +102,29 @@ async fn test_agent_loop() {
             tool_calls: None,
         },
     ];
-    
+
     let llm = Arc::new(MockLlm {
         responses: Arc::new(Mutex::new(responses)),
     });
-    
+
     let tool: Arc<dyn Tool> = Arc::new(MockTool);
-    
+
     let mut agent = AgentBuilder::default()
         .llm(llm)
         .with_tools(vec![tool])
         .system_prompt("System")
         .build()
         .unwrap();
-        
+
     let mut stream = Box::pin(agent.ask("Do something"));
     let mut result = String::new();
     while let Some(event) = stream.next().await {
         if let Ok(AgentEvent::ContentDelta { delta }) = event {
-             result.push_str(&delta);
+            result.push_str(&delta);
         } else if let Ok(AgentEvent::Finish { response }) = event {
-             result = response;
+            result = response;
         }
     }
-    
+
     assert_eq!(result, "Done: Tool output");
 }
