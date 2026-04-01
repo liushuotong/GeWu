@@ -25,7 +25,7 @@ async fn main() -> Result<()> {
         .system_prompt(
             "You are a helpful assistant. Use the bash tool to answer questions about the system.",
         )
-        .max_turns(5)
+        .max_turns(Some(5))
         .build()?;
 
     if api_key == "sk-test-key" {

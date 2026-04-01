@@ -12,7 +12,7 @@ pub struct Agent {
     llm: Arc<dyn LlmProvider>,
     tools: Vec<Arc<dyn Tool>>,
     system_prompt: String,
-    max_turns: usize,
+    max_turns: Option<usize>,
     pub memory: Box<dyn Memory>,
     pub context_limit: usize,
 }
@@ -21,7 +21,7 @@ pub struct AgentBuilder {
     llm: Option<Arc<dyn LlmProvider>>,
     tools: Vec<Arc<dyn Tool>>,
     system_prompt: String,
-    max_turns: usize,
+    max_turns: Option<usize>,
     memory: Option<Box<dyn Memory>>,
     context_limit: usize,
 }
@@ -32,7 +32,7 @@ impl Default for AgentBuilder {
             llm: None,
             tools: Vec::new(),
             system_prompt: String::new(),
-            max_turns: 10,
+            max_turns: None,
             memory: None,
             context_limit: 128_000,
         }
@@ -79,9 +79,11 @@ impl Agent {
                     info!("History compacted.");
                 }
 
-                if turn >= self.max_turns {
-                    yield AgentEvent::Error { error: "Max turns reached without final answer.".to_string() };
-                    break;
+                if let Some(max) = self.max_turns {
+                    if turn >= max {
+                        yield AgentEvent::Error { error: "Max turns reached without final answer.".to_string() };
+                        break;
+                    }
                 }
                 turn += 1;
 
@@ -351,7 +353,7 @@ impl AgentBuilder {
         self
     }
 
-    pub fn max_turns(mut self, max_turns: usize) -> Self {
+    pub fn max_turns(mut self, max_turns: Option<usize>) -> Self {
         self.max_turns = max_turns;
         self
     }
