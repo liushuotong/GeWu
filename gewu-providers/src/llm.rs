@@ -21,17 +21,18 @@
 //! - [`ResponseParser`] - Trait for parsing streaming responses
 //! - [`ToolCallAggregator`] - Handles fragmented tool call streaming
 
-use async_openai::Client;
-use async_openai::types::chat::{
+use crate::openai_types::{
     ChatCompletionMessageToolCall, ChatCompletionMessageToolCallChunk,
-    ChatCompletionMessageToolCalls, ChatCompletionRequestAssistantMessageArgs,
+    ChatCompletionMessageToolCalls,
     ChatCompletionRequestMessage, ChatCompletionRequestMessageContentPartImage,
     ChatCompletionRequestSystemMessageArgs, ChatCompletionRequestToolMessageArgs,
     ChatCompletionRequestUserMessageArgs, ChatCompletionRequestUserMessageContentPart,
-    ChatCompletionResponseStream, ChatCompletionTool, ChatCompletionTools,
-    CreateChatCompletionRequest, CreateChatCompletionRequestArgs,
-    FunctionCall as OpenAIFunctionCall, FunctionObjectArgs, ImageUrl,
+    ChatCompletionTools, ChatCompletionStream, ChatCompletionTool,
+    CreateChatCompletionRequest, FunctionCall as OpenAIFunctionCall,
+    FunctionObjectArgs, ImageUrl, OpenAIConfig, AssistantMessage,
+    ChatCompletionRequestMessageContentPartText,
 };
+use crate::Client;
 use async_trait::async_trait;
 use futures::StreamExt;
 use futures::stream::BoxStream;
@@ -65,14 +66,9 @@ pub trait RequestBuilder: Send + Sync {
 /// Implement this trait to handle different response formats from
 /// OpenAI-compatible APIs.
 pub trait ResponseParser: Send + Sync {
-    /// Parses a streaming response into a stream of provider events.
-    ///
-    /// # Arguments
-    ///
-    /// * `stream` - The raw response stream from the API.
     fn parse_stream(
         &self,
-        stream: ChatCompletionResponseStream,
+        stream: ChatCompletionStream,
     ) -> BoxStream<'static, Result<ProviderEvent, Box<dyn Error + Send + Sync>>>;
 }
 
@@ -107,7 +103,7 @@ pub trait ResponseParser: Send + Sync {
 /// );
 /// ```
 pub struct OpenAIProvider {
-    client: Client<async_openai::config::OpenAIConfig>,
+    client: Client,
     model: String,
     capabilities: Capabilities,
 }
@@ -120,7 +116,7 @@ impl OpenAIProvider {
     /// * `api_key` - Your OpenAI API key.
     /// * `model` - The model to use (e.g., "gpt-4", "gpt-4-turbo").
     pub fn new(api_key: &str, model: &str) -> Self {
-        let config = async_openai::config::OpenAIConfig::new().with_api_key(api_key);
+        let config = OpenAIConfig::new(api_key, "https://api.openai.com/v1");
         let capabilities = Self::default_capabilities_for_model(model);
         Self {
             client: Client::with_config(config),
@@ -140,9 +136,7 @@ impl OpenAIProvider {
     /// * `base_url` - The base URL of the API (e.g., "https://api.openai.com/v1").
     /// * `model` - The model identifier expected by the endpoint.
     pub fn new_with_endpoint(api_key: &str, base_url: &str, model: &str) -> Self {
-        let config = async_openai::config::OpenAIConfig::new()
-            .with_api_key(api_key)
-            .with_api_base(base_url);
+        let config = OpenAIConfig::new(api_key, base_url);
         let capabilities = Self::default_capabilities_for_model(model);
         Self {
             client: Client::with_config(config),
@@ -238,7 +232,8 @@ impl OpenAIProvider {
     ) -> Option<ChatCompletionRequestUserMessageContentPart> {
         match part {
             ContentPart::Text { text } => Some(ChatCompletionRequestUserMessageContentPart::Text(
-                async_openai::types::chat::ChatCompletionRequestMessageContentPartText {
+                ChatCompletionRequestMessageContentPartText {
+                    content_type: "text".to_string(),
                     text: text.clone(),
                 },
             )),
@@ -246,6 +241,7 @@ impl OpenAIProvider {
                 let url = format!("data:{};base64,{}", mime_type, data);
                 Some(ChatCompletionRequestUserMessageContentPart::ImageUrl(
                     ChatCompletionRequestMessageContentPartImage {
+                        content_type: "image_url".to_string(),
                         image_url: ImageUrl {
                             url: url.into(),
                             detail: None,
@@ -256,7 +252,8 @@ impl OpenAIProvider {
             ContentPart::Audio { data, mime_type } => {
                 let url = format!("data:{};base64,{}", mime_type, data);
                 Some(ChatCompletionRequestUserMessageContentPart::Text(
-                    async_openai::types::chat::ChatCompletionRequestMessageContentPartText {
+                    ChatCompletionRequestMessageContentPartText {
+                        content_type: "text".to_string(),
                         text: format!("[Audio file: {}]({})", mime_type, url),
                     },
                 ))
@@ -264,7 +261,8 @@ impl OpenAIProvider {
             ContentPart::Video { data, mime_type } => {
                 let url = format!("data:{};base64,{}", mime_type, data);
                 Some(ChatCompletionRequestUserMessageContentPart::Text(
-                    async_openai::types::chat::ChatCompletionRequestMessageContentPartText {
+                    ChatCompletionRequestMessageContentPartText {
+                        content_type: "text".to_string(),
                         text: format!("[Video file: {}]({})", mime_type, url),
                     },
                 ))
@@ -272,7 +270,8 @@ impl OpenAIProvider {
             ContentPart::File { data, mime_type } => {
                 let url = format!("data:{};base64,{}", mime_type, data);
                 Some(ChatCompletionRequestUserMessageContentPart::Text(
-                    async_openai::types::chat::ChatCompletionRequestMessageContentPartText {
+                    ChatCompletionRequestMessageContentPartText {
+                        content_type: "text".to_string(),
                         text: format!("[File: {}]({})", mime_type, url),
                     },
                 ))
@@ -328,31 +327,27 @@ impl OpenAIProvider {
                 content,
                 tool_calls,
             } => {
-                let mut builder = ChatCompletionRequestAssistantMessageArgs::default();
-                if let Some(c) = content {
-                    builder.content(c.clone());
-                }
-                if let Some(calls) = tool_calls {
-                    let openai_calls: Vec<ChatCompletionMessageToolCalls> = calls
+                let openai_calls = tool_calls.clone().map(|calls| {
+                    calls
                         .iter()
                         .map(|tc| {
-                            ChatCompletionMessageToolCalls::Function(
-                                ChatCompletionMessageToolCall {
-                                    id: tc.id.clone(),
-                                    function: OpenAIFunctionCall {
-                                        name: tc.function.name.clone(),
-                                        arguments: tc.function.arguments.clone(),
-                                    },
+                            ChatCompletionMessageToolCalls::Function(ChatCompletionMessageToolCall {
+                                id: tc.id.clone(),
+                                function: OpenAIFunctionCall {
+                                    name: tc.function.name.clone(),
+                                    arguments: tc.function.arguments.clone(),
                                 },
-                            )
+                            })
                         })
-                        .collect();
-                    builder.tool_calls(openai_calls);
-                }
-                let m = builder
-                    .build()
-                    .map_err(|e| Box::new(e) as Box<dyn Error + Send + Sync>)?;
-                Ok(vec![ChatCompletionRequestMessage::Assistant(m)])
+                        .collect()
+                });
+
+                Ok(vec![ChatCompletionRequestMessage::Assistant(
+                    AssistantMessage {
+                        content: content.clone(),
+                        tool_calls: openai_calls,
+                    },
+                )])
             }
             Message::Tool {
                 tool_call_id,
@@ -374,7 +369,8 @@ impl OpenAIProvider {
                         None => "Tool returned additional media:".to_string(),
                     };
                     parts.push(ChatCompletionRequestUserMessageContentPart::Text(
-                        async_openai::types::chat::ChatCompletionRequestMessageContentPartText {
+                        ChatCompletionRequestMessageContentPartText {
+                            content_type: "text".to_string(),
                             text: label,
                         },
                     ));
@@ -388,7 +384,10 @@ impl OpenAIProvider {
                                 part.mime_type()
                             );
                             parts.push(ChatCompletionRequestUserMessageContentPart::Text(
-                                async_openai::types::chat::ChatCompletionRequestMessageContentPartText { text: unsupported_label },
+                                ChatCompletionRequestMessageContentPartText {
+                                    content_type: "text".to_string(),
+                                    text: unsupported_label,
+                                },
                             ));
                         }
                     }
@@ -418,7 +417,10 @@ impl OpenAIProvider {
                 .build()
                 .map_err(|e| Box::new(e) as Box<dyn Error + Send + Sync>)?;
 
-            let t = ChatCompletionTools::Function(ChatCompletionTool { function });
+            let t = ChatCompletionTools::Function(ChatCompletionTool {
+                tool_type: "function".to_string(),
+                function,
+            });
             openai_tools.push(t);
         }
         Ok(openai_tools)
@@ -439,16 +441,14 @@ impl RequestBuilder for OpenAIProvider {
 
         let openai_tools = self.convert_tools(tools)?;
 
-        let mut request_builder = CreateChatCompletionRequestArgs::default();
-        request_builder.model(&self.model).messages(openai_messages);
-
-        if !openai_tools.is_empty() {
-            request_builder.tools(openai_tools);
-        }
-
-        request_builder
-            .build()
-            .map_err(|e| Box::new(e) as Box<dyn Error + Send + Sync>)
+        Ok(CreateChatCompletionRequest {
+            model: self.model.clone(),
+            messages: openai_messages,
+            tools: if openai_tools.is_empty() { None } else { Some(openai_tools) },
+            stream: None,
+            max_tokens: None,
+            temperature: None,
+        })
     }
 }
 
@@ -578,7 +578,7 @@ impl ToolCallAggregator {
 impl ResponseParser for OpenAIProvider {
     fn parse_stream(
         &self,
-        stream: ChatCompletionResponseStream,
+        stream: ChatCompletionStream,
     ) -> BoxStream<'static, Result<ProviderEvent, Box<dyn Error + Send + Sync>>> {
         let s = async_stream::try_stream! {
             let mut tool_aggregator = ToolCallAggregator::default();
@@ -588,6 +588,12 @@ impl ResponseParser for OpenAIProvider {
                 let response = result.map_err(|e| Box::new(e) as Box<dyn Error + Send + Sync>)?;
                 if let Some(choice) = response.choices.first() {
                     let delta = &choice.delta;
+
+                    if let Some(reasoning) = &delta.reasoning_content {
+                        if !reasoning.is_empty() {
+                            yield ProviderEvent::ReasoningDelta { delta: reasoning.clone() };
+                        }
+                    }
 
                     if let Some(content) = &delta.content {
                         if !content.is_empty() {
@@ -626,7 +632,7 @@ impl LlmProvider for OpenAIProvider {
         BoxStream<'a, Result<ProviderEvent, Box<dyn Error + Send + Sync>>>,
         Box<dyn Error + Send + Sync>,
     > {
-        let request = self.build(messages, tools)?;
+let request = self.build(messages, tools)?;
 
         let stream = self
             .client
@@ -653,7 +659,7 @@ impl LlmProvider for OpenAIProvider {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use async_openai::types::chat::FunctionCallStream;
+    use crate::openai_types::FunctionCallStream;
 
     #[test]
     fn test_new_provider() {
@@ -715,7 +721,7 @@ mod tests {
         ChatCompletionMessageToolCallChunk {
             index,
             id: id.map(|s| s.to_string()),
-            r#type: None,
+            function_type: None,
             function: Some(FunctionCallStream {
                 name: name.map(|s| s.to_string()),
                 arguments: arguments.map(|s| s.to_string()),

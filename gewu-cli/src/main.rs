@@ -23,13 +23,22 @@ async fn run_agent(agent: &mut gewu_core::Agent, prompt: &str) -> Result<()> {
     let mut stream = Box::pin(agent.ask(prompt));
     let mut reasoning = String::new();
     let mut content = String::new();
+    let mut reasoning_started = false;
     while let Some(event_result) = stream.next().await {
         match event_result {
             Ok(event) => match event {
                 AgentEvent::ContentDelta { delta } => {
+                    print!("{}", delta);
+                    std::io::stdout().flush()?;
                     content.push_str(&delta);
                 }
                 AgentEvent::ReasoningDelta { delta } => {
+                    if !reasoning_started {
+                        reasoning_started = true;
+                        print!("{}[thinking] ", DIM_GRAY);
+                    }
+                    print!("{}{}", delta, RESET);
+                    std::io::stdout().flush()?;
                     reasoning.push_str(&delta);
                 }
                 AgentEvent::ToolStart { tool, input } => {
@@ -44,8 +53,8 @@ async fn run_agent(agent: &mut gewu_core::Agent, prompt: &str) -> Result<()> {
                     println!("\n[Tool Finish: {}] Output: {}", tool, display_output);
                 }
                 AgentEvent::Finish { .. } => {
-                    if !reasoning.is_empty() {
-                        print!("{}{}[thinking]{} {}", DIM_GRAY, RESET, RESET, reasoning);
+                    if !reasoning.is_empty() && !reasoning_started {
+                        print!("{}[thinking] {}{}", DIM_GRAY, reasoning, RESET);
                         std::io::stdout().flush()?;
                     }
                     print!("{}", content);
