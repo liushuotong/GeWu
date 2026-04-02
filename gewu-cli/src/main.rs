@@ -53,12 +53,6 @@ async fn run_agent(agent: &mut gewu_core::Agent, prompt: &str) -> Result<()> {
                     println!("\n[Tool Finish: {}] Output: {}", tool, display_output);
                 }
                 AgentEvent::Finish { .. } => {
-                    if !reasoning.is_empty() && !reasoning_started {
-                        print!("{}[thinking] {}{}", DIM_GRAY, reasoning, RESET);
-                        std::io::stdout().flush()?;
-                    }
-                    print!("{}", content);
-                    std::io::stdout().flush()?;
                     println!();
                 }
                 AgentEvent::Error { error } => {
