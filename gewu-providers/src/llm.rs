@@ -23,14 +23,15 @@
 
 use crate::openai_types::{
     ChatCompletionMessageToolCall, ChatCompletionMessageToolCallChunk,
-    ChatCompletionMessageToolCalls,
+    ChatCompletionMessageToolCalls, ChatCompletionRequestAssistantMessageArgs,
     ChatCompletionRequestMessage, ChatCompletionRequestMessageContentPartImage,
     ChatCompletionRequestSystemMessageArgs, ChatCompletionRequestToolMessageArgs,
     ChatCompletionRequestUserMessageArgs, ChatCompletionRequestUserMessageContentPart,
     ChatCompletionTools, ChatCompletionStream, ChatCompletionTool,
     CreateChatCompletionRequest, FunctionCall as OpenAIFunctionCall,
     FunctionObjectArgs, ImageUrl, OpenAIConfig, AssistantMessage,
-    ChatCompletionRequestMessageContentPartText,
+    ChatCompletionRequestMessageContentPartText, FileData,
+    ChatCompletionRequestMessageContentPartFile,
 };
 use crate::Client;
 use async_trait::async_trait;
@@ -151,7 +152,7 @@ impl OpenAIProvider {
     /// For accurate capability settings, use a custom provider implementation.
     fn default_capabilities_for_model(model: &str) -> Capabilities {
         let model_lower = model.to_lowercase();
-        if model_lower.contains("gpt-4o") {
+        if model_lower.contains("gpt-4o") || model_lower.contains("gpt-5") {
             Capabilities {
                 input: gewu_core::types::InputCapabilities {
                     text: true,
@@ -268,13 +269,26 @@ impl OpenAIProvider {
                 ))
             }
             ContentPart::File { data, mime_type } => {
-                let url = format!("data:{};base64,{}", mime_type, data);
-                Some(ChatCompletionRequestUserMessageContentPart::Text(
-                    ChatCompletionRequestMessageContentPartText {
-                        content_type: "text".to_string(),
-                        text: format!("[File: {}]({})", mime_type, url),
-                    },
-                ))
+                if mime_type == "application/pdf" && self.capabilities.input.pdf {
+                    Some(ChatCompletionRequestUserMessageContentPart::File(
+                        ChatCompletionRequestMessageContentPartFile {
+                            content_type: "file".to_string(),
+                            file: FileData {
+                                filename: Some("document.pdf".to_string()),
+                                file_data: Some(data.clone()),
+                                file_id: None,
+                            },
+                        },
+                    ))
+                } else {
+                    let url = format!("data:{};base64,{}", mime_type, data);
+                    Some(ChatCompletionRequestUserMessageContentPart::Text(
+                        ChatCompletionRequestMessageContentPartText {
+                            content_type: "text".to_string(),
+                            text: format!("[File: {}]({})", mime_type, url),
+                        },
+                    ))
+                }
             }
         }
     }

@@ -301,20 +301,50 @@ pub struct ToolMessage {
 pub enum ChatCompletionRequestUserMessageContentPart {
     Text(ChatCompletionRequestMessageContentPartText),
     ImageUrl(ChatCompletionRequestMessageContentPartImage),
+    File(ChatCompletionRequestMessageContentPartFile),
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ChatCompletionRequestMessageContentPartText {
-    #[serde(rename = "type", default)]
+    #[serde(rename = "type", default = "default_text_type")]
     pub content_type: String,
     pub text: String,
 }
 
+fn default_text_type() -> String {
+    "text".to_string()
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ChatCompletionRequestMessageContentPartImage {
-    #[serde(rename = "type", default)]
+    #[serde(rename = "type", default = "default_image_type")]
     pub content_type: String,
     pub image_url: ImageUrl,
+}
+
+fn default_image_type() -> String {
+    "image_url".to_string()
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ChatCompletionRequestMessageContentPartFile {
+    #[serde(rename = "type", default = "default_file_type")]
+    pub content_type: String,
+    pub file: FileData,
+}
+
+fn default_file_type() -> String {
+    "file".to_string()
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct FileData {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub filename: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub file_data: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub file_id: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
