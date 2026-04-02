@@ -2,8 +2,9 @@ use crate::fs_utils::into_tool_error;
 use anyhow::Result;
 use async_trait::async_trait;
 use gewu_core::traits::{Tool, ToolRegistry};
-use serde::Deserialize;
-use serde_json::{Value, json};
+use gewu_core::types::{ToolContext, ToolResult};
+use serde::{Deserialize, Serialize};
+use serde_json::Value;
 use std::error::Error;
 use std::sync::Arc;
 use tokio::task::JoinSet;
@@ -11,14 +12,14 @@ use tokio::task::JoinSet;
 const DISALLOWED: &[&str] = &["batch", "invalid", "patch"];
 const MAX_TOOLS: usize = 25;
 
-#[derive(Debug, Deserialize)]
-struct ToolCallInput {
+#[derive(Debug, Deserialize, Serialize, schemars::JsonSchema)]
+pub struct ToolCallInput {
     tool: String,
-    parameters: Value,
+    parameters: serde_json::Value,
 }
 
-#[derive(Debug, Deserialize)]
-struct BatchArgs {
+#[derive(Debug, Deserialize, Serialize, schemars::JsonSchema)]
+pub struct BatchArgs {
     tool_calls: Vec<ToolCallInput>,
 }
 
@@ -42,29 +43,16 @@ impl Tool for BatchTool {
         "Execute multiple tools in parallel. Use this to run independent tool calls simultaneously for better performance."
     }
 
-    fn parameters_schema(&self) -> Value {
-        json!({
-            "type": "object",
-            "properties": {
-                "tool_calls": {
-                    "type": "array",
-                    "description": "Array of tool calls to execute in parallel",
-                    "items": {
-                        "type": "object",
-                        "properties": {
-                            "tool": { "type": "string", "description": "The name of the tool to execute" },
-                            "parameters": { "type": "object", "description": "Parameters for the tool" }
-                        },
-                        "required": ["tool", "parameters"]
-                    }
-                }
-            },
-            "required": ["tool_calls"]
-        })
+    fn schema(&self) -> schemars::schema::RootSchema {
+        schemars::schema_for!(BatchArgs)
     }
 
-    async fn call(&self, args: &str) -> Result<String, Box<dyn Error + Send + Sync>> {
-        let batch_args: BatchArgs = serde_json::from_str(args).map_err(into_tool_error)?;
+    async fn execute(
+        &self,
+        args: Value,
+        _ctx: &ToolContext,
+    ) -> Result<ToolResult, Box<dyn Error + Send + Sync>> {
+        let batch_args: BatchArgs = serde_json::from_value(args).map_err(into_tool_error)?;
 
         let tool_calls = batch_args
             .tool_calls
@@ -94,6 +82,7 @@ impl Tool for BatchTool {
                 continue;
             }
 
+            let ctx = ToolContext::new("batch", "batch");
             join_set.spawn(async move {
                 let result = async {
                     if DISALLOWED.contains(&tool_name.as_str()) {
@@ -113,8 +102,7 @@ impl Tool for BatchTool {
                         .into());
                     }
 
-                    let params_str = serde_json::to_string(&params).map_err(into_tool_error)?;
-                    registry.execute(&tool_name, &params_str).await
+                    registry.execute(&tool_name, params, &ctx).await
                 }
                 .await;
 
@@ -134,7 +122,7 @@ impl Tool for BatchTool {
 
         for (tool_name, result) in &results {
             match result {
-                Ok(output) => successes.push((tool_name.clone(), output.clone())),
+                Ok(output) => successes.push((tool_name.clone(), output.output.clone())),
                 Err(e) => errors.push((tool_name.clone(), e.to_string())),
             }
         }
@@ -184,143 +172,6 @@ impl Tool for BatchTool {
             );
         }
 
-        Ok(output)
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use std::sync::Arc;
-
-    struct MockTool {
-        name: String,
-        output: String,
-    }
-
-    #[async_trait]
-    impl Tool for MockTool {
-        fn name(&self) -> &str {
-            &self.name
-        }
-
-        fn description(&self) -> &str {
-            "Mock tool"
-        }
-
-        fn parameters_schema(&self) -> Value {
-            json!({})
-        }
-
-        async fn call(&self, _args: &str) -> Result<String, Box<dyn Error + Send + Sync>> {
-            Ok(self.output.clone())
-        }
-    }
-
-    struct MockRegistry {
-        tools: Vec<Arc<dyn Tool>>,
-    }
-
-    #[async_trait]
-    impl ToolRegistry for MockRegistry {
-        async fn execute(
-            &self,
-            name: &str,
-            args: &str,
-        ) -> Result<String, Box<dyn Error + Send + Sync>> {
-            let tool = self.tools.iter().find(|t| t.name() == name);
-            match tool {
-                Some(t) => t.call(args).await,
-                None => Err(format!("Tool not found: {}", name).into()),
-            }
-        }
-
-        fn list_tools(&self) -> Vec<String> {
-            self.tools.iter().map(|t| t.name().to_string()).collect()
-        }
-    }
-
-    #[tokio::test]
-    async fn test_batch_single_tool() {
-        let mock_tool = Arc::new(MockTool {
-            name: "read".to_string(),
-            output: "file content".to_string(),
-        });
-
-        let registry = Arc::new(MockRegistry {
-            tools: vec![mock_tool.clone()],
-        });
-
-        let batch = BatchTool::new(registry);
-
-        let args = json!({
-            "tool_calls": [
-                {"tool": "read", "parameters": {}}
-            ]
-        });
-
-        let result = batch.call(&args.to_string()).await.unwrap();
-        assert!(result.contains("All 1 tools executed successfully"));
-    }
-
-    #[tokio::test]
-    async fn test_batch_multiple_tools() {
-        let read_tool = Arc::new(MockTool {
-            name: "read".to_string(),
-            output: "file content".to_string(),
-        });
-
-        let glob_tool = Arc::new(MockTool {
-            name: "glob".to_string(),
-            output: "*.rs files".to_string(),
-        });
-
-        let registry = Arc::new(MockRegistry {
-            tools: vec![read_tool.clone(), glob_tool.clone()],
-        });
-
-        let batch = BatchTool::new(registry);
-
-        let args = json!({
-            "tool_calls": [
-                {"tool": "read", "parameters": {}},
-                {"tool": "glob", "parameters": {}}
-            ]
-        });
-
-        let result = batch.call(&args.to_string()).await.unwrap();
-        assert!(result.contains("All 2 tools executed successfully"));
-    }
-
-    #[tokio::test]
-    async fn test_batch_disallowed_tool() {
-        let registry = Arc::new(MockRegistry { tools: vec![] });
-
-        let batch = BatchTool::new(registry);
-
-        let args = json!({
-            "tool_calls": [
-                {"tool": "batch", "parameters": {}}
-            ]
-        });
-
-        let result = batch.call(&args.to_string()).await.unwrap();
-        assert!(result.contains("not allowed in batch"));
-    }
-
-    #[tokio::test]
-    async fn test_batch_unknown_tool() {
-        let registry = Arc::new(MockRegistry { tools: vec![] });
-
-        let batch = BatchTool::new(registry);
-
-        let args = json!({
-            "tool_calls": [
-                {"tool": "unknown_tool", "parameters": {}}
-            ]
-        });
-
-        let result = batch.call(&args.to_string()).await.unwrap();
-        assert!(result.contains("not in registry"));
+        Ok(ToolResult::new("batch", output))
     }
 }

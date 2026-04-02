@@ -3,9 +3,8 @@ use futures::StreamExt;
 use futures::stream::BoxStream;
 use gewu_core::Agent;
 use gewu_core::traits::{LlmProvider, Tool};
-use gewu_core::types::{AgentEvent, Message, ProviderEvent};
+use gewu_core::types::{AgentEvent, Message, ProviderEvent, ToolContext, ToolResult};
 use serde_json::Value;
-use serde_json::json;
 use std::error::Error;
 use std::sync::Arc;
 
@@ -26,14 +25,6 @@ impl LlmProvider for MockLlmProvider {
             .filter(|m| matches!(m, Message::Tool { .. }))
             .count();
 
-        // 0 -> call 0
-        // output 0
-        // 1 -> call 1
-        // output 1
-        // 2 -> call 2
-        // output 2
-        // 3 -> call 3 (doom loop triggers HERE)
-
         if tool_response_count >= 5 {
             let s = async_stream::try_stream! {
                 yield ProviderEvent::ContentDelta { delta: "Done".to_string() };
@@ -42,7 +33,6 @@ impl LlmProvider for MockLlmProvider {
             return Ok(Box::pin(s));
         }
 
-        // Return a tool call
         let call_id = format!("call_{}", tool_response_count);
         let s = async_stream::try_stream! {
             yield ProviderEvent::ToolCallStart { id: call_id.clone(), name: "test_tool".to_string() };
@@ -67,11 +57,11 @@ impl Tool for TestTool {
     fn description(&self) -> &str {
         "test"
     }
-    fn parameters_schema(&self) -> Value {
-        json!({})
+    fn schema(&self) -> schemars::schema::RootSchema {
+        schemars::schema_for!(serde_json::Value)
     }
-    async fn call(&self, _args: &str) -> Result<String, Box<dyn std::error::Error + Send + Sync>> {
-        Ok("output".to_string())
+    async fn execute(&self, _args: Value, _ctx: &ToolContext) -> Result<ToolResult, Box<dyn std::error::Error + Send + Sync>> {
+        Ok(ToolResult::new("test_tool", "output".to_string()))
     }
 }
 
@@ -100,7 +90,6 @@ async fn test_doom_loop_detection() {
         }
     }
 
-    // We expect the agent to stop early with the doom loop message
     assert!(
         error_text.contains("Doom loop detected"),
         "Error was: {}",

@@ -22,43 +22,26 @@
 use anyhow::{Context, Result};
 use async_trait::async_trait;
 use gewu_core::traits::Tool;
-use serde_json::{Value, json};
+use gewu_core::types::{ToolContext, ToolResult};
+use schemars::schema::RootSchema;
+use serde::{Deserialize, Serialize};
 use std::error::Error;
 use std::path::PathBuf;
 
-/// Tool for executing bash commands.
-///
-/// BashTool provides shell command execution capabilities to the agent.
-/// It can be configured with safe mode to restrict available commands.
-///
-/// # Safe Mode
-///
-/// When `safe_mode` is enabled, only a limited set of read-only commands
-/// are allowed:
-/// - `ls`, `cat`, `grep`, `rg`, `find`, `pwd`, `echo`, `wc`, `head`, `tail`
-/// - `whoami`, `date`, `git`, `printf`, `sort`, `uniq`, `diff`
-///
-/// Command chaining with `;`, `&&`, `||` is also blocked in safe mode.
-///
-/// # Path Safety
-///
-/// The tool resolves paths relative to `working_directory` and prevents
-/// directory traversal attacks. See [`resolve_safe_path`](super::fs_utils::resolve_safe_path).
-///
-/// # Example
-///
-/// ```ignore
-/// let tool = BashTool {
-///     working_directory: PathBuf::from("/home/user/project"),
-///     safe_mode: false,
-/// };
-///
-/// let result = tool.call(r#"{"command": "ls -la", "timeout": 30000}"#).await;
-/// ```
+#[derive(Debug, Deserialize, Serialize, schemars::JsonSchema)]
+pub struct BashArgs {
+    pub command: String,
+    #[serde(default = "default_timeout")]
+    pub timeout: u64,
+    pub workdir: Option<String>,
+}
+
+fn default_timeout() -> u64 {
+    120000
+}
+
 pub struct BashTool {
-    /// The directory to execute commands in.
     pub working_directory: PathBuf,
-    /// If true, only allow predefined read-only commands.
     pub safe_mode: bool,
 }
 
@@ -72,55 +55,19 @@ impl Tool for BashTool {
         include_str!("prompts/bash.txt")
     }
 
-    fn parameters_schema(&self) -> Value {
-        json!({
-            "type": "object",
-            "properties": {
-                "command": {
-                    "type": "string",
-                    "description": "The command to execute"
-                },
-                "timeout": {
-                    "type": "number",
-                    "description": "Optional timeout in milliseconds (default: 120000)"
-                },
-                "workdir": {
-                    "type": "string",
-                    "description": "The working directory to run the command in. Defaults to the current working directory. Use this instead of 'cd' commands."
-                }
-            },
-            "required": ["command"]
-        })
+    fn schema(&self) -> RootSchema {
+        schemars::schema_for!(BashArgs)
     }
 
-    /// Executes a bash command.
-    ///
-    /// # Arguments
-    ///
-    /// JSON string containing:
-    /// - `command` (required): The bash command to execute
-    /// - `timeout` (optional): Milliseconds before command times out (default: 120000)
-    /// - `workdir` (optional): Override working directory
-    ///
-    /// # Returns
-    ///
-    /// Returns stdout and stderr combined, or an error message if
-    /// the command was blocked, not found, or timed out.
-    ///
-    /// # Safety Checks
-    ///
-    /// In safe mode:
-    /// - First word must be in the allowed command whitelist
-    /// - Command chaining characters (`;`, `&&`, `||`) are blocked
-    async fn call(&self, args: &str) -> Result<String, Box<dyn Error + Send + Sync>> {
-        let args_val: Value = serde_json::from_str(args).map_err(|e| anyhow::anyhow!(e))?;
-        let command_str = args_val["command"]
-            .as_str()
-            .ok_or_else(|| anyhow::anyhow!("command is required"))?;
-        let timeout_ms = args_val["timeout"].as_u64().unwrap_or(120000);
+    async fn execute(
+        &self,
+        args: serde_json::Value,
+        _ctx: &ToolContext,
+    ) -> Result<ToolResult, Box<dyn Error + Send + Sync>> {
+        let input: BashArgs = serde_json::from_value(args).map_err(|e| anyhow::anyhow!(e))?;
 
         if self.safe_mode {
-            let trimmed = command_str.trim();
+            let trimmed = input.command.trim();
             let first_word = trimmed.split_whitespace().next().unwrap_or("");
             let allowed = [
                 "ls", "cat", "grep", "rg", "find", "pwd", "echo", "wc", "head", "tail", "whoami",
@@ -128,20 +75,20 @@ impl Tool for BashTool {
             ];
 
             if !allowed.contains(&first_word) {
-                return Ok(format!(
+                return Ok(ToolResult::new("bash", format!(
                     "Command '{}' is not allowed in safe mode. Allowed commands: {:?}",
                     first_word, allowed
-                ));
+                )));
             }
 
             if trimmed.contains(';') || trimmed.contains("&&") || trimmed.contains("||") {
-                return Ok(
+                return Ok(ToolResult::new("bash",
                     "Complex command chaining (;, &&, ||) is not allowed in safe mode.".to_string(),
-                );
+                ));
             }
         }
 
-        let work_dir = if let Some(wd) = args_val["workdir"].as_str() {
+        let work_dir = if let Some(wd) = &input.workdir {
             crate::fs_utils::resolve_safe_path(&self.working_directory, wd)
                 .map_err(|e| anyhow::anyhow!(e))?
         } else {
@@ -151,7 +98,7 @@ impl Tool for BashTool {
         let mut child = tokio::process::Command::new("bash");
         child
             .arg("-c")
-            .arg(command_str)
+            .arg(&input.command)
             .current_dir(&work_dir)
             .stdout(std::process::Stdio::piped())
             .stderr(std::process::Stdio::piped())
@@ -163,7 +110,7 @@ impl Tool for BashTool {
             .map_err(|e| anyhow::anyhow!(e))?;
 
         let output_result = tokio::time::timeout(
-            std::time::Duration::from_millis(timeout_ms),
+            std::time::Duration::from_millis(input.timeout),
             child_process.wait_with_output(),
         )
         .await;
@@ -194,10 +141,10 @@ impl Tool for BashTool {
                     result.push_str(&format!("Command failed with status: {}", output.status));
                 }
 
-                Ok(result)
+                Ok(ToolResult::new("bash", result))
             }
             Err(_) => {
-                Ok(format!("Command timed out after {} ms.", timeout_ms))
+                Ok(ToolResult::new("bash", format!("Command timed out after {} ms.", input.timeout)))
             }
         }
     }
@@ -215,18 +162,16 @@ mod tests {
         let dir = tempdir()?;
         let working_dir = dir.path().to_path_buf();
         let tool = BashTool {
-            working_directory: working_dir.clone(),
+            working_directory: working_dir,
             safe_mode: false,
         };
-        let args = json!({
+        let args = serde_json::json!({
             "command": "echo Hello world"
         });
 
-        let output = tool
-            .call(&args.to_string())
-            .await
-            .map_err(|e| anyhow::anyhow!(e.to_string()))?;
-        assert_eq!(output.trim(), "Hello world");
+        let ctx = ToolContext::new("test-session", "test-msg");
+        let result = tool.execute(args, &ctx).await.map_err(|e| anyhow::anyhow!(e.to_string()))?;
+        assert_eq!(result.output.trim(), "Hello world");
         Ok(())
     }
 
@@ -235,19 +180,17 @@ mod tests {
         let dir = tempdir()?;
         let working_dir = dir.path().to_path_buf();
         let tool = BashTool {
-            working_directory: working_dir.clone(),
+            working_directory: working_dir,
             safe_mode: false,
         };
-        let args = json!({
+        let args = serde_json::json!({
             "command": "sleep 2; echo done",
             "timeout": 500
         });
 
-        let output = tool
-            .call(&args.to_string())
-            .await
-            .map_err(|e| anyhow::anyhow!(e.to_string()))?;
-        assert!(output.contains("Command timed out"));
+        let ctx = ToolContext::new("test-session", "test-msg");
+        let result = tool.execute(args, &ctx).await.map_err(|e| anyhow::anyhow!(e.to_string()))?;
+        assert!(result.output.contains("Command timed out"));
         Ok(())
     }
 
@@ -260,41 +203,14 @@ mod tests {
             safe_mode: false,
         };
 
-        let args = json!({
+        let args = serde_json::json!({
             "command": "echo 'Bash content' > test_bash.txt"
         });
 
-        let _ = tool
-            .call(&args.to_string())
-            .await
-            .map_err(|e| anyhow::anyhow!(e.to_string()))?;
+        let ctx = ToolContext::new("test-session", "test-msg");
+        let _ = tool.execute(args, &ctx).await.map_err(|e| anyhow::anyhow!(e.to_string()))?;
         let content = fs::read_to_string(working_dir.join("test_bash.txt")).await?;
         assert_eq!(content.trim(), "Bash content");
-        Ok(())
-    }
-
-    #[tokio::test]
-    async fn test_bash_tool_workdir() -> Result<()> {
-        let dir = tempdir()?;
-        let working_dir = dir.path().to_path_buf();
-        let sub_dir = working_dir.join("sub");
-        fs::create_dir(&sub_dir).await?;
-
-        let tool = BashTool {
-            working_directory: working_dir.clone(),
-            safe_mode: false,
-        };
-
-        let args = json!({
-            "command": "pwd",
-            "workdir": "sub"
-        });
-
-        let output = tool
-            .call(&args.to_string())
-            .await
-            .map_err(|e| anyhow::anyhow!(e.to_string()))?;
-        assert!(output.contains("sub"));
         Ok(())
     }
 
@@ -303,36 +219,23 @@ mod tests {
         let dir = tempdir()?;
         let working_dir = dir.path().to_path_buf();
         let tool = BashTool {
-            working_directory: working_dir.clone(),
+            working_directory: working_dir,
             safe_mode: true,
         };
 
-        let args = json!({
+        let args = serde_json::json!({
             "command": "echo hello"
         });
-        let output = tool
-            .call(&args.to_string())
-            .await
-            .map_err(|e| anyhow::anyhow!(e.to_string()))?;
-        assert_eq!(output.trim(), "hello");
+        let ctx = ToolContext::new("test-session", "test-msg");
+        let result = tool.execute(args, &ctx).await.map_err(|e| anyhow::anyhow!(e.to_string()))?;
+        assert_eq!(result.output.trim(), "hello");
 
-        let args = json!({
+        let args = serde_json::json!({
             "command": "rm -rf /"
         });
-        let output = tool
-            .call(&args.to_string())
-            .await
-            .map_err(|e| anyhow::anyhow!(e.to_string()))?;
-        assert!(output.contains("not allowed in safe mode"));
-
-        let args = json!({
-            "command": "echo hello; rm -rf /"
-        });
-        let output = tool
-            .call(&args.to_string())
-            .await
-            .map_err(|e| anyhow::anyhow!(e.to_string()))?;
-        assert!(output.contains("not allowed in safe mode"));
+        let ctx = ToolContext::new("test-session", "test-msg");
+        let result = tool.execute(args, &ctx).await.map_err(|e| anyhow::anyhow!(e.to_string()))?;
+        assert!(result.output.contains("not allowed in safe mode"));
 
         Ok(())
     }

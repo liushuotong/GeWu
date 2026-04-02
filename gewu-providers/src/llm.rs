@@ -424,10 +424,13 @@ impl OpenAIProvider {
     ) -> Result<Vec<ChatCompletionTools>, Box<dyn Error + Send + Sync>> {
         let mut openai_tools: Vec<ChatCompletionTools> = Vec::new();
         for tool in tools {
+            let schema = tool.schema();
+            let parameters = serde_json::to_value(&schema)
+                .map_err(|e| Box::new(e) as Box<dyn Error + Send + Sync>)?;
             let function = FunctionObjectArgs::default()
                 .name(tool.name())
                 .description(tool.description())
-                .parameters(tool.parameters_schema())
+                .parameters(parameters)
                 .build()
                 .map_err(|e| Box::new(e) as Box<dyn Error + Send + Sync>)?;
 

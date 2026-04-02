@@ -38,25 +38,20 @@
 //! ```
 
 use crate::compaction::{self, estimate_message_tokens, is_overflow};
+use crate::middleware::TruncationService;
 use crate::traits::{LlmProvider, Memory, Tool, ToolRegistry};
-use crate::types::{AgentEvent, ContentPart, FunctionCall, Message, ProviderEvent, ToolCall};
+use crate::types::{
+    AgentEvent, ContentPart, FunctionCall, Message, ProviderEvent, ToolCall, ToolContext,
+    ToolResult,
+};
 use anyhow::{Context, Result};
 use async_trait::async_trait;
 use futures::{Stream, StreamExt};
 use serde::Deserialize;
 use std::sync::Arc;
 use tracing::{debug, info};
+use uuid::Uuid;
 
-/// The main agent runtime that processes requests and manages conversation flow.
-///
-/// The agent holds:
-/// - An LLM provider for generating responses
-/// - A collection of available tools
-/// - A system prompt for agent behavior
-/// - Optional max turns limit
-/// - A memory backend for conversation history
-///
-/// Use [`Agent::builder`] to construct an Agent instance.
 pub struct Agent {
     llm: Arc<dyn LlmProvider>,
     tools: Arc<Vec<Arc<dyn Tool>>>,
@@ -64,33 +59,10 @@ pub struct Agent {
     max_turns: Option<usize>,
     pub memory: Box<dyn Memory>,
     pub context_limit: usize,
+    truncation: TruncationService,
+    session_id: String,
 }
 
-/// Builder for constructing an [`Agent`] instance.
-///
-/// Follows the builder pattern to allow flexible configuration:
-/// - LLM provider (required)
-/// - Tools (optional, defaults to empty)
-/// - System prompt (optional, defaults to empty)
-/// - Max turns (optional)
-/// - Memory backend (optional, defaults to in-memory Vec)
-/// - Context limit (optional, defaults to 128,000 tokens)
-///
-/// # Example
-///
-/// ```
-/// use gewu_core::Agent;
-/// use std::sync::Arc;
-///
-/// // In real usage, provide an actual LLM provider:
-/// // let provider = Arc::new(MyLlmProvider::new());
-/// // let agent = Agent::builder()
-/// //     .llm(provider)
-/// //     .with_tools(vec![])
-/// //     .system_prompt("You are a helpful assistant.")
-/// //     .build()
-/// //     .unwrap();
-/// ```
 pub struct AgentBuilder {
     llm: Option<Arc<dyn LlmProvider>>,
     tools: Arc<Vec<Arc<dyn Tool>>>,
@@ -114,16 +86,10 @@ impl Default for AgentBuilder {
 }
 
 impl Agent {
-    /// Creates a new builder for constructing an Agent.
     pub fn builder() -> AgentBuilder {
         AgentBuilder::default()
     }
 
-    /// Resets the conversation history, preserving the system prompt.
-    ///
-    /// Clears all messages from memory and re-adds the system prompt if
-    /// one was configured. This is useful for starting a fresh conversation
-    /// while maintaining the same agent configuration.
     pub async fn reset(&mut self) {
         self.memory.clear().await;
         if !self.system_prompt.is_empty() {
@@ -135,38 +101,6 @@ impl Agent {
         }
     }
 
-    /// Sends a message to the agent and gets a response stream.
-    ///
-    /// This is the main entry point for interacting with the agent. The method
-    /// returns a stream of [`AgentEvent`]s that represent the progress of the
-    /// agent's execution. The caller should iterate over the stream to receive
-    /// content deltas, tool execution events, and the final response.
-    ///
-    /// # Arguments
-    ///
-    /// * `user_message` - The message to send to the agent.
-    ///
-    /// # Returns
-    ///
-    /// A stream of [`AgentEvent`] objects. The stream will emit:
-    ///
-    /// - [`AgentEvent::ContentDelta`] - Text content as it arrives
-    /// - [`AgentEvent::ReasoningDelta`] - Reasoning/thinking content as it arrives
-    /// - [`AgentEvent::ToolStart`] - When a tool execution begins
-    /// - [`AgentEvent::ToolFinish`] - When a tool execution completes
-    /// - [`AgentEvent::Finish`] - When the agent has produced a final response
-    /// - [`AgentEvent::Error`] - If an error occurs
-    ///
-    /// # Loop Behavior
-    ///
-    /// Each call to `ask` executes one full turn:
-    ///
-    /// 1. Adds user message to history
-    /// 2. Checks for context overflow, triggers compaction if needed
-    /// 3. Calls LLM with current history and tools
-    /// 4. Streams response events
-    /// 5. Executes any requested tools and adds results to history
-    /// 6. Yields final response when LLM indicates completion
     pub fn ask<'a>(
         &'a mut self,
         user_message: &'a str,
@@ -180,6 +114,7 @@ impl Agent {
 
             let mut turn = 0;
             let mut recent_tool_calls: Vec<(String, String)> = Vec::new();
+            let mut message_id = Uuid::new_v4().to_string();
 
             loop {
                 if self.compact_if_needed().await? {
@@ -280,12 +215,35 @@ impl Agent {
 
                     yield AgentEvent::ToolStart { tool: tool_name.clone(), input: args.clone() };
 
+                    let ctx = ToolContext::new(&self.session_id, &message_id);
+                    message_id = Uuid::new_v4().to_string();
+
                     let tool = self.tools.iter().find(|t| t.name() == tool_name);
 
                     let result_content = if let Some(t) = tool {
                         info!("Executing tool: {}", tool_name);
-                        match t.call(&args).await {
-                            Ok(res) => res,
+                        let args_val: serde_json::Value = match serde_json::from_str(&args) {
+                            Ok(v) => v,
+                            Err(e) => {
+                                yield AgentEvent::Error { error: format!("Failed to parse arguments: {}", e) };
+                                continue;
+                            }
+                        };
+                        match t.execute(args_val, &ctx).await {
+                            Ok(res) => {
+                                let truncation_result = self.truncation.truncate(&res.output, false);
+                                let output = if truncation_result.truncated {
+                                    format!(
+                                        "{}\n\n[Output truncated - {} bytes saved to {}]",
+                                        truncation_result.content,
+                                        truncation_result.content.len(),
+                                        truncation_result.output_path.map(|p| p.display().to_string()).unwrap_or_default()
+                                    )
+                                } else {
+                                    res.output
+                                };
+                                output
+                            }
                             Err(e) => format!("Error executing tool: {}", e),
                         }
                     } else {
@@ -306,37 +264,6 @@ impl Agent {
         }
     }
 
-    /// Checks if the current history exceeds the token limit and triggers summarization.
-    ///
-    /// When the estimated token count of the conversation history exceeds the
-    /// configured context limit (minus a buffer), this method uses the LLM to
-    /// create a summary of the conversation. The summary replaces the old
-    /// messages while preserving:
-    ///
-    /// - The system prompt (if any)
-    /// - The summary message
-    /// - The last user message (to maintain context about what the user just asked)
-    ///
-    /// # Summary Format
-    ///
-    /// The generated summary follows a structured template:
-    ///
-    /// ```markdown
-    /// ## Goal
-    /// [What goal(s) is the user trying to accomplish?]
-    ///
-    /// ## Instructions
-    /// [What important instructions did the user give you]
-    ///
-    /// ## Discoveries
-    /// [What notable things were learned]
-    ///
-    /// ## Accomplished
-    /// [What work has been completed]
-    ///
-    /// ## Relevant files / directories
-    /// [Files that have been read, edited, or created]
-    /// ```
     async fn compact_if_needed(&mut self) -> Result<bool> {
         let mut total_tokens: usize = 0;
         for msg in self.memory.messages() {
@@ -442,11 +369,12 @@ impl ToolRegistry for Agent {
     async fn execute(
         &self,
         name: &str,
-        args: &str,
-    ) -> Result<String, Box<dyn std::error::Error + Send + Sync>> {
+        args: serde_json::Value,
+        ctx: &ToolContext,
+    ) -> Result<ToolResult, Box<dyn std::error::Error + Send + Sync>> {
         let tool = self.tools.iter().find(|t| t.name() == name);
         match tool {
-            Some(t) => t.call(args).await,
+            Some(t) => t.execute(args, ctx).await,
             None => Err(format!("Tool not found: {}", name).into()),
         }
     }
@@ -457,65 +385,36 @@ impl ToolRegistry for Agent {
 }
 
 impl AgentBuilder {
-    /// Sets the LLM provider for the agent.
-    ///
-    /// This is a required field - the agent cannot function without an LLM provider.
     pub fn llm(mut self, llm: Arc<dyn LlmProvider>) -> Self {
         self.llm = Some(llm);
         self
     }
 
-    /// Sets the tools available to the agent.
-    ///
-    /// Tools are how the agent interacts with the outside world. The agent
-    /// can call any of these tools during its execution.
     pub fn with_tools(mut self, tools: Vec<Arc<dyn Tool>>) -> Self {
         self.tools = Arc::new(tools);
         self
     }
 
-    /// Sets the system prompt for the agent.
-    ///
-    /// The system prompt is added to the conversation when it is empty and
-    /// provides instructions that guide the agent's behavior.
     pub fn system_prompt(mut self, prompt: &str) -> Self {
         self.system_prompt = prompt.to_string();
         self
     }
 
-    /// Sets the maximum number of turns the agent can execute.
-    ///
-    /// A "turn" is one LLM call. If set, the agent will stop after the
-    /// specified number of turns and return an error.
     pub fn max_turns(mut self, max_turns: Option<usize>) -> Self {
         self.max_turns = max_turns;
         self
     }
 
-    /// Sets the context limit for the agent.
-    ///
-    /// This is the maximum number of tokens the agent will allow in the
-    /// conversation history before triggering compaction. Defaults to 128,000.
     pub fn context_limit(mut self, limit: usize) -> Self {
         self.context_limit = limit;
         self
     }
 
-    /// Sets the memory backend for conversation history.
-    ///
-    /// If not set, defaults to an in-memory Vec implementation.
-    /// Use [`SqliteMemory`](https://docs.rs/gewu-storage/latest/gewu_storage/struct.SqliteMemory.html)
-    /// for persistent storage across sessions.
     pub fn memory(mut self, memory: Box<dyn Memory>) -> Self {
         self.memory = Some(memory);
         self
     }
 
-    /// Builds the [`Agent`] instance.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error if the LLM provider is not set.
     pub fn build(self) -> Result<Agent> {
         let llm = self.llm.context("LLM provider is required")?;
         let agent = Agent {
@@ -525,6 +424,8 @@ impl AgentBuilder {
             max_turns: self.max_turns,
             memory: self.memory.unwrap_or_else(|| Box::new(Vec::new())),
             context_limit: self.context_limit,
+            truncation: TruncationService::new(),
+            session_id: Uuid::new_v4().to_string(),
         };
         Ok(agent)
     }
@@ -540,20 +441,6 @@ struct MediaPayload {
     message: Option<String>,
 }
 
-/// Extracts media parts from a tool result string.
-///
-/// Some tools (particularly file reading tools) can return media in addition
-/// to text content. This function parses JSON tool results that contain a
-/// `type: "media"` field and extracts the contained media parts.
-///
-/// # Arguments
-///
-/// * `content` - A JSON string that may contain a media payload.
-///
-/// # Returns
-///
-/// A vector of [`ContentPart`] objects extracted from the media payload,
-/// or an empty vector if the content is not a media payload.
 fn extract_media_parts(content: &str) -> Vec<ContentPart> {
     let parsed: MediaPayload = match serde_json::from_str(content) {
         Ok(value) => value,

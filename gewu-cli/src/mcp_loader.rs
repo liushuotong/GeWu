@@ -2,6 +2,7 @@ use anyhow::Result;
 use gewu_core::traits::Tool;
 use gewu_tools::mcp::types::McpServerConfig;
 use gewu_tools::mcp::{McpClient, McpToolWrapper};
+use schemars::schema::RootSchema;
 use std::collections::HashMap;
 use std::sync::Arc;
 use tokio::sync::Mutex;
@@ -38,11 +39,18 @@ pub async fn load_mcp_tools(
                 let client_arc = Arc::new(Mutex::new(client));
 
                 for tool in mcp_tools {
+                    let schema: Result<RootSchema, _> = serde_json::from_value(tool.input_schema.clone());
+                    let schema = schema.unwrap_or_else(|_| {
+                        serde_json::from_value(serde_json::json!({
+                            "type": "object",
+                            "properties": {}
+                        })).unwrap()
+                    });
                     tools.push(Box::new(McpToolWrapper {
                         client: client_arc.clone(),
                         name: tool.name,
                         description: tool.description.unwrap_or_default(),
-                        schema: tool.input_schema,
+                        schema,
                     }));
                 }
             }

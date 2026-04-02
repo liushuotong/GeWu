@@ -3,7 +3,7 @@ use futures::StreamExt;
 use futures::stream::BoxStream;
 use gewu_core::agent::AgentBuilder;
 use gewu_core::traits::{LlmProvider, Tool};
-use gewu_core::types::{AgentEvent, FunctionCall, Message, ProviderEvent, ToolCall};
+use gewu_core::types::{AgentEvent, FunctionCall, Message, ProviderEvent, ToolCall, ToolContext, ToolResult};
 use serde_json::Value;
 use std::error::Error;
 use std::sync::{Arc, Mutex};
@@ -71,11 +71,11 @@ impl Tool for MockTool {
     fn description(&self) -> &str {
         "Mock tool"
     }
-    fn parameters_schema(&self) -> Value {
-        serde_json::json!({})
+    fn schema(&self) -> schemars::schema::RootSchema {
+        schemars::schema_for!(serde_json::Value)
     }
-    async fn call(&self, _args: &str) -> Result<String, Box<dyn Error + Send + Sync>> {
-        Ok("Tool output".to_string())
+    async fn execute(&self, _args: Value, _ctx: &ToolContext) -> Result<ToolResult, Box<dyn Error + Send + Sync>> {
+        Ok(ToolResult::new("mock_tool", "Tool output".to_string()))
     }
 }
 
@@ -91,12 +91,10 @@ async fn test_agent_loop() {
     };
 
     let responses = vec![
-        // 1. LLM decides to call tool
         Message::Assistant {
             content: None,
             tool_calls: Some(vec![tool_call]),
         },
-        // 2. LLM sees tool output and gives final answer
         Message::Assistant {
             content: Some("Done: Tool output".to_string()),
             tool_calls: None,

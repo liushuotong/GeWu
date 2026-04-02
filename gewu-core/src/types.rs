@@ -7,6 +7,13 @@
 //! - [`ProviderEvent`] - Events emitted by LLM providers during streaming
 //! - [`AgentEvent`] - Events emitted by the agent during agent execution
 //! - [`Capabilities`] - Model capabilities for input/output modalities
+//! - [`ToolResult`] - Structured result from tool execution
+//! - [`ToolContext`] - Execution context passed to tools
+//! - [`FileAttachment`] - File attachment in tool results
+//! - [`TruncationResult`] - Result of output truncation
+
+use std::path::PathBuf;
+use std::sync::Arc;
 
 use serde::{Deserialize, Serialize};
 
@@ -204,4 +211,71 @@ pub enum Message {
         #[serde(default, skip_serializing_if = "Vec::is_empty")]
         media: Vec<ContentPart>,
     },
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct FileAttachment {
+    pub path: PathBuf,
+    pub mime: Option<String>,
+    pub size: u64,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct ToolResult {
+    pub title: String,
+    pub output: String,
+    #[serde(default)]
+    pub metadata: std::collections::HashMap<String, serde_json::Value>,
+    #[serde(default)]
+    pub attachments: Vec<FileAttachment>,
+    pub truncated: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub output_path: Option<PathBuf>,
+}
+
+impl ToolResult {
+    pub fn new(title: impl Into<String>, output: impl Into<String>) -> Self {
+        Self {
+            title: title.into(),
+            output: output.into(),
+            metadata: Default::default(),
+            attachments: Default::default(),
+            truncated: false,
+            output_path: None,
+        }
+    }
+}
+
+#[derive(Clone, Debug)]
+pub struct ToolContext {
+    pub session_id: String,
+    pub message_id: String,
+    pub abort: Arc<std::sync::atomic::AtomicBool>,
+    pub metadata: std::collections::HashMap<String, serde_json::Value>,
+}
+
+impl ToolContext {
+    pub fn new(session_id: impl Into<String>, message_id: impl Into<String>) -> Self {
+        Self {
+            session_id: session_id.into(),
+            message_id: message_id.into(),
+            abort: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            metadata: Default::default(),
+        }
+    }
+
+    pub fn is_aborted(&self) -> bool {
+        self.abort.load(std::sync::atomic::Ordering::SeqCst)
+    }
+
+    pub fn abort(&self) {
+        self.abort.store(true, std::sync::atomic::Ordering::SeqCst);
+    }
+}
+
+#[derive(Clone, Debug)]
+pub struct TruncationResult {
+    pub content: String,
+    pub truncated: bool,
+    pub output_path: Option<PathBuf>,
 }

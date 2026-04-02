@@ -10,23 +10,37 @@ use anyhow::Result;
 use async_trait::async_trait;
 use futures_util::StreamExt;
 use gewu_core::traits::Tool;
+use gewu_core::types::{ToolContext, ToolResult};
 use reqwest::Client;
+use schemars::schema::RootSchema;
 use serde::Deserialize;
-use serde_json::{Value, json};
 use std::error::Error;
 
-/// Tool for semantic code search.
-///
-/// Uses an external MCP (Model Context Protocol) server (hosted by Exa) to perform
-/// embedding-based search over the codebase.
+#[derive(Deserialize, schemars::JsonSchema)]
+pub struct CodeSearchArgs {
+    query: String,
+    #[serde(rename = "tokensNum", default = "default_tokens")]
+    tokens_num: u32,
+}
+
+fn default_tokens() -> u32 {
+    5000
+}
+
+#[derive(Deserialize, schemars::JsonSchema)]
+pub struct WebSearchArgs {
+    query: String,
+    #[serde(rename = "numResults", default = "default_num_results")]
+    num_results: u32,
+}
+
+fn default_num_results() -> u32 {
+    8
+}
+
 pub struct CodeSearchTool;
 
-#[derive(Deserialize)]
-struct CodeSearchArgs {
-    query: String,
-    #[serde(rename = "tokensNum")]
-    tokens_num: Option<u32>,
-}
+pub struct WebSearchTool;
 
 #[async_trait]
 impl Tool for CodeSearchTool {
@@ -38,23 +52,19 @@ impl Tool for CodeSearchTool {
         include_str!("prompts/codesearch.txt")
     }
 
-    fn parameters_schema(&self) -> Value {
-        json!({
-            "type": "object",
-            "properties": {
-                "query": { "type": "string", "description": "Search query" },
-                "tokensNum": { "type": "integer", "description": "Number of tokens (default 5000)" }
-            },
-            "required": ["query"]
-        })
+    fn schema(&self) -> RootSchema {
+        schemars::schema_for!(CodeSearchArgs)
     }
 
-    async fn call(&self, args: &str) -> Result<String, Box<dyn Error + Send + Sync>> {
-        let input: CodeSearchArgs = serde_json::from_str(args).map_err(into_tool_error)?;
+    async fn execute(
+        &self,
+        args: serde_json::Value,
+        _ctx: &ToolContext,
+    ) -> Result<ToolResult, Box<dyn Error + Send + Sync>> {
+        let input: CodeSearchArgs = serde_json::from_value(args).map_err(into_tool_error)?;
 
         let client = Client::new();
-        // Call the Exa MCP endpoint
-        let body = json!({
+        let body = serde_json::json!({
             "jsonrpc": "2.0",
             "id": 1,
             "method": "tools/call",
@@ -62,7 +72,7 @@ impl Tool for CodeSearchTool {
                 "name": "get_code_context_exa",
                 "arguments": {
                     "query": input.query,
-                    "tokensNum": input.tokens_num.unwrap_or(5000)
+                    "tokensNum": input.tokens_num
                 }
             }
         });
@@ -77,11 +87,9 @@ impl Tool for CodeSearchTool {
             .map_err(into_tool_error)?;
 
         if !res.status().is_success() {
-            return Err(anyhow::anyhow!("Request failed: {}", res.status()).into());
+            return Ok(ToolResult::new("codesearch", format!("Request failed: {}", res.status())));
         }
 
-        // The response is SSE (text/event-stream)
-        // We parse the stream to find the result content
         let mut stream = res.bytes_stream();
         let mut buffer = String::new();
         let mut results = String::new();
@@ -97,7 +105,7 @@ impl Tool for CodeSearchTool {
 
                 if line.starts_with("data: ") {
                     let data_str = &line[6..];
-                    if let Ok(val) = serde_json::from_str::<Value>(data_str) {
+                    if let Ok(val) = serde_json::from_str::<serde_json::Value>(data_str) {
                         if let Some(content) = val
                             .get("result")
                             .and_then(|r| r.get("content"))
@@ -117,24 +125,12 @@ impl Tool for CodeSearchTool {
             }
         }
 
-        if !results.is_empty() {
-            return Ok(results);
+        if results.is_empty() {
+            results = "No results found.".to_string();
         }
 
-        Ok("No results found.".to_string())
+        Ok(ToolResult::new("codesearch", results))
     }
-}
-
-/// Tool for web search.
-///
-/// Uses Exa to retrieve search results from the web.
-pub struct WebSearchTool;
-
-#[derive(Deserialize)]
-struct WebSearchArgs {
-    query: String,
-    #[serde(rename = "numResults")]
-    num_results: Option<u32>,
 }
 
 #[async_trait]
@@ -147,22 +143,19 @@ impl Tool for WebSearchTool {
         include_str!("prompts/websearch.txt")
     }
 
-    fn parameters_schema(&self) -> Value {
-        json!({
-            "type": "object",
-            "properties": {
-                "query": { "type": "string", "description": "Search query" },
-                "numResults": { "type": "integer", "description": "Number of results (default 8)" }
-            },
-            "required": ["query"]
-        })
+    fn schema(&self) -> RootSchema {
+        schemars::schema_for!(WebSearchArgs)
     }
 
-    async fn call(&self, args: &str) -> Result<String, Box<dyn Error + Send + Sync>> {
-        let input: WebSearchArgs = serde_json::from_str(args).map_err(into_tool_error)?;
+    async fn execute(
+        &self,
+        args: serde_json::Value,
+        _ctx: &ToolContext,
+    ) -> Result<ToolResult, Box<dyn Error + Send + Sync>> {
+        let input: WebSearchArgs = serde_json::from_value(args).map_err(into_tool_error)?;
 
         let client = Client::new();
-        let body = json!({
+        let body = serde_json::json!({
             "jsonrpc": "2.0",
             "id": 1,
             "method": "tools/call",
@@ -170,7 +163,7 @@ impl Tool for WebSearchTool {
                 "name": "web_search_exa",
                 "arguments": {
                     "query": input.query,
-                    "numResults": input.num_results.unwrap_or(8),
+                    "numResults": input.num_results,
                     "type": "auto",
                     "livecrawl": "fallback"
                 }
@@ -187,7 +180,7 @@ impl Tool for WebSearchTool {
             .map_err(into_tool_error)?;
 
         if !res.status().is_success() {
-            return Err(anyhow::anyhow!("Request failed: {}", res.status()).into());
+            return Ok(ToolResult::new("websearch", format!("Request failed: {}", res.status())));
         }
 
         let mut stream = res.bytes_stream();
@@ -205,7 +198,7 @@ impl Tool for WebSearchTool {
 
                 if line.starts_with("data: ") {
                     let data_str = &line[6..];
-                    if let Ok(val) = serde_json::from_str::<Value>(data_str) {
+                    if let Ok(val) = serde_json::from_str::<serde_json::Value>(data_str) {
                         if let Some(content) = val
                             .get("result")
                             .and_then(|r| r.get("content"))
@@ -225,10 +218,10 @@ impl Tool for WebSearchTool {
             }
         }
 
-        if !results.is_empty() {
-            return Ok(results);
+        if results.is_empty() {
+            results = "No results found.".to_string();
         }
 
-        Ok("No results found.".to_string())
+        Ok(ToolResult::new("websearch", results))
     }
 }

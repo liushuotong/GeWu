@@ -47,9 +47,10 @@
 
 pub mod agent;
 pub mod compaction;
+pub mod middleware;
 pub mod traits;
 pub mod types;
 
 pub use agent::Agent;
 pub use traits::{LlmProvider, Memory, Tool, ToolRegistry};
-pub use types::Message;
+pub use types::{FileAttachment, Message, ToolContext, ToolResult, TruncationResult};

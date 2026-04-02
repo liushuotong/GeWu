@@ -1,8 +1,10 @@
 use anyhow::Result;
 use async_trait::async_trait;
 use gewu_core::traits::{LlmProvider, Tool};
+use gewu_core::types::{ToolContext, ToolResult};
+use schemars::schema::RootSchema;
 use serde::Deserialize;
-use serde_json::{Value, json};
+use serde_json::{json, Value};
 use sqlx::SqlitePool;
 use std::error::Error;
 use std::sync::Arc;
@@ -17,6 +19,15 @@ pub struct TaskTool {
 
 #[derive(Deserialize)]
 struct TaskArgs {
+    description: String,
+    prompt: String,
+    subagent_type: String,
+    #[serde(default)]
+    task_id: Option<String>,
+}
+
+#[derive(Deserialize)]
+struct TaskArgsJson {
     description: String,
     prompt: String,
     subagent_type: String,
@@ -44,6 +55,22 @@ impl TaskTool {
 
         include_str!("prompts/task.txt").replace("{agents}", &agent_list)
     }
+
+    fn build_schema() -> RootSchema {
+        serde_json::from_value(json!({
+            "type": "object",
+            "properties": {
+                "description": { "type": "string", "description": "A short (3-5 words) description of the task" },
+                "prompt": { "type": "string", "description": "The task for the agent to perform" },
+                "subagent_type": { "type": "string", "description": "The type of specialized agent to use for this task" },
+                "task_id": {
+                    "type": "string",
+                    "description": "This should only be set if you mean to resume a previous task (you can pass a prior task_id and the task will continue the same subagent session as before instead of creating a fresh one)"
+                }
+            },
+            "required": ["description", "prompt", "subagent_type"]
+        })).unwrap()
+    }
 }
 
 #[async_trait]
@@ -56,24 +83,16 @@ impl Tool for TaskTool {
         &self.description
     }
 
-    fn parameters_schema(&self) -> Value {
-        json!({
-            "type": "object",
-            "properties": {
-                "description": { "type": "string", "description": "A short (3-5 words) description of the task" },
-                "prompt": { "type": "string", "description": "The task for the agent to perform" },
-                "subagent_type": { "type": "string", "description": "The type of specialized agent to use for this task" },
-                "task_id": {
-                    "type": "string",
-                    "description": "This should only be set if you mean to resume a previous task (you can pass a prior task_id and the task will continue the same subagent session as before instead of creating a fresh one)"
-                }
-            },
-            "required": ["description", "prompt", "subagent_type"]
-        })
+    fn schema(&self) -> RootSchema {
+        Self::build_schema()
     }
 
-    async fn call(&self, args: &str) -> Result<String, Box<dyn Error + Send + Sync>> {
-        let input: TaskArgs = serde_json::from_str(args)?;
+    async fn execute(
+        &self,
+        args: Value,
+        _ctx: &ToolContext,
+    ) -> Result<ToolResult, Box<dyn Error + Send + Sync>> {
+        let input: TaskArgsJson = serde_json::from_value(args)?;
 
         let session_id = input.task_id.unwrap_or_else(|| Uuid::new_v4().to_string());
 
@@ -87,12 +106,11 @@ impl Tool for TaskTool {
             self.provider.clone(),
             self.pool.clone(),
             session_id.clone(),
-            Vec::new(), // Sub-agents do not inherit MCP tools by default
+            Vec::new(),
         )
         .await
         .map_err(|e| format!("Failed to create agent: {}", e))?;
 
-        // Run the agent and accumulate the response
         let mut stream = Box::pin(agent.ask(&input.prompt));
         let mut result = String::new();
         use futures::StreamExt;
@@ -116,9 +134,9 @@ impl Tool for TaskTool {
             }
         }
 
-        Ok(format!(
+        Ok(ToolResult::new("task", format!(
             "task_id: {}\n\n<task_result>\n{}\n</task_result>",
             session_id, result
-        ))
+        )))
     }
 }

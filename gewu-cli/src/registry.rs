@@ -3,11 +3,13 @@ use anyhow::{Result, anyhow};
 use async_trait::async_trait;
 use gewu_core::Agent;
 use gewu_core::traits::{LlmProvider, Tool, ToolRegistry};
+use gewu_core::types::{ToolContext, ToolResult};
 use gewu_storage::SqliteMemory;
 use gewu_tools::{
     BashTool, BatchTool, CodeSearchTool, EditFileTool, GlobTool, GrepTool, ListTool, ReadFileTool,
     TodoItem, TodoReadTool, TodoWriteTool, WebFetchTool, WebSearchTool, WriteFileTool,
 };
+use serde_json::Value;
 use sqlx::SqlitePool;
 use std::sync::{Arc, Mutex};
 
@@ -42,11 +44,12 @@ impl ToolRegistry for ToolRegistryImpl {
     async fn execute(
         &self,
         name: &str,
-        args: &str,
-    ) -> Result<String, Box<dyn std::error::Error + Send + Sync>> {
+        args: Value,
+        ctx: &ToolContext,
+    ) -> Result<ToolResult, Box<dyn std::error::Error + Send + Sync>> {
         let tool = self.tools.iter().find(|t| t.name() == name);
         match tool {
-            Some(t) => t.call(args).await,
+            Some(t) => t.execute(args, ctx).await,
             None => Err(format!("Tool not found: {}", name).into()),
         }
     }
