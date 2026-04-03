@@ -4,11 +4,15 @@ use axum::{
     Json,
 };
 use std::sync::Arc;
-use tracing::{info, warn};
 
 #[derive(Debug, serde::Deserialize)]
 pub struct CreateSessionRequest {
     pub agent_type: String,
+}
+
+#[derive(Debug, serde::Deserialize)]
+pub struct TokenQuery {
+    pub token: Option<String>,
 }
 
 #[derive(Debug, serde::Serialize)]
@@ -26,66 +30,58 @@ pub struct MessageResponse {
     pub message: String,
 }
 
-#[derive(Debug, serde::Deserialize)]
-pub struct TokenQuery {
-    pub token: Option<String>,
+#[derive(Debug, serde::Serialize)]
+pub struct ServerInfo {
+    pub model: String,
+    pub endpoint: String,
+}
+
+#[derive(Debug, serde::Serialize)]
+pub struct ValidateResponse {
+    pub valid: bool,
+}
+
+pub async fn handle_validate(
+    State(app): State<Arc<AppState>>,
+    Query(query): Query<TokenQuery>,
+) -> Result<Json<ValidateResponse>, AppError> {
+    let token = query.token.as_ref().ok_or(AppError::Unauthorized)?;
+    let auth = app.auth_token.read().await;
+    if !auth.validate(token) {
+        return Err(AppError::Unauthorized);
+    }
+    Ok(Json(ValidateResponse { valid: true }))
+}
+
+pub async fn handle_server_info(
+    State(app): State<Arc<AppState>>,
+) -> Result<Json<ServerInfo>, AppError> {
+    let config = app.get_config().await;
+    Ok(Json(ServerInfo {
+        model: config.model.unwrap_or_else(|| "unknown".to_string()),
+        endpoint: config.endpoint.unwrap_or_else(|| "unknown".to_string()),
+    }))
 }
 
 pub async fn handle_list_sessions(
     State(app): State<Arc<AppState>>,
-    Query(query): Query<TokenQuery>,
 ) -> Result<Json<SessionsListResponse>, AppError> {
-    info!("handle_list_sessions called with token: {:?}", query.token);
-    let auth = app.auth_token.read().await;
-    let valid = query.token.as_ref().map(|t| auth.validate(t)).unwrap_or(false);
-    info!("Token valid: {}", valid);
-    drop(auth);
-    
-    if !valid {
-        warn!("Unauthorized list sessions attempt");
-        return Err(AppError::Unauthorized);
-    }
-
     let sessions = app.list_sessions().await;
-    info!("Returning {} sessions", sessions.len());
     Ok(Json(SessionsListResponse { sessions }))
 }
 
 pub async fn handle_create_session(
     State(app): State<Arc<AppState>>,
-    Query(query): Query<TokenQuery>,
     Json(req): Json<CreateSessionRequest>,
 ) -> Result<Json<SessionResponse>, AppError> {
-    info!("handle_create_session called");
-    let auth = app.auth_token.read().await;
-    let valid = query.token.as_ref().map(|t| auth.validate(t)).unwrap_or(false);
-    info!("Token valid: {}", valid);
-    drop(auth);
-    
-    if !valid {
-        warn!("Unauthorized create session attempt");
-        return Err(AppError::Unauthorized);
-    }
-
-    info!("Creating session with agent_type: {}", req.agent_type);
     let session = app.create_session(req.agent_type).await?;
-    info!("Session created: {}", session.id);
     Ok(Json(SessionResponse { session }))
 }
 
 pub async fn handle_delete_session(
     State(app): State<Arc<AppState>>,
-    Query(query): Query<TokenQuery>,
     axum::extract::Path(id): axum::extract::Path<String>,
 ) -> Result<Json<MessageResponse>, AppError> {
-    let auth = app.auth_token.read().await;
-    let valid = query.token.as_ref().map(|t| auth.validate(t)).unwrap_or(false);
-    drop(auth);
-    
-    if !valid {
-        return Err(AppError::Unauthorized);
-    }
-
     app.delete_session(&id).await?;
     Ok(Json(MessageResponse {
         message: "Session deleted".to_string(),

@@ -100,6 +100,8 @@ async fn main() -> Result<()> {
 
     let app = Router::new()
         .route("/", get(fallback::serve_index))
+        .route("/api/validate", get(routes::sessions::handle_validate))
+        .route("/api/info", get(routes::sessions::handle_server_info))
         .route("/api/chat", post(routes::chat::handle_chat))
         .route("/api/sessions", get(routes::sessions::handle_list_sessions))
         .route("/api/sessions", post(routes::sessions::handle_create_session))
