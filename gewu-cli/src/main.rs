@@ -1,7 +1,7 @@
-mod config;
-mod mcp_loader;
-mod registry;
-mod tools;
+pub mod config;
+pub mod mcp_loader;
+pub mod registry;
+pub mod tools;
 
 use anyhow::{Context, Result};
 use clap::Parser;
