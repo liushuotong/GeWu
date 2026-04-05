@@ -179,6 +179,26 @@
             white-space: nowrap;
             overflow: hidden;
             text-overflow: ellipsis;
+            flex: 1;
+        }
+
+        .session-delete-btn {
+            background: none;
+            border: none;
+            color: var(--text-muted);
+            cursor: pointer;
+            padding: 2px 6px;
+            font-size: 12px;
+            border-radius: var(--radius-sm);
+            opacity: 0;
+            transition: opacity var(--transition-fast), background var(--transition-fast);
+        }
+        .session-item:hover .session-delete-btn {
+            opacity: 1;
+        }
+        .session-delete-btn:hover {
+            background: var(--accent-red);
+            color: white;
         }
 
         .sidebar-footer {
@@ -202,6 +222,30 @@
             transition: background var(--transition-fast);
         }
         #new-session-btn:hover { background: var(--border-color); }
+
+        /* Agent Selector */
+        #agent-selector-container {
+            padding: 8px 12px;
+            border-bottom: 1px solid var(--border-color);
+            display: flex;
+            gap: 8px;
+            align-items: center;
+        }
+
+        #agent-selector {
+            flex: 1;
+            background: var(--bg-tertiary);
+            border: 1px solid var(--border-color);
+            color: var(--text-primary);
+            padding: 6px 8px;
+            border-radius: var(--radius-sm);
+            font-size: 12px;
+            cursor: pointer;
+        }
+        #agent-selector:focus {
+            outline: none;
+            border-color: var(--accent-blue);
+        }
 
         /* Resize Handle */
         #sidebar-handle {
@@ -539,6 +583,13 @@
 
         <!-- Sidebar -->
         <aside id="sidebar">
+        <div id="agent-selector-container">
+            <select id="agent-selector">
+                <option value="general">general</option>
+                <option value="build">build</option>
+                <option value="explore">explore</option>
+            </select>
+        </div>
             <div class="sidebar-content">
                 <div class="session-list" id="session-list"></div>
             </div>
@@ -588,6 +639,7 @@
         const toggleSidebarBtn = document.getElementById('toggle-sidebar');
         const newSessionBtn = document.getElementById('new-session-btn');
         const sidebarHandle = document.getElementById('sidebar-handle');
+        const agentSelector = document.getElementById('agent-selector');
 
         let token = '';
         let isLoading = false;
@@ -764,9 +816,17 @@
                 item.className = 'session-item' + (session.id === state.currentSession?.id ? ' active' : '');
                 item.innerHTML = `
                     <span class="session-icon">💬</span>
-                    <span class="session-name">${escapeHtml(session.agent_type)}</span>
+                    <span class="session-name" title="${escapeHtml(session.agent_type)}">${escapeHtml(session.id.substring(0, 8))}</span>
+                    <button class="session-delete-btn" title="Delete session">✕</button>
                 `;
-                item.addEventListener('click', () => switchSession(session));
+                item.addEventListener('click', (e) => {
+                    if (e.target.classList.contains('session-delete-btn')) {
+                        e.stopPropagation();
+                        deleteSession(session.id);
+                    } else {
+                        switchSession(session);
+                    }
+                });
                 sessionList.appendChild(item);
             });
         }
@@ -774,10 +834,88 @@
         async function switchSession(session) {
             if (state.currentSession?.id === session.id) return;
             state.currentSession = session;
+            agentSelector.value = session.agent_type;
             clearChat();
             renderSessions();
+            setStatus('Loading...', true);
+
+            // Load messages for this session
+            try {
+                const resp = await fetch(`/api/sessions/${session.id}/messages?token=${encodeURIComponent(token)}`);
+                if (resp.ok) {
+                    const data = await resp.json();
+                    if (data.messages && data.messages.length > 0) {
+                        for (const msg of data.messages) {
+                            renderMessage(msg);
+                        }
+                    } else {
+                        addMessage('assistant', 'Session ready. How can I help you?');
+                    }
+                } else {
+                    addMessage('assistant', 'Session ready. How can I help you?');
+                }
+            } catch (e) {
+                addMessage('assistant', 'Session ready. How can I help you?');
+            }
+
+            renderSessions();
             setStatus('Ready');
-            addMessage('assistant', 'Session ready. How can I help you?');
+        }
+
+        function renderMessage(msg) {
+            const div = document.createElement('div');
+            div.className = `message ${msg.role}`;
+
+            let content = '';
+            if (msg.role === 'system') {
+                content = escapeHtml(msg.content);
+            } else if (msg.role === 'user') {
+                if (Array.isArray(msg.content)) {
+                    content = msg.content.map(part => {
+                        if (part.type === 'text') return renderMarkdown(part.text);
+                        return escapeHtml(JSON.stringify(part));
+                    }).join('');
+                } else {
+                    content = renderMarkdown(msg.content || '');
+                }
+            } else if (msg.role === 'assistant') {
+                content = renderMarkdown(msg.content || '');
+                if (msg.tool_calls && msg.tool_calls.length > 0) {
+                    content += '<div class="tool-calls-info">Tool calls: ' + msg.tool_calls.map(tc => tc.function.name).join(', ') + '</div>';
+                }
+            } else if (msg.role === 'tool') {
+                content = `<span class="tool-label">[${msg.tool_name || 'tool'}]</span> ${escapeHtml(msg.content)}`;
+            }
+
+            div.innerHTML = `<div class="role">${msg.role}</div><div class="content">${content}</div>`;
+            chatContainer.appendChild(div);
+            chatContainer.scrollTop = chatContainer.scrollHeight;
+        }
+
+        async function deleteSession(sessionId) {
+            if (!confirm('Delete this session?')) return;
+            try {
+                const resp = await fetch(`/api/sessions/${sessionId}?token=${encodeURIComponent(token)}`, {
+                    method: 'DELETE'
+                });
+                if (!resp.ok) throw new Error('Failed to delete');
+                if (state.currentSession?.id === sessionId) {
+                    state.currentSession = null;
+                    clearChat();
+                    const idx = state.sessions.findIndex(s => s.id === sessionId);
+                    if (idx !== -1) state.sessions.splice(idx, 1);
+                    if (state.sessions.length > 0) {
+                        switchSession(state.sessions[0]);
+                    }
+                } else {
+                    const idx = state.sessions.findIndex(s => s.id === sessionId);
+                    if (idx !== -1) state.sessions.splice(idx, 1);
+                }
+                renderSessions();
+                saveState();
+            } catch (e) {
+                showError('Failed to delete session: ' + e.message);
+            }
         }
 
         async function createSession(agentType = 'general') {
@@ -791,6 +929,7 @@
                 const data = await resp.json();
                 const session = data.session;
                 state.currentSession = session;
+                agentSelector.value = session.agent_type;
                 state.sessions.unshift(session);
                 if (state.sessions.length > 10) state.sessions.pop();
                 clearChat();
@@ -802,6 +941,41 @@
                 showError('Failed to create session: ' + e.message);
                 setStatus('Error');
                 return false;
+            }
+        }
+
+        async function switchAgent() {
+            if (!state.currentSession) {
+                showError('No active session');
+                return;
+            }
+            const newAgentType = agentSelector.value;
+            if (newAgentType === state.currentSession.agent_type) {
+                return;
+            }
+            try {
+                setStatus('Switching agent...', true);
+                const resp = await fetch(`/api/sessions/${state.currentSession.id}/switch-agent?token=${encodeURIComponent(token)}`, {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ agent_type: newAgentType })
+                });
+                if (!resp.ok) {
+                    throw new Error('Failed to switch agent');
+                }
+                const data = await resp.json();
+                state.currentSession = data.session;
+                const idx = state.sessions.findIndex(s => s.id === state.currentSession.id);
+                if (idx !== -1) {
+                    state.sessions[idx] = data.session;
+                }
+                renderSessions();
+                saveState();
+                addMessage('assistant', `Agent switched to ${newAgentType}. Memory preserved from previous agent.`);
+                setStatus('Ready');
+            } catch (e) {
+                showError('Failed to switch agent: ' + e.message);
+                setStatus('Error');
             }
         }
 
@@ -987,6 +1161,8 @@
             }
         });
 
+        agentSelector.addEventListener('change', switchAgent);
+
         // Window resize handler
         window.addEventListener('resize', updateHandles);
 
@@ -1032,13 +1208,11 @@
         validateToken().then(valid => {
             if (!valid) return;
             loadServerInfo();
+            renderSessions();
             if (state.currentSession) {
-                renderSessions();
-                addMessage('assistant', 'Session restored. How can I help you?');
+                switchSession(state.currentSession);
             } else {
-                createSession().then(() => {
-                    addMessage('assistant', 'Session ready. How can I help you?');
-                });
+                addMessage('assistant', 'Select a session or create a new one to start.');
             }
         });
     </script>

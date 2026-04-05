@@ -86,6 +86,18 @@ impl Tool for BashTool {
                     "Complex command chaining (;, &&, ||) is not allowed in safe mode.".to_string(),
                 ));
             }
+
+            if trimmed.contains(" >") || trimmed.contains(">>") || trimmed.contains(" <<") {
+                return Ok(ToolResult::new("bash",
+                    "Output redirection (>, >>, <<) is not allowed in safe mode.".to_string(),
+                ));
+            }
+
+            if trimmed.contains("$(") || trimmed.contains("`") {
+                return Ok(ToolResult::new("bash",
+                    "Command substitution ($(...), backticks) is not allowed in safe mode.".to_string(),
+                ));
+            }
         }
 
         let work_dir = if let Some(wd) = &input.workdir {
@@ -236,6 +248,41 @@ mod tests {
         let ctx = ToolContext::new("test-session", "test-msg");
         let result = tool.execute(args, &ctx).await.map_err(|e| anyhow::anyhow!(e.to_string()))?;
         assert!(result.output.contains("not allowed in safe mode"));
+
+        let args = serde_json::json!({
+            "command": "echo hello > /tmp/out.txt"
+        });
+        let ctx = ToolContext::new("test-session", "test-msg");
+        let result = tool.execute(args, &ctx).await.map_err(|e| anyhow::anyhow!(e.to_string()))?;
+        assert!(result.output.contains("Output redirection"));
+
+        let args = serde_json::json!({
+            "command": "echo hello >> /tmp/out.txt"
+        });
+        let ctx = ToolContext::new("test-session", "test-msg");
+        let result = tool.execute(args, &ctx).await.map_err(|e| anyhow::anyhow!(e.to_string()))?;
+        assert!(result.output.contains("Output redirection"));
+
+        let args = serde_json::json!({
+            "command": "cat <<EOF\nhello\nEOF"
+        });
+        let ctx = ToolContext::new("test-session", "test-msg");
+        let result = tool.execute(args, &ctx).await.map_err(|e| anyhow::anyhow!(e.to_string()))?;
+        assert!(result.output.contains("Output redirection"));
+
+        let args = serde_json::json!({
+            "command": "echo $(whoami)"
+        });
+        let ctx = ToolContext::new("test-session", "test-msg");
+        let result = tool.execute(args, &ctx).await.map_err(|e| anyhow::anyhow!(e.to_string()))?;
+        assert!(result.output.contains("Command substitution"));
+
+        let args = serde_json::json!({
+            "command": "echo `whoami`"
+        });
+        let ctx = ToolContext::new("test-session", "test-msg");
+        let result = tool.execute(args, &ctx).await.map_err(|e| anyhow::anyhow!(e.to_string()))?;
+        assert!(result.output.contains("Command substitution"));
 
         Ok(())
     }

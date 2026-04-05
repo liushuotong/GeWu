@@ -11,6 +11,11 @@ pub struct CreateSessionRequest {
 }
 
 #[derive(Debug, serde::Deserialize)]
+pub struct SwitchAgentRequest {
+    pub agent_type: String,
+}
+
+#[derive(Debug, serde::Deserialize)]
 pub struct TokenQuery {
     pub token: Option<String>,
 }
@@ -39,6 +44,23 @@ pub struct ServerInfo {
 #[derive(Debug, serde::Serialize)]
 pub struct ValidateResponse {
     pub valid: bool,
+}
+
+#[derive(Debug, serde::Serialize)]
+pub struct MessagesResponse {
+    pub messages: Vec<serde_json::Value>,
+}
+
+pub async fn handle_get_messages(
+    State(app): State<Arc<AppState>>,
+    axum::extract::Path(id): axum::extract::Path<String>,
+) -> Result<Json<MessagesResponse>, AppError> {
+    let messages = app.get_session_messages(&id).await?;
+    let messages_json: Vec<serde_json::Value> = messages
+        .into_iter()
+        .map(|m| serde_json::to_value(m).unwrap_or(serde_json::Value::Null))
+        .collect();
+    Ok(Json(MessagesResponse { messages: messages_json }))
 }
 
 pub async fn handle_validate(
@@ -86,6 +108,15 @@ pub async fn handle_delete_session(
     Ok(Json(MessageResponse {
         message: "Session deleted".to_string(),
     }))
+}
+
+pub async fn handle_switch_agent(
+    State(app): State<Arc<AppState>>,
+    axum::extract::Path(id): axum::extract::Path<String>,
+    Json(req): Json<SwitchAgentRequest>,
+) -> Result<Json<SessionResponse>, AppError> {
+    let session = app.switch_agent(&id, req.agent_type).await?;
+    Ok(Json(SessionResponse { session }))
 }
 
 #[derive(Debug)]

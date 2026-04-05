@@ -106,6 +106,8 @@ async fn main() -> Result<()> {
         .route("/api/sessions", get(routes::sessions::handle_list_sessions))
         .route("/api/sessions", post(routes::sessions::handle_create_session))
         .route("/api/sessions/{id}", delete(routes::sessions::handle_delete_session))
+        .route("/api/sessions/{id}/messages", get(routes::sessions::handle_get_messages))
+        .route("/api/sessions/{id}/switch-agent", post(routes::sessions::handle_switch_agent))
         .route("/index.html", get(fallback::serve_index))
         .fallback(fallback::serve_static)
         .layer(cors)

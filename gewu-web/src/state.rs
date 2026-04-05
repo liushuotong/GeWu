@@ -1,17 +1,13 @@
 use anyhow::{Context, Result};
-use futures::Stream;
-use futures::stream::BoxStream;
-use futures::StreamExt;
 use gewu_providers::OpenAIProvider;
 use gewu_cli::registry::create_agent;
 use serde::{Deserialize, Serialize};
 use sqlx::sqlite::SqlitePoolOptions;
-use sqlx::SqlitePool;
+use sqlx::{SqlitePool, Row};
 use std::collections::HashMap;
-use std::pin::Pin;
 use std::sync::Arc;
 use tokio::sync::{Mutex, RwLock};
-use tracing::{info, error};
+use tracing::info;
 use uuid::Uuid;
 
 #[derive(Clone, Serialize, Deserialize, Debug)]
@@ -132,6 +128,78 @@ impl AppState {
 
     pub async fn get_agent(&self, session_id: &str) -> Option<Arc<AgentHandle>> {
         self.agents.read().await.get(session_id).cloned()
+    }
+
+    pub async fn get_session_messages(&self, session_id: &str) -> Result<Vec<gewu_core::types::Message>> {
+        let pool_guard = self.db_pool.lock().await;
+        let pool = pool_guard.as_ref().context("Database not initialized")?;
+
+        let rows = sqlx::query("SELECT content FROM memory_messages WHERE session_id = ? ORDER BY id ASC")
+            .bind(session_id)
+            .fetch_all(pool)
+            .await
+            .context("Failed to load messages from DB")?;
+
+        let mut messages = Vec::new();
+        for row in rows {
+            let content: String = row.try_get("content")?;
+            let message: gewu_core::types::Message =
+                serde_json::from_str(&content).context("Failed to deserialize message content")?;
+            messages.push(message);
+        }
+
+        info!("Loaded {} messages for session {}", messages.len(), session_id);
+        Ok(messages)
+    }
+
+    pub async fn switch_agent(&self, session_id: &str, new_agent_type: String) -> Result<SessionInfo> {
+        info!("Switching agent for session {} to type: {}", session_id, new_agent_type);
+
+        let old_handle = self.agents.write().await.remove(session_id);
+        if old_handle.is_none() {
+            return Err(anyhow::anyhow!("Session not found"));
+        }
+
+        let config = self.config.read().await;
+        let api_key = config.api_key.clone().context("API key not configured")?;
+        let endpoint = config.endpoint.clone().context("Endpoint not configured")?;
+        let model = config.model.clone().unwrap_or_else(|| "gpt-5.3-codex".to_string());
+        drop(config);
+
+        let pool_guard = self.db_pool.lock().await;
+        let pool = pool_guard.as_ref().context("Database not initialized")?;
+
+        let provider = Arc::new(OpenAIProvider::new_with_endpoint(&api_key, &endpoint, &model));
+
+        let (agent, _registry) = create_agent(&new_agent_type, provider, pool.clone(), session_id.to_string(), vec![]).await?;
+
+        let handle = Arc::new(AgentHandle {
+            agent: Arc::new(Mutex::new(agent)),
+            session_id: session_id.to_string(),
+            agent_type: new_agent_type.clone(),
+        });
+
+        let created_at = {
+            let sessions = self.sessions.read().await;
+            sessions.get(session_id).map(|s| s.created_at).unwrap_or_else(|| {
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap_or_default()
+                    .as_secs() as i64
+            })
+        };
+
+        let session_info = SessionInfo {
+            id: session_id.to_string(),
+            agent_type: new_agent_type,
+            created_at,
+        };
+
+        self.agents.write().await.insert(session_id.to_string(), handle);
+        *self.sessions.write().await.get_mut(session_id).unwrap() = session_info.clone();
+
+        info!("Agent switched successfully for session {}", session_id);
+        Ok(session_info)
     }
 
     pub async fn update_config(&self, new_config: ServerConfig) -> Result<()> {
