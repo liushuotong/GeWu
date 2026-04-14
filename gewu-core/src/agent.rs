@@ -48,6 +48,7 @@ use anyhow::{Context, Result};
 use async_trait::async_trait;
 use futures::{Stream, StreamExt};
 use serde::Deserialize;
+use std::collections::VecDeque;
 use std::sync::Arc;
 use tracing::{debug, info};
 use uuid::Uuid;
@@ -113,7 +114,7 @@ impl Agent {
             self.memory.add_message(Message::User { content: vec![ContentPart::Text { text: user_message.to_string() }] }).await;
 
             let mut turn = 0;
-            let mut recent_tool_calls: Vec<(String, String)> = Vec::new();
+            let mut recent_tool_calls: VecDeque<(String, String)> = VecDeque::new();
             let mut message_id = Uuid::new_v4().to_string();
 
             loop {
@@ -196,9 +197,9 @@ impl Agent {
                     let call_id = call.id;
 
                     let current_call_sig = (tool_name.clone(), args.clone());
-                    recent_tool_calls.push(current_call_sig.clone());
+                    recent_tool_calls.push_back(current_call_sig.clone());
                     if recent_tool_calls.len() > 3 {
-                        recent_tool_calls.remove(0);
+                        recent_tool_calls.pop_front();
                     }
 
                     if recent_tool_calls.len() == 3 && recent_tool_calls.iter().all(|x| x == &current_call_sig) {
@@ -327,6 +328,15 @@ When constructing the summary, try to stick to this template:
         }
 
         if summary_text.is_empty() {
+            compaction::prune(self.memory.messages_mut());
+            if is_overflow(
+                self.memory.messages().iter().map(|m| estimate_message_tokens(m)).sum(),
+                self.context_limit,
+            ) {
+                return Err(anyhow::anyhow!(
+                    "Compaction failed: LLM returned empty summary and pruning was insufficient"
+                ));
+            }
             return Ok(false);
         }
 

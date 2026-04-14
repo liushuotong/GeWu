@@ -159,8 +159,6 @@ impl Memory for SqliteMemory {
     /// If serialization fails, the in-memory cache is updated but
     /// the database write fails silently (logged as error).
     async fn add_message(&mut self, message: Message) {
-        self.messages.push(message.clone());
-
         let session_id = self.session_id.clone();
         let pool = self.pool.clone();
 
@@ -180,19 +178,23 @@ impl Memory for SqliteMemory {
                 .await
         {
             error!("Failed to persist message to DB: {}", e);
+            return;
         }
+
+        self.messages.push(message);
     }
 
     /// Clears all messages for this session from memory and database.
     async fn clear(&mut self) {
-        self.messages.clear();
         if let Err(e) = sqlx::query("DELETE FROM memory_messages WHERE session_id = ?")
             .bind(&self.session_id)
             .execute(&self.pool)
             .await
         {
             error!("Failed to clear messages from DB: {}", e);
+            return;
         }
+        self.messages.clear();
     }
 
     /// Replaces all messages with a new set.
@@ -207,8 +209,6 @@ impl Memory for SqliteMemory {
     /// If an error occurs mid-transaction, changes are rolled back
     /// and an error is logged.
     async fn replace(&mut self, messages: Vec<Message>) {
-        self.messages = messages.clone();
-
         let mut tx = match self.pool.begin().await {
             Ok(tx) => tx,
             Err(e) => {
@@ -226,11 +226,13 @@ impl Memory for SqliteMemory {
             return;
         }
 
-        for msg in messages {
+        let mut insert_failed = false;
+        for msg in &messages {
             let content = match serde_json::to_string(&msg) {
                 Ok(s) => s,
                 Err(e) => {
                     error!("Failed to serialize message in replace: {}", e);
+                    insert_failed = true;
                     continue;
                 }
             };
@@ -243,13 +245,20 @@ impl Memory for SqliteMemory {
                     .await
             {
                 error!("Failed to insert message in replace: {}", e);
-                return;
+                insert_failed = true;
             }
+        }
+
+        if insert_failed {
+            return;
         }
 
         if let Err(e) = tx.commit().await {
             error!("Failed to commit replace transaction: {}", e);
+            return;
         }
+
+        self.messages = messages.clone();
     }
 }
 

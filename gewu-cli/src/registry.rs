@@ -64,7 +64,7 @@ pub async fn create_agent(
     provider: Arc<dyn LlmProvider>,
     pool: SqlitePool,
     session_id: String,
-    additional_tools: Vec<Box<dyn Tool>>,
+    additional_tools: Vec<Arc<dyn Tool>>,
 ) -> Result<(Agent, Arc<dyn ToolRegistry>)> {
     let working_directory = std::env::current_dir()?;
 
@@ -165,11 +165,12 @@ pub async fn create_agent(
         _ => return Err(anyhow!("Unknown agent type: {}", name)),
     };
 
-    // Add additional tools
-    tools.extend(additional_tools);
+    // Convert built-in tools to Arc<dyn Tool>
+    let mut tools_arc: Vec<Arc<dyn Tool>> = tools.into_iter().map(|t| Arc::from(t) as Arc<dyn Tool>).collect();
 
-    // Convert Box<dyn Tool> to Arc<dyn Tool> for both registry and agent
-    let tools_arc: Vec<Arc<dyn Tool>> = tools.into_iter().map(|t| Arc::from(t)).collect();
+    // Add additional tools (already Arc<dyn Tool>)
+    tools_arc.extend(additional_tools);
+
     let tools_for_registry = Arc::new(tools_arc.clone());
     let registry: Arc<dyn ToolRegistry> = Arc::new(ToolRegistryImpl {
         tools: tools_for_registry,

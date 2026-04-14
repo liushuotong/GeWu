@@ -1,4 +1,5 @@
 use anyhow::{Context, Result};
+use gewu_core::traits::Tool;
 use gewu_providers::OpenAIProvider;
 use gewu_cli::registry::create_agent;
 use serde::{Deserialize, Serialize};
@@ -49,10 +50,11 @@ pub struct AppState {
     pub agents: Arc<RwLock<HashMap<String, Arc<AgentHandle>>>>,
     pub config: Arc<RwLock<ServerConfig>>,
     pub db_pool: Arc<Mutex<Option<SqlitePool>>>,
+    pub mcp_tools: Arc<Vec<Arc<dyn Tool>>>,
 }
 
 impl AppState {
-    pub async fn new(config: ServerConfig, auth_token: crate::auth::AuthState) -> Result<Self> {
+    pub async fn new(config: ServerConfig, auth_token: crate::auth::AuthState, mcp_tools: Vec<Arc<dyn Tool>>) -> Result<Self> {
         let db_pool = if let Some(ref path) = config.db_path {
             Some(create_db_pool(path).await?)
         } else {
@@ -66,6 +68,7 @@ impl AppState {
             agents: Arc::new(RwLock::new(HashMap::new())),
             config: Arc::new(RwLock::new(config)),
             db_pool: Arc::new(Mutex::new(db_pool)),
+            mcp_tools: Arc::new(mcp_tools),
         })
     }
 
@@ -85,7 +88,8 @@ impl AppState {
         info!("Creating provider and agent...");
         let provider = Arc::new(OpenAIProvider::new_with_endpoint(&api_key, &endpoint, &model));
 
-        let (agent, _registry) = create_agent(&agent_type, provider, pool.clone(), session_id.clone(), vec![]).await?;
+        let mcp_tools: Vec<Arc<dyn Tool>> = self.mcp_tools.iter().cloned().collect();
+        let (agent, _registry) = create_agent(&agent_type, provider, pool.clone(), session_id.clone(), mcp_tools).await?;
         info!("Agent created successfully");
 
         let created_at = std::time::SystemTime::now()
@@ -171,7 +175,8 @@ impl AppState {
 
         let provider = Arc::new(OpenAIProvider::new_with_endpoint(&api_key, &endpoint, &model));
 
-        let (agent, _registry) = create_agent(&new_agent_type, provider, pool.clone(), session_id.to_string(), vec![]).await?;
+        let mcp_tools: Vec<Arc<dyn Tool>> = self.mcp_tools.iter().cloned().collect();
+        let (agent, _registry) = create_agent(&new_agent_type, provider, pool.clone(), session_id.to_string(), mcp_tools).await?;
 
         let handle = Arc::new(AgentHandle {
             agent: Arc::new(Mutex::new(agent)),

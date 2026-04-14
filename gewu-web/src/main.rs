@@ -16,6 +16,7 @@ pub mod routes;
 pub mod state;
 
 use auth::AuthState;
+use gewu_cli::mcp_loader;
 use state::AppState;
 
 #[derive(Parser, Debug)]
@@ -54,31 +55,32 @@ async fn main() -> Result<()> {
     tracing::subscriber::set_global_default(subscriber)?;
 
     let loaded_config = gewu_cli::config::LoadedConfig::load(cli.config.as_deref())?;
-    let file_config = &loaded_config.config;
 
     let api_key = cli
         .api_key
         .or_else(|| std::env::var("OPENAI_API_KEY").ok())
-        .or(file_config.api_key.clone())
+        .or(loaded_config.config.api_key.clone())
         .context("OPENAI_API_KEY not provided")?;
 
     let endpoint = cli
         .endpoint
         .or_else(|| std::env::var("OPENAI_ENDPOINT").ok())
         .or_else(|| std::env::var("OPENAI_BASE_URL").ok())
-        .or(file_config.endpoint.clone())
+        .or(loaded_config.config.endpoint.clone())
         .context("Endpoint not provided")?;
 
     let model = cli
         .model
         .or_else(|| std::env::var("OPENAI_MODEL").ok())
-        .or(file_config.model.clone())
+        .or(loaded_config.config.model.clone())
         .unwrap_or_else(|| "gpt-5.3-codex".to_string());
 
     let db_path = cli.db_path.or_else(|| {
         dirs::home_dir()
             .map(|h| h.join(".gewu").join("gewu.db").to_string_lossy().to_string())
     });
+
+    let mcp_servers = loaded_config.config.mcp_servers;
 
     let config = state::ServerConfig {
         api_key: Some(api_key),
@@ -87,9 +89,11 @@ async fn main() -> Result<()> {
         db_path,
     };
 
+    let mcp_tools = mcp_loader::load_mcp_tools(mcp_servers).await?;
+
     let auth_state = AuthState::new();
 
-    let app_state = Arc::new(AppState::new(config, auth_state.clone()).await?);
+    let app_state = Arc::new(AppState::new(config, auth_state.clone(), mcp_tools).await?);
 
     let cors = CorsLayer::new()
         .allow_origin(Any)

@@ -10,8 +10,8 @@ use tracing::{info, warn};
 
 pub async fn load_mcp_tools(
     mcp_servers: HashMap<String, McpServerConfig>,
-) -> Result<Vec<Box<dyn Tool>>> {
-    let mut tools: Vec<Box<dyn Tool>> = Vec::new();
+) -> Result<Vec<Arc<dyn Tool>>> {
+    let mut tools: Vec<Arc<dyn Tool>> = Vec::new();
 
     for (server_name, server_config) in mcp_servers {
         info!("Connecting to MCP server: {}", server_name);
@@ -46,12 +46,12 @@ pub async fn load_mcp_tools(
                             "properties": {}
                         })).unwrap()
                     });
-                    tools.push(Box::new(McpToolWrapper {
+                    tools.push(Arc::new(McpToolWrapper {
                         client: client_arc.clone(),
                         name: tool.name,
                         description: tool.description.unwrap_or_default(),
                         schema,
-                    }));
+                    }) as Arc<dyn Tool>);
                 }
             }
             Err(e) => {
