@@ -48,8 +48,12 @@ use anyhow::{Context, Result};
 use async_trait::async_trait;
 use futures::{Stream, StreamExt};
 use serde::Deserialize;
+use std::any::Any;
 use std::collections::VecDeque;
+use std::error::Error;
+use std::panic::{catch_unwind, AssertUnwindSafe};
 use std::sync::Arc;
+use tokio::task::spawn_blocking;
 use tracing::{debug, info};
 use uuid::Uuid;
 
@@ -71,6 +75,78 @@ pub struct AgentBuilder {
     max_turns: Option<usize>,
     memory: Option<Box<dyn Memory>>,
     context_limit: usize,
+}
+
+fn extract_panic_message(panic_payload: Box<dyn Any + Send>) -> String {
+    if let Some(s) = panic_payload.downcast_ref::<&str>() {
+        s.to_string()
+    } else if let Some(s) = panic_payload.downcast_ref::<String>() {
+        s.clone()
+    } else if let Some(e) = panic_payload.downcast_ref::<Box<dyn Error + Send + 'static>>() {
+        e.to_string()
+    } else {
+        "Unknown panic cause".to_string()
+    }
+}
+
+async fn execute_tool_with_panic_recovery(
+    tool: Arc<dyn Tool>,
+    args: serde_json::Value,
+    ctx: ToolContext,
+) -> Result<ToolResult, Box<dyn Error + Send + Sync>> {
+    let tool_name = tool.name().to_string();
+
+    let result = spawn_blocking(move || {
+        catch_unwind(AssertUnwindSafe(|| {
+            let rt = tokio::runtime::Handle::current();
+            rt.block_on(tool.execute(args, &ctx))
+        }))
+    }).await;
+
+    match result {
+        Ok(Ok(res)) => res,
+        Ok(Err(e)) => {
+            let panic_msg = extract_panic_message(e);
+            Err(Box::new(std::io::Error::new(
+                std::io::ErrorKind::Other,
+                format!(
+                    "Tool '{}' panicked during execution: {}. This may indicate an issue with \
+                    the tool implementation or invalid input. Consider adjusting the tool arguments \
+                    or checking the tool's requirements.",
+                    tool_name, panic_msg
+                ),
+            )) as Box<dyn Error + Send + Sync>)
+        }
+        Err(join_err) => {
+            if join_err.is_panic() {
+                match join_err.try_into_panic() {
+                    Ok(panic_payload) => {
+                        let panic_msg = extract_panic_message(panic_payload);
+                        Err(Box::new(std::io::Error::new(
+                            std::io::ErrorKind::Other,
+                            format!(
+                                "Tool '{}' panicked during execution: {}. This may indicate an issue with \
+                                the tool implementation or invalid input. Consider adjusting the tool \
+                                arguments or checking the tool's requirements.",
+                                tool_name, panic_msg
+                            ),
+                        )) as Box<dyn Error + Send + Sync>)
+                    }
+                    Err(_) => {
+                        Err(Box::new(std::io::Error::new(
+                            std::io::ErrorKind::Other,
+                            format!("Tool '{}' panicked but could not retrieve panic payload", tool_name),
+                        )) as Box<dyn Error + Send + Sync>)
+                    }
+                }
+            } else {
+                Err(Box::new(std::io::Error::new(
+                    std::io::ErrorKind::Other,
+                    format!("Tool '{}' task was aborted unexpectedly", tool_name),
+                )) as Box<dyn Error + Send + Sync>)
+            }
+        }
+    }
 }
 
 impl Default for AgentBuilder {
@@ -230,7 +306,7 @@ impl Agent {
                                 continue;
                             }
                         };
-                        match t.execute(args_val, &ctx).await {
+                        match execute_tool_with_panic_recovery(t.clone(), args_val, ctx.clone()).await {
                             Ok(res) => {
                                 let truncation_result = self.truncation.truncate(&res.output, false);
                                 let output = if truncation_result.truncated {
@@ -381,7 +457,7 @@ impl ToolRegistry for Agent {
         name: &str,
         args: serde_json::Value,
         ctx: &ToolContext,
-    ) -> Result<ToolResult, Box<dyn std::error::Error + Send + Sync>> {
+) -> Result<ToolResult, Box<dyn Error + Send + Sync>> {
         let tool = self.tools.iter().find(|t| t.name() == name);
         match tool {
             Some(t) => t.execute(args, ctx).await,
