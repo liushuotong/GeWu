@@ -135,6 +135,21 @@ impl Tool for BashTool {
                 let stdout = String::from_utf8_lossy(&output.stdout);
                 let stderr = String::from_utf8_lossy(&output.stderr);
 
+                if !output.status.success() {
+                    let mut result = String::new();
+                    if !stdout.is_empty() {
+                        result.push_str(&stdout);
+                    }
+                    if !stderr.is_empty() {
+                        if !result.is_empty() {
+                            result.push_str("\n--- stderr ---\n");
+                        }
+                        result.push_str(&stderr);
+                    }
+                    result.push_str(&format!("\n--- exit status: {} ---\n", output.status));
+                    return Err(anyhow::anyhow!("Command failed: {}", result).into());
+                }
+
                 let mut result = String::new();
                 if !stdout.is_empty() {
                     result.push_str(&stdout);
@@ -144,13 +159,6 @@ impl Tool for BashTool {
                         result.push_str("\n--- stderr ---\n");
                     }
                     result.push_str(&stderr);
-                }
-
-                if !output.status.success() {
-                    if !result.is_empty() {
-                        result.push_str("\n--- status ---\n");
-                    }
-                    result.push_str(&format!("Command failed with status: {}", output.status));
                 }
 
                 Ok(ToolResult::new("bash", result))

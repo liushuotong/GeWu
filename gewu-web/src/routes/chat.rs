@@ -7,7 +7,7 @@ use axum::{
 use futures::Stream;
 use futures::StreamExt;
 use std::sync::Arc;
-use tracing::{info, error, warn};
+use tracing::{debug, error, info, warn};
 
 #[derive(Debug, serde::Deserialize)]
 pub struct ChatRequest {
@@ -107,16 +107,16 @@ pub async fn handle_chat(
         let stream = agent.ask(&message);
         futures::pin_mut!(stream);
         
+        let mut event_count = 0usize;
         while let Some(result) = stream.next().await {
-            info!("Stream received result: {:?}", result);
+            event_count += 1;
+            debug!("Stream received event #{}: {:?}", event_count, result);
             let sse_event = match result {
                 Ok(event) => match event {
                     gewu_core::types::AgentEvent::ReasoningDelta { delta } => {
-                        info!("reasoning_delta: {}", delta);
                         SseEvent::reasoning_delta(delta).to_sse_event()
                     }
                     gewu_core::types::AgentEvent::ContentDelta { delta } => {
-                        info!("content_delta: {}", delta);
                         SseEvent::content_delta(delta).to_sse_event()
                     }
                     gewu_core::types::AgentEvent::ToolStart { tool, input } => {
@@ -141,9 +141,12 @@ pub async fn handle_chat(
                     SseEvent::error(e.to_string()).to_sse_event()
                 }
             };
-            let _ = tx.send(Ok::<Event, std::convert::Infallible>(sse_event)).await;
+            if tx.send(Ok::<Event, std::convert::Infallible>(sse_event)).await.is_err() {
+                warn!("SSE channel closed, stopping stream");
+                break;
+            }
         }
-        info!("Stream finished for session");
+        info!("Stream finished for session ({} events sent)", event_count);
     });
 
     let stream = tokio_stream::wrappers::ReceiverStream::new(rx);

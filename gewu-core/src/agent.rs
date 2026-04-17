@@ -54,7 +54,7 @@ use std::error::Error;
 use std::panic::{catch_unwind, AssertUnwindSafe};
 use std::sync::Arc;
 use tokio::task::spawn_blocking;
-use tracing::{debug, info};
+use tracing::{debug, info, warn};
 use uuid::Uuid;
 
 pub struct Agent {
@@ -321,7 +321,10 @@ impl Agent {
                                 };
                                 output
                             }
-                            Err(e) => format!("Error executing tool: {}", e),
+                            Err(e) => {
+                                warn!("Tool '{}' failed: {}", tool_name, e);
+                                format!("Error: {}", e)
+                            }
                         }
                     } else {
                         format!("Tool not found: {}", tool_name)

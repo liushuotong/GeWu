@@ -272,6 +272,7 @@
             flex-direction: column;
             background: var(--bg-primary);
             overflow: hidden;
+            position: relative;
         }
 
         #chat-container {
@@ -540,16 +541,34 @@
 
         /* Error */
         #error-container {
+            position: absolute;
+            bottom: 0;
+            left: 0;
+            right: 0;
             padding: 8px 16px;
+            z-index: 10;
         }
 
         .error {
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
             background: #f8514920;
             color: var(--accent-red);
             padding: 10px 14px;
             border-radius: var(--radius-md);
             font-size: 13px;
             border-left: 3px solid var(--accent-red);
+        }
+
+        .error-close {
+            background: none;
+            border: none;
+            color: var(--accent-red);
+            font-size: 18px;
+            cursor: pointer;
+            padding: 0 0 0 8px;
+            line-height: 1;
         }
 
         /* Scrollbar */
@@ -791,8 +810,17 @@
         }
 
         function showError(msg) {
-            errorContainer.innerHTML = `<div class="error">${escapeHtml(msg)}</div>`;
-            setTimeout(() => errorContainer.innerHTML = '', 5000);
+            errorContainer.innerHTML = `
+                <div class="error">
+                    <span>${escapeHtml(msg)}</span>
+                    <button class="error-close" onclick="closeError()">×</button>
+                </div>
+            `;
+            errorContainer.scrollIntoView({ behavior: 'smooth', block: 'nearest' });
+        }
+
+        function closeError() {
+            errorContainer.innerHTML = '';
         }
 
         function clearChat() {
@@ -1133,12 +1161,15 @@
                             try {
                                 const event = JSON.parse(line.slice(6));
                                 handleSSEEvent(event);
-                            } catch (e) {}
+                            } catch (e) {
+                                console.error('Failed to parse SSE event:', e, 'line:', line);
+                            }
                         }
                     }
                 }
             } catch (e) {
-                showError('Error: ' + e.message);
+                console.error('Fetch error:', e);
+                showError('Connection error: ' + e.message);
             } finally {
                 isLoading = false;
                 sendBtn.disabled = false;
