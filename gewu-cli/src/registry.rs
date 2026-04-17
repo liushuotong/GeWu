@@ -74,7 +74,7 @@ pub async fn create_agent(
     // Shared in-memory todo list for this agent session
     let todos = Arc::new(Mutex::new(Vec::<TodoItem>::new()));
 
-    let mut tools: Vec<Box<dyn Tool>> = match name {
+    let tools: Vec<Box<dyn Tool>> = match name {
         "build" => {
             vec![
                 Box::new(TaskTool::new(provider.clone(), pool.clone())),

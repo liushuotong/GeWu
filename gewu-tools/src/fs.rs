@@ -41,7 +41,7 @@ const MAX_BYTES_LABEL: &str = "50 KB";
 
 #[derive(Debug, Deserialize, Serialize, schemars::JsonSchema)]
 pub struct ReadArgs {
-    pub filePath: String,
+    pub file_path: String,
     #[serde(default = "default_read_limit")]
     pub limit: usize,
     #[serde(default = "default_offset")]
@@ -58,17 +58,17 @@ fn default_offset() -> usize {
 
 #[derive(Debug, Deserialize, Serialize, schemars::JsonSchema)]
 pub struct WriteArgs {
-    pub filePath: String,
+    pub file_path: String,
     pub content: String,
 }
 
 #[derive(Debug, Deserialize, Serialize, schemars::JsonSchema)]
 pub struct EditArgs {
-    pub filePath: String,
-    pub oldString: String,
-    pub newString: String,
+    pub file_path: String,
+    pub old_string: String,
+    pub new_string: String,
     #[serde(default)]
-    pub replaceAll: bool,
+    pub replace_all: bool,
 }
 
 #[derive(Debug, Deserialize, Serialize, schemars::JsonSchema)]
@@ -114,7 +114,7 @@ impl Tool for ReadFileTool {
     ) -> Result<ToolResult, Box<dyn Error + Send + Sync>> {
         let input: ReadArgs = serde_json::from_value(args).map_err(into_tool_error)?;
 
-        let file_path = resolve_safe_path(&self.working_directory, &input.filePath)
+        let file_path = resolve_safe_path(&self.working_directory, &input.file_path)
             .map_err(into_tool_error)?;
 
         let metadata = tokio::fs::metadata(&file_path).await;
@@ -146,13 +146,13 @@ impl Tool for ReadFileTool {
                 if !suggestions.is_empty() {
                     return Ok(ToolResult::new("read_file", format!(
                         "File not found: {}\n\nDid you mean one of these?\n{}",
-                        input.filePath,
+                        input.file_path,
                         suggestions.join("\n")
                     )));
                 }
             }
 
-            return Ok(ToolResult::new("read_file", format!("File not found: {}", input.filePath)));
+            return Ok(ToolResult::new("read_file", format!("File not found: {}", input.file_path)));
         }
 
         let meta = metadata.unwrap();
@@ -196,7 +196,7 @@ impl Tool for ReadFileTool {
             let output = if truncated {
                 format!(
                     "<path>{}</path>\n<type>directory</type>\n<entries>\n{}\n</entries>\n\n(Showing {} of {} entries. Use 'offset' parameter to read beyond entry {})",
-                    input.filePath,
+                    input.file_path,
                     sliced.join("\n"),
                     sliced.len(),
                     entries.len(),
@@ -205,7 +205,7 @@ impl Tool for ReadFileTool {
             } else {
                 format!(
                     "<path>{}</path>\n<type>directory</type>\n<entries>\n{}\n</entries>\n\n({} entries)",
-                    input.filePath,
+                    input.file_path,
                     sliced.join("\n"),
                     entries.len()
                 )
@@ -248,7 +248,7 @@ impl Tool for ReadFileTool {
             .await
             .map_err(into_tool_error)?;
         if is_binary {
-            return Ok(ToolResult::new("read_file", format!("Cannot read binary file: {}", input.filePath)));
+            return Ok(ToolResult::new("read_file", format!("Cannot read binary file: {}", input.file_path)));
         }
 
         let start = input.offset.saturating_sub(1);
@@ -315,7 +315,7 @@ impl Tool for ReadFileTool {
 
         let mut output = format!(
             "<path>{}</path>\n<type>file</type>\n<content>\n{}\n</content>",
-            input.filePath,
+            input.file_path,
             content.join("\n")
         );
 
@@ -361,7 +361,7 @@ impl Tool for WriteFileTool {
     ) -> Result<ToolResult, Box<dyn Error + Send + Sync>> {
         let input: WriteArgs = serde_json::from_value(args).map_err(into_tool_error)?;
 
-        let file_path = resolve_safe_path(&self.working_directory, &input.filePath)
+        let file_path = resolve_safe_path(&self.working_directory, &input.file_path)
             .map_err(into_tool_error)?;
 
         write(&file_path, input.content.as_bytes())
@@ -395,12 +395,12 @@ impl Tool for EditFileTool {
     ) -> Result<ToolResult, Box<dyn Error + Send + Sync>> {
         let input: EditArgs = serde_json::from_value(args).map_err(into_tool_error)?;
 
-        let file_path = resolve_safe_path(&self.working_directory, &input.filePath)
+        let file_path = resolve_safe_path(&self.working_directory, &input.file_path)
             .map_err(into_tool_error)?;
 
         let content = read_text(&file_path).await.map_err(into_tool_error)?;
 
-        let new_content = smart_replace(&content, &input.oldString, &input.newString, input.replaceAll)
+        let new_content = smart_replace(&content, &input.old_string, &input.new_string, input.replace_all)
             .map_err(|e| anyhow::anyhow!("{}", e))?;
 
         write(&file_path, new_content.as_bytes())
@@ -473,7 +473,7 @@ mod tests {
             working_directory: working_dir,
         };
         let args = serde_json::json!({
-            "filePath": file_path.to_str().unwrap()
+            "file_path": file_path.to_str().unwrap()
         });
         let ctx = ToolContext::new("test", "msg");
 
@@ -494,7 +494,7 @@ mod tests {
             working_directory: working_dir,
         };
         let args = serde_json::json!({
-            "filePath": file_path.to_str().unwrap(),
+            "file_path": file_path.to_str().unwrap(),
             "content": "Hello written"
         });
         let ctx = ToolContext::new("test", "msg");
@@ -545,20 +545,20 @@ mod tests {
         };
 
         let args_multiple = serde_json::json!({
-            "filePath": file_path.to_str().unwrap(),
-            "oldString": "foo",
-            "newString": "baz",
-            "replaceAll": false
+            "file_path": file_path.to_str().unwrap(),
+            "old_string": "foo",
+            "new_string": "baz",
+            "replace_all": false
         });
         let ctx = ToolContext::new("test", "msg");
         let result = tool.execute(args_multiple, &ctx).await;
         assert!(result.is_err());
 
         let args_all = serde_json::json!({
-            "filePath": file_path.to_str().unwrap(),
-            "oldString": "foo",
-            "newString": "baz",
-            "replaceAll": true
+            "file_path": file_path.to_str().unwrap(),
+            "old_string": "foo",
+            "new_string": "baz",
+            "replace_all": true
         });
         let ctx = ToolContext::new("test", "msg");
         let _ = tool.execute(args_all, &ctx).await.map_err(|e| anyhow::anyhow!(e.to_string()))?;

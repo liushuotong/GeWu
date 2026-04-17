@@ -135,7 +135,7 @@ mod tests {
     fn test_truncation_by_bytes() {
         let service = TruncationService::new();
         let line = "x".repeat(100);
-        let text: String = (0..600).map(|i| format!("{}\n", line)).collect();
+        let text: String = (0..600).map(|_| format!("{}\n", line)).collect();
         let result = service.truncate(&text, false);
         assert!(result.truncated);
         assert!(result.output_path.is_some());

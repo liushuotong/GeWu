@@ -18,6 +18,7 @@ pub struct TaskTool {
 }
 
 #[derive(Deserialize)]
+#[allow(dead_code)]
 struct TaskArgs {
     description: String,
     prompt: String,

@@ -23,7 +23,7 @@
 
 use crate::openai_types::{
     ChatCompletionMessageToolCall, ChatCompletionMessageToolCallChunk,
-    ChatCompletionMessageToolCalls, ChatCompletionRequestAssistantMessageArgs,
+    ChatCompletionMessageToolCalls,
     ChatCompletionRequestMessage, ChatCompletionRequestMessageContentPartImage,
     ChatCompletionRequestSystemMessageArgs, ChatCompletionRequestToolMessageArgs,
     ChatCompletionRequestUserMessageArgs, ChatCompletionRequestUserMessageContentPart,
@@ -294,6 +294,7 @@ impl OpenAIProvider {
     }
 
     /// Checks if a content part type is supported by the current model.
+    #[allow(dead_code)]
     fn modality_supported(&self, part: &ContentPart) -> bool {
         match part {
             ContentPart::Text { .. } => true,

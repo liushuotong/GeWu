@@ -12,6 +12,7 @@ struct MockLlm {
 }
 
 #[derive(Debug)]
+#[allow(dead_code)]
 struct MockError(String);
 impl std::fmt::Display for MockError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
