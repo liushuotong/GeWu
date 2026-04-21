@@ -192,15 +192,9 @@ impl<S: State + 'static> CompiledGraph<S> {
         let graph = self.clone();
         Box::pin(async move {
             let mut current_state = input;
-            let mut visited: HashSet<String> = HashSet::new();
             let mut to_execute: Vec<String> = vec![entry];
 
             while let Some(node_name) = to_execute.pop() {
-                if visited.contains(&node_name) {
-                    continue;
-                }
-                visited.insert(node_name.clone());
-
                 let handler = graph
                     .nodes
                     .get(&node_name)
@@ -218,9 +212,7 @@ impl<S: State + 'static> CompiledGraph<S> {
                     if edge == END || edge.is_empty() {
                         continue;
                     }
-                    if !visited.contains(&edge) {
-                        to_execute.push(edge);
-                    }
+                    to_execute.push(edge);
                 }
 
                 if graph.finish_points.contains(&node_name) && to_execute.is_empty() {
@@ -237,17 +229,11 @@ impl<S: State + 'static> CompiledGraph<S> {
             let entry = self.entry_point.clone().ok_or(GraphError::NoEntryPoint)?;
 
             let mut current_state = input;
-            let mut visited: HashSet<String> = HashSet::new();
             let mut to_execute: Vec<String> = vec![entry];
 
             yield current_state.clone();
 
             while let Some(node_name) = to_execute.pop() {
-                if visited.contains(&node_name) {
-                    continue;
-                }
-                visited.insert(node_name.clone());
-
                 let handler = self.nodes.get(&node_name)
                     .ok_or_else(|| GraphError::NodeNotFound(node_name.clone()))?;
 
@@ -265,9 +251,7 @@ impl<S: State + 'static> CompiledGraph<S> {
                     if edge == END || edge.is_empty() {
                         continue;
                     }
-                    if !visited.contains(&edge) {
-                        to_execute.push(edge);
-                    }
+                    to_execute.push(edge);
                 }
 
                 if self.finish_points.contains(&node_name) && to_execute.is_empty() {
