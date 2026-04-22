@@ -57,7 +57,7 @@ where
         _ctx: &ToolContext,
     ) -> Result<ToolResult, Box<dyn Error + Send + Sync>> {
         let input: S = serde_json::from_value(args)?;
-        let result = self.graph.invoke(input).await?;
+        let result = self.graph.invoke(input)?;
         Ok(ToolResult::new(&self.name, serde_json::to_string(&result)?))
     }
 }

@@ -5,7 +5,7 @@ pub mod state;
 mod tests;
 
 pub use channels::{AnyValueChannel, BaseChannel, BinaryOperatorChannel, EphemeralValueChannel, LastValueChannel, NamedBarrierChannel, TopicChannel};
-pub use graph::{CompiledGraph, GraphError, GraphTool, StateGraph};
+pub use graph::{CompiledGraph, GraphError, GraphSend, GraphTool, NodeResult, StateGraph, StreamMode, StreamOutput, StreamWriter};
 pub use state::{Append, LastValue, Reducer, State, Sum};
 
 pub const START: &str = "__start__";
