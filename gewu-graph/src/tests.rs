@@ -898,4 +898,375 @@ mod tests {
 
         assert_eq!(result.count, 1);
     }
+
+    #[tokio::test]
+    async fn test_invoke_sync_equivalence() {
+        let mut graph = StateGraph::<TestState>::new();
+
+        let step1 = |state: TestState| async move {
+            partial(Some(state.count + 10), None)
+        };
+
+        let step2 = |state: TestState| async move {
+            partial(Some(state.count + 1), None)
+        };
+
+        graph.add_node("step1", step1);
+        graph.add_node("step2", step2);
+        graph.set_entry_point("step1");
+        graph.add_edge("step1", "step2");
+        graph.set_finish_point("step2");
+
+        let compiled = graph.compile();
+
+        let async_result1 = compiled.ainvoke(TestState { count: 0, messages: vec![] }).await.unwrap();
+        let async_result2 = compiled.ainvoke(TestState { count: 0, messages: vec![] }).await.unwrap();
+
+        assert_eq!(async_result1.count, async_result2.count);
+    }
+
+    #[tokio::test]
+    async fn test_node_returns_custom_only() {
+        let mut graph = StateGraph::<TestState>::new();
+
+        let custom_only = |_state: TestState| async move {
+            custom(serde_json::json!({"type": "custom_event", "value": 42}))
+        };
+
+        let after = |state: TestState| async move {
+            partial(Some(state.count + 100), None)
+        };
+
+        graph.add_node("custom_only", custom_only);
+        graph.add_node("after", after);
+        graph.set_entry_point("custom_only");
+        graph.add_edge("custom_only", "after");
+        graph.set_finish_point("after");
+
+        let compiled = graph.compile();
+        let result = compiled.ainvoke(TestState { count: 5, messages: vec![] }).await.unwrap();
+
+        assert_eq!(result.count, 105);
+    }
+
+    #[tokio::test]
+    async fn test_conditional_edge_unmapped_path() {
+        let mut graph = StateGraph::<TestState>::new();
+
+        let node = |state: TestState| async move {
+            partial(Some(state.count + 1), None)
+        };
+
+        let check = |_state: &TestState| -> String {
+            "unmapped_path".to_string()
+        };
+
+        graph.add_node("start", node);
+        graph.set_entry_point("start");
+        graph.add_conditional_edges(
+            "start",
+            check,
+            [("high".to_string(), "fallback".to_string())].into(),
+        );
+
+        let compiled = graph.compile();
+        let result = compiled.ainvoke(TestState { count: 0, messages: vec![] }).await;
+
+        assert!(matches!(result, Err(crate::graph::GraphError::NodeNotFound(_))));
+    }
+
+    #[tokio::test]
+    async fn test_send_to_finish_point_node() {
+        let mut graph = StateGraph::<TestState>::new();
+
+        let spawn = |_state: TestState| async move {
+            NodeResult::Send(vec![GraphSend("worker".to_string(), TestState { count: 50, messages: vec![] })])
+        };
+
+        let worker = |state: TestState| async move {
+            partial(Some(state.count + 1), None)
+        };
+
+        graph.add_node("spawn", spawn);
+        graph.add_node("worker", worker);
+        graph.set_entry_point("spawn");
+        graph.set_finish_point("worker");
+
+        let compiled = graph.compile();
+        let result = compiled.ainvoke(TestState { count: 0, messages: vec![] }).await.unwrap();
+
+        assert_eq!(result.count, 51);
+    }
+
+    #[tokio::test]
+    async fn test_invoke_parallel_chain_execution() {
+        let mut graph = StateGraph::<TestState>::new();
+
+        let a = |state: TestState| async move {
+            partial(Some(state.count + 1), None)
+        };
+
+        let b = |state: TestState| async move {
+            partial(Some(state.count + 10), None)
+        };
+
+        let c = |state: TestState| async move {
+            partial(Some(state.count + 100), None)
+        };
+
+        graph.add_node("a", a);
+        graph.add_node("b", b);
+        graph.add_node("c", c);
+        graph.set_entry_point("a");
+        graph.add_edge("a", "b");
+        graph.add_edge("b", "c");
+        graph.set_finish_point("c");
+
+        let compiled = graph.compile();
+        let result = compiled.invoke_parallel(TestState { count: 0, messages: vec![] }).await.unwrap();
+
+        assert_eq!(result.count, 111);
+    }
+
+    #[tokio::test]
+    #[should_panic(expected = "Subgraphs are not supported in invoke_parallel")]
+    async fn test_invoke_parallel_with_subgraph_panics() {
+        let mut subgraph = StateGraph::<TestState>::new();
+        let double = |state: TestState| async move {
+            partial(Some(state.count * 2), None)
+        };
+        subgraph.add_node("double", double);
+        subgraph.set_entry_point("double");
+        subgraph.set_finish_point("double");
+        let subgraph_compiled = subgraph.compile();
+
+        let mut graph = StateGraph::<TestState>::new();
+        graph.add_subgraph_node("nested", subgraph_compiled);
+        graph.set_entry_point("nested");
+        graph.set_finish_point("nested");
+
+        let compiled = graph.compile();
+        compiled.invoke_parallel(TestState { count: 5, messages: vec![] }).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn test_subgraph_depth_limit() {
+        let mut inner_graph = StateGraph::<TestState>::new();
+        inner_graph.add_node("node", |state: TestState| async move {
+            partial(Some(state.count + 1), None)
+        });
+        inner_graph.set_entry_point("node");
+        inner_graph.set_finish_point("node");
+        let inner_compiled = inner_graph.compile();
+
+        let mut graph = StateGraph::<TestState>::new();
+        graph.add_subgraph_node("nested", inner_compiled);
+        graph.set_entry_point("nested");
+        graph.set_finish_point("nested");
+
+        let compiled = graph.compile();
+        let result = compiled.ainvoke(TestState { count: 0, messages: vec![] }).await;
+
+        assert!(result.is_ok());
+    }
+
+    #[tokio::test]
+    async fn test_stream_custom_data_passthrough() {
+        let mut graph = StateGraph::<TestState>::new();
+
+        let custom_node = |_state: TestState| async move {
+            custom(serde_json::json!({"event": "test", "nested": {"key": "value"}}))
+        };
+
+        graph.add_node("custom_node", custom_node);
+        graph.set_entry_point("custom_node");
+        graph.set_finish_point("custom_node");
+
+        let compiled = graph.compile();
+        let stream = compiled.stream_with_modes(TestState { count: 0, messages: vec![] }, vec![StreamMode::Custom]);
+        let mut stream = Box::pin(stream);
+        let mut customs = Vec::new();
+
+        while let Some(result) = stream.next().await {
+            match result.unwrap() {
+                StreamOutput::Custom { node, data } => customs.push((node, data)),
+                _ => {}
+            }
+        }
+
+        assert_eq!(customs.len(), 1);
+        assert_eq!(customs[0].0, "custom_node");
+        assert_eq!(customs[0].1.get("event").unwrap(), &serde_json::json!("test"));
+    }
+
+    #[tokio::test]
+    async fn test_all_stream_modes_combined() {
+        let mut graph = StateGraph::<TestState>::new();
+
+        let step1 = |state: TestState| async move {
+            partial(Some(state.count + 10), None)
+        };
+
+        let step2 = |state: TestState| async move {
+            custom(serde_json::json!({"step2": "done"}))
+        };
+
+        let step3 = |state: TestState| async move {
+            partial(Some(state.count + 1), None)
+        };
+
+        graph.add_node("step1", step1);
+        graph.add_node("step2", step2);
+        graph.add_node("step3", step3);
+        graph.set_entry_point("step1");
+        graph.add_edge("step1", "step2");
+        graph.add_edge("step2", "step3");
+        graph.set_finish_point("step3");
+
+        let compiled = graph.compile();
+        let stream = compiled.stream_with_modes(
+            TestState { count: 0, messages: vec![] },
+            vec![StreamMode::Values, StreamMode::Updates, StreamMode::Custom, StreamMode::Tasks],
+        );
+        let mut stream = Box::pin(stream);
+
+        let mut values = Vec::new();
+        let mut updates = Vec::new();
+        let mut customs = Vec::new();
+        let mut task_starts = Vec::new();
+        let mut task_ends = Vec::new();
+
+        while let Some(result) = stream.next().await {
+            match result.unwrap() {
+                StreamOutput::Value(s) => values.push(s),
+                StreamOutput::Update { node, update } => updates.push((node, update)),
+                StreamOutput::Custom { node, data } => customs.push((node, data)),
+                StreamOutput::TaskStart { id, name } => task_starts.push((id, name)),
+                StreamOutput::TaskEnd { id, name, .. } => task_ends.push((id, name)),
+            }
+        }
+
+        assert_eq!(values.len(), 4);
+        assert_eq!(updates.len(), 2);
+        assert_eq!(customs.len(), 1);
+        assert_eq!(task_starts.len(), 3);
+        assert_eq!(task_ends.len(), 3);
+    }
+
+    #[tokio::test]
+    async fn test_finish_point_without_explicit_edge() {
+        let mut graph = StateGraph::<TestState>::new();
+
+        let node = |state: TestState| async move {
+            partial(Some(state.count + 1), None)
+        };
+
+        graph.add_node("start", node);
+        graph.set_entry_point("start");
+        graph.set_finish_point("start");
+
+        let compiled = graph.compile();
+        let result = compiled.ainvoke(TestState { count: 5, messages: vec![] }).await.unwrap();
+
+        assert_eq!(result.count, 6);
+    }
+
+    #[tokio::test]
+    async fn test_multiple_sends_to_different_nodes() {
+        let mut graph = StateGraph::<TestState>::new();
+
+        let splitter = |_state: TestState| async move {
+            NodeResult::Send(vec![
+                GraphSend("node_a".to_string(), TestState { count: 10, messages: vec![] }),
+                GraphSend("node_b".to_string(), TestState { count: 20, messages: vec![] }),
+                GraphSend("node_c".to_string(), TestState { count: 30, messages: vec![] }),
+            ])
+        };
+
+        let node_a = |state: TestState| async move { partial(Some(state.count), None) };
+        let node_b = |state: TestState| async move { partial(Some(state.count), None) };
+        let node_c = |state: TestState| async move { partial(Some(state.count), None) };
+
+        graph.add_node("splitter", splitter);
+        graph.add_node("node_a", node_a);
+        graph.add_node("node_b", node_b);
+        graph.add_node("node_c", node_c);
+        graph.set_entry_point("splitter");
+        graph.set_finish_point("splitter");
+
+        let compiled = graph.compile();
+        let result = compiled.ainvoke(TestState { count: 0, messages: vec![] }).await.unwrap();
+
+        assert_eq!(result.count, 30);
+    }
+
+    #[tokio::test]
+    async fn test_nested_send_three_levels() {
+        let mut graph = StateGraph::<TestState>::new();
+
+        let level0 = |_state: TestState| async move {
+            NodeResult::Send(vec![GraphSend("level1".to_string(), TestState { count: 1, messages: vec![] })])
+        };
+
+        let level1 = |state: TestState| async move {
+            NodeResult::Send(vec![GraphSend("level2".to_string(), TestState { count: state.count * 2, messages: vec![] })])
+        };
+
+        let level2 = |state: TestState| async move {
+            partial(Some(state.count + 1), None)
+        };
+
+        graph.add_node("level0", level0);
+        graph.add_node("level1", level1);
+        graph.add_node("level2", level2);
+        graph.set_entry_point("level0");
+        graph.set_finish_point("level0");
+
+        let compiled = graph.compile();
+        let result = compiled.ainvoke(TestState { count: 0, messages: vec![] }).await.unwrap();
+
+        assert_eq!(result.count, 3);
+    }
+
+    #[test]
+    fn test_constants_values() {
+        assert_eq!(START, "__start__");
+        assert_eq!(END, "__end__");
+    }
+
+    #[tokio::test]
+    async fn test_state_with_messages_accumulation() {
+        let mut graph = StateGraph::<TestState>::new();
+
+        let add_msg1 = |state: TestState| async move {
+            let mut msgs = state.messages.clone();
+            msgs.push("first".to_string());
+            partial(None, Some(msgs))
+        };
+
+        let add_msg2 = |state: TestState| async move {
+            let mut msgs = state.messages.clone();
+            msgs.push("second".to_string());
+            partial(None, Some(msgs))
+        };
+
+        let add_msg3 = |state: TestState| async move {
+            let mut msgs = state.messages.clone();
+            msgs.push("third".to_string());
+            partial(None, Some(msgs))
+        };
+
+        graph.add_node("msg1", add_msg1);
+        graph.add_node("msg2", add_msg2);
+        graph.add_node("msg3", add_msg3);
+        graph.set_entry_point("msg1");
+        graph.add_edge("msg1", "msg2");
+        graph.add_edge("msg2", "msg3");
+        graph.set_finish_point("msg3");
+
+        let compiled = graph.compile();
+        let result = compiled.ainvoke(TestState { count: 0, messages: vec![] }).await.unwrap();
+
+        assert_eq!(result.messages, vec!["first", "second", "third"]);
+    }
 }

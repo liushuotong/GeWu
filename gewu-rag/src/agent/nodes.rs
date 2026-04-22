@@ -698,7 +698,7 @@ pub async fn run_parallel_agents(
             let agent_state = AgentState::new(q.clone(), i);
             let graph = agent_graph.clone();
             async move {
-                graph.invoke(agent_state).await
+                graph.ainvoke(agent_state).await
             }
         })
         .collect();

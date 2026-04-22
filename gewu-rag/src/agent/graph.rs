@@ -7,7 +7,7 @@ use crate::retrieval::qdrant_store::QdrantStore;
 use crate::tools::retrieval::{RetrieveManyParentChunksTool, RetrieveParentChunksTool, SearchChildChunksTool};
 use gewu_core::types::Message;
 use gewu_core::{LlmProvider, Tool};
-use gewu_graph::{CompiledGraph, StateGraph};
+use gewu_graph::{CompiledGraph, NodeResult, StateGraph};
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
@@ -66,7 +66,7 @@ impl RagSystem {
         let agent_graph = self.build_agent_graph();
         let main_graph = self.build_main_graph(agent_graph);
 
-        let final_state = main_graph.invoke(initial_state).await?;
+        let final_state = main_graph.ainvoke(initial_state).await?;
 
         if let Some(last_msg) = final_state.messages.last() {
             if let Message::Assistant { content, .. } = last_msg {
@@ -97,7 +97,7 @@ impl RagSystem {
         let agent_graph = self.build_agent_graph();
         let main_graph = self.build_main_graph(agent_graph);
 
-        let final_state = main_graph.invoke(initial_state).await?;
+        let final_state = main_graph.ainvoke(initial_state).await?;
 
         if let Some(last_msg) = final_state.messages.last() {
             if let Message::Assistant { content, .. } = last_msg {
@@ -123,7 +123,7 @@ impl RagSystem {
             let config = config.clone();
 
             async move {
-                nodes::orchestrator(state, llm, tools, &config).await
+                NodeResult::Partial(nodes::orchestrator(state, llm, tools, &config).await)
             }
         });
 
@@ -132,7 +132,7 @@ impl RagSystem {
             let tools = tools2.clone();
 
             async move {
-                nodes::execute_tools(state, tools).await
+                NodeResult::Partial(nodes::execute_tools(state, tools).await)
             }
         });
 
@@ -141,10 +141,10 @@ impl RagSystem {
                 let node_id = next_graph_node_id();
                 tracing::info!("[GRAPH_NODE #{}] should_compress: tool_count={}, iteration={}, msgs={}",
                     node_id, state.tool_call_count, state.iteration_count, state.messages.len());
-                PartialAgentState {
+                NodeResult::Partial(PartialAgentState {
                     messages: Some(state.messages.clone()),
                     ..Default::default()
-                }
+                })
             }
         });
 
@@ -153,7 +153,7 @@ impl RagSystem {
             let llm = llm2.clone();
 
             async move {
-                nodes::compress_context(state, llm).await
+                NodeResult::Partial(nodes::compress_context(state, llm).await)
             }
         });
 
@@ -162,13 +162,13 @@ impl RagSystem {
             let llm = llm3.clone();
 
             async move {
-                nodes::fallback_response(state, llm).await
+                NodeResult::Partial(nodes::fallback_response(state, llm).await)
             }
         });
 
         graph.add_node("collect_answer", move |state: AgentState| {
             async move {
-                nodes::collect_answer(state).await
+                NodeResult::Partial(nodes::collect_answer(state).await)
             }
         });
 
@@ -222,7 +222,7 @@ impl RagSystem {
             let llm = llm.clone();
 
             async move {
-                nodes::summarize_history(state, llm).await
+                NodeResult::Partial(nodes::summarize_history(state, llm).await)
             }
         });
 
@@ -231,7 +231,7 @@ impl RagSystem {
             let llm = llm2.clone();
 
             async move {
-                nodes::rewrite_query(state, llm).await
+                NodeResult::Partial(nodes::rewrite_query(state, llm).await)
             }
         });
 
@@ -246,10 +246,10 @@ impl RagSystem {
             });
 
             async move {
-                PartialMainState {
+                NodeResult::Partial(PartialMainState {
                     messages: Some(messages),
                     ..Default::default()
-                }
+                })
             }
         });
 
@@ -259,7 +259,7 @@ impl RagSystem {
             let subgraph = agent_subgraph.clone();
 
             async move {
-                nodes::run_parallel_agents(state, llm, subgraph).await
+                NodeResult::Partial(nodes::run_parallel_agents(state, llm, subgraph).await)
             }
         });
 
@@ -268,7 +268,7 @@ impl RagSystem {
             let llm = llm4.clone();
 
             async move {
-                nodes::aggregate_answers(state, llm).await
+                NodeResult::Partial(nodes::aggregate_answers(state, llm).await)
             }
         });
 
