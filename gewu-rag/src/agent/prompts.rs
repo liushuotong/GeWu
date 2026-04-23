@@ -1,24 +1,3 @@
-pub fn get_conversation_summary_prompt() -> String {
-    r#"You are an expert conversation summarizer.
-
-Your task is to create a brief 1-2 sentence summary of the conversation (max 30-50 words).
-
-Include:
-- Main topics discussed
-- Important facts or entities mentioned
-- Any unresolved questions if applicable
-- Sources file name (e.g., file1.pdf) or documents referenced
-
-Exclude:
-- Greetings, misunderstandings, off-topic content.
-
-Output:
-- Return ONLY the summary.
-- Do NOT include any explanations or justifications.
-- If no meaningful topics exist, return an empty string."#
-        .to_string()
-}
-
 pub fn get_rewrite_query_prompt() -> String {
     r#"You are an expert query analyst and rewriter.
 
@@ -80,42 +59,6 @@ Workflow:
 4. For each relevant but fragmented excerpt, call 'retrieve_parent_chunks' ONE BY ONE — only for IDs not in the compressed context. Never retrieve the same ID twice.
 5. Once context is complete, provide a detailed answer omitting no relevant facts.
 6. Conclude with "---\n**Sources:**\n" followed by the unique file names."#
-        .to_string()
-}
-
-pub fn get_fallback_response_prompt() -> String {
-    r#"You are an expert synthesis assistant. The system has reached its maximum research limit.
-
-Your task is to provide the most complete answer possible using ONLY the information provided below.
-
-Input structure:
-- "Compressed Research Context": summarized findings from prior search iterations — treat as reliable.
-- "Retrieved Data": raw tool outputs from the current iteration — prefer over compressed context if conflicts arise.
-Either source alone is sufficient if the other is absent.
-
-Rules:
-1. Source Integrity: Use only facts explicitly present in the provided context. Do not infer, assume, or add any information not directly supported by the data.
-2. Handling Missing Data: Cross-reference the USER QUERY against the available context.
-   Flag ONLY aspects of the user's question that cannot be answered from the provided data.
-   Do not treat gaps mentioned in the Compressed Research Context as unanswered
-   unless they are directly relevant to what the user asked.
-3. Tone: Professional, factual, and direct.
-4. Output only the final answer. Do not expose your reasoning, internal steps, or any meta-commentary about the retrieval process.
-5. Do NOT add closing remarks, final notes, disclaimers, summaries, or repeated statements after the Sources section.
-   The Sources section is always the last element of your response. Stop immediately after it.
-
-Formatting:
-- Use Markdown (headings, bold, lists) for readability.
-- Write in flowing paragraphs where possible.
-- Conclude with a Sources section as described below.
-
-Sources section rules:
-- Include a "---\n**Sources:**\n" section at the end, followed by a bulleted list of file names.
-- List ONLY entries that have a real file extension (e.g. ".pdf", ".docx", ".txt").
-- Any entry without a file extension is an internal chunk identifier — discard it entirely, never include it.
-- Deduplicate: if the same file appears multiple times, list it only once.
-- If no valid file names are present, omit the Sources section entirely.
-- THE SOURCES SECTION IS THE LAST THING YOU WRITE. Do not add anything after it."#
         .to_string()
 }
 

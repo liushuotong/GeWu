@@ -1,5 +1,4 @@
 use crate::config::Config;
-use crate::document::chunker::DocumentChunker;
 use crate::retrieval::qdrant_store::{QdrantStore, SearchResult};
 use crate::retrieval::parent_store::ParentStore;
 use async_trait::async_trait;
@@ -15,6 +14,7 @@ pub enum RetrievalToolError {
     #[error("Store error: {0}")]
     Store(String),
     #[error("No relevant chunks found")]
+    #[allow(dead_code)]
     NoResults,
     #[error("Parent not found: {0}")]
     ParentNotFound(String),
@@ -49,25 +49,14 @@ pub struct SearchChildChunksTool {
     store: Arc<QdrantStore>,
     parent_store: Arc<ParentStore>,
     config: Config,
-    chunker: DocumentChunker,
 }
 
 impl SearchChildChunksTool {
     pub fn new(store: Arc<QdrantStore>, parent_store: Arc<ParentStore>, config: Config) -> Self {
-        let mut chunker = DocumentChunker::new(config.clone());
-        if config.enable_sparse {
-            let bm25_path = config.parent_store_path.join("bm25_state.json");
-            if bm25_path.exists() {
-                if let Err(e) = chunker.load_bm25_state(&bm25_path) {
-                    tracing::warn!("Failed to load BM25 state: {}", e);
-                }
-            }
-        }
         Self {
             store,
             parent_store,
             config,
-            chunker,
         }
     }
 }
@@ -114,7 +103,7 @@ impl Tool for SearchChildChunksTool {
             query, limit, self.config.similarity_threshold as f32);
 
         let search_result = if self.config.enable_sparse {
-            let sparse_vec = self.chunker.compute_sparse(query);
+            let sparse_vec = self.store.compute_sparse_from_text(query).await?;
             self.store
                 .hybrid_search(query, limit, self.config.similarity_threshold as f32, &sparse_vec)
                 .await

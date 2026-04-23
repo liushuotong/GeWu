@@ -1,20 +1,18 @@
 use crate::config::Config;
 use crate::document::chunker::{ChildChunk, Bm25SparseVector};
 use embed_anything::embeddings::embed::{Embedder, EmbeddingResult};
-use embed_anything::embeddings::embed::EmbedderBuilder;
-use qdrant_client::qdrant::Value;
 use qdrant_client::qdrant::{
     Datatype, Distance, Fusion, Modifier, NamedVectors, PointStruct, Query, QueryPointsBuilder,
-    SparseIndexConfigBuilder, SparseVectorParamsBuilder, SparseVectorBuilder, Vector,
-    VectorInput, VectorParamsBuilder, VectorsConfig,
+    SparseIndexConfigBuilder, SparseVectorParamsBuilder, SparseVectorBuilder, Value, Vector,
+    VectorInput, VectorParamsBuilder,
 };
 use qdrant_client::Qdrant;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
-use std::sync::Arc;
 use thiserror::Error;
 use tokio::sync::RwLock;
 
+#[allow(dead_code)]
 #[derive(Error, Debug)]
 pub enum RetrievalError {
     #[error("Qdrant error: {0}")]
@@ -40,6 +38,7 @@ pub struct QdrantStore {
     client: Qdrant,
     embedding_model: RwLock<Embedder>,
     embedding_dimension: usize,
+    sparse_embedder: Option<RwLock<Embedder>>,
 }
 
 impl QdrantStore {
@@ -51,19 +50,31 @@ impl QdrantStore {
         let client = builder.build()?;
 
         let embedding_model = Embedder::from_pretrained_hf(
-            "minishlab/potion-base-8M",
+            "BAAI/bge-base-en-v1.5",
             None,
             None,
             None,
         )?;
 
-        let embedding_dimension = 256;
+        let embedding_dimension = 768;
+
+        let sparse_embedder = if config.enable_sparse {
+            Some(RwLock::new(Embedder::from_pretrained_hf(
+                &config.sparse_model,
+                None,
+                None,
+                None,
+            )?))
+        } else {
+            None
+        };
 
         Ok(Self {
             config,
             client,
             embedding_model: tokio::sync::RwLock::new(embedding_model),
             embedding_dimension,
+            sparse_embedder,
         })
     }
 
@@ -112,6 +123,33 @@ impl QdrantStore {
             self.client.delete_collection(collection_name).await?;
         }
         Ok(())
+    }
+
+    fn convert_dense_to_sparse(dense: &[f32], threshold: f32) -> Bm25SparseVector {
+        let mut indices: Vec<u64> = Vec::new();
+        let mut values: Vec<f32> = Vec::new();
+
+        for (i, &val) in dense.iter().enumerate() {
+            if val > threshold {
+                indices.push(i as u64);
+                values.push(val);
+            }
+        }
+
+        Bm25SparseVector { indices, values }
+    }
+
+    pub async fn compute_sparse_from_text(&self, text: &str) -> Result<Bm25SparseVector, Box<dyn std::error::Error + Send + Sync>> {
+        if let Some(ref sparse_embedder) = self.sparse_embedder {
+            let raw_results = sparse_embedder.read().await
+                .embed(&[text], None, None).await?;
+            if let Some(EmbeddingResult::DenseVector(v)) = raw_results.first() {
+                let sparse = Self::convert_dense_to_sparse(v, 0.0);
+                tracing::debug!("SPLADE sparse: {} non-zero values out of {}", sparse.values.len(), v.len());
+                return Ok(sparse);
+            }
+        }
+        Ok(Bm25SparseVector { indices: vec![], values: vec![] })
     }
 
     pub async fn add_chunks(

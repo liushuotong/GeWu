@@ -47,8 +47,8 @@ impl State for AgentState {
     type Partial = PartialAgentState;
 
     fn merge(&self, update: Self::Partial) -> Self {
-        let old_tool_count = self.tool_call_count;
-        let update_tool_count = update.tool_call_count;
+        let _old_tool_count = self.tool_call_count;
+        let _update_tool_count = update.tool_call_count;
 
         let mut combined_keys = self.retrieval_keys.clone();
         if let Some(new_keys) = update.retrieval_keys {

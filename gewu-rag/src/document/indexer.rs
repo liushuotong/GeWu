@@ -1,5 +1,6 @@
 use crate::config::Config;
 use crate::document::chunker::{ChildChunk, DocumentChunker, Bm25SparseVector};
+use crate::document::pdf_processor::PdfProcessor;
 use crate::retrieval::parent_store::ParentStore;
 use crate::retrieval::qdrant_store::QdrantStore;
 use std::path::Path;
@@ -26,39 +27,71 @@ impl DocumentIndexer {
         })
     }
 
-    #[instrument(skip(self, markdown_dir))]
+    #[instrument(skip(self, docs_dir))]
     pub async fn index_markdown_dir(
         &mut self,
-        markdown_dir: impl AsRef<Path>,
+        docs_dir: impl AsRef<Path>,
     ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-        let dir = markdown_dir.as_ref();
+        let dir = docs_dir.as_ref();
         if !dir.exists() {
-            tracing::warn!("Markdown directory does not exist: {:?}", dir);
+            tracing::warn!("Docs directory does not exist: {:?}", dir);
             return Ok(());
         }
 
-        let pattern_path = dir.join("*.md");
-        let pattern_str = pattern_path.to_str().unwrap_or("");
-        let entries = glob::glob(pattern_str)?
+        let md_pattern = dir.join("*.md");
+        let md_pattern_str = md_pattern.to_str().unwrap_or("");
+        let md_entries = glob::glob(md_pattern_str)?
             .filter_map(|e| e.ok())
             .collect::<Vec<_>>();
 
-        if entries.is_empty() {
-            tracing::info!("No markdown files found in {:?}", dir);
+        let pdf_pattern = dir.join("*.pdf");
+        let pdf_pattern_str = pdf_pattern.to_str().unwrap_or("");
+        let pdf_entries = glob::glob(pdf_pattern_str)?
+            .filter_map(|e| e.ok())
+            .collect::<Vec<_>>();
+
+        if md_entries.is_empty() && pdf_entries.is_empty() {
+            tracing::info!("No markdown or PDF files found in {:?}", dir);
             return Ok(());
         }
 
         let mut all_contents: Vec<String> = Vec::new();
         let mut all_child_chunks: Vec<ChildChunk> = Vec::new();
+        let pdf_processor = PdfProcessor::new();
 
-        for md_path in &entries {
-            info!("Reading file: {:?}", md_path);
+        for md_path in &md_entries {
+            info!("Reading markdown file: {:?}", md_path);
             let content = std::fs::read_to_string(md_path)?;
             let source_name = md_path.file_stem()
                 .map(|s| s.to_string_lossy().to_string())
                 .unwrap_or_else(|| "unknown".to_string());
 
             let parent_chunks = self.chunker.create_parent_chunks(&content, &source_name);
+
+            for parent in &parent_chunks {
+                let children = self.chunker.create_child_chunks(parent, &source_name);
+                all_child_chunks.extend(children);
+                all_contents.push(parent.content.clone());
+            }
+
+            for parent in &parent_chunks {
+                self.parent_store.save(parent)?;
+            }
+        }
+
+        for pdf_path in &pdf_entries {
+            info!("Processing PDF file: {:?}", pdf_path);
+            let markdown = pdf_processor.process(pdf_path)?;
+            let source_name = pdf_path.file_stem()
+                .map(|s| s.to_string_lossy().to_string())
+                .unwrap_or_else(|| "unknown".to_string());
+
+            if markdown.trim().is_empty() {
+                info!("PDF {} produced empty content, skipping", source_name);
+                continue;
+            }
+
+            let parent_chunks = self.chunker.create_parent_chunks(&markdown, &source_name);
 
             for parent in &parent_chunks {
                 let children = self.chunker.create_child_chunks(parent, &source_name);
@@ -85,10 +118,10 @@ impl DocumentIndexer {
         }
 
         let sparse_vectors: Option<Vec<Bm25SparseVector>> = if self.config.enable_sparse {
-            info!("Computing sparse vectors for {} chunks", all_child_chunks.len());
+            info!("Computing SPLADE sparse vectors for {} chunks", all_child_chunks.len());
             let mut sparse = Vec::new();
             for chunk in &all_child_chunks {
-                let sv = self.chunker.compute_sparse(&chunk.content);
+                let sv = self.vector_store.compute_sparse_from_text(&chunk.content).await?;
                 sparse.push(sv);
             }
             Some(sparse)
@@ -99,16 +132,11 @@ impl DocumentIndexer {
         info!("Adding {} chunks to vector store", all_child_chunks.len());
         self.vector_store.add_chunks(&all_child_chunks, sparse_vectors.as_deref()).await?;
 
-        if self.config.enable_sparse {
-            let bm25_path = self.config.parent_store_path.join("bm25_state.json");
-            info!("Saving BM25 state to {:?}", bm25_path);
-            self.chunker.save_bm25_state(&bm25_path)?;
-        }
-
         info!("Indexing complete!");
         Ok(())
     }
 
+    #[allow(dead_code)]
     #[instrument(skip(self, md_path))]
     pub async fn index_markdown_file(
         &mut self,
@@ -131,10 +159,9 @@ impl DocumentIndexer {
         }
 
         let sparse_vectors: Option<Vec<Bm25SparseVector>> = if self.config.enable_sparse {
-            self.chunker.build_idf(&all_contents);
             let mut sparse = Vec::new();
             for chunk in &all_child_chunks {
-                sparse.push(self.chunker.compute_sparse(&chunk.content));
+                sparse.push(self.vector_store.compute_sparse_from_text(&chunk.content).await?);
             }
             Some(sparse)
         } else {
@@ -157,6 +184,61 @@ impl DocumentIndexer {
         Ok(())
     }
 
+    #[allow(dead_code)]
+    #[instrument(skip(self, pdf_path))]
+    pub async fn index_pdf_file(
+        &mut self,
+        pdf_path: impl AsRef<Path>,
+    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        let path = pdf_path.as_ref();
+        let pdf_processor = PdfProcessor::new();
+        let markdown = pdf_processor.process(path)?;
+        let source_name = path.file_stem().map(|s| s.to_string_lossy().to_string())
+            .unwrap_or_else(|| "unknown".to_string());
+
+        if markdown.trim().is_empty() {
+            info!("PDF {} produced empty content, skipping", source_name);
+            return Ok(());
+        }
+
+        let parent_chunks = self.chunker.create_parent_chunks(&markdown, &source_name);
+
+        let mut all_child_chunks: Vec<ChildChunk> = Vec::new();
+        let mut all_contents: Vec<String> = Vec::new();
+
+        for parent in &parent_chunks {
+            let children = self.chunker.create_child_chunks(parent, &source_name);
+            all_child_chunks.extend(children);
+            all_contents.push(parent.content.clone());
+        }
+
+        let sparse_vectors: Option<Vec<Bm25SparseVector>> = if self.config.enable_sparse {
+            let mut sparse = Vec::new();
+            for chunk in &all_child_chunks {
+                sparse.push(self.vector_store.compute_sparse_from_text(&chunk.content).await?);
+            }
+            Some(sparse)
+        } else {
+            None
+        };
+
+        if !all_child_chunks.is_empty() {
+            self.vector_store.add_chunks(&all_child_chunks, sparse_vectors.as_deref()).await?;
+        }
+
+        for parent in parent_chunks {
+            self.parent_store.save(&parent)?;
+        }
+
+        info!(
+            "Indexed {} child chunks from PDF",
+            all_child_chunks.len()
+        );
+
+        Ok(())
+    }
+
+    #[allow(dead_code)]
     pub async fn delete_collection(&mut self) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         self.vector_store.delete_collection().await
     }
@@ -168,9 +250,20 @@ impl DocumentIndexer {
     }
 }
 
+#[allow(dead_code)]
 pub fn pdf_to_markdown(
     pdf_path: impl AsRef<Path>,
     output_dir: impl AsRef<Path>,
 ) -> Result<std::path::PathBuf, Box<dyn std::error::Error + Send + Sync>> {
-    Ok(output_dir.as_ref().join(pdf_path.as_ref().file_stem().unwrap()).with_extension("md"))
+    let processor = crate::document::pdf_processor::PdfProcessor::new();
+    let markdown = processor.process(&pdf_path)?;
+
+    let output_path = output_dir.as_ref()
+        .join(pdf_path.as_ref().file_stem().unwrap())
+        .with_extension("md");
+
+    std::fs::create_dir_all(output_dir.as_ref())?;
+    std::fs::write(&output_path, &markdown)?;
+
+    Ok(output_path)
 }

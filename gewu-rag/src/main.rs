@@ -1,7 +1,6 @@
 use anyhow::{Context, Result};
 use clap::Parser;
 use gewu_providers::OpenAIProvider;
-use regex::Regex;
 use serde::Deserialize;
 use std::env;
 use std::fs;
@@ -131,6 +130,8 @@ struct ConfigFile {
     output_dir: Option<String>,
     #[serde(rename = "enable_sparse")]
     enable_sparse: Option<bool>,
+    #[serde(rename = "sparse_model")]
+    sparse_model: Option<String>,
 }
 
 fn strip_jsonc_comments(content: &str) -> String {
@@ -191,6 +192,8 @@ fn build_config(cli: &Cli, config_file: &Option<ConfigFile>) -> Config {
             .map(PathBuf::from)
             .unwrap_or_else(|| PathBuf::from("parent_store"));
         config.enable_sparse = cf.enable_sparse.unwrap_or(false);
+        config.sparse_model = cf.sparse_model.clone()
+            .unwrap_or_else(|| "prithivida/Splade_PP_en_v1".to_string());
     }
 
     if let Some(ref url) = cli.qdrant_url {

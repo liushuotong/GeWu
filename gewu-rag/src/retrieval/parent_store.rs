@@ -89,6 +89,7 @@ impl ParentStore {
         })
     }
 
+    #[allow(dead_code)]
     pub fn delete(&self, parent_id: &str) -> Result<(), ParentStoreError> {
         let file_name = if parent_id.to_lowercase().ends_with(".json") {
             parent_id.to_string()
@@ -105,6 +106,7 @@ impl ParentStore {
         Ok(())
     }
 
+    #[allow(dead_code)]
     pub fn list_all(&self) -> Result<Vec<String>, ParentStoreError> {
         if !self.base_path.exists() {
             return Ok(Vec::new());
@@ -124,6 +126,7 @@ impl ParentStore {
         Ok(entries)
     }
 
+    #[allow(dead_code)]
     pub fn clear(&self) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         if self.base_path.exists() {
             for entry in fs::read_dir(&self.base_path)? {

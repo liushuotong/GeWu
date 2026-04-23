@@ -140,10 +140,6 @@ pub fn route_after_tools(state: &AgentState, config: &Config) -> String {
     }
 }
 
-pub fn should_continue(state: &AgentState, config: &Config) -> String {
-    route_after_orchestrator(state, config)
-}
-
 fn estimate_tokens(state: &AgentState) -> i32 {
     let messages_tokens = state
         .messages
@@ -165,17 +161,6 @@ fn estimate_tokens(state: &AgentState) -> i32 {
     let summary_tokens = (state.context_summary.len() / 4) as i32;
 
     messages_tokens + summary_tokens
-}
-
-pub fn is_terminal_node(node_name: &str) -> bool {
-    matches!(
-        node_name,
-        "collect_answer" | "aggregate_answers" | "fallback_response"
-    )
-}
-
-pub fn is_finish_point(node_name: &str) -> bool {
-    matches!(node_name, "collect_answer" | "aggregate_answers")
 }
 
 #[cfg(test)]

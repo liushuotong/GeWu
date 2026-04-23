@@ -2,15 +2,6 @@ use crate::config::Config;
 use regex::Regex;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
-use std::fs;
-use std::path::Path;
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct Chunk {
-    pub id: String,
-    pub content: String,
-    pub metadata: HashMap<String, String>,
-}
 
 #[derive(Debug, Clone)]
 pub struct ParentChunk {
@@ -21,6 +12,7 @@ pub struct ParentChunk {
 
 #[derive(Debug, Clone)]
 pub struct ChildChunk {
+    #[allow(dead_code)]
     pub id: String,
     pub content: String,
     pub metadata: HashMap<String, String>,
@@ -38,16 +30,11 @@ pub struct Bm25SparseVector {
     pub values: Vec<f32>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct BM25State {
-    pub idf: HashMap<String, f32>,
-    pub vocab: HashMap<String, u64>,
-    pub avg_doc_length: f32,
-}
-
 #[derive(Debug, Clone)]
 pub struct BM25 {
+    #[allow(dead_code)]
     k1: f32,
+    #[allow(dead_code)]
     b: f32,
     idf: HashMap<String, f32>,
     avg_doc_length: f32,
@@ -84,55 +71,6 @@ impl BM25 {
             self.idf.insert(term, idf);
         }
     }
-
-    pub fn compute_bm25(
-        &self,
-        query_tokens: &[String],
-        doc_tokens: &[String],
-        doc_length: usize,
-    ) -> Bm25SparseVector {
-        let mut tf: HashMap<String, f32> = HashMap::new();
-        for token in doc_tokens {
-            *tf.entry(token.clone()).or_insert(0.0) += 1.0;
-        }
-
-        let mut indices: Vec<u64> = Vec::new();
-        let mut values: Vec<f32> = Vec::new();
-
-        for token in query_tokens.iter() {
-            if let Some(&idf) = self.idf.get(token) {
-                let tf_val = tf.get(token).copied().unwrap_or(0.0);
-                let doc_len = doc_length as f32;
-                let numerator = tf_val * (self.k1 + 1.0);
-                let denominator = tf_val
-                    + self.k1 * (1.0 - self.b + self.b * doc_len / self.avg_doc_length.max(1.0));
-                let score = idf * numerator / denominator.max(0.001);
-
-                if score > 0.0 {
-                    if let Some(&idx) = self.vocab.get(token) {
-                        indices.push(idx);
-                        values.push(score);
-                    }
-                }
-            }
-        }
-
-        Bm25SparseVector { indices, values }
-    }
-
-    pub fn get_state(&self) -> BM25State {
-        BM25State {
-            idf: self.idf.clone(),
-            vocab: self.vocab.clone(),
-            avg_doc_length: self.avg_doc_length,
-        }
-    }
-
-    pub fn set_state(&mut self, state: &BM25State) {
-        self.idf = state.idf.clone();
-        self.vocab = state.vocab.clone();
-        self.avg_doc_length = state.avg_doc_length;
-    }
 }
 
 impl DocumentChunker {
@@ -151,63 +89,8 @@ impl DocumentChunker {
             .collect()
     }
 
-    pub fn compute_sparse(&self, text: &str) -> Bm25SparseVector {
-        let tokens = self.tokenize(text);
-        let doc_length = tokens.len();
-
-        let mut tf: HashMap<String, f32> = HashMap::new();
-        for token in &tokens {
-            *tf.entry(token.clone()).or_insert(0.0) += 1.0;
-        }
-
-        let mut indices: Vec<u64> = Vec::new();
-        let mut values: Vec<f32> = Vec::new();
-
-        for token in &tokens {
-            if let Some(&idf) = self.bm25.idf.get(token) {
-                let tf_val = tf.get(token).copied().unwrap_or(0.0);
-                let doc_len = doc_length as f32;
-                let numerator = tf_val * (self.bm25.k1 + 1.0);
-                let denominator = tf_val
-                    + self.bm25.k1
-                        * (1.0 - self.bm25.b
-                            + self.bm25.b * doc_len / self.bm25.avg_doc_length.max(1.0));
-                let score = idf * numerator / denominator.max(0.001);
-
-                if score > 0.0 {
-                    if let Some(&idx) = self.bm25.vocab.get(token) {
-                        indices.push(idx);
-                        values.push(score);
-                    }
-                }
-            }
-        }
-
-        Bm25SparseVector { indices, values }
-    }
-
     pub fn set_avg_doc_length(&mut self, avg_len: f32) {
         self.bm25.avg_doc_length = avg_len;
-    }
-
-    pub fn save_bm25_state(
-        &self,
-        path: &Path,
-    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-        let state = self.bm25.get_state();
-        let json = serde_json::to_string_pretty(&state)?;
-        fs::write(path, json)?;
-        Ok(())
-    }
-
-    pub fn load_bm25_state(
-        &mut self,
-        path: &Path,
-    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-        let json = fs::read_to_string(path)?;
-        let state: BM25State = serde_json::from_str(&json)?;
-        self.bm25.set_state(&state);
-        Ok(())
     }
 
     pub fn build_idf(&mut self, documents: &[String]) {

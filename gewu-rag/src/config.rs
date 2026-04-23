@@ -18,11 +18,10 @@ pub struct Config {
     pub retrieval_limit: usize,
     pub similarity_threshold: f64,
     pub enable_sparse: bool,
+    pub sparse_model: String,
     pub sparse_vector_name: String,
     pub dense_vector_name: String,
     pub avg_doc_length: usize,
-    pub k1: f32,
-    pub b: f32,
 }
 
 impl Default for Config {
@@ -44,11 +43,10 @@ impl Default for Config {
             retrieval_limit: 5,
             similarity_threshold: 0.7,
             enable_sparse: false,
+            sparse_model: "prithivida/Splade_PP_en_v1".to_string(),
             sparse_vector_name: "sparse".to_string(),
             dense_vector_name: "dense".to_string(),
             avg_doc_length: 100,
-            k1: 1.5,
-            b: 0.75,
         }
     }
 }
@@ -56,15 +54,5 @@ impl Default for Config {
 impl Config {
     pub fn new() -> Self {
         Self::default()
-    }
-
-    pub fn with_collection_name(mut self, name: impl Into<String>) -> Self {
-        self.child_collection = name.into();
-        self
-    }
-
-    pub fn with_sparse(mut self, enable: bool) -> Self {
-        self.enable_sparse = enable;
-        self
     }
 }

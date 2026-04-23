@@ -15,7 +15,6 @@ static NODE_INVOCATION_COUNTER: AtomicUsize = AtomicUsize::new(0);
 fn next_invocation_id() -> usize {
     NODE_INVOCATION_COUNTER.fetch_add(1, Ordering::SeqCst)
 }
-use thiserror::Error;
 
 fn get_message_content(msg: &Message) -> String {
     match msg {
@@ -238,7 +237,7 @@ pub async fn orchestrator(
         all_messages.extend(state.messages.clone());
     }
 
-    let mut stream = llm.stream_response(&all_messages, &tools).await;
+    let stream = llm.stream_response(&all_messages, &tools).await;
     if let Err(e) = stream {
         tracing::error!("[NODE #{}] orchestrator: stream_response error: {:?}", invocation_id, e);
         return PartialAgentState::default();
@@ -419,41 +418,6 @@ pub async fn execute_tools(
     }
 }
 
-pub async fn should_compress(
-    state: AgentState,
-    _config: &Config,
-) -> PartialAgentState {
-    tracing::info!("[NODE] should_compress: tool_count={}, iteration={}, msgs={}",
-        state.tool_call_count, state.iteration_count, state.messages.len());
-    PartialAgentState {
-        messages: Some(state.messages.clone()),
-        ..Default::default()
-    }
-}
-
-fn estimate_tokens(state: &AgentState) -> i32 {
-    let messages_tokens = state
-        .messages
-        .iter()
-        .map(|m| match m {
-            Message::System { content } => content.len(),
-            Message::User { content } => content
-                .iter()
-                .map(|part| match part {
-                    ContentPart::Text { text } => text.len(),
-                    _ => 10,
-                })
-                .sum::<usize>(),
-            Message::Assistant { content, .. } => content.as_ref().map(|c| c.len()).unwrap_or(0),
-            Message::Tool { content, .. } => content.len(),
-        })
-        .sum::<usize>() as i32;
-
-    let summary_tokens = (state.context_summary.len() / 4) as i32;
-
-    messages_tokens + summary_tokens
-}
-
 pub async fn compress_context(
     state: AgentState,
     llm: Arc<dyn gewu_core::LlmProvider>,
@@ -622,52 +586,6 @@ pub async fn collect_answer(
     PartialAgentState {
         final_answer: Some(answer),
         agent_answers: Some(vec![result]),
-        ..Default::default()
-    }
-}
-
-pub async fn request_clarification(
-    state: MainState,
-    llm: Arc<dyn gewu_core::LlmProvider>,
-) -> PartialMainState {
-    let clarification = state
-        .clarification_needed
-        .clone()
-        .unwrap_or_else(|| "I need more information to understand your question.".to_string());
-
-    let messages = vec![
-        Message::System { content: prompts::get_orchestrator_prompt() },
-        Message::User {
-            content: vec![ContentPart::Text { text: state.original_query.clone() }],
-        },
-    ];
-
-    let mut stream = llm.stream_response(&messages, &[]).await.unwrap_or_else(|_| {
-        Box::pin(futures::stream::once(async {
-            Ok(ProviderEvent::Error {
-                error: "LLM error".to_string(),
-            })
-        }))
-    });
-
-    let mut response = String::new();
-    while let Some(event) = stream.next().await {
-        if let Ok(ProviderEvent::ContentDelta { delta }) = event {
-            response.push_str(&delta);
-        }
-    }
-
-    let mut messages = state.messages.clone();
-    messages.push(Message::Assistant {
-        content: Some(clarification),
-        tool_calls: None,
-    });
-    messages.push(Message::User {
-        content: vec![ContentPart::Text { text: response }],
-    });
-
-    PartialMainState {
-        messages: Some(messages),
         ..Default::default()
     }
 }

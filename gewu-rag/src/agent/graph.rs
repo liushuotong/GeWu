@@ -79,37 +79,6 @@ impl RagSystem {
         }
     }
 
-    pub async fn query_with_history(
-        &self,
-        question: &str,
-        conversation_summary: &str,
-    ) -> Result<String, Box<dyn std::error::Error + Send + Sync>> {
-        let messages = vec![Message::User {
-            content: vec![gewu_core::types::ContentPart::Text { text: question.to_string() }]
-        }];
-
-        let initial_state = MainState {
-            messages,
-            conversation_summary: conversation_summary.to_string(),
-            ..Default::default()
-        };
-
-        let agent_graph = self.build_agent_graph();
-        let main_graph = self.build_main_graph(agent_graph);
-
-        let final_state = main_graph.ainvoke(initial_state).await?;
-
-        if let Some(last_msg) = final_state.messages.last() {
-            if let Message::Assistant { content, .. } = last_msg {
-                Ok(content.clone().unwrap_or_else(|| "No response generated.".to_string()))
-            } else {
-                Ok("No response generated.".to_string())
-            }
-        } else {
-            Ok("No response generated.".to_string())
-        }
-    }
-
     fn build_agent_graph(&self) -> CompiledGraph<AgentState> {
         let config = self.config.clone();
         let llm = self.llm.clone();
@@ -292,11 +261,4 @@ impl RagSystem {
 
         graph.compile()
     }
-}
-
-pub async fn create_rag_system(
-    config: Config,
-    llm: Arc<dyn LlmProvider>,
-) -> Result<RagSystem, Box<dyn std::error::Error + Send + Sync>> {
-    RagSystem::new(config, llm).await
 }
