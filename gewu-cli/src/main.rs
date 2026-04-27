@@ -8,7 +8,7 @@ use clap::Parser;
 use futures::StreamExt;
 use gewu_core::traits::LlmProvider;
 use gewu_core::types::AgentEvent;
-use gewu_providers::OpenAIProvider;
+use gewu_providers::{AnthropicProvider, OpenAIProvider};
 use sqlx::sqlite::SqlitePoolOptions;
 use std::env;
 use std::io::Write;
@@ -16,7 +16,6 @@ use std::sync::Arc;
 use tracing::{error, info};
 use uuid::Uuid;
 
-const DIM_GRAY: &str = "\x1b[90m";
 const RESET: &str = "\x1b[0m";
 
 async fn run_agent(agent: &mut gewu_core::Agent, prompt: &str) -> Result<()> {
@@ -24,10 +23,18 @@ async fn run_agent(agent: &mut gewu_core::Agent, prompt: &str) -> Result<()> {
     let mut reasoning = String::new();
     let mut content = String::new();
     let mut reasoning_started = false;
+    let mut content_started = false;
     while let Some(event_result) = stream.next().await {
         match event_result {
             Ok(event) => match event {
                 AgentEvent::ContentDelta { delta } => {
+                    if !content_started {
+                        content_started = true;
+                        if reasoning_started {
+                            print!("{}", RESET);
+                        }
+                        println!();
+                    }
                     print!("{}", delta);
                     std::io::stdout().flush()?;
                     content.push_str(&delta);
@@ -35,13 +42,17 @@ async fn run_agent(agent: &mut gewu_core::Agent, prompt: &str) -> Result<()> {
                 AgentEvent::ReasoningDelta { delta } => {
                     if !reasoning_started {
                         reasoning_started = true;
-                        print!("{}[thinking] ", DIM_GRAY);
+                        print!("\x1b[90m[thinking]\x1b[0m ");
+                        print!("\x1b[90m");
                     }
-                    print!("{}{}", delta, RESET);
+                    print!("{}", delta);
                     std::io::stdout().flush()?;
                     reasoning.push_str(&delta);
                 }
                 AgentEvent::ToolStart { tool, input } => {
+                    if reasoning_started {
+                        print!("{}", RESET);
+                    }
                     println!("\n[Tool Start: {}] Input: {}", tool, input);
                 }
                 AgentEvent::ToolFinish { tool, output } => {
@@ -53,9 +64,15 @@ async fn run_agent(agent: &mut gewu_core::Agent, prompt: &str) -> Result<()> {
                     println!("\n[Tool Finish: {}] Output: {}", tool, display_output);
                 }
                 AgentEvent::Finish { .. } => {
+                    if reasoning_started {
+                        print!("{}", RESET);
+                    }
                     println!();
                 }
                 AgentEvent::Error { error } => {
+                    if reasoning_started {
+                        print!("{}", RESET);
+                    }
                     error!("Error from agent: {}", error);
                 }
             },
@@ -89,6 +106,10 @@ struct Cli {
     /// Custom Model Name
     #[arg(long, short, env = "OPENAI_MODEL")]
     model: Option<String>,
+
+    /// LLM Provider to use (openai or anthropic)
+    #[arg(long, env = "GEWU_PROVIDER")]
+    provider: Option<String>,
 
     /// Initial Agent (default: build)
     #[arg(long, default_value = "build")]
@@ -163,15 +184,28 @@ async fn main() -> Result<()> {
         .or(file_config.api_key.clone())
         .context("OPENAI_API_KEY not provided. Set via --api-key, OPENAI_API_KEY env var, or config.json")?;
 
-    let endpoint = cli.endpoint
-        .or_else(|| env::var("OPENAI_ENDPOINT").ok())
-        .or(cli.base_url.clone())
+    let base_url = cli
+        .base_url
+        .clone()
         .or_else(|| env::var("OPENAI_BASE_URL").ok())
-        .or(file_config.endpoint.clone())
-        .context("Endpoint not provided. Set via --endpoint, --base-url, OPENAI_ENDPOINT/OPENAI_BASE_URL env var, or config.json")?;
+        .or(cli.endpoint.clone())
+        .or_else(|| env::var("OPENAI_ENDPOINT").ok())
+        .or(file_config.base_url.clone());
+
+    let provider_name = cli
+        .provider
+        .or_else(|| env::var("GEWU_PROVIDER").ok())
+        .or_else(|| file_config.provider.clone())
+        .unwrap_or_else(|| "openai".to_string());
 
     if cli.list_models {
-        let provider = OpenAIProvider::new_with_endpoint(&api_key, &endpoint, "dummy");
+        let model = cli
+            .model
+            .or_else(|| env::var("OPENAI_MODEL").ok())
+            .or(file_config.model.clone())
+            .unwrap_or_else(|| "gpt-5.3-codex".to_string());
+        let url = base_url.unwrap_or_else(|| "https://api.openai.com/v1".to_string());
+        let provider = OpenAIProvider::new_with_endpoint(&api_key, &url, &model);
         match provider.list_models().await {
             Ok(models) => {
                 println!("Available Models:");
@@ -193,14 +227,24 @@ async fn main() -> Result<()> {
         .unwrap_or_else(|| "gpt-5.3-codex".to_string());
 
     info!("Using model: {}", model);
-
-    let base_url = Some(endpoint);
+    info!("Using provider: {}", provider_name);
 
     // Initialize Provider
-    let provider = if let Some(url) = base_url {
-        Arc::new(OpenAIProvider::new_with_endpoint(&api_key, &url, &model))
-    } else {
-        Arc::new(OpenAIProvider::new(&api_key, &model))
+    let provider: Arc<dyn LlmProvider> = match provider_name.to_lowercase().as_str() {
+        "anthropic" => {
+            if let Some(url) = base_url {
+                Arc::new(AnthropicProvider::new_with_endpoint(&api_key, &url, &model))
+            } else {
+                Arc::new(AnthropicProvider::new(&api_key, &model))
+            }
+        }
+        "openai" | _ => {
+            if let Some(url) = base_url {
+                Arc::new(OpenAIProvider::new_with_endpoint(&api_key, &url, &model))
+            } else {
+                Arc::new(OpenAIProvider::new(&api_key, &model))
+            }
+        }
     };
 
     // Initialize SQLite Pool

@@ -66,7 +66,7 @@ async fn main() -> Result<()> {
         .endpoint
         .or_else(|| std::env::var("OPENAI_ENDPOINT").ok())
         .or_else(|| std::env::var("OPENAI_BASE_URL").ok())
-        .or(loaded_config.config.endpoint.clone())
+        .or(loaded_config.config.base_url.clone())
         .context("Endpoint not provided")?;
 
     let model = cli
