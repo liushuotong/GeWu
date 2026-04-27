@@ -87,7 +87,7 @@ async fn run_agent(agent: &mut gewu_core::Agent, prompt: &str) -> Result<()> {
 #[command(version = "0.1.0")]
 #[command(about = "GeWu CLI Agent", long_about = None)]
 struct Cli {
-    /// Initial prompt to start the session
+    /// Prompt to send (without -i flag, runs once and exits)
     #[arg(trailing_var_arg = true)]
     prompt: Option<Vec<String>>,
 
@@ -138,6 +138,10 @@ struct Cli {
     /// Path to LLM configuration file
     #[arg(long)]
     llm_config: Option<String>,
+
+    /// Run in interactive mode
+    #[arg(short, long)]
+    interactive: bool,
 }
 
 #[tokio::main]
@@ -273,7 +277,6 @@ async fn main() -> Result<()> {
 
     // Determine Session ID
     let session_id = cli.session_id.unwrap_or_else(|| Uuid::new_v4().to_string());
-    println!("Session ID: {}", session_id);
 
     // Load MCP tools
     let mcp_tools = mcp_loader::load_mcp_tools(loaded_config.config.mcp_servers).await?;
@@ -283,8 +286,14 @@ async fn main() -> Result<()> {
         registry::create_agent(&cli.agent, provider, pool, session_id, mcp_tools).await?;
     info!("Initialized agent: {}", cli.agent);
 
-    // Initial Prompt handling
-    if let Some(prompt_parts) = cli.prompt {
+    // Validate that either a prompt is provided or interactive mode is enabled
+    if cli.prompt.is_none() && !cli.interactive {
+        eprintln!("Error: No prompt provided. Either provide a prompt as argument or use -i/--interactive for interactive mode.");
+        std::process::exit(1);
+    }
+
+    // Initial Prompt handling (only if prompt provided)
+    if let Some(prompt_parts) = &cli.prompt {
         let prompt = prompt_parts.join(" ");
         if !prompt.is_empty() {
             println!("> {}", prompt);
@@ -294,29 +303,31 @@ async fn main() -> Result<()> {
         }
     }
 
-    // Interactive Loop
-    use std::io::{self, Write};
-    println!("--- GeWu CLI (Agent: {}) ---", cli.agent);
-    println!("Type 'exit' or 'quit' to end.");
+    // Interactive Loop (only if -i flag is set)
+    if cli.interactive {
+        use std::io::{self, Write};
+        println!("--- GeWu CLI (Agent: {}) ---", cli.agent);
+        println!("Type 'exit' or 'quit' to end.");
 
-    loop {
-        print!("> ");
-        io::stdout().flush()?;
+        loop {
+            print!("> ");
+            io::stdout().flush()?;
 
-        let mut input = String::new();
-        io::stdin().read_line(&mut input)?;
-        let input = input.trim();
+            let mut input = String::new();
+            io::stdin().read_line(&mut input)?;
+            let input = input.trim();
 
-        if input.is_empty() {
-            continue;
-        }
+            if input.is_empty() {
+                continue;
+            }
 
-        if input == "exit" || input == "quit" {
-            break;
-        }
+            if input == "exit" || input == "quit" {
+                break;
+            }
 
-        if let Err(e) = run_agent(&mut agent, input).await {
-            error!("Error processing message: {}", e);
+            if let Err(e) = run_agent(&mut agent, input).await {
+                error!("Error processing message: {}", e);
+            }
         }
     }
 

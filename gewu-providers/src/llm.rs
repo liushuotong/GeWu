@@ -38,8 +38,8 @@ use crate::anthropic_types::{
     AnthropicChunk, AnthropicConfig, AnthropicMessage, AnthropicStream, AnthropicTool,
     ContentBlock, ContentBlockDeltaChunk, ContentBlockStart,
     ContentBlockStartChunk, ContentDelta, CreateMessageRequest,
-    MessageStartChunk, SourceBlock, UserMessage, AssistantMessage as AnthropicAssistantMessage,
-    Client as AnthropicClient,
+    MessageStartChunk, ToolCall, UserMessage,
+    AssistantMessage as AnthropicAssistantMessage, Client as AnthropicClient,
 };
 use async_trait::async_trait;
 use futures::StreamExt;
@@ -774,41 +774,19 @@ impl AnthropicProvider {
             ContentPart::Text { text } => Some(ContentBlock::Text {
                 text: text.clone(),
             }),
-            ContentPart::Image { data, mime_type } => Some(ContentBlock::Source {
-                source: SourceBlock {
-                    source_type: "base64".to_string(),
-                    media_type: mime_type.clone(),
-                    data: data.clone(),
-                },
+            ContentPart::Image { data, mime_type } => Some(ContentBlock::Text {
+                text: format!("[Image: {}](data:{};base64,{})", mime_type, mime_type, data),
             }),
-            ContentPart::Audio { data, mime_type } => Some(ContentBlock::Source {
-                source: SourceBlock {
-                    source_type: "base64".to_string(),
-                    media_type: mime_type.clone(),
-                    data: data.clone(),
-                },
+            ContentPart::Audio { data, mime_type } => Some(ContentBlock::Text {
+                text: format!("[Audio: {}](data:{};base64,{})", mime_type, mime_type, data),
             }),
-            ContentPart::Video { data, mime_type } => Some(ContentBlock::Source {
-                source: SourceBlock {
-                    source_type: "base64".to_string(),
-                    media_type: mime_type.clone(),
-                    data: data.clone(),
-                },
+            ContentPart::Video { data, mime_type } => Some(ContentBlock::Text {
+                text: format!("[Video: {}](data:{};base64,{})", mime_type, mime_type, data),
             }),
             ContentPart::File { data, mime_type } => {
-                if mime_type == "application/pdf" && self.capabilities.input.pdf {
-                    Some(ContentBlock::Source {
-                        source: SourceBlock {
-                            source_type: "base64".to_string(),
-                            media_type: mime_type.clone(),
-                            data: data.clone(),
-                        },
-                    })
-                } else {
-                    Some(ContentBlock::Text {
-                        text: format!("[File: {}](data:{};base64,{})", mime_type, mime_type, data),
-                    })
-                }
+                Some(ContentBlock::Text {
+                    text: format!("[File: {}](data:{};base64,{})", mime_type, mime_type, data),
+                })
             }
         }
     }
@@ -836,28 +814,40 @@ impl AnthropicProvider {
                         blocks.push(ContentBlock::Text { text: text.clone() });
                     }
                 }
-                if let Some(calls) = tool_calls {
-                    for tc in calls {
-                        blocks.push(ContentBlock::Source {
-                            source: SourceBlock {
-                                source_type: "base64".to_string(),
-                                media_type: "text/plain".to_string(),
-                                data: format!(
-                                    r#"{{"id":"{}","name":"{}","arguments":{}}}"#,
-                                    tc.id,
-                                    tc.function.name,
-                                    tc.function.arguments
-                                ),
-                            },
-                        });
+                let anthropic_tool_calls: Option<Vec<ToolCall>> = if let Some(calls) = tool_calls {
+                    if !calls.is_empty() {
+                        Some(
+                            calls
+                                .iter()
+                                .map(|tc| {
+                                    let args_value: Value =
+                                        serde_json::from_str(&tc.function.arguments)
+                                            .unwrap_or(Value::Null);
+                                    ToolCall {
+                                        id: tc.id.clone(),
+                                        tool_type: "tool_use".to_string(),
+                                        name: tc.function.name.clone(),
+                                        input: args_value,
+                                    }
+                                })
+                                .collect(),
+                        )
+                    } else {
+                        None
                     }
-                }
-                if blocks.is_empty() {
+                } else {
+                    None
+                };
+                if blocks.is_empty() && anthropic_tool_calls.is_none() {
                     Ok(vec![])
                 } else {
                     Ok(vec![AnthropicMessage::Assistant(AnthropicAssistantMessage {
-                        content: Some(blocks),
-                        tool_calls: None,
+                        content: if blocks.is_empty() {
+                            None
+                        } else {
+                            Some(blocks)
+                        },
+                        tool_calls: anthropic_tool_calls,
                     })])
                 }
             }
