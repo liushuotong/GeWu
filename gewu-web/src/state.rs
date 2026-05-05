@@ -89,7 +89,7 @@ impl AppState {
         let provider = Arc::new(OpenAIProvider::new_with_endpoint(&api_key, &endpoint, &model));
 
         let mcp_tools: Vec<Arc<dyn Tool>> = self.mcp_tools.iter().cloned().collect();
-        let (agent, _registry) = create_agent(&agent_type, provider, pool.clone(), session_id.clone(), mcp_tools).await?;
+        let (agent, _registry, _experience_store) = create_agent(&agent_type, provider, pool.clone(), session_id.clone(), mcp_tools, None).await?;
         info!("Agent created successfully");
 
         let created_at = std::time::SystemTime::now()
@@ -176,7 +176,7 @@ impl AppState {
         let provider = Arc::new(OpenAIProvider::new_with_endpoint(&api_key, &endpoint, &model));
 
         let mcp_tools: Vec<Arc<dyn Tool>> = self.mcp_tools.iter().cloned().collect();
-        let (agent, _registry) = create_agent(&new_agent_type, provider, pool.clone(), session_id.to_string(), mcp_tools).await?;
+        let (agent, _registry, _experience_store) = create_agent(&new_agent_type, provider, pool.clone(), session_id.to_string(), mcp_tools, None).await?;
 
         let handle = Arc::new(AgentHandle {
             agent: Arc::new(Mutex::new(agent)),

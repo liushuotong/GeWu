@@ -1,4 +1,5 @@
 pub mod config;
+pub mod evolve_tools;
 pub mod mcp_loader;
 pub mod registry;
 pub mod tools;

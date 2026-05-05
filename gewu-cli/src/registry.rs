@@ -1,9 +1,12 @@
+use crate::evolve_tools::{PythonExecuteTool, SkillCreateTool, SkillListTool, SkillLoadTool};
 use crate::tools::TaskTool;
 use anyhow::{Result, anyhow};
 use async_trait::async_trait;
+use dirs::home_dir;
 use gewu_core::Agent;
 use gewu_core::traits::{LlmProvider, Tool, ToolRegistry};
 use gewu_core::types::{ToolContext, ToolResult};
+use gewu_experience::{ExperienceRecallTool, ExperienceStore, ExperienceStoreTool};
 use gewu_storage::SqliteMemory;
 use gewu_tools::{
     BashTool, BatchTool, CodeSearchTool, EditFileTool, GlobTool, GrepTool, ListTool, ReadFileTool,
@@ -11,6 +14,7 @@ use gewu_tools::{
 };
 use serde_json::Value;
 use sqlx::SqlitePool;
+use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 
 pub struct AgentConfig {
@@ -31,6 +35,10 @@ pub fn list_available_agents() -> Vec<AgentConfig> {
         AgentConfig {
             name: "general".to_string(),
             description: "General-purpose agent for researching complex questions and executing multi-step tasks.".to_string(),
+        },
+        AgentConfig {
+            name: "evolve".to_string(),
+            description: "Self-evolving agent with experience memory and self-critique capabilities.".to_string(),
         },
     ]
 }
@@ -65,18 +73,44 @@ pub async fn create_agent(
     pool: SqlitePool,
     session_id: String,
     additional_tools: Vec<Arc<dyn Tool>>,
-) -> Result<(Agent, Arc<dyn ToolRegistry>)> {
+    experience_config: Option<gewu_experience::Config>,
+) -> Result<(Agent, Arc<dyn ToolRegistry>, Option<Arc<ExperienceStore>>)> {
     let working_directory = std::env::current_dir()?;
 
     // Initialize persistent memory
-    let memory = SqliteMemory::new(pool.clone(), session_id).await?;
+    let memory = SqliteMemory::new(pool.clone(), session_id.clone()).await?;
 
     // Shared in-memory todo list for this agent session
     let todos = Arc::new(Mutex::new(Vec::<TodoItem>::new()));
 
+    // Initialize experience store if available
+    let experience_store = if let Some(config) = experience_config {
+        if !config.qdrant_url().is_empty() {
+            match gewu_experience::ExperienceStore::new(config).await {
+                Ok(store) => {
+                    tracing::info!("Experience store initialized successfully");
+                    Some(Arc::new(store))
+                }
+                Err(e) => {
+                    tracing::warn!("Failed to initialize experience store: {}. Experience tools will not be available.", e);
+                    None
+                }
+            }
+        } else {
+            None
+        }
+    } else {
+        None
+    };
+
+    // Initialize skill directory path
+    let skill_dir = home_dir()
+        .map(|h| h.join(".gewu").join("skills"))
+        .unwrap_or_else(|| PathBuf::from("~/.gewu/skills"));
+
     let tools: Vec<Box<dyn Tool>> = match name {
         "build" => {
-            vec![
+            let mut tool_list: Vec<Box<dyn Tool>> = vec![
                 Box::new(TaskTool::new(provider.clone(), pool.clone())),
                 Box::new(ReadFileTool {
                     working_directory: working_directory.clone(),
@@ -105,7 +139,12 @@ pub async fn create_agent(
                 Box::new(WebSearchTool),
                 Box::new(TodoWriteTool::new(todos.clone())),
                 Box::new(TodoReadTool::new(todos.clone())),
-            ]
+            ];
+            if let Some(ref store) = experience_store {
+                tool_list.push(Box::new(ExperienceStoreTool::new(store.clone())));
+                tool_list.push(Box::new(ExperienceRecallTool::new(store.clone())));
+            }
+            tool_list
         }
         "explore" => {
             vec![
@@ -162,6 +201,47 @@ pub async fn create_agent(
                 Box::new(TodoReadTool::new(todos.clone())),
             ]
         }
+        "evolve" => {
+            let mut tool_list: Vec<Box<dyn Tool>> = vec![
+                Box::new(TaskTool::new(provider.clone(), pool.clone())),
+                Box::new(ReadFileTool {
+                    working_directory: working_directory.clone(),
+                }),
+                Box::new(WriteFileTool {
+                    working_directory: working_directory.clone(),
+                }),
+                Box::new(EditFileTool {
+                    working_directory: working_directory.clone(),
+                }),
+                Box::new(GlobTool {
+                    working_directory: working_directory.clone(),
+                }),
+                Box::new(BashTool {
+                    working_directory: working_directory.clone(),
+                    safe_mode: false,
+                }),
+                Box::new(GrepTool {
+                    working_directory: working_directory.clone(),
+                }),
+                Box::new(WebFetchTool),
+                Box::new(ListTool {
+                    working_directory: working_directory.clone(),
+                }),
+                Box::new(CodeSearchTool),
+                Box::new(WebSearchTool),
+                Box::new(TodoWriteTool::new(todos.clone())),
+                Box::new(TodoReadTool::new(todos.clone())),
+                Box::new(PythonExecuteTool::new(30)),
+                Box::new(SkillListTool::new(skill_dir.clone())),
+                Box::new(SkillLoadTool::new(skill_dir.clone())),
+                Box::new(SkillCreateTool::new(skill_dir.clone(), provider.clone())),
+            ];
+            if let Some(ref store) = experience_store {
+                tool_list.push(Box::new(ExperienceStoreTool::new(store.clone())));
+                tool_list.push(Box::new(ExperienceRecallTool::new(store.clone())));
+            }
+            tool_list
+        }
         _ => return Err(anyhow!("Unknown agent type: {}", name)),
     };
 
@@ -200,8 +280,14 @@ pub async fn create_agent(
             .memory(Box::new(memory))
             .system_prompt(include_str!("prompts/general.txt"))
             .build()?,
+        "evolve" => Agent::builder()
+            .llm(provider)
+            .with_tools(all_tools)
+            .memory(Box::new(memory))
+            .system_prompt(include_str!("prompts/general.txt"))
+            .build()?,
         _ => return Err(anyhow!("Unknown agent type: {}", name)),
     };
 
-    Ok((agent, registry))
+    Ok((agent, registry, experience_store))
 }

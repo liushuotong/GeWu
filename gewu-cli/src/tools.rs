@@ -102,12 +102,13 @@ impl Tool for TaskTool {
             input.subagent_type, input.description, session_id
         );
 
-        let (mut agent, _registry) = crate::registry::create_agent(
+        let (mut agent, _registry, _experience_store) = crate::registry::create_agent(
             &input.subagent_type,
             self.provider.clone(),
             self.pool.clone(),
             session_id.clone(),
             Vec::new(),
+            None,
         )
         .await
         .map_err(|e| format!("Failed to create agent: {}", e))?;

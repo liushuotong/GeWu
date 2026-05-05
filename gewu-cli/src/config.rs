@@ -13,6 +13,8 @@ pub struct Config {
     pub provider: Option<String>,
     #[serde(rename = "mcpServers", default)]
     pub mcp_servers: std::collections::HashMap<String, McpServerConfig>,
+    pub qdrant_url: Option<String>,
+    pub qdrant_api_key: Option<String>,
 }
 
 #[derive(Debug)]

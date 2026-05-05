@@ -1,4 +1,5 @@
 pub mod config;
+pub mod evolve_tools;
 pub mod mcp_loader;
 pub mod registry;
 pub mod tools;
@@ -18,12 +19,71 @@ use uuid::Uuid;
 
 const RESET: &str = "\x1b[0m";
 
-async fn run_agent(agent: &mut gewu_core::Agent, prompt: &str) -> Result<()> {
-    let mut stream = Box::pin(agent.ask(prompt));
+async fn build_experience_context(
+    store: &gewu_experience::ExperienceStore,
+    query: &str,
+) -> Option<String> {
+    let experience_query = gewu_experience::ExperienceQuery {
+        query_text: query.to_string(),
+        task_type_filter: None,
+        limit: 3,
+        score_threshold: 0.5,
+    };
+
+    match store.recall(&experience_query).await {
+        Ok(results) if !results.is_empty() => {
+            let mut context = String::from("\n\n[Relevant past experiences for this task]\n");
+            for (i, recalled) in results.iter().enumerate() {
+                let exp = &recalled.experience;
+                context.push_str(&format!(
+                    "{}. [{}] {}\n   Solution: {}\n",
+                    i + 1,
+                    exp.task_type,
+                    exp.task_description,
+                    exp.solution_summary
+                ));
+            }
+            context.push_str("Use these experiences to inform your approach.\n");
+            context.push_str("---\n\n");
+            tracing::info!("Recalled {} relevant experiences", results.len());
+            Some(context)
+        }
+        Ok(results) => {
+            tracing::debug!("Recall returned {} results (empty)", results.len());
+            None
+        }
+        Err(e) => {
+            tracing::warn!("Failed to recall experiences: {}", e);
+            None
+        }
+    }
+}
+
+async fn run_agent(
+    agent: &mut gewu_core::Agent,
+    prompt: &str,
+    experience_store: Option<Arc<gewu_experience::ExperienceStore>>,
+) -> Result<()> {
+    let full_prompt = if let Some(ref store) = experience_store {
+        if let Some(context) = build_experience_context(store, prompt).await {
+            context + prompt
+        } else {
+            prompt.to_string()
+        }
+    } else {
+        prompt.to_string()
+    };
+
+    let mut stream = Box::pin(agent.ask(&full_prompt));
     let mut reasoning = String::new();
     let mut content = String::new();
     let mut reasoning_started = false;
     let mut content_started = false;
+    let mut tools_used: Vec<String> = Vec::new();
+    let mut task_completed = false;
+    let mut task_failed = false;
+    let mut final_response = String::new();
+
     while let Some(event_result) = stream.next().await {
         match event_result {
             Ok(event) => match event {
@@ -38,6 +98,7 @@ async fn run_agent(agent: &mut gewu_core::Agent, prompt: &str) -> Result<()> {
                     print!("{}", delta);
                     std::io::stdout().flush()?;
                     content.push_str(&delta);
+                    final_response.push_str(&delta);
                 }
                 AgentEvent::ReasoningDelta { delta } => {
                     if !reasoning_started {
@@ -49,36 +110,62 @@ async fn run_agent(agent: &mut gewu_core::Agent, prompt: &str) -> Result<()> {
                     std::io::stdout().flush()?;
                     reasoning.push_str(&delta);
                 }
-                AgentEvent::ToolStart { tool, input } => {
+                AgentEvent::ToolStart { tool, input: _ } => {
                     if reasoning_started {
                         print!("{}", RESET);
                     }
-                    println!("\n[Tool Start: {}] Input: {}", tool, input);
+                    if !tools_used.contains(&tool) {
+                        tools_used.push(tool.clone());
+                    }
                 }
-                AgentEvent::ToolFinish { tool, output } => {
-                    let display_output = if output.len() > 200 {
-                        format!("{}...", &output[..200])
-                    } else {
-                        output
-                    };
-                    println!("\n[Tool Finish: {}] Output: {}", tool, display_output);
+                AgentEvent::ToolFinish { tool, output: _ } => {
+                    let tool_count = tools_used.len();
+                    println!("\n[Tool Finish: {}] ({} tools used total)", tool, tool_count);
                 }
-                AgentEvent::Finish { .. } => {
+                AgentEvent::Finish { response } => {
                     if reasoning_started {
                         print!("{}", RESET);
                     }
                     println!();
+                    final_response = response;
+                    task_completed = true;
                 }
                 AgentEvent::Error { error } => {
                     if reasoning_started {
                         print!("{}", RESET);
                     }
                     error!("Error from agent: {}", error);
+                    task_failed = true;
                 }
             },
             Err(e) => error!("Stream error: {}", e),
         }
     }
+
+    if let Some(store) = experience_store {
+        if task_completed && !final_response.is_empty() {
+            let user_message = prompt.to_string();
+            let assistant_response = final_response;
+
+            let experience = gewu_experience::Experience::new(
+                user_message.clone(),
+                "general".to_string(),
+                user_message,
+                assistant_response,
+                tools_used,
+                1,
+                true,
+                String::new(),
+            );
+
+            if let Err(e) = store.store(&experience).await {
+                tracing::warn!("Failed to store experience: {}", e);
+            } else {
+                tracing::info!("Experience stored successfully");
+            }
+        }
+    }
+
     Ok(())
 }
 
@@ -142,6 +229,14 @@ struct Cli {
     /// Run in interactive mode
     #[arg(short, long)]
     interactive: bool,
+
+    /// List all stored experiences and exit
+    #[arg(long)]
+    list_experiences: bool,
+
+    /// Dump all experiences to a markdown file
+    #[arg(long)]
+    dump_experiences: Option<String>,
 }
 
 #[tokio::main]
@@ -174,6 +269,108 @@ async fn main() -> Result<()> {
     }
 
     let loaded_config = config::LoadedConfig::load(cli.llm_config.as_deref())?;
+
+    if cli.list_experiences {
+        let experience_config = if let Some(ref url) = loaded_config.config.qdrant_url {
+            if !url.is_empty() {
+                Some(gewu_experience::Config::with_qdrant(
+                    url,
+                    loaded_config.config.qdrant_api_key.clone(),
+                ))
+            } else {
+                None
+            }
+        } else {
+            None
+        };
+
+        if let Some(config) = experience_config {
+            match gewu_experience::ExperienceStore::new(config).await {
+                Ok(store) => {
+                    let experiences = store.list_all().await?;
+                    if experiences.is_empty() {
+                        println!("No experiences stored yet.");
+                    } else {
+                        println!("{:4} | {:12} | {:40} | {:8} | {}", "ID", "Type", "Task Description", "Success", "Created");
+                        println!("{}", "-".repeat(120));
+                        for exp in &experiences {
+                            let desc = if exp.task_description.len() > 38 {
+                                format!("{}...", &exp.task_description[..38])
+                            } else {
+                                exp.task_description.clone()
+                            };
+                            println!("{:4} | {:12} | {:40} | {:8} | {}",
+                                &exp.id[..4],
+                                exp.task_type,
+                                desc,
+                                if exp.success { "yes" } else { "no" },
+                                exp.created_at.format("%Y-%m-%d %H:%M")
+                            );
+                        }
+                        println!("\nTotal: {} experiences", experiences.len());
+                    }
+                }
+                Err(e) => {
+                    eprintln!("Failed to initialize experience store: {}", e);
+                }
+            }
+        } else {
+            eprintln!("Qdrant not configured. Cannot list experiences.");
+        }
+        return Ok(());
+    }
+
+    if let Some(dump_path) = &cli.dump_experiences {
+        let experience_config = if let Some(ref url) = loaded_config.config.qdrant_url {
+            if !url.is_empty() {
+                Some(gewu_experience::Config::with_qdrant(
+                    url,
+                    loaded_config.config.qdrant_api_key.clone(),
+                ))
+            } else {
+                None
+            }
+        } else {
+            None
+        };
+
+        if let Some(config) = experience_config {
+            match gewu_experience::ExperienceStore::new(config).await {
+                Ok(store) => {
+                    let experiences = store.list_all().await?;
+                    if experiences.is_empty() {
+                        println!("No experiences to dump.");
+                    } else {
+                        let mut md = String::from("# Experience Library\n\n");
+                        md.push_str(&format!("Total: {} experiences\n\n", experiences.len()));
+
+                        for exp in &experiences {
+                            md.push_str(&format!("## {} [{}\\]\n\n", exp.task_description, exp.task_type));
+                            md.push_str(&format!("**ID:** `{}`\n\n", exp.id));
+                            md.push_str(&format!("**Created:** {}\n\n", exp.created_at.format("%Y-%m-%d %H:%M:%S")));
+                            md.push_str(&format!("**Success:** {}\n\n", if exp.success { "Yes" } else { "No" }));
+                            md.push_str(&format!("**Attempts:** {}\n\n", exp.iteration_count));
+                            md.push_str("### Problem\n\n");
+                            md.push_str(&format!("{}\n\n", exp.problem_summary));
+                            md.push_str("### Solution\n\n");
+                            md.push_str(&format!("{}\n\n", exp.solution_summary));
+                            md.push_str(&format!("### Tools Used\n\n{}\n\n", exp.tools_used.join(", ")));
+                            md.push_str("---\n\n");
+                        }
+
+                        std::fs::write(dump_path, &md)?;
+                        println!("Dumped {} experiences to {}", experiences.len(), dump_path);
+                    }
+                }
+                Err(e) => {
+                    eprintln!("Failed to initialize experience store: {}", e);
+                }
+            }
+        } else {
+            eprintln!("Qdrant not configured. Cannot dump experiences.");
+        }
+        return Ok(());
+    }
 
     if let Some(path) = &loaded_config.path {
         info!("Loaded config from: {}", path.display());
@@ -279,11 +476,31 @@ async fn main() -> Result<()> {
     let session_id = cli.session_id.unwrap_or_else(|| Uuid::new_v4().to_string());
 
     // Load MCP tools
-    let mcp_tools = mcp_loader::load_mcp_tools(loaded_config.config.mcp_servers).await?;
+    let mcp_tools = mcp_loader::load_mcp_tools(loaded_config.config.mcp_servers.clone()).await?;
+
+    // Build experience config from config file or env
+    let experience_config = if let Some(ref url) = loaded_config.config.qdrant_url {
+        if !url.is_empty() {
+            Some(gewu_experience::Config::with_qdrant(
+                url,
+                loaded_config.config.qdrant_api_key.clone(),
+            ))
+        } else {
+            None
+        }
+    } else {
+        // Fall back to env vars
+        let env_url = std::env::var("QDRANT_URL").unwrap_or_default();
+        if !env_url.is_empty() {
+            Some(gewu_experience::Config::from_env())
+        } else {
+            None
+        }
+    };
 
     // Create Agent
-    let (mut agent, _registry) =
-        registry::create_agent(&cli.agent, provider, pool, session_id, mcp_tools).await?;
+    let (mut agent, _registry, experience_store) =
+        registry::create_agent(&cli.agent, provider, pool, session_id, mcp_tools, experience_config).await?;
     info!("Initialized agent: {}", cli.agent);
 
     // Determine the prompt: from args, from stdin, or error
@@ -311,7 +528,7 @@ async fn main() -> Result<()> {
         let prompt = prompt_parts.join(" ");
         if !prompt.is_empty() {
             println!("> {}", prompt);
-            if let Err(e) = run_agent(&mut agent, &prompt).await {
+            if let Err(e) = run_agent(&mut agent, &prompt, experience_store.clone()).await {
                 error!("Error: {}", e);
             }
         }
@@ -323,7 +540,7 @@ async fn main() -> Result<()> {
             } else {
                 println!("> {}", trimmed);
             }
-            if let Err(e) = run_agent(&mut agent, trimmed).await {
+            if let Err(e) = run_agent(&mut agent, trimmed, experience_store.clone()).await {
                 error!("Error: {}", e);
             }
         }
@@ -351,7 +568,7 @@ async fn main() -> Result<()> {
                 break;
             }
 
-            if let Err(e) = run_agent(&mut agent, input).await {
+            if let Err(e) = run_agent(&mut agent, input, experience_store.clone()).await {
                 error!("Error processing message: {}", e);
             }
         }
