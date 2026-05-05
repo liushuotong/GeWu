@@ -11,7 +11,7 @@ use gewu_core::types::AgentEvent;
 use gewu_providers::{AnthropicProvider, OpenAIProvider};
 use sqlx::sqlite::SqlitePoolOptions;
 use std::env;
-use std::io::Write;
+use std::io::{Read, Write};
 use std::sync::Arc;
 use tracing::{error, info};
 use uuid::Uuid;
@@ -286,18 +286,44 @@ async fn main() -> Result<()> {
         registry::create_agent(&cli.agent, provider, pool, session_id, mcp_tools).await?;
     info!("Initialized agent: {}", cli.agent);
 
-    // Validate that either a prompt is provided or interactive mode is enabled
-    if cli.prompt.is_none() && !cli.interactive {
-        eprintln!("Error: No prompt provided. Either provide a prompt as argument or use -i/--interactive for interactive mode.");
+    // Determine the prompt: from args, from stdin, or error
+    let prompt_from_args = cli.prompt.clone();
+    let prompt_from_stdin = if prompt_from_args.is_none() && !atty::is(atty::Stream::Stdin) {
+        let mut buffer = String::new();
+        std::io::stdin().read_to_string(&mut buffer).ok();
+        if buffer.trim().is_empty() {
+            None
+        } else {
+            Some(buffer)
+        }
+    } else {
+        None
+    };
+
+    // Validate that we have a prompt or interactive mode
+    if prompt_from_args.is_none() && prompt_from_stdin.is_none() && !cli.interactive {
+        eprintln!("Error: No prompt provided. Either provide a prompt as argument, pipe content to stdin, or use -i/--interactive for interactive mode.");
         std::process::exit(1);
     }
 
-    // Initial Prompt handling (only if prompt provided)
-    if let Some(prompt_parts) = &cli.prompt {
+    // Initial Prompt handling
+    if let Some(prompt_parts) = &prompt_from_args {
         let prompt = prompt_parts.join(" ");
         if !prompt.is_empty() {
             println!("> {}", prompt);
             if let Err(e) = run_agent(&mut agent, &prompt).await {
+                error!("Error: {}", e);
+            }
+        }
+    } else if let Some(stdin_prompt) = &prompt_from_stdin {
+        let trimmed = stdin_prompt.trim();
+        if !trimmed.is_empty() {
+            if trimmed.len() > 100 {
+                println!("> {}...", &trimmed[..100]);
+            } else {
+                println!("> {}", trimmed);
+            }
+            if let Err(e) = run_agent(&mut agent, trimmed).await {
                 error!("Error: {}", e);
             }
         }

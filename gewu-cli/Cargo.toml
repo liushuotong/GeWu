@@ -23,3 +23,4 @@ uuid = { version = "1.10", features = ["v4"] }
 dirs = "6.0.0"
 futures = "0.3.32"
 schemars = "0.8"
+atty = "0.2"
