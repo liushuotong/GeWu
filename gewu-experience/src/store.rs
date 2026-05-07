@@ -1,7 +1,7 @@
 //! Experience store implementation combining SQLite and Qdrant.
 
 use crate::config::Config;
-use crate::types::{Experience, ExperienceQuery, RecalledExperience};
+use crate::types::{Experience, ExperienceQuery, RecalledExperience, StoreResult};
 use anyhow::{Context, Result};
 use embed_anything::embeddings::embed::{Embedder, EmbeddingResult};
 use qdrant_client::qdrant::{
@@ -82,13 +82,35 @@ impl ExperienceStore {
                 iteration_count INTEGER NOT NULL,
                 success INTEGER NOT NULL,
                 embedding_id TEXT NOT NULL,
-                created_at INTEGER NOT NULL
+                created_at INTEGER NOT NULL,
+                quality_score REAL DEFAULT 0.0,
+                recall_count INTEGER DEFAULT 0
             )
             "#,
         )
         .execute(&self.pool)
         .await
         .context("Failed to create experiences table")?;
+
+        let alter_result = sqlx::query(
+            "ALTER TABLE experiences ADD COLUMN quality_score REAL DEFAULT 0.0"
+        )
+        .execute(&self.pool)
+        .await;
+
+        if let Err(e) = alter_result {
+            tracing::debug!("Alter quality_score (may already exist): {}", e);
+        }
+
+        let alter_result2 = sqlx::query(
+            "ALTER TABLE experiences ADD COLUMN recall_count INTEGER DEFAULT 0"
+        )
+        .execute(&self.pool)
+        .await;
+
+        if let Err(e) = alter_result2 {
+            tracing::debug!("Alter recall_count (may already exist): {}", e);
+        }
 
         sqlx::query(
             "CREATE INDEX IF NOT EXISTS idx_experiences_task_type ON experiences(task_type)"
@@ -220,6 +242,141 @@ impl ExperienceStore {
         Ok(())
     }
 
+    pub async fn smart_store(
+        &self,
+        task_description: &str,
+        task_type: &str,
+        solution: &str,
+        tools_used: &[String],
+        success: bool,
+    ) -> Result<StoreResult> {
+        let quality_score = Experience::compute_quality_score(solution);
+
+        if quality_score < 5.0 {
+            return Ok(StoreResult::Skipped {
+                reason: "Quality score below threshold (5.0)".to_string(),
+            });
+        }
+
+        let query = ExperienceQuery {
+            query_text: task_description.to_string(),
+            task_type_filter: None,
+            limit: 3,
+            score_threshold: 0.7,
+        };
+
+        let similar = self.recall(&query).await?;
+
+        if let Some(best_match) = similar.first() {
+            let similarity = best_match.similarity_score;
+
+            if similarity > 0.8 {
+                if quality_score > best_match.experience.quality_score {
+                    self.update_solution(&best_match.experience.id, solution, quality_score).await?;
+                    return Ok(StoreResult::Updated {
+                        id: best_match.experience.id.clone(),
+                        action: "replaced".to_string(),
+                    });
+                } else {
+                    return Ok(StoreResult::Skipped {
+                        reason: "Existing experience has equal or better quality".to_string(),
+                    });
+                }
+            } else if similarity > 0.7 {
+                self.merge_solution(&best_match.experience.id, solution, tools_used).await?;
+                return Ok(StoreResult::Merged {
+                    id: best_match.experience.id.clone(),
+                });
+            }
+        }
+
+        let embedding_id = format!("exp_{}", uuid::Uuid::new_v4());
+
+        let experience = Experience::new(
+            task_description.to_string(),
+            task_type.to_string(),
+            task_description.to_string(),
+            solution.to_string(),
+            tools_used.to_vec(),
+            1,
+            success,
+            embedding_id,
+        );
+
+        self.store(&experience).await?;
+
+        let _ = sqlx::query(
+            "UPDATE experiences SET quality_score = ? WHERE id = ?",
+        )
+        .bind(quality_score)
+        .bind(&experience.id)
+        .execute(&self.pool)
+        .await;
+
+        Ok(StoreResult::Created {
+            id: experience.id,
+        })
+    }
+
+    async fn update_solution(&self, id: &str, new_solution: &str, quality_score: f32) -> Result<()> {
+        sqlx::query(
+            r#"UPDATE experiences
+               SET solution_summary = ?, quality_score = ?, iteration_count = iteration_count + 1
+               WHERE id = ?"#,
+        )
+        .bind(new_solution)
+        .bind(quality_score)
+        .bind(id)
+        .execute(&self.pool)
+        .await
+        .context("Failed to update experience")?;
+        Ok(())
+    }
+
+    async fn merge_solution(&self, id: &str, new_solution: &str, tools_used: &[String]) -> Result<()> {
+        let existing = self.get_by_id(id).await?
+            .context("Experience not found")?;
+
+        let merged_solution = format!(
+            "{}\n\n---\n\n{}",
+            existing.solution_summary, new_solution
+        );
+
+        let mut all_tools = existing.tools_used;
+        for tool in tools_used {
+            if !all_tools.contains(tool) {
+                all_tools.push(tool.clone());
+            }
+        }
+
+        let avg_quality = (existing.quality_score + Experience::compute_quality_score(new_solution)) / 2.0;
+
+        sqlx::query(
+            r#"UPDATE experiences
+               SET solution_summary = ?, tools_used = ?, quality_score = ?, iteration_count = iteration_count + 1
+               WHERE id = ?"#,
+        )
+        .bind(&merged_solution)
+        .bind(serde_json::to_string(&all_tools)?)
+        .bind(avg_quality)
+        .bind(id)
+        .execute(&self.pool)
+        .await
+        .context("Failed to merge experience")?;
+        Ok(())
+    }
+
+    async fn increment_recall_count(&self, id: &str) -> Result<()> {
+        sqlx::query(
+            r#"UPDATE experiences SET recall_count = recall_count + 1 WHERE id = ?"#,
+        )
+        .bind(id)
+        .execute(&self.pool)
+        .await
+        .context("Failed to increment recall count")?;
+        Ok(())
+    }
+
     pub async fn recall(&self, query: &ExperienceQuery) -> Result<Vec<RecalledExperience>> {
         let embedding = self.compute_embedding(&query.query_text).await?;
         let collection_name = &self.config.collection_name;
@@ -243,6 +400,7 @@ impl ExperienceStore {
 
             if !experience_id.is_empty() {
                 if let Some(exp) = self.get_by_id(&experience_id).await? {
+                    self.increment_recall_count(&experience_id).await?;
                     recalled.push(RecalledExperience {
                         experience: exp,
                         similarity_score: point.score,
@@ -364,6 +522,8 @@ impl ExperienceStore {
                 embedding_id: row.try_get("embedding_id")?,
                 created_at: chrono::DateTime::from_timestamp(row.try_get::<i64, _>("created_at")?, 0)
                     .unwrap_or_else(chrono::Utc::now),
+                quality_score: row.try_get::<f32, _>("quality_score").unwrap_or(0.0),
+                recall_count: row.try_get::<i32, _>("recall_count").unwrap_or(0),
             });
         }
         Ok(experiences)
@@ -412,6 +572,8 @@ impl ExperienceStore {
             success: success != 0,
             embedding_id,
             created_at,
+            quality_score: row.try_get::<f32, _>("quality_score").unwrap_or(0.0),
+            recall_count: row.try_get::<i32, _>("recall_count").unwrap_or(0),
         })
     }
 }
@@ -419,18 +581,26 @@ impl ExperienceStore {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::path::PathBuf;
     use tempfile::tempdir;
 
     fn create_test_config(tmp_dir: &std::path::Path) -> Config {
-        Config {
-            qdrant_url: "http://localhost:6334".to_string(),
-            qdrant_api_key: None,
-            collection_name: "test_experiences".to_string(),
-            db_path: tmp_dir.join("test_experiences.db"),
-            embedding_model: "BAAI/bge-base-en-v1.5".to_string(),
-            default_score_threshold: 0.7,
-            embedding_dimension: 768,
-        }
+        let manifest_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+        let config_path = manifest_dir.join("../config.jsonc");
+
+        let mut config = if config_path.exists() {
+            Config::from_file(&config_path).unwrap_or_else(|e| {
+                tracing::warn!("Failed to load config.jsonc: {}, using defaults", e);
+                Config::with_qdrant("http://localhost:6334", None)
+            })
+        } else {
+            Config::with_qdrant("http://localhost:6334", None)
+        };
+
+        config.db_path = tmp_dir.join("test_experiences.db");
+        config.collection_name = format!("test_experiences_{}", uuid::Uuid::new_v4());
+
+        config
     }
 
     #[tokio::test]
@@ -536,5 +706,455 @@ mod tests {
         store.store(&exp).await.unwrap();
         let count = store.count().await.unwrap();
         assert_eq!(count, 1);
+    }
+
+    fn make_quality_solution(min_quality: f32) -> String {
+        let base_solution = r#"
+# Solution
+
+This is a comprehensive solution that addresses the problem.
+
+## Implementation
+
+Here is the code:
+
+```rust
+fn main() {
+    println!("Hello, world!");
+}
+```
+
+## Steps
+
+1. First step
+2. Second step
+3. Third step
+
+## Additional Details
+
+The solution includes proper error handling and follows best practices.
+It is well-documented and tested.
+"#;
+
+        if min_quality <= 5.0 {
+            return base_solution.to_string();
+        }
+
+        let mut solution = base_solution.to_string();
+        while Experience::compute_quality_score(&solution) < min_quality {
+            solution.push_str("\n\n## Extended Analysis\n\n");
+            solution.push_str("Additional content to increase quality score. ");
+            solution.push_str("This solution provides a thorough approach to the problem. ");
+        }
+        solution
+    }
+
+    fn make_bug_fix_task(variant: u8) -> String {
+        match variant {
+            0 => "Fix memory leak in connection pool handler".to_string(),
+            1 => "Fix memory leak in database connection manager".to_string(),
+            2 => "Fix crash when handling concurrent HTTP requests".to_string(),
+            3 => "Fix null pointer exception in user authentication".to_string(),
+            _ => format!("Fix bug number {}", variant),
+        }
+    }
+
+    fn make_feature_impl_task(variant: u8) -> String {
+        match variant {
+            0 => "Implement user authentication with JWT tokens".to_string(),
+            1 => "Add rate limiting to API endpoints".to_string(),
+            2 => "Create caching layer for database queries".to_string(),
+            _ => format!("Implement feature number {}", variant),
+        }
+    }
+
+    async fn delete_collection_if_exists(store: &ExperienceStore) {
+        let collection_name = &store.config.collection_name;
+        let _ = store.qdrant.delete_collection(collection_name).await;
+    }
+
+    #[tokio::test]
+    async fn smart_store_creates_new_when_no_similar() {
+        let tmp_dir = tempdir().unwrap();
+        let config = create_test_config(tmp_dir.path());
+
+        let store = ExperienceStore::new(config.clone()).await;
+        if store.is_err() {
+            tracing::warn!("Skipping test: Qdrant not available");
+            return;
+        }
+        let store = store.unwrap();
+        let store = Arc::new(store);
+
+        let result = store
+            .smart_store(
+                "Implement user authentication",
+                "feature_impl",
+                &make_quality_solution(6.0),
+                &["rust".to_string(), "jwt".to_string()],
+                true,
+            )
+            .await
+            .unwrap();
+
+        assert!(matches!(result, StoreResult::Created { .. }));
+
+        let count = store.count().await.unwrap();
+        assert_eq!(count, 1);
+
+        delete_collection_if_exists(&store).await;
+    }
+
+    #[tokio::test]
+    async fn smart_store_replaces_when_higher_quality() {
+        let tmp_dir = tempdir().unwrap();
+        let config = create_test_config(tmp_dir.path());
+
+        let store = ExperienceStore::new(config.clone()).await;
+        if store.is_err() {
+            tracing::warn!("Skipping test: Qdrant not available");
+            return;
+        }
+        let store = store.unwrap();
+        let store = Arc::new(store);
+
+        let task_desc = "Fix memory leak in connection pool";
+
+        let result1 = store
+            .smart_store(
+                task_desc,
+                "bug_fix",
+                &make_quality_solution(5.5),
+                &["grep".to_string(), "sed".to_string()],
+                true,
+            )
+            .await
+            .unwrap();
+        assert!(matches!(result1, StoreResult::Created { .. }));
+
+        let result2 = store
+            .smart_store(
+                task_desc,
+                "bug_fix",
+                &make_quality_solution(7.0),
+                &["rust".to_string(), "profiling".to_string(), "valgrind".to_string()],
+                true,
+            )
+            .await
+            .unwrap();
+
+        assert!(matches!(
+            result2,
+            StoreResult::Updated { id: _, action: ref a } if a == "replaced"
+        ));
+
+        let count = store.count().await.unwrap();
+        assert_eq!(count, 1);
+
+        let retrieved = store.get_by_id(&result2.id()).await.unwrap().unwrap();
+        assert!(retrieved.solution_summary.contains("Extended Analysis"));
+        assert_eq!(retrieved.iteration_count, 2);
+
+        delete_collection_if_exists(&store).await;
+    }
+
+    #[tokio::test]
+    async fn smart_store_skips_when_lower_quality() {
+        let tmp_dir = tempdir().unwrap();
+        let config = create_test_config(tmp_dir.path());
+
+        let store = ExperienceStore::new(config.clone()).await;
+        if store.is_err() {
+            tracing::warn!("Skipping test: Qdrant not available");
+            return;
+        }
+        let store = store.unwrap();
+        let store = Arc::new(store);
+
+        let task_desc = "Fix memory leak in connection pool";
+
+        let result1 = store
+            .smart_store(
+                task_desc,
+                "bug_fix",
+                &make_quality_solution(7.0),
+                &["rust".to_string(), "profiling".to_string()],
+                true,
+            )
+            .await
+            .unwrap();
+        assert!(matches!(result1, StoreResult::Created { .. }));
+
+        let result2 = store
+            .smart_store(
+                "Fix memory leak in connection pool",
+                "bug_fix",
+                "Quick fix.",
+                &["sed".to_string()],
+                true,
+            )
+            .await
+            .unwrap();
+
+        assert!(matches!(
+            result2,
+            StoreResult::Skipped { reason: ref r } if r.contains("Quality score below threshold")
+        ));
+
+        let count = store.count().await.unwrap();
+        assert_eq!(count, 1);
+
+        let retrieved = store.get_by_id(&result1.id()).await.unwrap().unwrap();
+        assert!(!retrieved.solution_summary.contains("Quick fix"));
+
+        delete_collection_if_exists(&store).await;
+    }
+
+    #[tokio::test]
+    async fn smart_store_skips_when_equal_quality() {
+        let tmp_dir = tempdir().unwrap();
+        let config = create_test_config(tmp_dir.path());
+
+        let store = ExperienceStore::new(config.clone()).await;
+        if store.is_err() {
+            tracing::warn!("Skipping test: Qdrant not available");
+            return;
+        }
+        let store = store.unwrap();
+        let store = Arc::new(store);
+
+        let task_desc = make_bug_fix_task(0);
+
+        let solution1 = make_quality_solution(6.0);
+        let result1 = store
+            .smart_store(&task_desc, "bug_fix", &solution1, &["rust".to_string()], true)
+            .await
+            .unwrap();
+        assert!(matches!(result1, StoreResult::Created { .. }));
+
+        let solution2 = make_quality_solution(5.5);
+        let result2 = store
+            .smart_store(&task_desc, "bug_fix", &solution2, &["rust".to_string()], true)
+            .await
+            .unwrap();
+
+        assert!(matches!(
+            result2,
+            StoreResult::Skipped { reason: ref r } if r.contains("equal or better quality")
+        ));
+
+        let count = store.count().await.unwrap();
+        assert_eq!(count, 1);
+
+        delete_collection_if_exists(&store).await;
+    }
+
+    #[tokio::test]
+    async fn smart_store_merges_when_moderate_similarity() {
+        let tmp_dir = tempdir().unwrap();
+        let config = create_test_config(tmp_dir.path());
+
+        let store = ExperienceStore::new(config.clone()).await;
+        if store.is_err() {
+            tracing::warn!("Skipping test: Qdrant not available");
+            return;
+        }
+        let store = store.unwrap();
+        let store = Arc::new(store);
+
+        let task1 = "Fix memory leak in connection pool handler";
+        let result1 = store
+            .smart_store(task1, "bug_fix", &make_quality_solution(6.0), &["rust".to_string()], true)
+            .await
+            .unwrap();
+        assert!(matches!(result1, StoreResult::Created { .. }));
+
+        let task2 = "Fix memory leak in database connection manager";
+        let result2 = store
+            .smart_store(
+                task2,
+                "bug_fix",
+                &make_quality_solution(6.0),
+                &["gdb".to_string(), "strace".to_string()],
+                true,
+            )
+            .await
+            .unwrap();
+
+        assert!(matches!(result2, StoreResult::Merged { .. }), "Expected Merged, got {:?}", result2);
+
+        let count = store.count().await.unwrap();
+        assert_eq!(count, 1);
+
+        let retrieved = store.get_by_id(&result2.id()).await.unwrap().unwrap();
+        assert!(retrieved.solution_summary.contains("---"));
+        assert!(retrieved.tools_used.contains(&"gdb".to_string()));
+        assert!(retrieved.tools_used.contains(&"rust".to_string()));
+        assert_eq!(retrieved.iteration_count, 2);
+
+        delete_collection_if_exists(&store).await;
+    }
+
+    #[tokio::test]
+    async fn smart_store_stores_failed_attempt() {
+        let tmp_dir = tempdir().unwrap();
+        let config = create_test_config(tmp_dir.path());
+
+        let store = ExperienceStore::new(config.clone()).await;
+        if store.is_err() {
+            tracing::warn!("Skipping test: Qdrant not available");
+            return;
+        }
+        let store = store.unwrap();
+        let store = Arc::new(store);
+
+        let result = store
+            .smart_store(
+                "Fix critical bug",
+                "bug_fix",
+                &make_quality_solution(6.0),
+                &["debugger".to_string()],
+                false,
+            )
+            .await
+            .unwrap();
+
+        assert!(matches!(result, StoreResult::Created { .. }));
+
+        let count = store.count().await.unwrap();
+        assert_eq!(count, 1);
+
+        let retrieved = store
+            .get_by_id(&result.id())
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(!retrieved.success);
+
+        delete_collection_if_exists(&store).await;
+    }
+
+    #[tokio::test]
+    async fn recall_returns_similar_sorted_by_score() {
+        let tmp_dir = tempdir().unwrap();
+        let config = create_test_config(tmp_dir.path());
+
+        let store = ExperienceStore::new(config.clone()).await;
+        if store.is_err() {
+            tracing::warn!("Skipping test: Qdrant not available");
+            return;
+        }
+        let store = store.unwrap();
+        let store = Arc::new(store);
+
+        store
+            .smart_store(
+                &make_bug_fix_task(0),
+                "bug_fix",
+                &make_quality_solution(6.0),
+                &["rust".to_string()],
+                true,
+            )
+            .await
+            .unwrap();
+
+        tokio::time::sleep(tokio::time::Duration::from_millis(500)).await;
+
+        store
+            .smart_store(
+                &make_feature_impl_task(0),
+                "feature_impl",
+                &make_quality_solution(6.0),
+                &["rust".to_string(), "jwt".to_string()],
+                true,
+            )
+            .await
+            .unwrap();
+
+        tokio::time::sleep(tokio::time::Duration::from_millis(500)).await;
+
+        store
+            .smart_store(
+                &make_bug_fix_task(1),
+                "bug_fix",
+                &make_quality_solution(6.0),
+                &["rust".to_string()],
+                true,
+            )
+            .await
+            .unwrap();
+
+        tokio::time::sleep(tokio::time::Duration::from_millis(500)).await;
+
+        let query = ExperienceQuery {
+            query_text: "Fix crash in web server handler".to_string(),
+            task_type_filter: None,
+            limit: 5,
+            score_threshold: 0.5,
+        };
+
+        let recalled = store.recall(&query).await.unwrap();
+
+        assert!(!recalled.is_empty());
+
+        for i in 1..recalled.len() {
+            assert!(recalled[i - 1].similarity_score >= recalled[i].similarity_score);
+        }
+
+        let bug_fixes: Vec<_> = recalled
+            .iter()
+            .filter(|r| r.experience.task_type == "bug_fix")
+            .collect();
+        assert!(!bug_fixes.is_empty());
+
+        delete_collection_if_exists(&store).await;
+    }
+
+    #[tokio::test]
+    async fn recall_count_incremented() {
+        let tmp_dir = tempdir().unwrap();
+        let config = create_test_config(tmp_dir.path());
+
+        let store = ExperienceStore::new(config.clone()).await;
+        if store.is_err() {
+            tracing::warn!("Skipping test: Qdrant not available");
+            return;
+        }
+        let store = store.unwrap();
+        let store = Arc::new(store);
+
+        let create_result = store
+            .smart_store(
+                "Implement caching layer",
+                "feature_impl",
+                &make_quality_solution(6.0),
+                &["redis".to_string(), "rust".to_string()],
+                true,
+            )
+            .await
+            .unwrap();
+
+        let id = create_result.id();
+        let query = ExperienceQuery {
+            query_text: "Implement caching layer".to_string(),
+            task_type_filter: None,
+            limit: 3,
+            score_threshold: 0.5,
+        };
+
+        let recalled1 = store.recall(&query).await.unwrap();
+        assert!(!recalled1.is_empty());
+        assert_eq!(recalled1[0].experience.id, id);
+
+        let after_first = store.get_by_id(id).await.unwrap().unwrap();
+        assert_eq!(after_first.recall_count, 1);
+
+        let recalled2 = store.recall(&query).await.unwrap();
+        assert!(!recalled2.is_empty());
+
+        let after_second = store.get_by_id(id).await.unwrap().unwrap();
+        assert_eq!(after_second.recall_count, 2);
+
+        delete_collection_if_exists(&store).await;
     }
 }

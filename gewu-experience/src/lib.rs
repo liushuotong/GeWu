@@ -40,4 +40,4 @@ mod store;
 pub use config::Config;
 pub use store::ExperienceStore;
 pub use tools::{ExperienceRecallTool, ExperienceStoreTool};
-pub use types::{Experience, ExperienceQuery, RecalledExperience};
+pub use types::{Experience, ExperienceQuery, RecalledExperience, StoreResult};

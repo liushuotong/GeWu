@@ -1,5 +1,6 @@
 //! Configuration for the Experience store.
 
+use anyhow::{Context, Result};
 use directories::ProjectDirs;
 use std::path::PathBuf;
 
@@ -79,6 +80,42 @@ impl Config {
 
     pub fn db_path(&self) -> &PathBuf {
         &self.db_path
+    }
+
+    pub fn from_file(path: &PathBuf) -> Result<Self> {
+        let content = std::fs::read_to_string(path)
+            .with_context(|| format!("Failed to read config file: {}", path.display()))?;
+
+        let mut stripped = content.clone();
+        json_strip_comments::strip(&mut stripped)?;
+
+        let json: serde_json::Value = serde_json::from_str(&stripped)
+            .with_context(|| format!("Failed to parse config file: {}", path.display()))?;
+
+        let qdrant_url = json["qdrant_url"]
+            .as_str()
+            .unwrap_or("http://localhost:6334")
+            .to_string();
+
+        let qdrant_api_key = json["qdrant_api_key"].as_str().map(|s| s.to_string());
+
+        let db_path = if let Some(proj_dirs) = ProjectDirs::from("com", "gewu", "GeWu") {
+            proj_dirs.data_dir().join("experiences.db")
+        } else if let Some(home) = dirs::home_dir() {
+            home.join(".gewu").join("experiences.db")
+        } else {
+            PathBuf::from("/tmp/.gewu_experiences.db")
+        };
+
+        Ok(Config {
+            qdrant_url,
+            qdrant_api_key,
+            collection_name: "test_experiences".to_string(),
+            db_path,
+            embedding_model: "BAAI/bge-base-en-v1.5".to_string(),
+            default_score_threshold: 0.7,
+            embedding_dimension: 768,
+        })
     }
 }
 

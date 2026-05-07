@@ -59,11 +59,87 @@ async fn build_experience_context(
     }
 }
 
+const TASK_CLASSIFICATION_PROMPT: &str = r#"Classify this task into ONE of the following categories:
+- bug_fix: Fixing bugs, errors, crashes
+- feature_impl: Implementing new features, adding functionality
+- refactor: Improving code structure, optimization
+- test: Writing or updating tests
+- docs: Documentation, README, comments
+- research: Investigation, exploration, learning
+- general: Other tasks
+
+Task: {task_description}
+
+Respond with ONLY the category name, nothing else."#;
+
+fn classify_task_type_sync(task_description: &str) -> String {
+    let desc_lower = task_description.to_lowercase();
+
+    if desc_lower.contains("bug") || desc_lower.contains("fix") || desc_lower.contains("error") || desc_lower.contains("crash") {
+        "bug_fix".to_string()
+    } else if desc_lower.contains("implement") || desc_lower.contains("add") || desc_lower.contains("create") || desc_lower.contains("new") {
+        "feature_impl".to_string()
+    } else if desc_lower.contains("refactor") || desc_lower.contains("optimize") || desc_lower.contains("improve") || desc_lower.contains("restructure") {
+        "refactor".to_string()
+    } else if desc_lower.contains("test") || desc_lower.contains("spec") || desc_lower.contains("verify") {
+        "test".to_string()
+    } else if desc_lower.contains("doc") || desc_lower.contains("readme") || desc_lower.contains("comment") || desc_lower.contains("comment") {
+        "docs".to_string()
+    } else if desc_lower.contains("research") || desc_lower.contains("investigate") || desc_lower.contains("explore") || desc_lower.contains("understand") {
+        "research".to_string()
+    } else {
+        "general".to_string()
+    }
+}
+
+async fn classify_task_type(agent: &mut gewu_core::Agent, task_description: &str) -> String {
+    let prompt = TASK_CLASSIFICATION_PROMPT.replace("{task_description}", task_description);
+
+    let mut stream = Box::pin(agent.ask(&prompt));
+    let mut result = String::new();
+
+    while let Some(event_result) = stream.next().await {
+        match event_result {
+            Ok(event) => match event {
+                AgentEvent::ContentDelta { delta } => {
+                    result.push_str(&delta);
+                }
+                AgentEvent::Finish { response } => {
+                    result = response;
+                }
+                _ => {}
+            },
+            Err(e) => {
+                tracing::warn!("Classification call failed: {}, using heuristic", e);
+                return classify_task_type_sync(task_description);
+            }
+        }
+    }
+
+    let trimmed = result.trim().to_lowercase();
+    let valid_types = ["bug_fix", "feature_impl", "refactor", "test", "docs", "research", "general"];
+
+    for t in valid_types {
+        if trimmed.contains(t) {
+            return t.to_string();
+        }
+    }
+
+    tracing::warn!("Could not parse LLM classification response: '{}', using heuristic", result);
+    classify_task_type_sync(task_description)
+}
+
 async fn run_agent(
     agent: &mut gewu_core::Agent,
     prompt: &str,
     experience_store: Option<Arc<gewu_experience::ExperienceStore>>,
 ) -> Result<()> {
+    let task_type = if experience_store.is_some() {
+        Some(classify_task_type(agent, prompt).await)
+    } else {
+        None
+    };
+
     let full_prompt = if let Some(ref store) = experience_store {
         if let Some(context) = build_experience_context(store, prompt).await {
             context + prompt
@@ -142,26 +218,26 @@ async fn run_agent(
         }
     }
 
-    if let Some(store) = experience_store {
-        if task_completed && !final_response.is_empty() {
-            let user_message = prompt.to_string();
-            let assistant_response = final_response;
+    if let Some((store, task_type)) = experience_store.zip(task_type) {
+        let should_store = (task_completed && !final_response.is_empty())
+            || (task_failed && !final_response.is_empty());
 
-            let experience = gewu_experience::Experience::new(
-                user_message.clone(),
-                "general".to_string(),
-                user_message,
-                assistant_response,
-                tools_used,
-                1,
-                true,
-                String::new(),
-            );
+        if should_store {
+            let result = store.smart_store(
+                prompt,
+                &task_type,
+                &final_response,
+                &tools_used,
+                task_completed && !task_failed,
+            ).await;
 
-            if let Err(e) = store.store(&experience).await {
-                tracing::warn!("Failed to store experience: {}", e);
-            } else {
-                tracing::info!("Experience stored successfully");
+            match result {
+                Ok(store_result) => {
+                    tracing::info!("Store result: {}", store_result);
+                }
+                Err(e) => {
+                    tracing::warn!("Failed to store experience: {}", e);
+                }
             }
         }
     }

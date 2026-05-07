@@ -17,9 +17,36 @@ pub struct Experience {
     pub embedding_id: String,
     #[serde(with = "chrono::serde::ts_seconds")]
     pub created_at: chrono::DateTime<chrono::Utc>,
+    #[serde(default)]
+    pub quality_score: f32,
+    #[serde(default)]
+    pub recall_count: i32,
 }
 
 impl Experience {
+    pub fn compute_quality_score(solution: &str) -> f32 {
+        let mut score = 0.0;
+
+        let char_count = solution.len() as f32;
+        score += (char_count / 300.0).min(2.0);
+
+        if solution.contains("```") || solution.contains("`") {
+            score += 2.0;
+        }
+
+        if solution.contains("# ") || solution.contains("\n- ")
+            || solution.contains("\n1. ") || solution.contains("| ")
+        {
+            score += 1.0;
+        }
+
+        if solution.len() > 200 {
+            score += 2.0;
+        }
+
+        score.max(0.0).min(8.0)
+    }
+
     pub fn new(
         task_description: String,
         task_type: String,
@@ -41,6 +68,8 @@ impl Experience {
             success,
             embedding_id,
             created_at: chrono::Utc::now(),
+            quality_score: 0.0,
+            recall_count: 0,
         }
     }
 
@@ -53,6 +82,36 @@ impl Experience {
             self.solution_summary,
             self.tools_used.join(", ")
         )
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub enum StoreResult {
+    Created { id: String },
+    Updated { id: String, action: String },
+    Merged { id: String },
+    Skipped { reason: String },
+}
+
+impl std::fmt::Display for StoreResult {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            StoreResult::Created { id } => write!(f, "Created new experience: {}", id),
+            StoreResult::Updated { id, action } => write!(f, "Updated experience {} ({})", id, action),
+            StoreResult::Merged { id } => write!(f, "Merged into experience: {}", id),
+            StoreResult::Skipped { reason } => write!(f, "Skipped: {}", reason),
+        }
+    }
+}
+
+impl StoreResult {
+    pub fn id(&self) -> &str {
+        match self {
+            StoreResult::Created { id } => id,
+            StoreResult::Updated { id, .. } => id,
+            StoreResult::Merged { id } => id,
+            StoreResult::Skipped { .. } => "",
+        }
     }
 }
 

@@ -51,104 +51,98 @@ impl PythonSandbox {
         let stdout = child.stdout.take().expect("stdout not captured");
         let stderr = child.stderr.take().expect("stderr not captured");
 
-        let write_future = async {
-            stdin.write_all(payload_str.as_bytes()).await?;
-            stdin.write_all(b"\n").await?;
-            Ok::<(), std::io::Error>(())
-        };
+        stdin.write_all(payload_str.as_bytes()).await?;
+        stdin.write_all(b"\n").await?;
+        drop(stdin);
 
-        let read_future = async {
-            let mut reader = BufReader::new(stderr).lines();
-            let mut error_output = String::new();
-            while let Some(line) = reader.next_line().await? {
-                error_output.push_str(&line);
-                error_output.push('\n');
+        let process_future = async {
+            let status = child.wait().await?;
+            let mut stderr_reader = BufReader::new(stderr).lines();
+            let mut stderr_output = String::new();
+            while let Some(line) = stderr_reader.next_line().await? {
+                stderr_output.push_str(&line);
+                stderr_output.push('\n');
             }
-            Ok::<String, std::io::Error>(error_output)
+            let mut stdout_reader = BufReader::new(stdout).lines();
+            let mut stdout_output = String::new();
+            while let Some(line) = stdout_reader.next_line().await? {
+                stdout_output.push_str(&line);
+                stdout_output.push('\n');
+            }
+            Ok::<_, std::io::Error>((status, stderr_output, stdout_output))
         };
-
-        let (write_result, error_output, status_result) = tokio::join!(
-            write_future,
-            read_future,
-            child.wait()
-        );
-
-        write_result?;
-        let stderr_output = error_output.unwrap_or_default();
 
         let result = timeout(
             Duration::from_secs(self.timeout_secs),
-            async {
-                let mut output_reader = BufReader::new(stdout).lines();
-                let mut result_str = String::new();
-                while let Some(line) = output_reader.next_line().await? {
-                    result_str.push_str(&line);
-                    result_str.push('\n');
-                }
-                Ok::<String, std::io::Error>(result_str)
-            }
+            process_future,
         ).await;
 
-        let stdout_output = match result {
-            Ok(Ok(s)) => s,
-            Ok(Err(_)) => String::new(),
+        match result {
+            Ok(Ok((status, stderr_output, stdout_output))) => {
+                if !status.success() && !stderr_output.is_empty() {
+                    return Ok(PythonResult {
+                        stdout: stdout_output,
+                        stderr: stderr_output.clone(),
+                        result: None,
+                        error: Some(stderr_output),
+                        timed_out: false,
+                    });
+                }
+
+                let parsed: serde_json::Value = match serde_json::from_str(stdout_output.trim()) {
+                    Ok(v) => v,
+                    Err(_) => {
+                        return Ok(PythonResult {
+                            stdout: stdout_output,
+                            stderr: stderr_output,
+                            result: None,
+                            error: Some("Failed to parse result as JSON".to_string()),
+                            timed_out: false,
+                        });
+                    }
+                };
+
+                if let Some(err) = parsed.get("error").and_then(|e| e.as_str()) {
+                    return Ok(PythonResult {
+                        stdout: stdout_output,
+                        stderr: stderr_output,
+                        result: parsed.get("result").cloned(),
+                        error: Some(err.to_string()),
+                        timed_out: false,
+                    });
+                }
+
+                Ok(PythonResult {
+                    stdout: stdout_output,
+                    stderr: stderr_output,
+                    result: parsed.get("result").cloned(),
+                    error: None,
+                    timed_out: false,
+                })
+            }
+            Ok(Err(e)) => {
+                Ok(PythonResult {
+                    stdout: String::new(),
+                    stderr: String::new(),
+                    result: None,
+                    error: Some(format!("IO error: {}", e)),
+                    timed_out: false,
+                })
+            }
             Err(_) => {
                 let _ = child.kill().await;
-                return Ok(PythonResult {
+                Ok(PythonResult {
                     stdout: String::new(),
-                    stderr: stderr_output,
+                    stderr: String::new(),
                     result: None,
                     error: Some(format!(
                         "Execution timed out after {} seconds",
                         self.timeout_secs
                     )),
                     timed_out: true,
-                });
+                })
             }
-        };
-
-        let status = status_result?;
-
-        if !status.success() && !stderr_output.is_empty() {
-            return Ok(PythonResult {
-                stdout: stdout_output,
-                stderr: stderr_output.clone(),
-                result: None,
-                error: Some(stderr_output),
-                timed_out: false,
-            });
         }
-
-        let parsed: serde_json::Value = match serde_json::from_str(stdout_output.trim()) {
-            Ok(v) => v,
-            Err(_) => {
-                return Ok(PythonResult {
-                    stdout: stdout_output,
-                    stderr: stderr_output,
-                    result: None,
-                    error: Some("Failed to parse result as JSON".to_string()),
-                    timed_out: false,
-                });
-            }
-        };
-
-        if let Some(err) = parsed.get("error").and_then(|e| e.as_str()) {
-            return Ok(PythonResult {
-                stdout: stdout_output,
-                stderr: stderr_output,
-                result: parsed.get("result").cloned(),
-                error: Some(err.to_string()),
-                timed_out: false,
-            });
-        }
-
-        Ok(PythonResult {
-            stdout: stdout_output,
-            stderr: stderr_output,
-            result: parsed.get("result").cloned(),
-            error: None,
-            timed_out: false,
-        })
     }
 
     fn create_wrapper_code() -> String {

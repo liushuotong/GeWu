@@ -20,6 +20,7 @@ qdrant-client = "1.16"
 embed_anything = { git = "https://github.com/StarlightSearch/EmbedAnything", rev = "273bf9da0317cd5740b66f6c69de9000fa76049e" }
 directories = "5.0"
 dirs = "5.0"
+json-strip-comments = "3.1"
 
 [dev-dependencies]
 tokio-test = "0.4"
