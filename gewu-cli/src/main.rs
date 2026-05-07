@@ -188,14 +188,13 @@ async fn run_agent(
                     std::io::stdout().flush()?;
                     reasoning.push_str(&delta);
                 }
-                AgentEvent::ToolStart { tool, input } => {
+                AgentEvent::ToolStart { tool, input: _ } => {
                     if reasoning_started {
                         print!("{}", RESET);
                     }
                     if !tools_used.contains(&tool) {
                         tools_used.push(tool.clone());
                     }
-                    println!("\n[Tool Start: {}] {}", tool, input);
                 }
                 AgentEvent::ToolFinish { tool, output: _ } => {
                     let tool_count = tools_used.len();

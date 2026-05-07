@@ -290,7 +290,6 @@ impl EvolutionGraph {
             state.current_plan = Some(plan.clone());
             state.current_plan_id = Some(plan_id.clone());
 
-            tracing::debug!("=== REVIEWER INPUT ===\nTask:\n{}\n\nPlan:\n{}", state.task, plan);
             let review = reviewer.review_plan(&state.task, &plan).await?;
             tracing::debug!("=== REVIEWER OUTPUT ===\n{}", review);
             state.review_history.push(review.clone());

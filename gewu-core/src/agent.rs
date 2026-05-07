@@ -54,7 +54,7 @@ use std::error::Error;
 use std::panic::{catch_unwind, AssertUnwindSafe};
 use std::sync::Arc;
 use tokio::task::spawn_blocking;
-use tracing::{debug, info, warn};
+use tracing::{info, warn, trace};
 use uuid::Uuid;
 
 pub struct Agent {
@@ -213,7 +213,7 @@ impl Agent {
 
                 let provider = self.llm.clone();
                 let messages = self.memory.messages().to_vec();
-                debug!("LLM request messages: {:?}", messages);
+                trace!("LLM request messages: {:?}", messages);
 
                 let tools_clone = self.tools.clone();
                 let mut stream = provider.stream_response(&messages, tools_clone.as_slice()).await
@@ -298,7 +298,7 @@ impl Agent {
                     let tool = self.tools.iter().find(|t| t.name() == tool_name);
 
                     let result_content = if let Some(t) = tool {
-                        info!("Executing tool: {}", tool_name);
+                        info!("Executing tool: {} with args: {}", tool_name, args);
                         let args_val: serde_json::Value = match serde_json::from_str(&args) {
                             Ok(v) => v,
                             Err(e) => {

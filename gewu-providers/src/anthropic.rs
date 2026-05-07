@@ -1,3 +1,26 @@
+//! Anthropic API types, HTTP client, and SSE parsing.
+//!
+//! This module provides types for interacting with Anthropic's Messages API,
+//! including request/response structures, streaming support via Server-Sent Events,
+//! and an HTTP client implementation.
+//!
+//! # Request Flow
+//!
+//! 1. Create a [`Client`] with [`AnthropicConfig`]
+//! 2. Use [`Client::messages()`] to get a [`Messages`] handle
+//! 3. Call [`Messages::create_stream()`] to get a streaming response
+//!
+//! # Extended Thinking
+//!
+//! Some models support extended thinking. Enable it via [`AnthropicConfig::with_beta`]:
+//!
+//! ```ignore
+//! use gewu_providers::anthropic::AnthropicConfig;
+//!
+//! let config = AnthropicConfig::new("api-key", "https://api.anthropic.com")
+//!     .with_beta("thinking-2025-05-14");
+//! ```
+
 use bytes::Bytes;
 use futures::Stream;
 use reqwest::Client as HttpClient;
@@ -7,28 +30,42 @@ use std::pin::Pin;
 use std::task::{Context, Poll};
 use thiserror::Error;
 
+/// Errors that can occur when interacting with the Anthropic API.
 #[derive(Error, Debug)]
 pub enum AnthropicError {
+    /// HTTP request failed (network error, timeout, etc.)
     #[error("HTTP request failed: {0}")]
     Http(#[from] reqwest::Error),
+    /// Error parsing Server-Sent Events response.
     #[error("SSE parse error: {0}")]
     SseParse(String),
+    /// API returned an error response.
     #[error("API error: {0}")]
     Api(String),
+    /// Error parsing JSON response.
     #[error("JSON parse error: {0}")]
     Json(#[from] serde_json::Error),
+    /// Error building request (missing required fields, etc.).
     #[error("Build error: {0}")]
     Build(String),
 }
 
+/// Configuration for the Anthropic API client.
 #[derive(Debug, Clone)]
 pub struct AnthropicConfig {
     api_key: String,
     base_url: String,
+    /// Beta header value for enabling experimental features (e.g., extended thinking).
     pub beta: Option<String>,
 }
 
 impl AnthropicConfig {
+    /// Creates a new configuration.
+    ///
+    /// # Arguments
+    ///
+    /// * `api_key` - Your Anthropic API key.
+    /// * `base_url` - The base URL of the API (e.g., <https://api.anthropic.com>).
     pub fn new(api_key: &str, base_url: &str) -> Self {
         Self {
             api_key: api_key.to_string(),
@@ -37,14 +74,24 @@ impl AnthropicConfig {
         }
     }
 
+    /// Sets the beta header for experimental features.
+    ///
+    /// Use this to enable features like extended thinking:
+    ///
+    /// ```ignore
+    /// let config = AnthropicConfig::new("api-key", "https://api.anthropic.com")
+    ///     .with_beta("thinking-2025-05-14");
+    /// ```
     pub fn with_beta(mut self, beta: &str) -> Self {
         self.beta = Some(beta.to_string());
         self
     }
 }
 
+/// HTTP client for Anthropic API requests.
 #[derive(Debug)]
 pub struct Client {
+    /// The configuration used by this client.
     pub config: AnthropicConfig,
     http_client: HttpClient,
 }

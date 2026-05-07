@@ -1,6 +1,6 @@
 //! LLM provider implementations.
 //!
-//! This module provides implementations of the [`LlmProvider`] trait
+//! This module provides implementations of the `LlmProvider` trait (from `gewu_core`)
 //! for various LLM APIs. Currently supports OpenAI-compatible APIs
 //! and Anthropic's Claude API.
 //!
@@ -20,9 +20,8 @@
 //! - [`AnthropicProvider`] - Anthropic Claude provider implementation
 //! - [`RequestBuilder`] - Trait for building API requests
 //! - [`ResponseParser`] - Trait for parsing streaming responses
-//! - [`ToolCallAggregator`] - Handles fragmented tool call streaming
 
-use crate::openai_types::{
+use crate::openai::{
     ChatCompletionMessageToolCall, ChatCompletionMessageToolCallChunk,
     ChatCompletionMessageToolCalls,
     ChatCompletionRequestMessage, ChatCompletionRequestMessageContentPartImage,
@@ -32,9 +31,9 @@ use crate::openai_types::{
     CreateChatCompletionRequest, FunctionCall as OpenAIFunctionCall,
     FunctionObjectArgs, ImageUrl, OpenAIConfig, AssistantMessage as OpenAIAssistantMessage,
     ChatCompletionRequestMessageContentPartText, FileData,
-    ChatCompletionRequestMessageContentPartFile, Client as OpenAIClient,
+    ChatCompletionRequestMessageContentPartFile, OpenAIClient,
 };
-use crate::anthropic_types::{
+use crate::anthropic::{
     AnthropicChunk, AnthropicConfig, AnthropicMessage, AnthropicStream, AnthropicTool,
     ContentBlock, ContentBlockDeltaChunk, ContentBlockStart,
     ContentBlockStartChunk, ContentDelta, CreateMessageRequest,
@@ -50,13 +49,61 @@ use serde_json::Value;
 use std::error::Error;
 use std::sync::Arc;
 
+static MULTIMODAL_CAP: Capabilities = Capabilities {
+    input: gewu_core::types::InputCapabilities {
+        text: true,
+        image: true,
+        audio: false,
+        video: false,
+        pdf: true,
+    },
+    output: gewu_core::types::OutputCapabilities {
+        text: true,
+        image: false,
+        audio: false,
+        video: false,
+        pdf: false,
+    },
+};
+
+static TEXT_ONLY_CAP: Capabilities = Capabilities {
+    input: gewu_core::types::InputCapabilities {
+        text: true,
+        image: false,
+        audio: false,
+        video: false,
+        pdf: false,
+    },
+    output: gewu_core::types::OutputCapabilities {
+        text: true,
+        image: false,
+        audio: false,
+        video: false,
+        pdf: false,
+    },
+};
+
 /// Trait for building API requests from GeWu types.
 ///
 /// Implement this trait to create custom request formats for different
-/// OpenAI-compatible APIs. The default implementation handles the
-/// standard OpenAI request format.
+/// LLM APIs. The implementations handle converting GeWu's [`Message`] type
+/// into provider-specific request formats.
+///
+/// # Example
+///
+/// ```ignore
+/// impl RequestBuilder for MyCustomProvider {
+///     fn build(
+///         &self,
+///         messages: &[Message],
+///         tools: &[Arc<dyn Tool>],
+///     ) -> Result<MyRequest, Box<dyn Error + Send + Sync>> {
+///         // Convert messages and tools to your format
+///     }
+/// }
+/// ```
 pub trait RequestBuilder: Send + Sync {
-    /// Builds a chat completion request.
+    /// Builds a provider-specific chat completion request.
     ///
     /// # Arguments
     ///
@@ -72,8 +119,13 @@ pub trait RequestBuilder: Send + Sync {
 /// Trait for parsing streaming responses into provider events.
 ///
 /// Implement this trait to handle different response formats from
-/// OpenAI-compatible APIs.
+/// various LLM APIs, converting them into GeWu's [`ProviderEvent`] stream.
 pub trait ResponseParser: Send + Sync {
+    /// Parses a provider-specific stream into a stream of [`ProviderEvent`]s.
+    ///
+    /// # Arguments
+    ///
+    /// * `stream` - The provider's streaming response.
     fn parse_stream(
         &self,
         stream: ChatCompletionStream,
@@ -141,7 +193,7 @@ impl OpenAIProvider {
     /// # Arguments
     ///
     /// * `api_key` - Your API key (may be ignored by some endpoints).
-    /// * `base_url` - The base URL of the API (e.g., "https://api.openai.com/v1").
+    /// * `base_url` - The base URL of the API (e.g., <https://api.openai.com/v1>).
     /// * `model` - The model identifier expected by the endpoint.
     pub fn new_with_endpoint(api_key: &str, base_url: &str, model: &str) -> Self {
         let config = OpenAIConfig::new(api_key, base_url);
@@ -159,75 +211,20 @@ impl OpenAIProvider {
     /// For accurate capability settings, use a custom provider implementation.
     fn default_capabilities_for_model(model: &str) -> Capabilities {
         let model_lower = model.to_lowercase();
-        if model_lower.contains("gpt-4o") || model_lower.contains("gpt-5") {
-            Capabilities {
-                input: gewu_core::types::InputCapabilities {
-                    text: true,
-                    image: true,
-                    audio: false,
-                    video: false,
-                    pdf: true,
-                },
-                output: gewu_core::types::OutputCapabilities {
-                    text: true,
-                    image: false,
-                    audio: false,
-                    video: false,
-                    pdf: false,
-                },
-            }
-        } else if model_lower.contains("gpt-4-turbo") {
-            Capabilities {
-                input: gewu_core::types::InputCapabilities {
-                    text: true,
-                    image: true,
-                    audio: false,
-                    video: false,
-                    pdf: true,
-                },
-                output: gewu_core::types::OutputCapabilities {
-                    text: true,
-                    image: false,
-                    audio: false,
-                    video: false,
-                    pdf: false,
-                },
-            }
-        } else if model_lower.contains("gpt-3.5-turbo") {
-            Capabilities {
-                input: gewu_core::types::InputCapabilities {
-                    text: true,
-                    image: false,
-                    audio: false,
-                    video: false,
-                    pdf: false,
-                },
-                output: gewu_core::types::OutputCapabilities {
-                    text: true,
-                    image: false,
-                    audio: false,
-                    video: false,
-                    pdf: false,
-                },
-            }
-        } else {
-            Capabilities {
-                input: gewu_core::types::InputCapabilities {
-                    text: true,
-                    image: false,
-                    audio: false,
-                    video: false,
-                    pdf: false,
-                },
-                output: gewu_core::types::OutputCapabilities {
-                    text: true,
-                    image: false,
-                    audio: false,
-                    video: false,
-                    pdf: false,
-                },
-            }
-        }
+
+        static MODEL_RULES: &[(&[&str], &Capabilities)] = &[
+            (&["gpt-4o", "gpt-5"], &MULTIMODAL_CAP),
+            (&["gpt-4-turbo"], &MULTIMODAL_CAP),
+            (&["gpt-3.5-turbo"], &TEXT_ONLY_CAP),
+        ];
+
+        MODEL_RULES
+            .iter()
+            .filter(|(patterns, _)| patterns.iter().any(|p| model_lower.contains(p)))
+            .map(|(_, caps)| *caps)
+            .next()
+            .unwrap_or(&TEXT_ONLY_CAP)
+            .clone()
     }
 
     /// Converts a [`ContentPart`] to an OpenAI API content part.
@@ -681,6 +678,28 @@ let request = self.build(messages, tools)?;
     }
 }
 
+/// Anthropic Claude API provider.
+///
+/// This provider works with:
+/// - Anthropic's official Claude API
+/// - Anthropic-compatible proxies
+///
+/// # Model Capabilities
+///
+/// The provider automatically detects capabilities based on model name:
+/// - **Claude 3.5 Sonnet / Claude 3 Opus**: text + image input, PDF support
+/// - **Claude 3 Haiku**: text-only
+/// - **Other models**: text + image input (conservative default)
+///
+/// # Extended Thinking
+///
+/// For models that support extended thinking (like Claude 3.7), use
+/// [`with_extended_thinking`](AnthropicProvider::with_extended_thinking):
+///
+/// ```ignore
+/// let provider = AnthropicProvider::new("api-key", "claude-3-7-sonnet")
+///     .with_extended_thinking();
+/// ```
 pub struct AnthropicProvider {
     client: AnthropicClient,
     model: String,
@@ -688,6 +707,12 @@ pub struct AnthropicProvider {
 }
 
 impl AnthropicProvider {
+    /// Creates a new provider for the official Anthropic API.
+    ///
+    /// # Arguments
+    ///
+    /// * `api_key` - Your Anthropic API key.
+    /// * `model` - The model to use (e.g., "claude-3-5-sonnet-20241022").
     pub fn new(api_key: &str, model: &str) -> Self {
         let config = AnthropicConfig::new(api_key, "https://api.anthropic.com");
         let capabilities = Self::default_capabilities_for_model(model);
@@ -698,6 +723,16 @@ impl AnthropicProvider {
         }
     }
 
+    /// Creates a new provider with a custom endpoint.
+    ///
+    /// Use this for proxies, caching servers, or self-hosted models
+    /// that are Anthropic-compatible.
+    ///
+    /// # Arguments
+    ///
+    /// * `api_key` - Your API key (may be ignored by some endpoints).
+    /// * `base_url` - The base URL of the API (e.g., <https://api.anthropic.com>).
+    /// * `model` - The model identifier expected by the endpoint.
     pub fn new_with_endpoint(api_key: &str, base_url: &str, model: &str) -> Self {
         let config = AnthropicConfig::new(api_key, base_url);
         let capabilities = Self::default_capabilities_for_model(model);
@@ -708,6 +743,17 @@ impl AnthropicProvider {
         }
     }
 
+    /// Enables extended thinking for supported models.
+    ///
+    /// Extended thinking allows models like Claude 3.7 to show their reasoning process.
+    /// This is a builder-style method that returns a new provider instance.
+    ///
+    /// # Example
+    ///
+    /// ```ignore
+    /// let provider = AnthropicProvider::new("api-key", "claude-3-7-sonnet")
+    ///     .with_extended_thinking();
+    /// ```
     pub fn with_extended_thinking(mut self) -> Self {
         self.client.config.beta = Some("thinking-2025-05-14".to_string());
         self
@@ -715,58 +761,19 @@ impl AnthropicProvider {
 
     fn default_capabilities_for_model(model: &str) -> Capabilities {
         let model_lower = model.to_lowercase();
-        if model_lower.contains("claude-3-5-sonnet") || model_lower.contains("claude-3-opus") {
-            Capabilities {
-                input: gewu_core::types::InputCapabilities {
-                    text: true,
-                    image: true,
-                    audio: false,
-                    video: false,
-                    pdf: true,
-                },
-                output: gewu_core::types::OutputCapabilities {
-                    text: true,
-                    image: false,
-                    audio: false,
-                    video: false,
-                    pdf: false,
-                },
-            }
-        } else if model_lower.contains("claude-3-haiku") {
-            Capabilities {
-                input: gewu_core::types::InputCapabilities {
-                    text: true,
-                    image: false,
-                    audio: false,
-                    video: false,
-                    pdf: false,
-                },
-                output: gewu_core::types::OutputCapabilities {
-                    text: true,
-                    image: false,
-                    audio: false,
-                    video: false,
-                    pdf: false,
-                },
-            }
-        } else {
-            Capabilities {
-                input: gewu_core::types::InputCapabilities {
-                    text: true,
-                    image: true,
-                    audio: false,
-                    video: false,
-                    pdf: true,
-                },
-                output: gewu_core::types::OutputCapabilities {
-                    text: true,
-                    image: false,
-                    audio: false,
-                    video: false,
-                    pdf: false,
-                },
-            }
-        }
+
+        static MODEL_RULES: &[(&[&str], &Capabilities)] = &[
+            (&["claude-3-5-sonnet", "claude-3-opus"], &MULTIMODAL_CAP),
+            (&["claude-3-haiku"], &TEXT_ONLY_CAP),
+        ];
+
+        MODEL_RULES
+            .iter()
+            .filter(|(patterns, _)| patterns.iter().any(|p| model_lower.contains(p)))
+            .map(|(_, caps)| *caps)
+            .next()
+            .unwrap_or(&MULTIMODAL_CAP)
+            .clone()
     }
 
     fn convert_content_part(&self, part: &ContentPart) -> Option<ContentBlock> {
@@ -1104,7 +1111,12 @@ impl LlmProvider for AnthropicProvider {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::openai_types::FunctionCallStream;
+    use crate::openai::FunctionCallStream;
+    use async_trait::async_trait;
+    use gewu_core::types::{FunctionCall as CoreFunctionCall, ToolCall as CoreToolCall};
+    use gewu_core::{ToolContext, ToolResult, Tool};
+    use schemars::schema::RootSchema;
+    use serde_json::Value;
 
     #[test]
     fn test_new_provider() {
@@ -1239,5 +1251,234 @@ mod tests {
             events.is_empty(),
             "Duplicate arguments should not emit new deltas"
         );
+    }
+
+    #[test]
+    fn openai_default_capabilities_gpt4o() {
+        let caps = OpenAIProvider::default_capabilities_for_model("gpt-4o");
+        assert!(caps.input.image);
+        assert!(caps.input.pdf);
+        assert!(!caps.input.audio);
+        assert!(!caps.input.video);
+    }
+
+    #[test]
+    fn openai_default_capabilities_gpt35() {
+        let caps = OpenAIProvider::default_capabilities_for_model("gpt-3.5-turbo");
+        assert!(!caps.input.image);
+        assert!(!caps.input.pdf);
+        assert!(caps.input.text);
+    }
+
+    #[test]
+    fn openai_default_capabilities_unknown() {
+        let caps = OpenAIProvider::default_capabilities_for_model("unknown-model");
+        assert!(caps.input.text);
+        assert!(!caps.input.image);
+    }
+
+    #[test]
+    fn convert_message_system() {
+        let provider = OpenAIProvider::new("test-key", "gpt-4");
+        let msg = Message::System {
+            content: "You are helpful".to_string(),
+        };
+        let converted = provider.convert_message(&msg).expect("convert success");
+        assert_eq!(converted.len(), 1);
+        assert!(matches!(
+            converted[0],
+            ChatCompletionRequestMessage::System(_)
+        ));
+    }
+
+    #[test]
+    fn convert_message_user_text() {
+        let provider = OpenAIProvider::new("test-key", "gpt-4");
+        let msg = Message::User {
+            content: vec![ContentPart::Text {
+                text: "Hello".to_string(),
+            }],
+        };
+        let converted = provider.convert_message(&msg).expect("convert success");
+        assert_eq!(converted.len(), 1);
+        assert!(matches!(
+            converted[0],
+            ChatCompletionRequestMessage::User(_)
+        ));
+    }
+
+    #[test]
+    fn convert_message_assistant_with_content() {
+        let provider = OpenAIProvider::new("test-key", "gpt-4");
+        let msg = Message::Assistant {
+            content: Some("Hello world".to_string()),
+            tool_calls: None,
+        };
+        let converted = provider.convert_message(&msg).expect("convert success");
+        assert_eq!(converted.len(), 1);
+        match &converted[0] {
+            ChatCompletionRequestMessage::Assistant(asm) => {
+                assert_eq!(asm.content.as_deref(), Some("Hello world"));
+            }
+            _ => panic!("expected Assistant message"),
+        }
+    }
+
+    #[test]
+    fn convert_message_assistant_with_tool_calls() {
+        let provider = OpenAIProvider::new("test-key", "gpt-4");
+        let msg = Message::Assistant {
+            content: None,
+            tool_calls: Some(vec![CoreToolCall {
+                id: "call_1".to_string(),
+                r#type: "function".to_string(),
+                function: CoreFunctionCall {
+                    name: "get_weather".to_string(),
+                    arguments: "{\"city\":\"NYC\"}".to_string(),
+                },
+            }]),
+        };
+        let converted = provider.convert_message(&msg).expect("convert success");
+        assert_eq!(converted.len(), 1);
+        match &converted[0] {
+            ChatCompletionRequestMessage::Assistant(asm) => {
+                assert!(asm.tool_calls.is_some());
+                let calls = asm.tool_calls.as_ref().unwrap();
+                assert_eq!(calls.len(), 1);
+                match &calls[0] {
+                    ChatCompletionMessageToolCalls::Function(f) => {
+                        assert_eq!(f.function.name, "get_weather");
+                    }
+                }
+            }
+            _ => panic!("expected Assistant message"),
+        }
+    }
+
+    #[test]
+    fn convert_message_tool_simple() {
+        let provider = OpenAIProvider::new("test-key", "gpt-4");
+        let msg = Message::Tool {
+            tool_call_id: "call_1".to_string(),
+            tool_name: Some("get_weather".to_string()),
+            content: "{\"temp\":72}".to_string(),
+            media: vec![],
+        };
+        let converted = provider.convert_message(&msg).expect("convert success");
+        assert_eq!(converted.len(), 1);
+        match &converted[0] {
+            ChatCompletionRequestMessage::Tool(tm) => {
+                assert_eq!(tm.tool_call_id, "call_1");
+                assert_eq!(tm.content, "{\"temp\":72}");
+            }
+            _ => panic!("expected Tool message"),
+        }
+    }
+
+    #[test]
+    fn anthropic_default_capabilities_sonnet() {
+        let caps = AnthropicProvider::default_capabilities_for_model("claude-3-5-sonnet");
+        assert!(caps.input.image);
+        assert!(caps.input.pdf);
+        assert!(!caps.input.audio);
+    }
+
+    #[test]
+    fn anthropic_default_capabilities_haiku() {
+        let caps = AnthropicProvider::default_capabilities_for_model("claude-3-haiku");
+        assert!(!caps.input.image);
+        assert!(caps.input.text);
+    }
+
+    #[test]
+    fn anthropic_default_capabilities_unknown() {
+        let caps = AnthropicProvider::default_capabilities_for_model("unknown-model");
+        assert!(caps.input.image);
+        assert!(caps.input.pdf);
+    }
+
+    #[test]
+    fn anthropic_convert_message_user() {
+        let provider = AnthropicProvider::new("test-key", "claude-3-5-sonnet");
+        let msg = Message::User {
+            content: vec![ContentPart::Text {
+                text: "Hello".to_string(),
+            }],
+        };
+        let converted = provider.convert_message(&msg).expect("convert success");
+        assert_eq!(converted.len(), 1);
+    }
+
+    #[test]
+    fn anthropic_convert_message_system_returns_empty() {
+        let provider = AnthropicProvider::new("test-key", "claude-3-5-sonnet");
+        let msg = Message::System {
+            content: "You are helpful".to_string(),
+        };
+        let converted = provider.convert_message(&msg).expect("convert success");
+        assert!(converted.is_empty(), "System messages should return empty for Anthropic");
+    }
+
+    struct MockTool {
+        name: String,
+        description: String,
+    }
+
+    impl MockTool {
+        fn new(name: &str, description: &str) -> Self {
+            Self {
+                name: name.to_string(),
+                description: description.to_string(),
+            }
+        }
+    }
+
+    #[async_trait]
+    impl Tool for MockTool {
+        fn name(&self) -> &str {
+            &self.name
+        }
+        fn description(&self) -> &str {
+            &self.description
+        }
+        fn schema(&self) -> RootSchema {
+            schemars::schema_for!(serde_json::Value)
+        }
+        async fn execute(
+            &self,
+            _args: Value,
+            _ctx: &ToolContext,
+        ) -> Result<ToolResult, Box<dyn Error + Send + Sync>> {
+            Ok(ToolResult::new(&self.name, "ok"))
+        }
+    }
+
+    #[test]
+    fn openai_convert_tools() {
+        let provider = OpenAIProvider::new("test-key", "gpt-4");
+        let tools: Vec<Arc<dyn Tool>> = vec![
+            Arc::new(MockTool::new("get_weather", "Get weather for a city")),
+            Arc::new(MockTool::new("search", "Search the web")),
+        ];
+        let converted = provider.convert_tools(&tools).expect("convert success");
+        assert_eq!(converted.len(), 2);
+        match &converted[0] {
+            ChatCompletionTools::Function(tf) => {
+                assert_eq!(tf.function.name, "get_weather");
+                assert_eq!(tf.function.description, "Get weather for a city");
+            }
+        }
+    }
+
+    #[test]
+    fn anthropic_convert_tools() {
+        let provider = AnthropicProvider::new("test-key", "claude-3-5-sonnet");
+        let tools: Vec<Arc<dyn Tool>> = vec![
+            Arc::new(MockTool::new("get_weather", "Get weather for a city")),
+        ];
+        let converted = provider.convert_tools(&tools).expect("convert success");
+        assert_eq!(converted.len(), 1);
+        assert_eq!(converted[0].name, "get_weather");
+        assert_eq!(converted[0].description, "Get weather for a city");
     }
 }
