@@ -7,6 +7,8 @@ use std::path::PathBuf;
 pub struct Config {
     pub enabled: bool,
     pub max_attempts: i32,
+    pub max_plan_attempts: i32,
+    pub experience_recall_limit: i32,
     pub python_sandbox_timeout_secs: u64,
     pub skill_directory: PathBuf,
 }
@@ -38,9 +40,21 @@ impl Config {
                 }
             });
 
+        let max_plan_attempts = std::env::var("EVOLUTION_MAX_PLAN_ATTEMPTS")
+            .unwrap_or_else(|_| "3".to_string())
+            .parse::<i32>()
+            .unwrap_or(3);
+
+        let experience_recall_limit = std::env::var("EXPERIENCE_RECALL_LIMIT")
+            .unwrap_or_else(|_| "3".to_string())
+            .parse::<i32>()
+            .unwrap_or(3);
+
         Self {
             enabled,
             max_attempts,
+            max_plan_attempts,
+            experience_recall_limit,
             python_sandbox_timeout_secs,
             skill_directory,
         }

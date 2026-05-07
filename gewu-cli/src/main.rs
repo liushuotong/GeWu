@@ -9,7 +9,9 @@ use clap::Parser;
 use futures::StreamExt;
 use gewu_core::traits::LlmProvider;
 use gewu_core::types::AgentEvent;
+use gewu_evolve::{EvolutionGraph, EvolutionState};
 use gewu_providers::{AnthropicProvider, OpenAIProvider};
+use registry::AgentResult;
 use sqlx::sqlite::SqlitePoolOptions;
 use std::env;
 use std::io::{Read, Write};
@@ -243,6 +245,23 @@ async fn run_agent(
     }
 
     Ok(())
+}
+
+async fn run_evolve_agent(
+    task: &str,
+    llm: Arc<dyn LlmProvider>,
+    tools: Arc<dyn gewu_core::traits::ToolRegistry>,
+    tools_list: Arc<Vec<Arc<dyn gewu_core::traits::Tool>>>,
+    experience_store: Option<Arc<gewu_experience::ExperienceStore>>,
+) -> Result<EvolutionState> {
+    let config = gewu_evolve::Config::from_env();
+    let graph = EvolutionGraph::new(config);
+
+    println!("\n\x1b[36m╔═══════════════════════════════════════════════════════════════╗\x1b[0m");
+    println!("\x1b[36m║           Multi-Agent Evolve Framework                           ║\x1b[0m");
+    println!("\x1b[36m╚═══════════════════════════════════════════════════════════════╝\x1b[0m\n");
+
+    graph.run_multi_agent(task, llm, tools, tools_list, experience_store).await
 }
 
 #[derive(Parser)]
@@ -575,8 +594,8 @@ async fn main() -> Result<()> {
     };
 
     // Create Agent
-    let (mut agent, _registry, experience_store) =
-        registry::create_agent(&cli.agent, provider, pool, session_id, mcp_tools, experience_config).await?;
+    let (mut agent_result, _registry, experience_store) =
+        registry::create_agent(&cli.agent, provider.clone(), pool, session_id, mcp_tools, experience_config).await?;
     info!("Initialized agent: {}", cli.agent);
 
     // Determine the prompt: from args, from stdin, or error
@@ -604,8 +623,28 @@ async fn main() -> Result<()> {
         let prompt = prompt_parts.join(" ");
         if !prompt.is_empty() {
             println!("> {}", prompt);
-            if let Err(e) = run_agent(&mut agent, &prompt, experience_store.clone()).await {
-                error!("Error: {}", e);
+            match agent_result {
+                AgentResult::Standard(ref mut agent) => {
+                    if let Err(e) = run_agent(agent, &prompt, experience_store.clone()).await {
+                        error!("Error: {}", e);
+                    }
+                }
+                AgentResult::Evolve { ref tools, ref tools_list, .. } => {
+                    let state = run_evolve_agent(&prompt, provider.clone(), tools.clone(), tools_list.clone(), experience_store.clone()).await;
+                    match state {
+                        Ok(s) => {
+                            if !s.outcome.is_empty() {
+                                println!("{}", s.outcome);
+                            }
+                            if !s.execution_output.is_empty() && tracing::enabled!(tracing::Level::DEBUG) {
+                                println!("{}", s.execution_output);
+                            }
+                        }
+                        Err(e) => {
+                            error!("Evolution error: {}", e);
+                        }
+                    }
+                }
             }
         }
     } else if let Some(stdin_prompt) = &prompt_from_stdin {
@@ -616,8 +655,28 @@ async fn main() -> Result<()> {
             } else {
                 println!("> {}", trimmed);
             }
-            if let Err(e) = run_agent(&mut agent, trimmed, experience_store.clone()).await {
-                error!("Error: {}", e);
+            match agent_result {
+                AgentResult::Standard(ref mut agent) => {
+                    if let Err(e) = run_agent(agent, trimmed, experience_store.clone()).await {
+                        error!("Error: {}", e);
+                    }
+                }
+                AgentResult::Evolve { ref tools, ref tools_list, .. } => {
+                    let state = run_evolve_agent(trimmed, provider.clone(), tools.clone(), tools_list.clone(), experience_store.clone()).await;
+                    match state {
+                        Ok(s) => {
+                            if !s.outcome.is_empty() {
+                                println!("{}", s.outcome);
+                            }
+                            if !s.execution_output.is_empty() && tracing::enabled!(tracing::Level::DEBUG) {
+                                println!("{}", s.execution_output);
+                            }
+                        }
+                        Err(e) => {
+                            error!("Evolution error: {}", e);
+                        }
+                    }
+                }
             }
         }
     }
@@ -644,8 +703,28 @@ async fn main() -> Result<()> {
                 break;
             }
 
-            if let Err(e) = run_agent(&mut agent, input, experience_store.clone()).await {
-                error!("Error processing message: {}", e);
+            match agent_result {
+                AgentResult::Standard(ref mut agent) => {
+                    if let Err(e) = run_agent(agent, input, experience_store.clone()).await {
+                        error!("Error processing message: {}", e);
+                    }
+                }
+                AgentResult::Evolve { ref tools, ref tools_list, .. } => {
+                    let state = run_evolve_agent(input, provider.clone(), tools.clone(), tools_list.clone(), experience_store.clone()).await;
+                    match state {
+                        Ok(s) => {
+                            if !s.outcome.is_empty() {
+                                println!("{}", s.outcome);
+                            }
+                            if !s.execution_output.is_empty() && tracing::enabled!(tracing::Level::DEBUG) {
+                                println!("{}", s.execution_output);
+                            }
+                        }
+                        Err(e) => {
+                            error!("Evolution error: {}", e);
+                        }
+                    }
+                }
             }
         }
     }

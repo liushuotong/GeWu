@@ -102,7 +102,7 @@ impl Tool for TaskTool {
             input.subagent_type, input.description, session_id
         );
 
-        let (mut agent, _registry, _experience_store) = crate::registry::create_agent(
+        let (agent_result, _registry, _experience_store) = crate::registry::create_agent(
             &input.subagent_type,
             self.provider.clone(),
             self.pool.clone(),
@@ -112,6 +112,13 @@ impl Tool for TaskTool {
         )
         .await
         .map_err(|e| format!("Failed to create agent: {}", e))?;
+
+        let mut agent = match agent_result {
+            crate::registry::AgentResult::Standard(agent) => agent,
+            crate::registry::AgentResult::Evolve { .. } => {
+                return Err("Sub-agent type 'evolve' is not supported for sub-tasks. Use 'build', 'explore', or 'general'.".into());
+            }
+        };
 
         let mut stream = Box::pin(agent.ask(&input.prompt));
         let mut result = String::new();
