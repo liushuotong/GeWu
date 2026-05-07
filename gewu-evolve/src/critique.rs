@@ -1,6 +1,7 @@
 //! Self-critique module for analyzing failures and generating feedback.
 
 use anyhow::Result;
+use futures::StreamExt;
 use gewu_core::traits::LlmProvider;
 use serde::{Deserialize, Serialize};
 
@@ -169,5 +170,3 @@ More text after"#;
         assert!(!result.should_retry);
     }
 }
-
-use futures::StreamExt;

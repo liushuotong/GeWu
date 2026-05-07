@@ -2,69 +2,45 @@
 
 use anyhow::Result;
 use futures::StreamExt;
-use gewu_core::traits::LlmProvider;
-use std::sync::Arc;
+use gewu_core::Agent;
 
 pub struct Planner {
-    llm: Arc<dyn LlmProvider>,
+    agent: Agent,
 }
 
 impl Planner {
-    pub fn new(llm: Arc<dyn LlmProvider>) -> Self {
-        Self { llm }
+    pub fn new(agent: Agent) -> Self {
+        Self { agent }
     }
 
-    pub async fn create_plan(&self, task: &str) -> Result<String> {
+    pub async fn create_plan(&mut self, task: &str) -> Result<String> {
         let prompt = Self::build_plan_prompt(task, None, None);
-
-        let messages = vec![gewu_core::types::Message::User {
-            content: vec![gewu_core::types::ContentPart::Text { text: prompt }],
-        }];
-
-        let mut stream = self.llm.stream_response(&messages, &[]).await
-            .map_err(|e| anyhow::anyhow!("LLM stream error: {}", e))?;
-
-        let mut response_text = String::new();
-        while let Some(result) = stream.next().await {
-            match result {
-                Ok(event) => match event {
-                    gewu_core::types::ProviderEvent::ContentDelta { delta } => {
-                        response_text.push_str(&delta);
-                    }
-                    _ => {}
-                },
-                Err(e) => {
-                    tracing::warn!("Error in planner stream: {}", e);
-                    break;
-                }
-            }
-        }
-
-        Ok(response_text)
+        self.agent.reset().await;
+        self.collect_response(&prompt).await
     }
 
     pub async fn revise_plan(
-        &self,
+        &mut self,
         task: &str,
         existing_plan: &str,
         feedback: &str,
     ) -> Result<String> {
         let prompt = Self::build_plan_prompt(task, Some(existing_plan), Some(feedback));
+        self.agent.reset().await;
+        self.collect_response(&prompt).await
+    }
 
-        let messages = vec![gewu_core::types::Message::User {
-            content: vec![gewu_core::types::ContentPart::Text { text: prompt }],
-        }];
-
-        let mut stream = self.llm.stream_response(&messages, &[]).await
-            .map_err(|e| anyhow::anyhow!("LLM stream error: {}", e))?;
-
+    async fn collect_response(&mut self, prompt: &str) -> Result<String> {
+        let mut stream = Box::pin(self.agent.ask(prompt));
         let mut response_text = String::new();
+
         while let Some(result) = stream.next().await {
             match result {
                 Ok(event) => match event {
-                    gewu_core::types::ProviderEvent::ContentDelta { delta } => {
+                    gewu_core::types::AgentEvent::ContentDelta { delta } => {
                         response_text.push_str(&delta);
                     }
+                    gewu_core::types::AgentEvent::Finish { .. } => break,
                     _ => {}
                 },
                 Err(e) => {
@@ -101,6 +77,15 @@ impl Planner {
 
 Your task is to break down the user's request into clear, sequential steps.
 
+When planning, you may use available tools to:
+- Read existing files to understand the codebase structure
+- Search for relevant code patterns
+- Look up documentation or references
+
+However, you should NOT execute bash commands or modify files during planning.
+
+Create clear, sequential plans that can be executed by a separate executor agent.
+
 {}
 {}
 
@@ -111,13 +96,5 @@ Respond with:
 Format your response clearly so it can be understood by an executor agent."#,
             task_section, revision_section
         )
-    }
-}
-
-impl Default for Planner {
-    fn default() -> Self {
-        Self {
-            llm: Arc::new(gewu_providers::OpenAIProvider::new("dummy", "dummy")),
-        }
     }
 }

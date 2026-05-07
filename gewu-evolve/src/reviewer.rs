@@ -3,8 +3,7 @@
 use crate::critique::CritiqueResult;
 use anyhow::Result;
 use futures::StreamExt;
-use gewu_core::traits::LlmProvider;
-use std::sync::Arc;
+use gewu_core::Agent;
 
 #[derive(Debug, Clone)]
 pub struct ReviewResult {
@@ -14,31 +13,31 @@ pub struct ReviewResult {
 }
 
 pub struct Reviewer {
-    llm: Arc<dyn LlmProvider>,
+    agent: Agent,
 }
 
 impl Reviewer {
-    pub fn new(llm: Arc<dyn LlmProvider>) -> Self {
-        Self { llm }
+    pub fn new(agent: Agent) -> Self {
+        Self { agent }
     }
 
-    pub async fn review_plan(&self, task: &str, plan: &str) -> Result<String> {
+    pub async fn review_plan(&mut self, task: &str, plan: &str) -> Result<String> {
         let prompt = Self::build_review_prompt(task, plan);
+        self.agent.reset().await;
+        self.collect_response(&prompt).await
+    }
 
-        let messages = vec![gewu_core::types::Message::User {
-            content: vec![gewu_core::types::ContentPart::Text { text: prompt }],
-        }];
-
-        let mut stream = self.llm.stream_response(&messages, &[]).await
-            .map_err(|e| anyhow::anyhow!("LLM stream error: {}", e))?;
-
+    async fn collect_response(&mut self, prompt: &str) -> Result<String> {
+        let mut stream = Box::pin(self.agent.ask(prompt));
         let mut response_text = String::new();
+
         while let Some(result) = stream.next().await {
             match result {
                 Ok(event) => match event {
-                    gewu_core::types::ProviderEvent::ContentDelta { delta } => {
+                    gewu_core::types::AgentEvent::ContentDelta { delta } => {
                         response_text.push_str(&delta);
                     }
+                    gewu_core::types::AgentEvent::Finish { .. } => break,
                     _ => {}
                 },
                 Err(e) => {
@@ -53,13 +52,14 @@ impl Reviewer {
 
     fn build_review_prompt(task: &str, plan: &str) -> String {
         format!(
-            r#"You are reviewing an execution plan for the following task:
+            r#"You are a reviewer agent evaluating execution plans.
 
-Task:
-{}
+When reviewing, you may use available tools to:
+- Read files to verify plan feasibility
+- Search code to check for potential issues
+- Look up documentation
 
-Plan:
-{}
+However, you should NOT execute bash commands or modify files.
 
 Please evaluate this plan and respond with:
 
@@ -77,44 +77,27 @@ Suggestions for improvement:
 - suggestion 2
 - etc.
 
-Be specific and constructive in your feedback."#,
+Be specific and constructive in your feedback.
+
+Task:
+{}
+
+Plan:
+{}"#,
             task, plan
         )
     }
 
     pub async fn critique_failure(
-        &self,
+        &mut self,
         task: &str,
         plan: &str,
         error: &str,
         tools_used: &[String],
     ) -> Result<String> {
         let prompt = Self::build_critique_prompt(task, plan, error, tools_used);
-
-        let messages = vec![gewu_core::types::Message::User {
-            content: vec![gewu_core::types::ContentPart::Text { text: prompt }],
-        }];
-
-        let mut stream = self.llm.stream_response(&messages, &[]).await
-            .map_err(|e| anyhow::anyhow!("LLM stream error: {}", e))?;
-
-        let mut response_text = String::new();
-        while let Some(result) = stream.next().await {
-            match result {
-                Ok(event) => match event {
-                    gewu_core::types::ProviderEvent::ContentDelta { delta } => {
-                        response_text.push_str(&delta);
-                    }
-                    _ => {}
-                },
-                Err(e) => {
-                    tracing::warn!("Error in critique stream: {}", e);
-                    break;
-                }
-            }
-        }
-
-        Ok(response_text)
+        self.agent.reset().await;
+        self.collect_response(&prompt).await
     }
 
     fn build_critique_prompt(
@@ -131,6 +114,13 @@ Be specific and constructive in your feedback."#,
 
         format!(
             r#"You are analyzing why a task failed during execution.
+
+When analyzing, you may use available tools to:
+- Read files to investigate the failure
+- Search code for potential issues
+- Look up documentation
+
+However, you should NOT execute bash commands or modify files.
 
 Task Description:
 {}
@@ -264,17 +254,6 @@ Tools to adjust: (optional) list any tools that might need different usage"#,
             }
         } else {
             None
-        }
-    }
-}
-
-impl Default for Reviewer {
-    fn default() -> Self {
-        Self {
-            llm: Arc::new(gewu_providers::OpenAIProvider::new(
-                "dummy",
-                "dummy",
-            )),
         }
     }
 }

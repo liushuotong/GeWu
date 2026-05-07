@@ -10,7 +10,9 @@ use anyhow::Result;
 use gewu_core::traits::{LlmProvider, Tool};
 use gewu_core::Agent;
 use gewu_graph::state::State;
+use gewu_tools::{GlobTool, GrepTool, ListTool, ReadFileTool, WebFetchTool, WebSearchTool};
 use serde::{Deserialize, Serialize};
+use std::path::PathBuf;
 use std::sync::Arc;
 use uuid::Uuid;
 
@@ -188,8 +190,37 @@ impl EvolutionGraph {
     ) -> Result<EvolutionState> {
         let mut state = EvolutionState::with_config(task.to_string(), &self.config);
 
-        let planner = Planner::new(llm.clone());
-        let reviewer = Reviewer::new(llm.clone());
+        let read_only_tools: Vec<Arc<dyn Tool>> = vec![
+            Arc::new(ReadFileTool {
+                working_directory: std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")),
+            }),
+            Arc::new(GlobTool {
+                working_directory: std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")),
+            }),
+            Arc::new(GrepTool {
+                working_directory: std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")),
+            }),
+            Arc::new(ListTool {
+                working_directory: std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")),
+            }),
+            Arc::new(WebSearchTool),
+            Arc::new(WebFetchTool),
+        ];
+
+        let planner_agent = Agent::builder()
+            .llm(llm.clone())
+            .with_tools(read_only_tools.clone())
+            .system_prompt("You are a planner agent creating execution plans. When planning, you may use available tools to read files, search code, and gather information. However, you should NOT execute bash commands or modify files during planning.")
+            .build()?;
+
+        let reviewer_agent = Agent::builder()
+            .llm(llm.clone())
+            .with_tools(read_only_tools.clone())
+            .system_prompt("You are a reviewer agent evaluating execution plans. When reviewing, you may use available tools to read files, search code, and gather information. However, you should NOT execute bash commands or modify files.")
+            .build()?;
+
+        let mut planner = Planner::new(planner_agent);
+        let mut reviewer = Reviewer::new(reviewer_agent);
 
         let agent = Agent::builder()
             .llm(llm.clone())
@@ -283,7 +314,8 @@ impl EvolutionGraph {
                         state.max_plan_attempts,
                         parsed_review.issues.join("; ")
                     );
-                    continue;
+                    state.completed = false;
+                    break;
                 }
 
                 continue;

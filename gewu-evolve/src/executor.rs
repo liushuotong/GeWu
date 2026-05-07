@@ -118,9 +118,6 @@ When the plan is complete, provide a summary of what was accomplished."#,
         })
     }
 
-    pub fn abort(&self) {
-        tracing::info!("Executor abort requested");
-    }
 }
 
 impl Default for Executor {

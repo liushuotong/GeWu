@@ -8,6 +8,7 @@ gewu-core = { path = "../gewu-core" }
 gewu-graph = { path = "../gewu-graph" }
 gewu-experience = { path = "../gewu-experience" }
 gewu-providers = { path = "../gewu-providers" }
+gewu-tools = { path = "../gewu-tools" }
 anyhow = "1.0"
 async-trait = "0.1"
 serde = { version = "1.0", features = ["derive"] }

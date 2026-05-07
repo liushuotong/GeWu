@@ -257,10 +257,6 @@ async fn run_evolve_agent(
     let config = gewu_evolve::Config::from_env();
     let graph = EvolutionGraph::new(config);
 
-    println!("\n\x1b[36m╔═══════════════════════════════════════════════════════════════╗\x1b[0m");
-    println!("\x1b[36m║           Multi-Agent Evolve Framework                           ║\x1b[0m");
-    println!("\x1b[36m╚═══════════════════════════════════════════════════════════════╝\x1b[0m\n");
-
     graph.run_multi_agent(task, llm, tools, tools_list, experience_store).await
 }
 
