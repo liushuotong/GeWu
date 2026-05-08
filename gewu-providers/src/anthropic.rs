@@ -12,14 +12,7 @@
 //!
 //! # Extended Thinking
 //!
-//! Some models support extended thinking. Enable it via [`AnthropicConfig::with_beta`]:
-//!
-//! ```ignore
-//! use gewu_providers::anthropic::AnthropicConfig;
-//!
-//! let config = AnthropicConfig::new("api-key", "https://api.anthropic.com")
-//!     .with_beta("thinking-2025-05-14");
-//! ```
+//! Some models support extended thinking via beta headers.
 
 use bytes::Bytes;
 use futures::Stream;
@@ -36,26 +29,16 @@ pub enum AnthropicError {
     /// HTTP request failed (network error, timeout, etc.)
     #[error("HTTP request failed: {0}")]
     Http(#[from] reqwest::Error),
-    /// Error parsing Server-Sent Events response.
-    #[error("SSE parse error: {0}")]
-    SseParse(String),
     /// API returned an error response.
     #[error("API error: {0}")]
     Api(String),
-    /// Error parsing JSON response.
-    #[error("JSON parse error: {0}")]
-    Json(#[from] serde_json::Error),
-    /// Error building request (missing required fields, etc.).
-    #[error("Build error: {0}")]
-    Build(String),
 }
 
 /// Configuration for the Anthropic API client.
 #[derive(Debug, Clone)]
 pub struct AnthropicConfig {
-    api_key: String,
-    base_url: String,
-    /// Beta header value for enabling experimental features (e.g., extended thinking).
+    pub api_key: String,
+    pub base_url: String,
     pub beta: Option<String>,
 }
 
@@ -72,19 +55,6 @@ impl AnthropicConfig {
             base_url: base_url.trim_end_matches('/').to_string(),
             beta: None,
         }
-    }
-
-    /// Sets the beta header for experimental features.
-    ///
-    /// Use this to enable features like extended thinking:
-    ///
-    /// ```ignore
-    /// let config = AnthropicConfig::new("api-key", "https://api.anthropic.com")
-    ///     .with_beta("thinking-2025-05-14");
-    /// ```
-    pub fn with_beta(mut self, beta: &str) -> Self {
-        self.beta = Some(beta.to_string());
-        self
     }
 }
 
@@ -170,12 +140,6 @@ fn default_source_type() -> String {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct ToolUse {
-    pub name: String,
-    pub input: Value,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ToolCall {
     pub id: String,
     #[serde(rename = "type", default = "default_tool_type")]
@@ -194,22 +158,6 @@ pub struct AnthropicTool {
     pub description: String,
     #[serde(rename = "input_schema")]
     pub input_schema: Value,
-}
-
-#[derive(Debug, Clone, Deserialize)]
-pub struct MessageResponse {
-    pub id: String,
-    #[serde(rename = "type")]
-    pub response_type: String,
-    pub role: String,
-    pub content: Vec<ResponseContentBlock>,
-}
-
-#[derive(Debug, Clone, Deserialize)]
-#[serde(tag = "type", rename_all = "snake_case")]
-pub enum ResponseContentBlock {
-    Text { text: String },
-    ToolUse { id: String, name: String, input: Value },
 }
 
 impl<'a> Messages<'a> {
@@ -347,13 +295,7 @@ where
                                     }
                                 }
                                 "content_block_stop" => {
-                                    if let Ok(chunk) =
-                                        serde_json::from_str::<ContentBlockStopChunk>(data)
-                                    {
-                                        return Poll::Ready(Some(Ok(AnthropicChunk::ContentBlockStop(
-                                            chunk,
-                                        ))));
-                                    }
+                                    return Poll::Ready(Some(Ok(AnthropicChunk::ContentBlockStop(()))));
                                 }
                                 "message_delta" => {
                                     if let Ok(chunk) =
@@ -411,7 +353,8 @@ pub enum AnthropicChunk {
     MessageStart(MessageStartChunk),
     ContentBlockStart(ContentBlockStartChunk),
     ContentBlockDelta(ContentBlockDeltaChunk),
-    ContentBlockStop(ContentBlockStopChunk),
+    #[serde(skip)]
+    ContentBlockStop(()),
     MessageDelta(MessageDeltaChunk),
     MessageStop,
     Error(ErrorChunk),
@@ -419,14 +362,14 @@ pub enum AnthropicChunk {
 
 #[derive(Debug, Clone, Deserialize)]
 pub struct MessageStartChunk {
-    pub message: Message,
+    pub _message: Message,
 }
 
 #[derive(Debug, Clone, Deserialize)]
 pub struct Message {
-    pub id: String,
-    pub role: String,
-    pub content: Vec<Value>,
+    pub _id: String,
+    pub _role: String,
+    pub _content: Vec<Value>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -438,9 +381,9 @@ pub struct ContentBlockStartChunk {
 #[derive(Debug, Clone, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum ContentBlockStart {
-    Text { text: String },
+    Text { _text: String },
     ToolUse { id: String, name: String },
-    Thinking { thinking: String, signature: String },
+    Thinking { thinking: String, _signature: String },
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -459,14 +402,9 @@ pub enum ContentDelta {
 }
 
 #[derive(Debug, Clone, Deserialize)]
-pub struct ContentBlockStopChunk {
-    pub index: u32,
-}
-
-#[derive(Debug, Clone, Deserialize)]
 pub struct MessageDeltaChunk {
     pub delta: MessageDelta,
-    pub usage: MessageUsage,
+    pub _usage: MessageUsage,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -476,7 +414,7 @@ pub struct MessageDelta {
 
 #[derive(Debug, Clone, Deserialize)]
 pub struct MessageUsage {
-    pub output_tokens: u32,
+    pub _output_tokens: u32,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -487,7 +425,7 @@ pub struct ErrorChunk {
 #[derive(Debug, Clone, Deserialize)]
 pub struct ErrorDetail {
     #[serde(rename = "type")]
-    pub error_type: String,
+    pub _error_type: String,
     pub message: String,
 }
 
@@ -528,6 +466,6 @@ pub struct ModelsResponse {
 pub struct Model {
     pub id: String,
     #[serde(rename = "type")]
-    pub model_type: String,
-    pub display_name: Option<String>,
+    pub _model_type: String,
+    pub _display_name: Option<String>,
 }

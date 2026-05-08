@@ -40,9 +40,6 @@ pub enum OpenAIError {
     /// API returned an error response.
     #[error("API error: {0}")]
     Api(String),
-    /// Error parsing JSON response.
-    #[error("JSON parse error: {0}")]
-    Json(#[from] serde_json::Error),
     /// Error building request (missing required fields, etc.).
     #[error("Build error: {0}")]
     Build(String),
@@ -125,30 +122,6 @@ impl<'a> ChatCompletions<'a> {
 
         let stream = response.bytes_stream();
         Ok(ChatCompletionStream::new(stream))
-    }
-
-    pub async fn create(
-        &self,
-        request: CreateChatCompletionRequest,
-    ) -> Result<ChatCompletionResponse, OpenAIError> {
-        let url = format!("{}/chat/completions", self.client.config.base_url);
-        
-        let response = self.client.http_client
-            .post(&url)
-            .header("Authorization", format!("Bearer {}", self.client.config.api_key))
-            .header("Content-Type", "application/json")
-            .json(&request)
-            .send()
-            .await?;
-
-        let status = response.status();
-        if !status.is_success() {
-            let error_text = response.text().await.unwrap_or_default();
-            return Err(OpenAIError::Api(format!("{}: {}", status, error_text)));
-        }
-
-        let chunk: ChatCompletionResponse = response.json().await?;
-        Ok(chunk)
     }
 }
 
@@ -470,72 +443,6 @@ impl FunctionObjectArgs {
     }
 }
 
-#[derive(Debug, Serialize, Deserialize)]
-pub struct CreateChatCompletionRequestArgs {
-    model: Option<String>,
-    messages: Option<Vec<ChatCompletionRequestMessage>>,
-    tools: Option<Vec<ChatCompletionTools>>,
-    stream: Option<bool>,
-    max_tokens: Option<u32>,
-    temperature: Option<f32>,
-}
-
-impl Default for CreateChatCompletionRequestArgs {
-    fn default() -> Self {
-        Self {
-            model: None,
-            messages: None,
-            tools: None,
-            stream: None,
-            max_tokens: None,
-            temperature: None,
-        }
-    }
-}
-
-impl CreateChatCompletionRequestArgs {
-    pub fn model(mut self, model: &str) -> Self {
-        self.model = Some(model.to_string());
-        self
-    }
-    
-    pub fn messages(mut self, messages: Vec<ChatCompletionRequestMessage>) -> Self {
-        self.messages = Some(messages);
-        self
-    }
-    
-    pub fn tools(mut self, tools: Vec<ChatCompletionTools>) -> Self {
-        self.tools = Some(tools);
-        self
-    }
-    
-    pub fn stream(mut self, stream: bool) -> Self {
-        self.stream = Some(stream);
-        self
-    }
-    
-    pub fn max_tokens(mut self, max_tokens: u32) -> Self {
-        self.max_tokens = Some(max_tokens);
-        self
-    }
-    
-    pub fn temperature(mut self, temperature: f32) -> Self {
-        self.temperature = Some(temperature);
-        self
-    }
-    
-    pub fn build(self) -> Result<CreateChatCompletionRequest, OpenAIError> {
-        Ok(CreateChatCompletionRequest {
-            model: self.model.ok_or_else(|| OpenAIError::Build("model is required".to_string()))?,
-            messages: self.messages.unwrap_or_default(),
-            tools: self.tools,
-            stream: self.stream,
-            max_tokens: self.max_tokens,
-            temperature: self.temperature,
-        })
-    }
-}
-
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ChatCompletionRequestSystemMessageArgs {
     content: Option<String>,
@@ -580,40 +487,6 @@ impl ChatCompletionRequestUserMessageArgs {
     pub fn build(self) -> Result<UserMessage, OpenAIError> {
         Ok(UserMessage {
             content: self.content.unwrap_or_default(),
-        })
-    }
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct ChatCompletionRequestAssistantMessageArgs {
-    content: Option<String>,
-    tool_calls: Option<Vec<ChatCompletionMessageToolCalls>>,
-}
-
-impl Default for ChatCompletionRequestAssistantMessageArgs {
-    fn default() -> Self {
-        Self {
-            content: None,
-            tool_calls: None,
-        }
-    }
-}
-
-impl ChatCompletionRequestAssistantMessageArgs {
-    pub fn content(mut self, content: String) -> Self {
-        self.content = Some(content);
-        self
-    }
-    
-    pub fn tool_calls(mut self, tool_calls: Vec<ChatCompletionMessageToolCalls>) -> Self {
-        self.tool_calls = Some(tool_calls);
-        self
-    }
-    
-    pub fn build(self) -> Result<AssistantMessage, OpenAIError> {
-        Ok(AssistantMessage {
-            content: self.content,
-            tool_calls: self.tool_calls,
         })
     }
 }
@@ -704,26 +577,4 @@ pub struct Usage {
     pub prompt_tokens: u32,
     pub completion_tokens: u32,
     pub total_tokens: u32,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct ChatCompletionResponse {
-    pub id: String,
-    pub choices: Vec<ChatCompletionResponseChoice>,
-    #[serde(default)]
-    pub usage: Option<Usage>,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct ChatCompletionResponseChoice {
-    pub index: u32,
-    pub message: ChatCompletionResponseMessage,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub finish_reason: Option<String>,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct ChatCompletionResponseMessage {
-    pub role: String,
-    pub content: String,
 }

@@ -52,5 +52,10 @@ pub mod traits;
 pub mod types;
 
 pub use agent::Agent;
+pub use compaction::{estimate_tokens, is_overflow, prune};
+pub use middleware::TruncationService;
 pub use traits::{LlmProvider, Memory, Tool, ToolRegistry};
-pub use types::{FileAttachment, Message, ToolContext, ToolResult, TruncationResult};
+pub use types::{
+    AgentEvent, ContentPart, FileAttachment, FunctionCall, Message, ProviderEvent, ToolCall,
+    ToolContext, ToolResult, TruncationResult,
+};

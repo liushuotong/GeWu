@@ -297,24 +297,6 @@ impl OpenAIProvider {
         }
     }
 
-    /// Checks if a content part type is supported by the current model.
-    #[allow(dead_code)]
-    fn modality_supported(&self, part: &ContentPart) -> bool {
-        match part {
-            ContentPart::Text { .. } => true,
-            ContentPart::Image { .. } => self.capabilities.input.image,
-            ContentPart::Audio { .. } => self.capabilities.input.audio,
-            ContentPart::Video { .. } => self.capabilities.input.video,
-            ContentPart::File { mime_type, .. } => {
-                if mime_type == "application/pdf" {
-                    self.capabilities.input.pdf
-                } else {
-                    self.capabilities.input.text
-                }
-            }
-        }
-    }
-
     /// Converts a [`Message`] to OpenAI API message format.
     ///
     /// Tool messages may produce multiple API messages: one for the tool result
@@ -703,6 +685,7 @@ let request = self.build(messages, tools)?;
 pub struct AnthropicProvider {
     client: AnthropicClient,
     model: String,
+    #[allow(dead_code)]
     capabilities: Capabilities,
 }
 

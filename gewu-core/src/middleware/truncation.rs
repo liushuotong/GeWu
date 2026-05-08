@@ -38,7 +38,7 @@ impl TruncationService {
         self
     }
 
-    pub fn truncate(&self, text: &str, _has_task_tool: bool) -> TruncationResult {
+    pub fn truncate(&self, text: &str) -> TruncationResult {
         let lines: Vec<&str> = text.lines().collect();
         let total_bytes = text.len();
         let total_lines = lines.len();
@@ -115,7 +115,7 @@ mod tests {
     fn test_no_truncation_small_output() {
         let service = TruncationService::new();
         let text = "Hello, world!";
-        let result = service.truncate(text, false);
+        let result = service.truncate(text);
         assert!(!result.truncated);
         assert_eq!(result.content, text);
         assert!(result.output_path.is_none());
@@ -125,7 +125,7 @@ mod tests {
     fn test_truncation_by_lines() {
         let service = TruncationService::new();
         let text: String = (0..3000).map(|i| format!("line {}\n", i)).collect();
-        let result = service.truncate(&text, false);
+        let result = service.truncate(&text);
         assert!(result.truncated);
         assert!(result.output_path.is_some());
         assert!(result.content.contains("truncated"));
@@ -136,7 +136,7 @@ mod tests {
         let service = TruncationService::new();
         let line = "x".repeat(100);
         let text: String = (0..600).map(|_| format!("{}\n", line)).collect();
-        let result = service.truncate(&text, false);
+        let result = service.truncate(&text);
         assert!(result.truncated);
         assert!(result.output_path.is_some());
     }
