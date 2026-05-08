@@ -15,6 +15,7 @@ schemars = "0.8"
 uuid = { version = "1.0", features = ["v4"] }
 futures = "0.3.32"
 async-stream = "0.3.6"
+chrono = { version = "0.4", features = ["serde"] }
 
 [dev-dependencies]
 gewu-providers = { path = "../gewu-providers" }

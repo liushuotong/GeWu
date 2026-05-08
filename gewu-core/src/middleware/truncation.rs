@@ -1,10 +1,26 @@
+//! Middleware services for agent processing.
+//!
+//! This module provides middleware components that intercept and process
+//! agent operations, such as output truncation for managing response sizes.
+
 use crate::types::TruncationResult;
 use std::path::PathBuf;
 
+/// Maximum number of lines to retain before truncation.
 pub const MAX_LINES: usize = 2000;
+
+/// Maximum bytes to retain before truncation.
 pub const MAX_BYTES: usize = 50 * 1024;
+
+/// Directory name for storing truncated output files.
 pub const TRUNCATION_DIR: &str = "truncation";
 
+/// Service for truncating long tool outputs.
+///
+/// The `TruncationService` limits the size of tool outputs by truncating
+/// them to a maximum number of lines or bytes. When output is truncated,
+/// the full content is saved to a file and a placeholder message is
+/// returned instead.
 #[derive(Clone)]
 pub struct TruncationService {
     max_lines: usize,
@@ -19,6 +35,9 @@ impl Default for TruncationService {
 }
 
 impl TruncationService {
+    /// Creates a new `TruncationService` with default limits.
+    ///
+    /// Default limits are 2000 lines or 50KB, whichever is reached first.
     pub fn new() -> Self {
         Self {
             max_lines: MAX_LINES,
@@ -27,17 +46,38 @@ impl TruncationService {
         }
     }
 
+    /// Sets a custom directory for storing truncated files.
     pub fn with_dir(mut self, dir: PathBuf) -> Self {
         self.truncation_dir = dir;
         self
     }
 
+    /// Sets custom limits for truncation.
+    ///
+    /// # Arguments
+    ///
+    /// * `max_lines` - Maximum lines to retain
+    /// * `max_bytes` - Maximum bytes to retain
     pub fn with_limits(mut self, max_lines: usize, max_bytes: usize) -> Self {
         self.max_lines = max_lines;
         self.max_bytes = max_bytes;
         self
     }
 
+    /// Truncates text if it exceeds the configured limits.
+    ///
+    /// If the text exceeds either the line or byte limit, it is truncated
+    /// and the full content is saved to a file. The returned `TruncationResult`
+    /// contains either the original text (if within limits) or a truncated
+    /// version with a reference to the saved file.
+    ///
+    /// # Arguments
+    ///
+    /// * `text` - The text to potentially truncate
+    ///
+    /// # Returns
+    ///
+    /// A [`TruncationResult`] containing either the original or truncated content
     pub fn truncate(&self, text: &str) -> TruncationResult {
         let lines: Vec<&str> = text.lines().collect();
         let total_bytes = text.len();

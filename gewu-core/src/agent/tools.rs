@@ -1,3 +1,8 @@
+//! Tool execution utilities.
+//!
+//! This module provides utility functions for safe tool execution,
+//! including panic recovery and error handling.
+
 use crate::types::{ToolContext, ToolResult};
 use anyhow::Result;
 use std::error::Error;
@@ -6,6 +11,22 @@ use tokio::task::spawn_blocking;
 
 use super::extract_panic_message;
 
+/// Executes a tool with panic recovery.
+///
+/// This function wraps tool execution in a `spawn_blocking` call with panic recovery.
+/// If the tool panics, the panic is caught and converted into an error return value
+/// rather than propagating as an unhandled panic.
+///
+/// # Arguments
+///
+/// * `tool` - The tool to execute
+/// * `args` - JSON arguments for the tool
+/// * `ctx` - Execution context
+///
+/// # Returns
+///
+/// Returns the tool's result on success, or an error if the tool panicked or
+/// the task was aborted.
 pub async fn execute_tool_with_panic_recovery(
     tool: std::sync::Arc<dyn crate::traits::Tool>,
     args: serde_json::Value,

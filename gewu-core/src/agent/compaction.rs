@@ -1,3 +1,8 @@
+//! Agent-side compaction logic.
+//!
+//! This module provides the compaction functionality specific to the Agent,
+//! including history summarization when context limits are exceeded.
+
 use crate::compaction::{self, estimate_message_tokens, is_overflow};
 use crate::types::{ContentPart, Message, ProviderEvent};
 use anyhow::{anyhow, Result};
@@ -6,8 +11,10 @@ use tracing::info;
 
 use super::Agent;
 
+/// Error type for compaction failures.
 #[derive(Debug)]
 pub struct CompactionError {
+    /// Human-readable error message.
     pub message: String,
 }
 

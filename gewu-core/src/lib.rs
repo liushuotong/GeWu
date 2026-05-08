@@ -19,6 +19,9 @@
 //! - [`Tool`] - Trait for implementing tools the agent can call
 //! - [`LlmProvider`] - Trait for integrating different LLM backends
 //! - [`Memory`] - Trait for conversation history storage
+//! - [`Experiences`] - Trait for storing and retrieving past experiences
+//!   When configured with [`AgentBuilder::with_experiences`](agent::AgentBuilder::with_experiences),
+//!   a [`search_experiences`](agent::SearchExperiencesTool) tool is automatically registered
 //!
 //! # Crates in the GeWu Workspace
 //!
@@ -54,8 +57,8 @@ pub mod types;
 pub use agent::Agent;
 pub use compaction::{estimate_tokens, is_overflow, prune};
 pub use middleware::TruncationService;
-pub use traits::{LlmProvider, Memory, Tool, ToolRegistry};
+pub use traits::{Experiences, LlmProvider, Memory, Tool, ToolRegistry};
 pub use types::{
-    AgentEvent, ContentPart, FileAttachment, FunctionCall, Message, ProviderEvent, ToolCall,
-    ToolContext, ToolResult, TruncationResult,
+    AgentEvent, ContentPart, Experience, ExperienceQuery, FileAttachment, FunctionCall, Message,
+    ProviderEvent, RecalledExperience, ToolCall, ToolContext, ToolResult, TruncationResult,
 };
