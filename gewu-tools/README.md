@@ -10,7 +10,8 @@
 - **`BashTool`**: Executes shell commands securely.
 - **`GrepTool`**: Searches for patterns in files.
 - **`WebFetchTool`**: Fetches content from URLs.
-- **`SearchTool`**: Performs web searches.
+- **`WebSearchTool`** (`websearch`): Performs web searches through Exa.
+- **`CodeSearchTool`** (`codesearch`): Performs semantic code searches through Exa.
 - **`ListTool`**: Lists files in directories.
 
 ### MCP (Model Context Protocol)

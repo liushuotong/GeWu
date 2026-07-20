@@ -1,5 +1,4 @@
 pub mod config;
-pub mod evolve_tools;
 pub mod mcp_loader;
 pub mod registry;
 pub mod tools;
@@ -9,9 +8,7 @@ use clap::Parser;
 use futures::StreamExt;
 use gewu_core::traits::LlmProvider;
 use gewu_core::types::AgentEvent;
-use gewu_evolve::{EvolutionGraph, EvolutionState};
 use gewu_providers::{AnthropicProvider, OpenAIProvider};
-use registry::AgentResult;
 use sqlx::sqlite::SqlitePoolOptions;
 use std::env;
 use std::io::{Read, Write};
@@ -21,147 +18,10 @@ use uuid::Uuid;
 
 const RESET: &str = "\x1b[0m";
 
-async fn build_experience_context(
-    store: &gewu_experience::ExperienceStore,
-    query: &str,
-) -> Option<String> {
-    let experience_query = gewu_experience::ExperienceQuery {
-        query_text: query.to_string(),
-        task_type_filter: None,
-        limit: 3,
-        score_threshold: 0.5,
-    };
-
-    match store.recall(&experience_query).await {
-        Ok(results) if !results.is_empty() => {
-            let mut context = String::from("\n\n[Relevant past experiences for this task]\n");
-            for (i, recalled) in results.iter().enumerate() {
-                let exp = &recalled.experience;
-                context.push_str(&format!(
-                    "{}. [{}] {}\n   Solution: {}\n",
-                    i + 1,
-                    exp.task_type,
-                    exp.task_description,
-                    exp.solution_summary
-                ));
-            }
-            context.push_str("Use these experiences to inform your approach.\n");
-            context.push_str("---\n\n");
-            tracing::info!("Recalled {} relevant experiences", results.len());
-            Some(context)
-        }
-        Ok(results) => {
-            tracing::debug!("Recall returned {} results (empty)", results.len());
-            None
-        }
-        Err(e) => {
-            tracing::warn!("Failed to recall experiences: {}", e);
-            None
-        }
-    }
-}
-
-const TASK_CLASSIFICATION_PROMPT: &str = r#"Classify this task into ONE of the following categories:
-- bug_fix: Fixing bugs, errors, crashes
-- feature_impl: Implementing new features, adding functionality
-- refactor: Improving code structure, optimization
-- test: Writing or updating tests
-- docs: Documentation, README, comments
-- research: Investigation, exploration, learning
-- general: Other tasks
-
-Task: {task_description}
-
-Respond with ONLY the category name, nothing else."#;
-
-fn classify_task_type_sync(task_description: &str) -> String {
-    let desc_lower = task_description.to_lowercase();
-
-    if desc_lower.contains("bug") || desc_lower.contains("fix") || desc_lower.contains("error") || desc_lower.contains("crash") {
-        "bug_fix".to_string()
-    } else if desc_lower.contains("implement") || desc_lower.contains("add") || desc_lower.contains("create") || desc_lower.contains("new") {
-        "feature_impl".to_string()
-    } else if desc_lower.contains("refactor") || desc_lower.contains("optimize") || desc_lower.contains("improve") || desc_lower.contains("restructure") {
-        "refactor".to_string()
-    } else if desc_lower.contains("test") || desc_lower.contains("spec") || desc_lower.contains("verify") {
-        "test".to_string()
-    } else if desc_lower.contains("doc") || desc_lower.contains("readme") || desc_lower.contains("comment") || desc_lower.contains("comment") {
-        "docs".to_string()
-    } else if desc_lower.contains("research") || desc_lower.contains("investigate") || desc_lower.contains("explore") || desc_lower.contains("understand") {
-        "research".to_string()
-    } else {
-        "general".to_string()
-    }
-}
-
-async fn classify_task_type(agent: &mut gewu_core::Agent, task_description: &str) -> String {
-    let prompt = TASK_CLASSIFICATION_PROMPT.replace("{task_description}", task_description);
-
-    let mut stream = Box::pin(agent.ask(&prompt));
-    let mut result = String::new();
-
-    while let Some(event_result) = stream.next().await {
-        match event_result {
-            Ok(event) => match event {
-                AgentEvent::ContentDelta { delta } => {
-                    result.push_str(&delta);
-                }
-                AgentEvent::Finish { response } => {
-                    result = response;
-                }
-                _ => {}
-            },
-            Err(e) => {
-                tracing::warn!("Classification call failed: {}, using heuristic", e);
-                return classify_task_type_sync(task_description);
-            }
-        }
-    }
-
-    let trimmed = result.trim().to_lowercase();
-    let valid_types = ["bug_fix", "feature_impl", "refactor", "test", "docs", "research", "general"];
-
-    for t in valid_types {
-        if trimmed.contains(t) {
-            return t.to_string();
-        }
-    }
-
-    tracing::warn!("Could not parse LLM classification response: '{}', using heuristic", result);
-    classify_task_type_sync(task_description)
-}
-
-async fn run_agent(
-    agent: &mut gewu_core::Agent,
-    prompt: &str,
-    experience_store: Option<Arc<gewu_experience::ExperienceStore>>,
-) -> Result<()> {
-    let task_type = if experience_store.is_some() {
-        Some(classify_task_type(agent, prompt).await)
-    } else {
-        None
-    };
-
-    let full_prompt = if let Some(ref store) = experience_store {
-        if let Some(context) = build_experience_context(store, prompt).await {
-            context + prompt
-        } else {
-            prompt.to_string()
-        }
-    } else {
-        prompt.to_string()
-    };
-
-    let mut stream = Box::pin(agent.ask(&full_prompt));
-    let mut reasoning = String::new();
-    let mut content = String::new();
+async fn run_agent(agent: &mut gewu_core::Agent, prompt: &str) -> Result<()> {
+    let mut stream = Box::pin(agent.ask(prompt));
     let mut reasoning_started = false;
     let mut content_started = false;
-    let mut tools_used: Vec<String> = Vec::new();
-    let mut task_completed = false;
-    let mut task_failed = false;
-    let mut final_response = String::new();
-
     while let Some(event_result) = stream.next().await {
         match event_result {
             Ok(event) => match event {
@@ -175,8 +35,6 @@ async fn run_agent(
                     }
                     print!("{}", delta);
                     std::io::stdout().flush()?;
-                    content.push_str(&delta);
-                    final_response.push_str(&delta);
                 }
                 AgentEvent::ReasoningDelta { delta } => {
                     if !reasoning_started {
@@ -186,78 +44,37 @@ async fn run_agent(
                     }
                     print!("{}", delta);
                     std::io::stdout().flush()?;
-                    reasoning.push_str(&delta);
                 }
-                AgentEvent::ToolStart { tool, input: _ } => {
+                AgentEvent::ToolStart { .. } => {
                     if reasoning_started {
                         print!("{}", RESET);
                     }
-                    if !tools_used.contains(&tool) {
-                        tools_used.push(tool.clone());
+                }
+                AgentEvent::ToolFinish { tool, output } => {
+                    if output.starts_with("Error:") {
+                        eprintln!("\n[Tool Error: {}] {}", tool, output);
+                    } else {
+                        println!("\n[Tool Finish: {}]", tool);
                     }
                 }
-                AgentEvent::ToolFinish { tool, output: _ } => {
-                    let tool_count = tools_used.len();
-                    println!("\n[Tool Finish: {}] ({} tools used total)", tool, tool_count);
-                }
-                AgentEvent::Finish { response } => {
+                AgentEvent::Finish { response: _ } => {
                     if reasoning_started {
                         print!("{}", RESET);
                     }
                     println!();
-                    final_response = response;
-                    task_completed = true;
                 }
                 AgentEvent::Error { error } => {
                     if reasoning_started {
                         print!("{}", RESET);
                     }
                     error!("Error from agent: {}", error);
-                    task_failed = true;
                 }
             },
             Err(e) => error!("Stream error: {}", e),
         }
     }
 
-    if let Some((store, task_type)) = experience_store.zip(task_type) {
-        let should_store = (task_completed && !final_response.is_empty())
-            || (task_failed && !final_response.is_empty());
-
-        if should_store {
-            let result = store.smart_store(
-                prompt,
-                &task_type,
-                &final_response,
-                &tools_used,
-                task_completed && !task_failed,
-            ).await;
-
-            match result {
-                Ok(store_result) => {
-                    tracing::info!("Store result: {}", store_result);
-                }
-                Err(e) => {
-                    tracing::warn!("Failed to store experience: {}", e);
-                }
-            }
-        }
-    }
-
     Ok(())
-}
-
-async fn run_evolve_agent(
-    task: &str,
-    llm: Arc<dyn LlmProvider>,
-    tools: Arc<dyn gewu_core::traits::ToolRegistry>,
-    tools_list: Arc<Vec<Arc<dyn gewu_core::traits::Tool>>>,
-    experience_store: Option<Arc<gewu_experience::ExperienceStore>>,
-) -> Result<EvolutionState> {
-    let config = gewu_evolve::Config::from_env();
-    let graph = EvolutionGraph::new(config);
-
-    graph.run_multi_agent(task, llm, tools, tools_list, experience_store).await
 }
 
 #[derive(Parser)]
@@ -320,14 +137,6 @@ struct Cli {
     /// Run in interactive mode
     #[arg(short, long)]
     interactive: bool,
-
-    /// List all stored experiences and exit
-    #[arg(long)]
-    list_experiences: bool,
-
-    /// Dump all experiences to a markdown file
-    #[arg(long)]
-    dump_experiences: Option<String>,
 }
 
 #[tokio::main]
@@ -360,108 +169,6 @@ async fn main() -> Result<()> {
     }
 
     let loaded_config = config::LoadedConfig::load(cli.llm_config.as_deref())?;
-
-    if cli.list_experiences {
-        let experience_config = if let Some(ref url) = loaded_config.config.qdrant_url {
-            if !url.is_empty() {
-                Some(gewu_experience::Config::with_qdrant(
-                    url,
-                    loaded_config.config.qdrant_api_key.clone(),
-                ))
-            } else {
-                None
-            }
-        } else {
-            None
-        };
-
-        if let Some(config) = experience_config {
-            match gewu_experience::ExperienceStore::new(config).await {
-                Ok(store) => {
-                    let experiences = store.list_all().await?;
-                    if experiences.is_empty() {
-                        println!("No experiences stored yet.");
-                    } else {
-                        println!("{:4} | {:12} | {:40} | {:8} | {}", "ID", "Type", "Task Description", "Success", "Created");
-                        println!("{}", "-".repeat(120));
-                        for exp in &experiences {
-                            let desc = if exp.task_description.len() > 38 {
-                                format!("{}...", &exp.task_description[..38])
-                            } else {
-                                exp.task_description.clone()
-                            };
-                            println!("{:4} | {:12} | {:40} | {:8} | {}",
-                                &exp.id[..4],
-                                exp.task_type,
-                                desc,
-                                if exp.success { "yes" } else { "no" },
-                                exp.created_at.format("%Y-%m-%d %H:%M")
-                            );
-                        }
-                        println!("\nTotal: {} experiences", experiences.len());
-                    }
-                }
-                Err(e) => {
-                    eprintln!("Failed to initialize experience store: {}", e);
-                }
-            }
-        } else {
-            eprintln!("Qdrant not configured. Cannot list experiences.");
-        }
-        return Ok(());
-    }
-
-    if let Some(dump_path) = &cli.dump_experiences {
-        let experience_config = if let Some(ref url) = loaded_config.config.qdrant_url {
-            if !url.is_empty() {
-                Some(gewu_experience::Config::with_qdrant(
-                    url,
-                    loaded_config.config.qdrant_api_key.clone(),
-                ))
-            } else {
-                None
-            }
-        } else {
-            None
-        };
-
-        if let Some(config) = experience_config {
-            match gewu_experience::ExperienceStore::new(config).await {
-                Ok(store) => {
-                    let experiences = store.list_all().await?;
-                    if experiences.is_empty() {
-                        println!("No experiences to dump.");
-                    } else {
-                        let mut md = String::from("# Experience Library\n\n");
-                        md.push_str(&format!("Total: {} experiences\n\n", experiences.len()));
-
-                        for exp in &experiences {
-                            md.push_str(&format!("## {} [{}\\]\n\n", exp.task_description, exp.task_type));
-                            md.push_str(&format!("**ID:** `{}`\n\n", exp.id));
-                            md.push_str(&format!("**Created:** {}\n\n", exp.created_at.format("%Y-%m-%d %H:%M:%S")));
-                            md.push_str(&format!("**Success:** {}\n\n", if exp.success { "Yes" } else { "No" }));
-                            md.push_str(&format!("**Attempts:** {}\n\n", exp.iteration_count));
-                            md.push_str("### Problem\n\n");
-                            md.push_str(&format!("{}\n\n", exp.problem_summary));
-                            md.push_str("### Solution\n\n");
-                            md.push_str(&format!("{}\n\n", exp.solution_summary));
-                            md.push_str(&format!("### Tools Used\n\n{}\n\n", exp.tools_used.join(", ")));
-                            md.push_str("---\n\n");
-                        }
-
-                        std::fs::write(dump_path, &md)?;
-                        println!("Dumped {} experiences to {}", experiences.len(), dump_path);
-                    }
-                }
-                Err(e) => {
-                    eprintln!("Failed to initialize experience store: {}", e);
-                }
-            }
-        } else {
-            eprintln!("Qdrant not configured. Cannot dump experiences.");
-        }
-        return Ok(());
-    }
 
     if let Some(path) = &loaded_config.path {
         info!("Loaded config from: {}", path.display());
@@ -569,29 +276,9 @@ async fn main() -> Result<()> {
     // Load MCP tools
     let mcp_tools = mcp_loader::load_mcp_tools(loaded_config.config.mcp_servers.clone()).await?;
 
-    // Build experience config from config file or env
-    let experience_config = if let Some(ref url) = loaded_config.config.qdrant_url {
-        if !url.is_empty() {
-            Some(gewu_experience::Config::with_qdrant(
-                url,
-                loaded_config.config.qdrant_api_key.clone(),
-            ))
-        } else {
-            None
-        }
-    } else {
-        // Fall back to env vars
-        let env_url = std::env::var("QDRANT_URL").unwrap_or_default();
-        if !env_url.is_empty() {
-            Some(gewu_experience::Config::from_env())
-        } else {
-            None
-        }
-    };
-
     // Create Agent
-    let (mut agent_result, _registry, experience_store) =
-        registry::create_agent(&cli.agent, provider.clone(), pool, session_id, mcp_tools, experience_config).await?;
+    let (mut agent, _registry) =
+        registry::create_agent(&cli.agent, provider, pool, session_id, mcp_tools).await?;
     info!("Initialized agent: {}", cli.agent);
 
     // Determine the prompt: from args, from stdin, or error
@@ -610,7 +297,9 @@ async fn main() -> Result<()> {
 
     // Validate that we have a prompt or interactive mode
     if prompt_from_args.is_none() && prompt_from_stdin.is_none() && !cli.interactive {
-        eprintln!("Error: No prompt provided. Either provide a prompt as argument, pipe content to stdin, or use -i/--interactive for interactive mode.");
+        eprintln!(
+            "Error: No prompt provided. Either provide a prompt as argument, pipe content to stdin, or use -i/--interactive for interactive mode."
+        );
         std::process::exit(1);
     }
 
@@ -619,28 +308,8 @@ async fn main() -> Result<()> {
         let prompt = prompt_parts.join(" ");
         if !prompt.is_empty() {
             println!("> {}", prompt);
-            match agent_result {
-                AgentResult::Standard(ref mut agent) => {
-                    if let Err(e) = run_agent(agent, &prompt, experience_store.clone()).await {
-                        error!("Error: {}", e);
-                    }
-                }
-                AgentResult::Evolve { ref tools, ref tools_list, .. } => {
-                    let state = run_evolve_agent(&prompt, provider.clone(), tools.clone(), tools_list.clone(), experience_store.clone()).await;
-                    match state {
-                        Ok(s) => {
-                            if !s.outcome.is_empty() {
-                                println!("{}", s.outcome);
-                            }
-                            if !s.execution_output.is_empty() && tracing::enabled!(tracing::Level::DEBUG) {
-                                println!("{}", s.execution_output);
-                            }
-                        }
-                        Err(e) => {
-                            error!("Evolution error: {}", e);
-                        }
-                    }
-                }
+            if let Err(e) = run_agent(&mut agent, &prompt).await {
+                error!("Error: {}", e);
             }
         }
     } else if let Some(stdin_prompt) = &prompt_from_stdin {
@@ -651,28 +320,8 @@ async fn main() -> Result<()> {
             } else {
                 println!("> {}", trimmed);
             }
-            match agent_result {
-                AgentResult::Standard(ref mut agent) => {
-                    if let Err(e) = run_agent(agent, trimmed, experience_store.clone()).await {
-                        error!("Error: {}", e);
-                    }
-                }
-                AgentResult::Evolve { ref tools, ref tools_list, .. } => {
-                    let state = run_evolve_agent(trimmed, provider.clone(), tools.clone(), tools_list.clone(), experience_store.clone()).await;
-                    match state {
-                        Ok(s) => {
-                            if !s.outcome.is_empty() {
-                                println!("{}", s.outcome);
-                            }
-                            if !s.execution_output.is_empty() && tracing::enabled!(tracing::Level::DEBUG) {
-                                println!("{}", s.execution_output);
-                            }
-                        }
-                        Err(e) => {
-                            error!("Evolution error: {}", e);
-                        }
-                    }
-                }
+            if let Err(e) = run_agent(&mut agent, trimmed).await {
+                error!("Error: {}", e);
             }
         }
     }
@@ -699,28 +348,8 @@ async fn main() -> Result<()> {
                 break;
             }
 
-            match agent_result {
-                AgentResult::Standard(ref mut agent) => {
-                    if let Err(e) = run_agent(agent, input, experience_store.clone()).await {
-                        error!("Error processing message: {}", e);
-                    }
-                }
-                AgentResult::Evolve { ref tools, ref tools_list, .. } => {
-                    let state = run_evolve_agent(input, provider.clone(), tools.clone(), tools_list.clone(), experience_store.clone()).await;
-                    match state {
-                        Ok(s) => {
-                            if !s.outcome.is_empty() {
-                                println!("{}", s.outcome);
-                            }
-                            if !s.execution_output.is_empty() && tracing::enabled!(tracing::Level::DEBUG) {
-                                println!("{}", s.execution_output);
-                            }
-                        }
-                        Err(e) => {
-                            error!("Evolution error: {}", e);
-                        }
-                    }
-                }
+            if let Err(e) = run_agent(&mut agent, input).await {
+                error!("Error processing message: {}", e);
             }
         }
     }

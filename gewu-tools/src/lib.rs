@@ -15,10 +15,11 @@
 //! | [`GlobTool`](fs::GlobTool) | `glob` | Find files by glob patterns |
 //! | [`GrepTool`](grep::GrepTool) | `grep` | Search file contents |
 //! | [`ListTool`](list::ListTool) | `list` | List directory contents |
-//! | [`WebFetchTool`](web_fetch::WebFetchTool) | `web_fetch` | Fetch web pages |
-//! | [`WebSearchTool`](search::WebSearchTool) | `web_search` | Search the web |
-//! | [`TodoReadTool`](todo::TodoReadTool) | `todo_read` | Read the task list |
-//! | [`TodoWriteTool`](todo::TodoWriteTool) | `todo_write` | Write the task list |
+//! | [`WebFetchTool`](web_fetch::WebFetchTool) | `webfetch` | Fetch web pages |
+//! | [`WebSearchTool`](search::WebSearchTool) | `websearch` | Search the web |
+//! | [`CodeSearchTool`](search::CodeSearchTool) | `codesearch` | Search code semantically |
+//! | [`TodoReadTool`](todo::TodoReadTool) | `todoread` | Read the task list |
+//! | [`TodoWriteTool`](todo::TodoWriteTool) | `todowrite` | Write the task list |
 //! | [`BatchTool`](batch::BatchTool) | `batch` | Execute multiple tools at once |
 //!
 //! # MCP Tools

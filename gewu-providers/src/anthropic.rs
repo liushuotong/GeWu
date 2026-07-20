@@ -116,8 +116,6 @@ pub struct UserMessage {
 pub struct AssistantMessage {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub content: Option<Vec<ContentBlock>>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub tool_calls: Option<Vec<ToolCall>>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -125,6 +123,13 @@ pub struct AssistantMessage {
 pub enum ContentBlock {
     Text { text: String },
     Source { source: SourceBlock },
+    ToolUse { id: String, name: String, input: Value },
+    ToolResult {
+        tool_use_id: String,
+        content: String,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        is_error: Option<bool>,
+    },
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -137,19 +142,6 @@ pub struct SourceBlock {
 
 fn default_source_type() -> String {
     "base64".to_string()
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct ToolCall {
-    pub id: String,
-    #[serde(rename = "type", default = "default_tool_type")]
-    pub tool_type: String,
-    pub name: String,
-    pub input: Value,
-}
-
-fn default_tool_type() -> String {
-    "tool_use".to_string()
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

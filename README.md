@@ -12,7 +12,7 @@ GeWu (格物) is a comprehensive framework for building and deploying AI agents.
 | **`gewu-providers`** | LLM provider implementations supporting OpenAI-compatible APIs and Anthropic Claude. Features streaming responses, tool/function calling, and multi-modal content handling. |
 | **`gewu-storage`** | Persistent memory implementation using SQLite via `sqlx`. Enables multi-session support where conversations persist across process restarts. |
 | **`gewu-tools`** | Collection of built-in tools for filesystem operations, bash execution, web fetching, code search, and MCP (Model Context Protocol) integration. |
-| **`gewu-cli`** | Command-line interface for interacting with GeWu agents. Supports multiple agent types (build, explore, general, evolve) with configurable tools and permissions. |
+| **`gewu-cli`** | Command-line interface for interacting with GeWu agents. Supports build, explore, and general agent profiles with configurable tools and permissions. |
 | **`gewu-web`** | Web UI built with Axum, providing a browser-based interface with SSE streaming for real-time agent interactions. |
 | **`gewu-graph`** | Stateful graph execution library for building complex workflow orchestration with conditional routing, parallel execution, and nested subgraphs. |
 | **`gewu-rag`** | RAG (Retrieval Augmented Generation) system with document processing (PDF, text), embedding generation, and vector storage integration (Qdrant). |
@@ -66,7 +66,6 @@ The CLI provides pre-configured agent types optimized for different use cases:
 | **build** | Default agent for software engineering tasks | Off | All tools including bash, file edit, task management |
 | **explore** | Fast agent for exploring codebases | On | Read-only tools, restricted bash |
 | **general** | General-purpose agent for research and multi-step tasks | Off | All tools including task management |
-| **evolve** | Self-evolving agent with experience memory and skill creation | Off | Build tools + python_execute, skill_create, skill_list, skill_load + experience tools |
 
 ## Built-in Tools
 
@@ -79,18 +78,12 @@ The CLI provides pre-configured agent types optimized for different use cases:
 | Glob | `glob` | Find files by glob patterns respecting .gitignore |
 | Grep | `grep` | Search file contents with regex support |
 | List | `list` | List directory contents |
-| Web Fetch | `web_fetch` | Fetch and parse web pages to markdown |
-| Web Search | `web_search` | Search the web |
-| Code Search | `code_search` | Search code using grep patterns |
-| Todo Read | `todo_read` | Read the task list |
-| Todo Write | `todo_write` | Write/update the task list |
+| Web Fetch | `webfetch` | Fetch and parse web pages to markdown |
+| Web Search | `websearch` | Search the web |
+| Code Search | `codesearch` | Search code using semantic search |
+| Todo Read | `todoread` | Read the task list |
+| Todo Write | `todowrite` | Write/update the task list |
 | Batch | `batch` | Execute multiple tools in parallel |
-| Python Execute | `python_execute` | Execute Python code in a sandboxed environment |
-| Skill Create | `skill_create` | Create a new skill from natural language description |
-| Skill List | `skill_list` | List all available skills in the skill library |
-| Skill Load | `skill_load` | Load a skill from the skill library by name |
-| Experience Store | `experience_store` | Store a successful task resolution for future recall |
-| Experience Recall | `experience_recall` | Query past experiences semantically |
 
 ## Getting Started
 

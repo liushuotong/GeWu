@@ -146,9 +146,12 @@ impl Tool for BatchTool {
         }
 
         if !successes.is_empty() {
-            output.push_str("Results:\n");
-            for (tool_name, _) in &successes {
-                output.push_str(&format!("- {}: success\n", tool_name));
+            output.push_str("Results:\n\n");
+            for (index, (tool_name, tool_output)) in successes.iter().enumerate() {
+                if index > 0 {
+                    output.push_str("\n---\n\n");
+                }
+                output.push_str(&format!("## {}\n\n{}\n", tool_name, tool_output));
             }
         }
 
@@ -173,5 +176,48 @@ impl Tool for BatchTool {
         }
 
         Ok(ToolResult::new("batch", output))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    struct TestRegistry;
+
+    #[async_trait]
+    impl ToolRegistry for TestRegistry {
+        async fn execute(
+            &self,
+            name: &str,
+            _args: Value,
+            _ctx: &ToolContext,
+        ) -> Result<ToolResult, Box<dyn Error + Send + Sync>> {
+            Ok(ToolResult::new(name, "search result content"))
+        }
+
+        fn list_tools(&self) -> Vec<String> {
+            vec!["websearch".to_string()]
+        }
+    }
+
+    #[tokio::test]
+    async fn includes_successful_tool_output() {
+        let tool = BatchTool::new(Arc::new(TestRegistry));
+        let result = tool
+            .execute(
+                serde_json::json!({
+                    "tool_calls": [{
+                        "tool": "websearch",
+                        "parameters": {"query": "rust"}
+                    }]
+                }),
+                &ToolContext::new("test", "test"),
+            )
+            .await
+            .unwrap();
+
+        assert!(result.output.contains("## websearch"));
+        assert!(result.output.contains("search result content"));
     }
 }

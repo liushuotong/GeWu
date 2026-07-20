@@ -37,7 +37,7 @@ use crate::anthropic::{
     AnthropicChunk, AnthropicConfig, AnthropicMessage, AnthropicStream, AnthropicTool,
     ContentBlock, ContentBlockDeltaChunk, ContentBlockStart,
     ContentBlockStartChunk, ContentDelta, CreateMessageRequest,
-    MessageStartChunk, ToolCall, UserMessage,
+    MessageStartChunk, UserMessage,
     AssistantMessage as AnthropicAssistantMessage, Client as AnthropicClient,
 };
 use async_trait::async_trait;
@@ -804,52 +804,37 @@ impl AnthropicProvider {
                         blocks.push(ContentBlock::Text { text: text.clone() });
                     }
                 }
-                let anthropic_tool_calls: Option<Vec<ToolCall>> = if let Some(calls) = tool_calls {
-                    if !calls.is_empty() {
-                        Some(
-                            calls
-                                .iter()
-                                .map(|tc| {
-                                    let args_value: Value =
-                                        serde_json::from_str(&tc.function.arguments)
-                                            .unwrap_or(Value::Null);
-                                    ToolCall {
-                                        id: tc.id.clone(),
-                                        tool_type: "tool_use".to_string(),
-                                        name: tc.function.name.clone(),
-                                        input: args_value,
-                                    }
-                                })
-                                .collect(),
-                        )
-                    } else {
-                        None
+                if let Some(calls) = tool_calls {
+                    for call in calls {
+                        let input: Value = serde_json::from_str(&call.function.arguments).map_err(|e| {
+                            format!("Invalid arguments for Anthropic tool call '{}': {}", call.function.name, e)
+                        })?;
+                        blocks.push(ContentBlock::ToolUse {
+                            id: call.id.clone(),
+                            name: call.function.name.clone(),
+                            input,
+                        });
                     }
-                } else {
-                    None
-                };
-                if blocks.is_empty() && anthropic_tool_calls.is_none() {
+                }
+                if blocks.is_empty() {
                     Ok(vec![])
                 } else {
                     Ok(vec![AnthropicMessage::Assistant(AnthropicAssistantMessage {
-                        content: if blocks.is_empty() {
-                            None
-                        } else {
-                            Some(blocks)
-                        },
-                        tool_calls: anthropic_tool_calls,
+                        content: Some(blocks),
                     })])
                 }
             }
             Message::Tool {
-                tool_call_id: _,
+                tool_call_id,
                 tool_name: _,
                 content,
                 media,
             } => {
                 let mut blocks: Vec<ContentBlock> = Vec::new();
-                blocks.push(ContentBlock::Text {
-                    text: content.clone(),
+                blocks.push(ContentBlock::ToolResult {
+                    tool_use_id: tool_call_id.clone(),
+                    content: content.clone(),
+                    is_error: None,
                 });
                 for part in media {
                     if let Some(block) = self.convert_content_part(part) {
@@ -1390,6 +1375,59 @@ mod tests {
         };
         let converted = provider.convert_message(&msg).expect("convert success");
         assert_eq!(converted.len(), 1);
+    }
+
+    #[test]
+    fn anthropic_convert_message_assistant_with_tool_use() {
+        let provider = AnthropicProvider::new("test-key", "claude-3-5-sonnet");
+        let msg = Message::Assistant {
+            content: None,
+            tool_calls: Some(vec![CoreToolCall {
+                id: "toolu_1".to_string(),
+                r#type: "function".to_string(),
+                function: CoreFunctionCall {
+                    name: "websearch".to_string(),
+                    arguments: r#"{"query":"Kai Zhang"}"#.to_string(),
+                },
+            }]),
+        };
+
+        let converted = provider.convert_message(&msg).expect("convert success");
+        match &converted[0] {
+            AnthropicMessage::Assistant(message) => match message.content.as_ref().unwrap().first() {
+                Some(ContentBlock::ToolUse { id, name, input }) => {
+                    assert_eq!(id, "toolu_1");
+                    assert_eq!(name, "websearch");
+                    assert_eq!(input["query"], "Kai Zhang");
+                }
+                _ => panic!("expected Anthropic tool_use block"),
+            },
+            _ => panic!("expected Anthropic assistant message"),
+        }
+    }
+
+    #[test]
+    fn anthropic_convert_message_tool_result() {
+        let provider = AnthropicProvider::new("test-key", "claude-3-5-sonnet");
+        let msg = Message::Tool {
+            tool_call_id: "toolu_1".to_string(),
+            tool_name: Some("websearch".to_string()),
+            content: "Search results".to_string(),
+            media: vec![],
+        };
+
+        let converted = provider.convert_message(&msg).expect("convert success");
+        match &converted[0] {
+            AnthropicMessage::User(message) => match message.content.first() {
+                Some(ContentBlock::ToolResult { tool_use_id, content, is_error }) => {
+                    assert_eq!(tool_use_id, "toolu_1");
+                    assert_eq!(content, "Search results");
+                    assert_eq!(*is_error, None);
+                }
+                _ => panic!("expected Anthropic tool_result block"),
+            },
+            _ => panic!("expected Anthropic user message"),
+        }
     }
 
     #[test]
