@@ -87,7 +87,7 @@ where
 
     /// Executes the graph with the provided input state.
     ///
-    /// This calls the underlying graph's `invoke()` method synchronously.
+    /// This calls the underlying graph's async execution method.
     /// The input is deserialized from JSON, the graph executes, and the
     /// result is serialized back to JSON in a `ToolResult`.
     async fn execute(
@@ -96,7 +96,7 @@ where
         _ctx: &ToolContext,
     ) -> Result<ToolResult, Box<dyn Error + Send + Sync>> {
         let input: S = serde_json::from_value(args)?;
-        let result = self.graph.invoke(input)?;
+        let result = self.graph.ainvoke(input).await?;
         Ok(ToolResult::new(&self.name, serde_json::to_string(&result)?))
     }
 }

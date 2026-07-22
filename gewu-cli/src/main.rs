@@ -1,10 +1,11 @@
 pub mod config;
 pub mod mcp_loader;
+mod memory_view;
 pub mod registry;
 pub mod tools;
 
 use anyhow::{Context, Result};
-use clap::Parser;
+use clap::{Args, Parser, Subcommand};
 use futures::StreamExt;
 use gewu_core::traits::LlmProvider;
 use gewu_core::types::AgentEvent;
@@ -50,7 +51,7 @@ async fn run_agent(agent: &mut gewu_core::Agent, prompt: &str) -> Result<()> {
                         print!("{}", RESET);
                     }
                 }
-                AgentEvent::ToolFinish { tool, output } => {
+                AgentEvent::ToolFinish { tool, output, .. } => {
                     if output.starts_with("Error:") {
                         eprintln!("\n[Tool Error: {}] {}", tool, output);
                     } else {
@@ -82,6 +83,20 @@ async fn run_agent(agent: &mut gewu_core::Agent, prompt: &str) -> Result<()> {
 #[command(version = "0.1.0")]
 #[command(about = "GeWu CLI Agent", long_about = None)]
 struct Cli {
+    #[command(subcommand)]
+    command: Command,
+}
+
+#[derive(Subcommand)]
+enum Command {
+    /// Run an agent with a prompt or in interactive mode
+    Run(RunArgs),
+    /// View persisted agent memory
+    View(ViewArgs),
+}
+
+#[derive(Args)]
+struct RunArgs {
     /// Prompt to send (without -i flag, runs once and exits)
     #[arg(trailing_var_arg = true)]
     prompt: Option<Vec<String>>,
@@ -139,13 +154,29 @@ struct Cli {
     interactive: bool,
 }
 
+#[derive(Args)]
+struct ViewArgs {
+    /// Session ID to display; omit to list available sessions
+    session_id: Option<String>,
+
+    /// Path to SQLite database file
+    #[arg(long)]
+    db_path: Option<String>,
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
-    // Load .env file
     dotenvy::dotenv().ok();
 
-    let cli = Cli::parse();
+    match Cli::parse().command {
+        Command::Run(args) => run(args).await,
+        Command::View(args) => {
+            memory_view::execute(args.session_id.as_deref(), args.db_path.as_deref()).await
+        }
+    }
+}
 
+async fn run(cli: RunArgs) -> Result<()> {
     // Initialize logging
     let log_level = match cli.log_level.to_lowercase().as_str() {
         "error" => tracing::Level::ERROR,
@@ -355,4 +386,40 @@ async fn main() -> Result<()> {
     }
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parses_run_command() {
+        let cli = Cli::try_parse_from(["gewu-cli", "run", "hello", "world"]).unwrap();
+        match cli.command {
+            Command::Run(args) => {
+                assert_eq!(args.prompt, Some(vec!["hello".into(), "world".into()]))
+            }
+            Command::View(_) => panic!("expected run command"),
+        }
+    }
+
+    #[test]
+    fn parses_view_commands() {
+        let list = Cli::try_parse_from(["gewu-cli", "view"]).unwrap();
+        match list.command {
+            Command::View(args) => assert_eq!(args.session_id, None),
+            Command::Run(_) => panic!("expected view command"),
+        }
+
+        let show = Cli::try_parse_from(["gewu-cli", "view", "session-1"]).unwrap();
+        match show.command {
+            Command::View(args) => assert_eq!(args.session_id.as_deref(), Some("session-1")),
+            Command::Run(_) => panic!("expected view command"),
+        }
+    }
+
+    #[test]
+    fn rejects_legacy_top_level_prompt() {
+        assert!(Cli::try_parse_from(["gewu-cli", "hello"]).is_err());
+    }
 }

@@ -2,15 +2,16 @@ use crate::graph::constants::{END, START};
 use crate::state::State;
 use futures::Stream;
 use futures::StreamExt;
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::future::Future;
+use std::marker::Send as StdSend;
 use std::pin::Pin;
 use std::sync::Arc;
-use std::marker::Send as StdSend;
 use thiserror::Error;
 use tokio::sync::mpsc;
 
 const MAX_SUBGRAPH_DEPTH: usize = 10;
+const DEFAULT_MAX_STEPS: usize = 1000;
 
 /// Errors that can occur during graph execution.
 #[derive(Error, Debug)]
@@ -31,6 +32,10 @@ pub enum GraphError {
     /// This prevents infinite recursion in deeply nested subgraph structures.
     #[error("Subgraph depth limit ({0}) exceeded")]
     SubgraphDepthLimitExceeded(usize),
+
+    /// Returned when execution exceeds the configured number of supersteps.
+    #[error("Execution step limit ({0}) exceeded")]
+    StepLimitExceeded(usize),
 }
 
 /// A tuple struct representing a message to be sent to another node.
@@ -118,6 +123,54 @@ pub enum StreamOutput<S: State> {
     },
 }
 
+#[derive(Clone, Debug)]
+struct WaitingEdge {
+    sources: HashSet<String>,
+    target: String,
+}
+
+#[derive(Clone, Debug)]
+struct ScheduledTask<S: State> {
+    id: String,
+    node: String,
+    input: S,
+    path: Vec<usize>,
+}
+
+#[derive(Debug)]
+enum TaskResult<S: State> {
+    Node(NodeResult<S>),
+    Subgraph(S),
+}
+
+#[derive(Debug)]
+struct TaskOutcome<S: State> {
+    task: ScheduledTask<S>,
+    result: TaskResult<S>,
+}
+
+#[derive(Debug)]
+enum ExecutionEvent<S: State> {
+    Value(S),
+    Update {
+        node: String,
+        update: S::Partial,
+    },
+    Custom {
+        node: String,
+        data: serde_json::Value,
+    },
+    TaskStart {
+        id: String,
+        name: String,
+    },
+    TaskEnd {
+        id: String,
+        name: String,
+        result: S::Partial,
+    },
+}
+
 /// A writer for emitting custom data during streaming execution.
 ///
 /// This is used internally when a node's handler needs to write custom
@@ -143,8 +196,7 @@ impl StreamWriter {
 #[derive(Clone)]
 pub struct NodeHandler<S: State> {
     name: String,
-    handler:
-        Arc<dyn Fn(S) -> Pin<Box<dyn Future<Output = NodeResult<S>> + StdSend>> + Send + Sync>,
+    handler: Arc<dyn Fn(S) -> Pin<Box<dyn Future<Output = NodeResult<S>> + StdSend>> + Send + Sync>,
     subgraph: Option<Box<CompiledGraph<S>>>,
 }
 
@@ -166,13 +218,12 @@ impl<S: State + 'static> NodeHandler<S> {
     {
         let handler = Arc::new(handler);
         let wrapper: Arc<
-                dyn Fn(S) -> Pin<Box<dyn Future<Output = NodeResult<S>> + StdSend>> + Send + Sync,
-            > = Arc::new(move |state: S| {
-                let h = handler.clone();
-                Box::pin(async move {
-                    h(state).await
-                }) as Pin<Box<dyn Future<Output = NodeResult<S>> + StdSend>>
-            });
+            dyn Fn(S) -> Pin<Box<dyn Future<Output = NodeResult<S>> + StdSend>> + Send + Sync,
+        > = Arc::new(move |state: S| {
+            let h = handler.clone();
+            Box::pin(async move { h(state).await })
+                as Pin<Box<dyn Future<Output = NodeResult<S>> + StdSend>>
+        });
         Self {
             name: name.to_string(),
             handler: wrapper,
@@ -187,12 +238,11 @@ impl<S: State + 'static> NodeHandler<S> {
     /// as a partial update.
     pub fn with_subgraph(subgraph: CompiledGraph<S>) -> Self {
         let wrapper: Arc<
-                dyn Fn(S) -> Pin<Box<dyn Future<Output = NodeResult<S>> + StdSend>> + Send + Sync,
-            > = Arc::new(move |_: S| {
-                Box::pin(async move {
-                    NodeResult::map_partial(S::Partial::default())
-                }) as Pin<Box<dyn Future<Output = NodeResult<S>> + StdSend>>
-            });
+            dyn Fn(S) -> Pin<Box<dyn Future<Output = NodeResult<S>> + StdSend>> + Send + Sync,
+        > = Arc::new(move |_: S| {
+            Box::pin(async move { NodeResult::map_partial(S::Partial::default()) })
+                as Pin<Box<dyn Future<Output = NodeResult<S>> + StdSend>>
+        });
         Self {
             name: subgraph.entry_point.clone().unwrap_or_default(),
             handler: wrapper,
@@ -226,6 +276,8 @@ pub struct StateGraph<S: State> {
     conditional_edges: HashMap<String, Vec<ConditionalEdge<S>>>,
     entry_point: Option<String>,
     finish_points: HashSet<String>,
+    waiting_edges: Vec<WaitingEdge>,
+    max_steps: usize,
 }
 
 impl<S: State + 'static> Default for StateGraph<S> {
@@ -243,6 +295,8 @@ impl<S: State + 'static> StateGraph<S> {
             conditional_edges: HashMap::new(),
             entry_point: None,
             finish_points: HashSet::new(),
+            waiting_edges: Vec::new(),
+            max_steps: DEFAULT_MAX_STEPS,
         }
     }
 
@@ -308,6 +362,25 @@ impl<S: State + 'static> StateGraph<S> {
             panic!("END cannot be START node");
         }
         self.edges.insert((start.to_string(), end.to_string()));
+        self
+    }
+
+    /// Adds an edge that triggers `target` only after every named source has completed.
+    pub fn add_waiting_edge<I, T>(&mut self, sources: I, target: &str) -> &mut Self
+    where
+        I: IntoIterator<Item = T>,
+        T: Into<String>,
+    {
+        let sources = sources.into_iter().map(Into::into).collect::<HashSet<_>>();
+        assert!(
+            !sources.is_empty(),
+            "Waiting edge requires at least one source"
+        );
+        assert!(target != START, "Waiting edge target cannot be START");
+        self.waiting_edges.push(WaitingEdge {
+            sources,
+            target: target.to_string(),
+        });
         self
     }
 
@@ -382,6 +455,12 @@ impl<S: State + 'static> StateGraph<S> {
         self
     }
 
+    /// Sets the maximum number of execution supersteps.
+    pub fn set_max_steps(&mut self, max_steps: usize) -> &mut Self {
+        self.max_steps = max_steps;
+        self
+    }
+
     /// Compiles the graph into an executable form.
     ///
     /// This creates a `CompiledGraph` that can be invoked multiple times.
@@ -392,7 +471,8 @@ impl<S: State + 'static> StateGraph<S> {
             edges: self.edges.clone(),
             conditional_edges: self.conditional_edges.clone(),
             entry_point: self.entry_point.clone(),
-            finish_points: self.finish_points.clone(),
+            waiting_edges: self.waiting_edges.clone(),
+            max_steps: self.max_steps,
         }
     }
 }
@@ -408,7 +488,8 @@ pub struct CompiledGraph<S: State> {
     edges: HashSet<(String, String)>,
     conditional_edges: HashMap<String, Vec<ConditionalEdge<S>>>,
     entry_point: Option<String>,
-    finish_points: HashSet<String>,
+    waiting_edges: Vec<WaitingEdge>,
+    max_steps: usize,
 }
 
 impl<S: State + 'static> CompiledGraph<S> {
@@ -436,141 +517,211 @@ impl<S: State + 'static> CompiledGraph<S> {
         self.ainvoke_internal(input, 0).await
     }
 
-    async fn ainvoke_internal(
+    async fn ainvoke_internal(&self, input: S, depth: usize) -> Result<S, GraphError> {
+        self.execute_with_sink(input, depth, |_| {}).await
+    }
+
+    async fn execute_with_sink<F>(
         &self,
         input: S,
         depth: usize,
-    ) -> Result<S, GraphError> {
+        mut emit: F,
+    ) -> Result<S, GraphError>
+    where
+        F: FnMut(ExecutionEvent<S>) + Send,
+    {
         if depth > MAX_SUBGRAPH_DEPTH {
             return Err(GraphError::SubgraphDepthLimitExceeded(MAX_SUBGRAPH_DEPTH));
         }
 
-        let entry = match self.entry_point.clone() {
-            Some(e) => e,
-            None => return Err(GraphError::NoEntryPoint),
-        };
-
+        let entry = self.entry_point.clone().ok_or(GraphError::NoEntryPoint)?;
         let mut current_state = input;
-        let mut to_execute: Vec<String> = vec![entry];
-        let mut sent_to: HashSet<String> = HashSet::new();
+        let mut tasks = vec![ScheduledTask {
+            id: uuid::Uuid::new_v4().to_string(),
+            node: entry,
+            input: current_state.clone(),
+            path: vec![0],
+        }];
+        let mut barrier_arrivals = vec![HashSet::<String>::new(); self.waiting_edges.len()];
+        let mut step = 0;
 
-        while let Some(node_name) = to_execute.pop() {
-            let handler = self
-                .nodes
-                .get(&node_name)
-                .ok_or_else(|| GraphError::NodeNotFound(node_name.clone()))?;
+        emit(ExecutionEvent::Value(current_state.clone()));
 
-            if let Some(subgraph) = &handler.subgraph {
-                let subgraph = subgraph.clone();
-                let new_depth = depth + 1;
-                current_state = Box::pin(async move {
-                    subgraph.ainvoke_internal(current_state, new_depth).await
-                })
-                .await?;
-            } else {
-                let result = (handler.handler)(current_state.clone()).await;
-                let is_send = matches!(result, NodeResult::Send(_));
-                current_state = match result {
-                    NodeResult::Partial(partial) => current_state.merge(partial),
-                    NodeResult::Send(sends) => {
-                        let sent_names: Vec<String> = sends.iter().map(|s| s.0.clone()).collect();
-                        for name in &sent_names {
-                            sent_to.insert(name.clone());
-                        }
-                        current_state = self.process_sends(sends, current_state, depth).await?;
-                        current_state
+        while !tasks.is_empty() {
+            if step >= self.max_steps {
+                return Err(GraphError::StepLimitExceeded(self.max_steps));
+            }
+            step += 1;
+            tasks.sort_by(|a, b| a.path.cmp(&b.path).then_with(|| a.node.cmp(&b.node)));
+
+            let mut futures = Vec::with_capacity(tasks.len());
+            let current_tasks = std::mem::take(&mut tasks);
+            for task in current_tasks {
+                let handler = self
+                    .nodes
+                    .get(&task.node)
+                    .cloned()
+                    .ok_or_else(|| GraphError::NodeNotFound(task.node.clone()))?;
+                emit(ExecutionEvent::TaskStart {
+                    id: task.id.clone(),
+                    name: task.node.clone(),
+                });
+
+                futures.push(async move {
+                    let result = if let Some(subgraph) = handler.subgraph {
+                        let state =
+                            Box::pin(subgraph.ainvoke_internal(task.input.clone(), depth + 1))
+                                .await?;
+                        TaskResult::Subgraph(state)
+                    } else {
+                        TaskResult::Node((handler.handler)(task.input.clone()).await)
+                    };
+                    Ok::<_, GraphError>(TaskOutcome { task, result })
+                });
+            }
+
+            let outcomes = futures::future::join_all(futures)
+                .await
+                .into_iter()
+                .collect::<Result<Vec<_>, _>>()?;
+
+            struct CompletedTask<S: State> {
+                task: ScheduledTask<S>,
+                local_state: S,
+                sends: Option<Vec<GraphSend<S>>>,
+            }
+
+            let mut updates = Vec::new();
+            let mut branches = Vec::new();
+            let mut completed = Vec::new();
+
+            for outcome in outcomes {
+                let task = outcome.task;
+                match outcome.result {
+                    TaskResult::Node(NodeResult::Partial(update)) => {
+                        let local_state = task.input.merge(update.clone());
+                        emit(ExecutionEvent::Update {
+                            node: task.node.clone(),
+                            update: update.clone(),
+                        });
+                        emit(ExecutionEvent::TaskEnd {
+                            id: task.id.clone(),
+                            name: task.node.clone(),
+                            result: update.clone(),
+                        });
+                        updates.push(update);
+                        completed.push(CompletedTask {
+                            task,
+                            local_state,
+                            sends: None,
+                        });
                     }
-                    NodeResult::Custom(_) => current_state,
-                };
-                if is_send {
+                    TaskResult::Node(NodeResult::Send(sends)) => {
+                        emit(ExecutionEvent::TaskEnd {
+                            id: task.id.clone(),
+                            name: task.node.clone(),
+                            result: S::Partial::default(),
+                        });
+                        completed.push(CompletedTask {
+                            local_state: task.input.clone(),
+                            task,
+                            sends: Some(sends),
+                        });
+                    }
+                    TaskResult::Node(NodeResult::Custom(data)) => {
+                        emit(ExecutionEvent::Custom {
+                            node: task.node.clone(),
+                            data,
+                        });
+                        emit(ExecutionEvent::TaskEnd {
+                            id: task.id.clone(),
+                            name: task.node.clone(),
+                            result: S::Partial::default(),
+                        });
+                        completed.push(CompletedTask {
+                            local_state: task.input.clone(),
+                            task,
+                            sends: None,
+                        });
+                    }
+                    TaskResult::Subgraph(branch) => {
+                        emit(ExecutionEvent::TaskEnd {
+                            id: task.id.clone(),
+                            name: task.node.clone(),
+                            result: S::Partial::default(),
+                        });
+                        branches.push(branch.clone());
+                        completed.push(CompletedTask {
+                            task,
+                            local_state: branch,
+                            sends: None,
+                        });
+                    }
+                }
+            }
+
+            current_state = current_state.merge_many(updates);
+            for branch in branches {
+                current_state = current_state.merge_branch(branch);
+            }
+            emit(ExecutionEvent::Value(current_state.clone()));
+
+            let mut push_tasks = Vec::new();
+            let mut pull_targets = BTreeMap::<String, Vec<usize>>::new();
+
+            for completed_task in completed {
+                if let Some(sends) = completed_task.sends {
+                    for (index, GraphSend(target, input)) in sends.into_iter().enumerate() {
+                        if !self.nodes.contains_key(&target) {
+                            return Err(GraphError::NodeNotFound(target));
+                        }
+                        let mut path = completed_task.task.path.clone();
+                        path.push(index);
+                        push_tasks.push(ScheduledTask {
+                            id: uuid::Uuid::new_v4().to_string(),
+                            node: target,
+                            input,
+                            path,
+                        });
+                    }
                     continue;
                 }
-            }
 
-            let outgoing = self.get_outgoing_edges(&node_name, &current_state);
-            for edge in outgoing {
-                if edge == END || edge.is_empty() || sent_to.contains(&edge) {
-                    continue;
-                }
-                to_execute.push(edge);
-            }
-
-            if self.finish_points.contains(&node_name) && to_execute.is_empty() {
-                return Ok(current_state);
-            }
-        }
-
-        Ok(current_state)
-    }
-
-    /// Processes Send operations, executing target nodes in parallel.
-    async fn process_sends(
-        &self,
-        sends: Vec<GraphSend<S>>,
-        mut current_state: S,
-        depth: usize,
-    ) -> Result<S, GraphError> {
-        if sends.is_empty() {
-            return Ok(current_state);
-        }
-
-        #[derive(Debug)]
-        enum SendResult<S: State> {
-            Partial(NodeResult<S>),
-            Subgraph(Box<CompiledGraph<S>>, S),
-        }
-
-        let mut futures: Vec<_> = Vec::new();
-
-        for send in sends {
-            let handler = self.nodes.get(&send.0).cloned();
-            let state_to_use = send.1;
-
-            futures.push(async move {
-                match handler {
-                    Some(h) if h.subgraph.is_none() => {
-                        let result = (h.handler)(state_to_use).await;
-                        Ok(SendResult::Partial(result))
+                for (index, target) in self
+                    .get_outgoing_edges(&completed_task.task.node, &completed_task.local_state)
+                    .into_iter()
+                    .enumerate()
+                {
+                    if target == END || target.is_empty() {
+                        continue;
                     }
-                    Some(h) if h.subgraph.is_some() => {
-                        let subgraph = h.subgraph.clone().unwrap();
-                        Ok(SendResult::Subgraph(subgraph, state_to_use))
-                    }
-                    _ => Err(GraphError::NodeNotFound(send.0.clone())),
+                    let mut path = completed_task.task.path.clone();
+                    path.push(index);
+                    pull_targets.entry(target).or_insert(path);
                 }
-            });
-        }
 
-        let results: Vec<Result<SendResult<S>, GraphError>> =
-            futures::future::join_all(futures).await;
-
-        for result in results {
-            match result {
-                Ok(SendResult::Partial(node_result)) => {
-                    match node_result {
-                        NodeResult::Partial(partial) => {
-                            current_state = current_state.merge(partial);
+                for (index, waiting_edge) in self.waiting_edges.iter().enumerate() {
+                    if waiting_edge.sources.contains(&completed_task.task.node) {
+                        barrier_arrivals[index].insert(completed_task.task.node.clone());
+                        if barrier_arrivals[index] == waiting_edge.sources {
+                            pull_targets
+                                .entry(waiting_edge.target.clone())
+                                .or_insert_with(|| completed_task.task.path.clone());
+                            barrier_arrivals[index].clear();
                         }
-                        NodeResult::Send(nested_sends) => {
-                            let nested_sends = nested_sends;
-                            let this = self;
-                            let d = depth + 1;
-                            current_state = Box::pin(async move {
-                                this.process_sends(nested_sends, current_state, d).await
-                            })
-                            .await?;
-                        }
-                        NodeResult::Custom(_) => {}
                     }
                 }
-                Ok(SendResult::Subgraph(subgraph, state)) => {
-                    current_state = Box::pin(async {
-                        subgraph.ainvoke_internal(state, depth + 1).await
-                    })
-                    .await?;
-                }
-                Err(e) => return Err(e),
             }
+
+            for (node, path) in pull_targets {
+                tasks.push(ScheduledTask {
+                    id: uuid::Uuid::new_v4().to_string(),
+                    node,
+                    input: current_state.clone(),
+                    path,
+                });
+            }
+            tasks.extend(push_tasks);
         }
 
         Ok(current_state)
@@ -615,93 +766,47 @@ impl<S: State + 'static> CompiledGraph<S> {
         input: S,
         modes: Vec<StreamMode>,
     ) -> impl Stream<Item = Result<StreamOutput<S>, GraphError>> + '_ {
-        async_stream::try_stream! {
-            let entry = self.entry_point.clone().ok_or(GraphError::NoEntryPoint)?;
-
-            let mut current_state = input;
-            let mut to_execute: Vec<String> = vec![entry];
-            let has_values = modes.contains(&StreamMode::Values);
-            let has_updates = modes.contains(&StreamMode::Updates);
-            let has_custom = modes.contains(&StreamMode::Custom);
-            let has_tasks = modes.contains(&StreamMode::Tasks);
-
-            if has_values {
-                yield StreamOutput::Value(current_state.clone());
-            }
-
-            while let Some(node_name) = to_execute.pop() {
-                let handler = self
-                    .nodes
-                    .get(&node_name)
-                    .ok_or_else(|| GraphError::NodeNotFound(node_name.clone()))?;
-
-                let task_id = format!("{}_{}", node_name, uuid::Uuid::new_v4());
-
-                if has_tasks {
-                    yield StreamOutput::TaskStart {
-                        id: task_id.clone(),
-                        name: node_name.clone(),
-                    };
+        let graph = self.clone();
+        async_stream::stream! {
+            let (sender, mut receiver) = tokio::sync::mpsc::unbounded_channel();
+            tokio::spawn(async move {
+                let result = graph
+                    .execute_with_sink(input, 0, |event| {
+                        let _ = sender.send(Ok(event));
+                    })
+                    .await;
+                if let Err(error) = result {
+                    let _ = sender.send(Err(error));
                 }
+            });
 
-                let node_result = if let Some(subgraph) = &handler.subgraph {
-                    let new_state = subgraph.ainvoke(current_state.clone()).await?;
-                    current_state = new_state;
-                    NodeResult::Partial(S::Partial::default())
-                } else {
-                    (handler.handler)(current_state.clone()).await
-                };
-
-                let is_send = matches!(node_result, NodeResult::Send(_));
-                match node_result {
-                    NodeResult::Partial(partial) => {
-                        if has_updates {
-                            yield StreamOutput::Update {
-                                node: node_name.clone(),
-                                update: partial.clone(),
-                            };
-                        }
-                        current_state = current_state.merge(partial);
+            while let Some(event) = receiver.recv().await {
+                match event {
+                    Ok(ExecutionEvent::Value(state)) if modes.contains(&StreamMode::Values) => {
+                        yield Ok(StreamOutput::Value(state));
                     }
-                    NodeResult::Send(sends) => {
-                        current_state = self.process_sends(sends, current_state, 0).await?;
+                    Ok(ExecutionEvent::Update { node, update })
+                        if modes.contains(&StreamMode::Updates) =>
+                    {
+                        yield Ok(StreamOutput::Update { node, update });
                     }
-                    NodeResult::Custom(data) => {
-                        if has_custom {
-                            yield StreamOutput::Custom {
-                                node: node_name.clone(),
-                                data,
-                            };
-                        }
+                    Ok(ExecutionEvent::Custom { node, data })
+                        if modes.contains(&StreamMode::Custom) =>
+                    {
+                        yield Ok(StreamOutput::Custom { node, data });
                     }
-                }
-
-                if has_tasks {
-                    yield StreamOutput::TaskEnd {
-                        id: task_id.clone(),
-                        name: node_name.clone(),
-                        result: S::Partial::default(),
-                    };
-                }
-
-                if has_values {
-                    yield StreamOutput::Value(current_state.clone());
-                }
-
-                if is_send {
-                    continue;
-                }
-
-                let outgoing = self.get_outgoing_edges(&node_name, &current_state);
-                for edge in outgoing {
-                    if edge == END || edge.is_empty() {
-                        continue;
+                    Ok(ExecutionEvent::TaskStart { id, name })
+                        if modes.contains(&StreamMode::Tasks) =>
+                    {
+                        yield Ok(StreamOutput::TaskStart { id, name });
                     }
-                    to_execute.push(edge);
-                }
-
-                if self.finish_points.contains(&node_name) && to_execute.is_empty() {
-                    break;
+                    Ok(ExecutionEvent::TaskEnd { id, name, result })
+                        if modes.contains(&StreamMode::Tasks) =>
+                    {
+                        yield Ok(StreamOutput::TaskEnd { id, name, result });
+                    }
+                    Ok(_) => {}
+                    Err(error) => yield Err(error),
                 }
             }
         }
@@ -711,10 +816,7 @@ impl<S: State + 'static> CompiledGraph<S> {
     ///
     /// This is a convenience method that filters the stream to only
     /// yield `StreamOutput::Value` items, ignoring updates and other events.
-    pub async fn astream(
-        &self,
-        input: S,
-    ) -> impl Stream<Item = Result<S, GraphError>> + '_ {
+    pub async fn astream(&self, input: S) -> impl Stream<Item = Result<S, GraphError>> + '_ {
         self.stream(input).filter_map(|r| async move {
             match r {
                 Ok(StreamOutput::Value(v)) => Some(Ok(v)),
@@ -734,83 +836,8 @@ impl<S: State + 'static> CompiledGraph<S> {
     /// can be computed concurrently, with state merges happening between
     /// supersteps.
     ///
-    /// # Panics
-    /// Panics if the graph contains subgraph nodes (subgraphs are not supported).
     pub async fn invoke_parallel(&self, input: S) -> Result<S, GraphError> {
-        let entry = self.entry_point.clone().ok_or(GraphError::NoEntryPoint)?;
-
-        let mut current_state = input;
-        let mut finished: HashSet<String> = HashSet::new();
-        let mut ready: Vec<String> = vec![entry];
-
-        while !ready.is_empty() {
-            let superstep_state = current_state.clone();
-
-            let mut futures: Vec<_> = Vec::new();
-
-            for name in ready.iter() {
-                if finished.contains(name) {
-                    continue;
-                }
-                if let Some(handler) = self.nodes.get(name) {
-                    let state_clone = superstep_state.clone();
-                    let has_subgraph = handler.subgraph.is_some();
-
-                    futures.push(async move {
-                        if has_subgraph {
-                            panic!("Subgraphs are not supported in invoke_parallel");
-                        }
-                        let result = (handler.handler)(state_clone).await;
-                        (name.clone(), result)
-                    });
-                }
-            }
-
-            if futures.is_empty() {
-                break;
-            }
-
-            let results: Vec<(String, NodeResult<S>)> =
-                futures::future::join_all(futures).await;
-
-            let mut next_ready: Vec<String> = Vec::new();
-
-            for (name, result) in results {
-                let is_send = matches!(result, NodeResult::Send(_));
-                match result {
-                    NodeResult::Partial(partial) => {
-                        current_state = current_state.merge(partial);
-                    }
-                    NodeResult::Send(sends) => {
-                        for send in sends {
-                            if !finished.contains(&send.0) && !next_ready.contains(&send.0) {
-                                next_ready.push(send.0.clone());
-                            }
-                        }
-                    }
-                    NodeResult::Custom(_) => {}
-                }
-                finished.insert(name.clone());
-
-                if is_send {
-                    continue;
-                }
-
-                let outgoing = self.get_outgoing_edges(&name, &current_state);
-                for edge in outgoing {
-                    if edge == END || edge.is_empty() {
-                        continue;
-                    }
-                    if !finished.contains(&edge) && !next_ready.contains(&edge) {
-                        next_ready.push(edge);
-                    }
-                }
-            }
-
-            ready = next_ready;
-        }
-
-        Ok(current_state)
+        self.ainvoke(input).await
     }
 
     /// Determines outgoing edges for a node given current state.
@@ -829,11 +856,16 @@ impl<S: State + 'static> CompiledGraph<S> {
         if let Some(conditions) = self.conditional_edges.get(node_name) {
             for cond in conditions {
                 let path_result = (cond.path_fn)(state);
-                let dest = cond.path_map.get(&path_result).cloned().unwrap_or(path_result);
+                let dest = cond
+                    .path_map
+                    .get(&path_result)
+                    .cloned()
+                    .unwrap_or(path_result);
                 outgoing.push(dest);
             }
         }
 
+        outgoing.sort();
         outgoing
     }
 }

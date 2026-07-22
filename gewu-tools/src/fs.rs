@@ -18,8 +18,8 @@
 //! - [`GlobTool`] - Finds files using glob patterns, respects .gitignore
 
 use crate::fs_utils::{
-    glob_with_gitignore, into_tool_error, is_binary_file, mime_type, read_bytes,
-    read_text, resolve_safe_path, write,
+    glob_with_gitignore, into_tool_error, is_binary_file, mime_type, read_bytes, read_text,
+    resolve_safe_path, write,
 };
 use crate::replacers::smart_replace;
 use anyhow::Result;
@@ -144,15 +144,21 @@ impl Tool for ReadFileTool {
                 }
 
                 if !suggestions.is_empty() {
-                    return Ok(ToolResult::new("read_file", format!(
-                        "File not found: {}\n\nDid you mean one of these?\n{}",
-                        input.file_path,
-                        suggestions.join("\n")
-                    )));
+                    return Ok(ToolResult::new(
+                        "read_file",
+                        format!(
+                            "File not found: {}\n\nDid you mean one of these?\n{}",
+                            input.file_path,
+                            suggestions.join("\n")
+                        ),
+                    ));
                 }
             }
 
-            return Ok(ToolResult::new("read_file", format!("File not found: {}", input.file_path)));
+            return Ok(ToolResult::new(
+                "read_file",
+                format!("File not found: {}", input.file_path),
+            ));
         }
 
         let meta = metadata.unwrap();
@@ -229,7 +235,8 @@ impl Tool for ReadFileTool {
                 "mime": mime,
                 "data": encoded,
                 "message": format!("{} read successfully", msg)
-            }).to_string();
+            })
+            .to_string();
             return Ok(ToolResult {
                 title: "read_file".into(),
                 output: result,
@@ -248,7 +255,10 @@ impl Tool for ReadFileTool {
             .await
             .map_err(into_tool_error)?;
         if is_binary {
-            return Ok(ToolResult::new("read_file", format!("Cannot read binary file: {}", input.file_path)));
+            return Ok(ToolResult::new(
+                "read_file",
+                format!("Cannot read binary file: {}", input.file_path),
+            ));
         }
 
         let start = input.offset.saturating_sub(1);
@@ -295,11 +305,13 @@ impl Tool for ReadFileTool {
         }
 
         if total_lines < input.offset && !(total_lines == 0 && input.offset == 1) {
-            return Ok(ToolResult::new("read_file", format!(
-                "Offset {} is out of range for this file ({} lines)",
-                input.offset,
-                total_lines
-            )));
+            return Ok(ToolResult::new(
+                "read_file",
+                format!(
+                    "Offset {} is out of range for this file ({} lines)",
+                    input.offset, total_lines
+                ),
+            ));
         }
 
         let content: Vec<String> = lines
@@ -367,10 +379,10 @@ impl Tool for WriteFileTool {
         write(&file_path, input.content.as_bytes())
             .await
             .map_err(into_tool_error)?;
-        Ok(ToolResult::new("write_file", format!(
-            "Successfully wrote to {}",
-            file_path.to_string_lossy()
-        )))
+        Ok(ToolResult::new(
+            "write_file",
+            format!("Successfully wrote to {}", file_path.to_string_lossy()),
+        ))
     }
 }
 
@@ -400,16 +412,21 @@ impl Tool for EditFileTool {
 
         let content = read_text(&file_path).await.map_err(into_tool_error)?;
 
-        let new_content = smart_replace(&content, &input.old_string, &input.new_string, input.replace_all)
-            .map_err(|e| anyhow::anyhow!("{}", e))?;
+        let new_content = smart_replace(
+            &content,
+            &input.old_string,
+            &input.new_string,
+            input.replace_all,
+        )
+        .map_err(|e| anyhow::anyhow!("{}", e))?;
 
         write(&file_path, new_content.as_bytes())
             .await
             .map_err(into_tool_error)?;
-        Ok(ToolResult::new("edit_file", format!(
-            "Successfully modified {}",
-            file_path.to_string_lossy()
-        )))
+        Ok(ToolResult::new(
+            "edit_file",
+            format!("Successfully modified {}", file_path.to_string_lossy()),
+        ))
     }
 }
 
@@ -451,7 +468,10 @@ impl Tool for GlobTool {
             .map(|p| p.to_string_lossy().into_owned())
             .collect();
 
-        Ok(ToolResult::new("glob", serde_json::to_string_pretty(&paths_str).unwrap()))
+        Ok(ToolResult::new(
+            "glob",
+            serde_json::to_string_pretty(&paths_str).unwrap(),
+        ))
     }
 }
 
@@ -477,7 +497,10 @@ mod tests {
         });
         let ctx = ToolContext::new("test", "msg");
 
-        let result = tool.execute(args, &ctx).await.map_err(|e| anyhow::anyhow!(e.to_string()))?;
+        let result = tool
+            .execute(args, &ctx)
+            .await
+            .map_err(|e| anyhow::anyhow!(e.to_string()))?;
         assert!(result.output.contains("<path>"));
         assert!(result.output.contains("<type>file</type>"));
         assert!(result.output.contains("1: Hello from file"));
@@ -499,7 +522,10 @@ mod tests {
         });
         let ctx = ToolContext::new("test", "msg");
 
-        let result = tool.execute(args, &ctx).await.map_err(|e| anyhow::anyhow!(e.to_string()))?;
+        let result = tool
+            .execute(args, &ctx)
+            .await
+            .map_err(|e| anyhow::anyhow!(e.to_string()))?;
         assert!(result.output.contains("Successfully wrote"));
 
         let content = fs::read_to_string(&file_path).await?;
@@ -526,7 +552,10 @@ mod tests {
         });
         let ctx = ToolContext::new("test", "msg");
 
-        let result = tool.execute(args, &ctx).await.map_err(|e| anyhow::anyhow!(e.to_string()))?;
+        let result = tool
+            .execute(args, &ctx)
+            .await
+            .map_err(|e| anyhow::anyhow!(e.to_string()))?;
         let files: Vec<String> = serde_json::from_str(&result.output)?;
 
         assert_eq!(files.len(), 2);
@@ -561,7 +590,10 @@ mod tests {
             "replace_all": true
         });
         let ctx = ToolContext::new("test", "msg");
-        let _ = tool.execute(args_all, &ctx).await.map_err(|e| anyhow::anyhow!(e.to_string()))?;
+        let _ = tool
+            .execute(args_all, &ctx)
+            .await
+            .map_err(|e| anyhow::anyhow!(e.to_string()))?;
         let content = fs::read_to_string(&file_path).await?;
         assert_eq!(content, "baz bar baz");
 

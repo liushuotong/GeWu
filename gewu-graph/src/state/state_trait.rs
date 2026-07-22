@@ -29,6 +29,26 @@ pub trait State: Serialize + DeserializeOwned + Default + Debug + Clone + Send +
     /// # Returns
     /// A new state with the update applied
     fn merge(&self, update: Self::Partial) -> Self;
+
+    /// Merges all updates produced during one execution superstep.
+    ///
+    /// The default implementation applies updates in deterministic task order.
+    /// States that need field-level reducers can override this method to combine
+    /// concurrent writes before producing the next state.
+    fn merge_many(&self, updates: Vec<Self::Partial>) -> Self {
+        updates
+            .into_iter()
+            .fold(self.clone(), |state, update| state.merge(update))
+    }
+
+    /// Merges the final state returned by a subgraph branch.
+    ///
+    /// The default preserves the historical behavior where a subgraph replaces
+    /// the parent state. Override this when multiple concurrent subgraphs need
+    /// reducer-style state combination.
+    fn merge_branch(&self, branch: Self) -> Self {
+        branch
+    }
 }
 
 /// A trait for combining values using a binary operation.

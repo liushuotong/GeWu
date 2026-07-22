@@ -3,9 +3,7 @@
 //! This module provides helper structs and functions used by the [`Agent::ask`](super::Agent::ask)
 //! method to modularize the main agent loop logic.
 
-use crate::types::{
-    AgentEvent, FunctionCall, ProviderEvent, ToolCall, ToolContext,
-};
+use crate::types::{AgentEvent, FunctionCall, ProviderEvent, ToolCall, ToolContext, ToolResult};
 use anyhow::Result;
 use std::collections::VecDeque;
 use tracing::warn;
@@ -54,8 +52,7 @@ impl DoomLoopDetector {
         {
             return Some(format!(
                 "Doom loop detected: Tool '{}' called {} times repeatedly with identical arguments. Stopping.",
-                tool,
-                self.threshold
+                tool, self.threshold
             ));
         }
         None
@@ -117,9 +114,7 @@ impl LlmResponseAggregator {
                 self.content.push_str(&delta);
                 Some(AgentEvent::ContentDelta { delta })
             }
-            ProviderEvent::ReasoningDelta { delta } => {
-                Some(AgentEvent::ReasoningDelta { delta })
-            }
+            ProviderEvent::ReasoningDelta { delta } => Some(AgentEvent::ReasoningDelta { delta }),
             ProviderEvent::ToolCallStart { id, name } => {
                 self.tool_calls.push(ToolCall {
                     id,
@@ -151,7 +146,10 @@ impl LlmResponseAggregator {
     ///
     /// A tuple of (content string, tool calls vector)
     pub(super) fn take_parts(&mut self) -> (String, Vec<ToolCall>) {
-        (std::mem::take(&mut self.content), std::mem::take(&mut self.tool_calls))
+        (
+            std::mem::take(&mut self.content),
+            std::mem::take(&mut self.tool_calls),
+        )
     }
 }
 
@@ -161,7 +159,7 @@ impl LlmResponseAggregator {
 /// 1. Parses the JSON arguments
 /// 2. Executes the tool with panic recovery
 /// 3. Truncates the output if necessary
-/// 4. Returns the output (or error message) as a string
+/// 4. Returns the tool result with its output truncated if necessary
 ///
 /// # Arguments
 ///
@@ -172,13 +170,13 @@ impl LlmResponseAggregator {
 ///
 /// # Returns
 ///
-/// The tool output as a string, or an error if argument parsing failed
+/// The tool result, or an error if argument parsing failed
 pub(super) async fn execute_tool_call(
     tool: std::sync::Arc<dyn Tool>,
     call: ToolCall,
     ctx: ToolContext,
     truncation: &TruncationService,
-) -> Result<String> {
+) -> Result<ToolResult> {
     let tool_name = tool.name().to_string();
     let args = call.function.arguments;
 
@@ -186,10 +184,10 @@ pub(super) async fn execute_tool_call(
         .map_err(|e| anyhow::anyhow!("Failed to parse arguments: {}", e))?;
 
     match execute_tool_with_panic_recovery(tool, args_val, ctx).await {
-        Ok(res) => {
+        Ok(mut res) => {
             let truncation_result = truncation.truncate(&res.output);
-            let output = if truncation_result.truncated {
-                format!(
+            if truncation_result.truncated {
+                res.output = format!(
                     "{}\n\n[Output truncated - {} bytes saved to {}]",
                     truncation_result.content,
                     truncation_result.content.len(),
@@ -197,15 +195,13 @@ pub(super) async fn execute_tool_call(
                         .output_path
                         .map(|p| p.display().to_string())
                         .unwrap_or_default()
-                )
-            } else {
-                res.output
-            };
-            Ok(output)
+                );
+            }
+            Ok(res)
         }
         Err(e) => {
             warn!("Tool '{}' failed: {}", tool_name, e);
-            Ok(format!("Error: {}", e))
+            Ok(ToolResult::new(tool_name, format!("Error: {}", e)))
         }
     }
 }

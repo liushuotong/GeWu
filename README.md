@@ -90,7 +90,15 @@ The CLI provides pre-configured agent types optimized for different use cases:
 ### Running the CLI
 
 ```bash
-cargo run --bin gewu-cli -- --help
+cargo run -p gewu-cli -- run --help
+```
+
+Run an agent or inspect persisted memory:
+
+```bash
+cargo run -p gewu-cli -- run "Hello"
+cargo run -p gewu-cli -- view
+cargo run -p gewu-cli -- view <SESSION_ID>
 ```
 
 ### Running the Web UI

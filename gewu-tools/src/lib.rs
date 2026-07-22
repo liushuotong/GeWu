@@ -9,6 +9,7 @@
 //! | Tool | Name | Description |
 //! |------|------|-------------|
 //! | [`BashTool`](bash::BashTool) | `bash` | Execute shell commands |
+//! | [`ApplyPatchTool`](apply_patch::ApplyPatchTool) | `apply_patch` | Apply validated multi-file patches |
 //! | [`ReadFileTool`](fs::ReadFileTool) | `read_file` | Read files and directories |
 //! | [`WriteFileTool`](fs::WriteFileTool) | `write_file` | Write/create files |
 //! | [`EditFileTool`](fs::EditFileTool) | `edit_file` | Edit files by replacing text |
@@ -52,6 +53,7 @@
 //! }
 //! ```
 
+pub mod apply_patch;
 pub mod bash;
 pub mod batch;
 pub mod fs;
@@ -64,6 +66,7 @@ pub mod search;
 pub mod todo;
 pub mod web_fetch;
 
+pub use apply_patch::ApplyPatchTool;
 pub use bash::BashTool;
 pub use batch::BatchTool;
 pub use fs::{EditFileTool, GlobTool, ReadFileTool, WriteFileTool};

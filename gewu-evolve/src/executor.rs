@@ -65,7 +65,7 @@ When the plan is complete, provide a summary of what was accomplished."#,
                         AgentEvent::ToolStart { tool, .. } => {
                             tracing::info!("Tool started: {}", tool);
                         }
-                        AgentEvent::ToolFinish { tool, output } => {
+                        AgentEvent::ToolFinish { tool, output, .. } => {
                             tracing::info!("Tool finished: {} - {} chars", tool, output.len());
                             if !tools_used.contains(tool) {
                                 tools_used.push(tool.clone());
@@ -117,13 +117,14 @@ When the plan is complete, provide a summary of what was accomplished."#,
             step_results,
         })
     }
-
 }
 
 impl Default for Executor {
     fn default() -> Self {
         Self {
-            agent: Agent::builder().build().expect("Failed to build default Agent"),
+            agent: Agent::builder()
+                .build()
+                .expect("Failed to build default Agent"),
         }
     }
 }

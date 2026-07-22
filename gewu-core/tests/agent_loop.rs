@@ -2,11 +2,15 @@ use async_trait::async_trait;
 use futures::StreamExt;
 use futures::stream::BoxStream;
 use gewu_core::agent::AgentBuilder;
-use gewu_core::traits::{LlmProvider, Tool, ToolRegistry};
-use gewu_core::types::{AgentEvent, ContentPart, FunctionCall, Message, ProviderEvent, ToolCall, ToolContext, ToolResult};
+use gewu_core::traits::{LlmProvider, Tool};
+use gewu_core::types::{
+    AgentEvent, FunctionCall, Message, ProviderEvent, ToolCall, ToolContext, ToolResult,
+};
+use gewu_tools::ApplyPatchTool;
 use serde_json::Value;
 use std::error::Error;
 use std::sync::{Arc, Mutex};
+use tempfile::tempdir;
 
 struct MockLlm {
     responses: Arc<Mutex<Vec<Message>>>,
@@ -74,8 +78,16 @@ impl Tool for MockTool {
     fn schema(&self) -> schemars::schema::RootSchema {
         schemars::schema_for!(serde_json::Value)
     }
-    async fn execute(&self, _args: Value, _ctx: &ToolContext) -> Result<ToolResult, Box<dyn Error + Send + Sync>> {
-        Ok(ToolResult::new("mock_tool", "Tool output".to_string()))
+    async fn execute(
+        &self,
+        _args: Value,
+        _ctx: &ToolContext,
+    ) -> Result<ToolResult, Box<dyn Error + Send + Sync>> {
+        let mut result = ToolResult::new("Mock Result Title", "Tool output".to_string());
+        result
+            .metadata
+            .insert("kind".to_string(), serde_json::json!("mock"));
+        Ok(result)
     }
 }
 
@@ -116,13 +128,88 @@ async fn test_agent_loop() {
 
     let mut stream = Box::pin(agent.ask("Do something"));
     let mut result = String::new();
+    let mut tool_finish = None;
     while let Some(event) = stream.next().await {
-        if let Ok(AgentEvent::ContentDelta { delta }) = event {
-            result.push_str(&delta);
-        } else if let Ok(AgentEvent::Finish { response }) = event {
-            result = response;
+        match event.unwrap() {
+            AgentEvent::ToolFinish {
+                tool,
+                title,
+                output,
+                metadata,
+            } => tool_finish = Some((tool, title, output, metadata)),
+            AgentEvent::ContentDelta { delta } => result.push_str(&delta),
+            AgentEvent::Finish { response } => result = response,
+            _ => {}
         }
     }
 
+    let (tool, title, output, metadata) = tool_finish.unwrap();
+    assert_eq!(tool, "mock_tool");
+    assert_eq!(title, "Mock Result Title");
+    assert_eq!(output, "Tool output");
+    assert_eq!(metadata["kind"], serde_json::json!("mock"));
     assert_eq!(result, "Done: Tool output");
+}
+
+#[tokio::test]
+async fn test_apply_patch_metadata_through_agent_loop() {
+    let directory = tempdir().unwrap();
+    let tool_call = ToolCall {
+        id: "call_patch".to_string(),
+        r#type: "function".to_string(),
+        function: FunctionCall {
+            name: "apply_patch".to_string(),
+            arguments: serde_json::json!({
+                "patchText": "*** Begin Patch\n*** Add File: created.txt\n+created\n*** End Patch"
+            })
+            .to_string(),
+        },
+    };
+    let llm = Arc::new(MockLlm {
+        responses: Arc::new(Mutex::new(vec![
+            Message::Assistant {
+                content: None,
+                tool_calls: Some(vec![tool_call]),
+            },
+            Message::Assistant {
+                content: Some("patched".to_string()),
+                tool_calls: None,
+            },
+        ])),
+    });
+    let tool: Arc<dyn Tool> = Arc::new(ApplyPatchTool {
+        working_directory: directory.path().to_path_buf(),
+    });
+    let mut agent = AgentBuilder::default()
+        .llm(llm)
+        .with_tools(vec![tool])
+        .system_prompt("System")
+        .build()
+        .unwrap();
+    let mut stream = Box::pin(agent.ask("Create a file"));
+    let mut finish = None;
+
+    while let Some(event) = stream.next().await {
+        if let AgentEvent::ToolFinish {
+            tool,
+            title,
+            output,
+            metadata,
+        } = event.unwrap()
+        {
+            finish = Some((tool, title, output, metadata));
+        }
+    }
+
+    let (tool, title, output, metadata) = finish.expect("missing ToolFinish");
+    assert_eq!(tool, "apply_patch");
+    assert_eq!(title, "apply_patch");
+    assert!(output.contains("A created.txt"));
+    assert_eq!(metadata["files"][0]["operation"], "add");
+    assert_eq!(
+        tokio::fs::read_to_string(directory.path().join("created.txt"))
+            .await
+            .unwrap(),
+        "created\n"
+    );
 }

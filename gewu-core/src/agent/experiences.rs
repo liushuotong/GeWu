@@ -7,8 +7,8 @@
 use crate::traits::{Experiences, Tool};
 use crate::types::{ExperienceQuery, RecalledExperience, ToolContext, ToolResult};
 use async_trait::async_trait;
-use schemars::schema::RootSchema;
 use schemars::JsonSchema;
+use schemars::schema::RootSchema;
 use serde::Deserialize;
 use std::error::Error;
 use std::sync::Arc;

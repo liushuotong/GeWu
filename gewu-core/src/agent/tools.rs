@@ -6,7 +6,7 @@
 use crate::types::{ToolContext, ToolResult};
 use anyhow::Result;
 use std::error::Error;
-use std::panic::{catch_unwind, AssertUnwindSafe};
+use std::panic::{AssertUnwindSafe, catch_unwind};
 use tokio::task::spawn_blocking;
 
 use super::extract_panic_message;
@@ -71,12 +71,13 @@ pub async fn execute_tool_with_panic_recovery(
                             ),
                         )) as Box<dyn Error + Send + Sync>)
                     }
-                    Err(_) => {
-                        Err(Box::new(std::io::Error::new(
-                            std::io::ErrorKind::Other,
-                            format!("Tool '{}' panicked but could not retrieve panic payload", tool_name),
-                        )) as Box<dyn Error + Send + Sync>)
-                    }
+                    Err(_) => Err(Box::new(std::io::Error::new(
+                        std::io::ErrorKind::Other,
+                        format!(
+                            "Tool '{}' panicked but could not retrieve panic payload",
+                            tool_name
+                        ),
+                    )) as Box<dyn Error + Send + Sync>),
                 }
             } else {
                 Err(Box::new(std::io::Error::new(

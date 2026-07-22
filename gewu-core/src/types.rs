@@ -162,7 +162,14 @@ pub enum AgentEvent {
     /// The agent has started executing a tool.
     ToolStart { tool: String, input: String },
     /// A tool has finished executing.
-    ToolFinish { tool: String, output: String },
+    ToolFinish {
+        tool: String,
+        #[serde(default, skip_serializing_if = "String::is_empty")]
+        title: String,
+        output: String,
+        #[serde(default, skip_serializing_if = "std::collections::HashMap::is_empty")]
+        metadata: std::collections::HashMap<String, serde_json::Value>,
+    },
     /// The agent has finished with a final response.
     Finish { response: String },
     /// An error occurred during agent execution.

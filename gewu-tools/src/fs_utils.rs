@@ -9,6 +9,7 @@
 use anyhow::{Context, Result};
 use mime_guess;
 use serde::{Serialize, de::DeserializeOwned};
+use std::io::ErrorKind;
 use std::path::{Component, Path, PathBuf};
 use tokio::fs;
 
@@ -87,6 +88,98 @@ pub fn resolve_safe_path(root: impl AsRef<Path>, user_path: impl AsRef<Path>) ->
             root
         ))
     }
+}
+
+/// Canonicalizes a filesystem root used to constrain mutating operations.
+pub async fn canonicalize_root(root: impl AsRef<Path>) -> Result<PathBuf> {
+    let root = fs::canonicalize(root.as_ref())
+        .await
+        .with_context(|| format!("Failed to resolve working directory: {:?}", root.as_ref()))?;
+    let metadata = fs::metadata(&root).await?;
+    anyhow::ensure!(
+        metadata.is_dir(),
+        "Working directory is not a directory: {:?}",
+        root
+    );
+    Ok(root)
+}
+
+async fn reject_symlink_components(root: &Path, path: &Path) -> Result<()> {
+    let relative = path
+        .strip_prefix(root)
+        .with_context(|| format!("Path {:?} is outside working directory {:?}", path, root))?;
+    let mut current = root.to_path_buf();
+
+    for component in relative.components() {
+        current.push(component.as_os_str());
+        match fs::symlink_metadata(&current).await {
+            Ok(metadata) => anyhow::ensure!(
+                !metadata.file_type().is_symlink(),
+                "Symbolic links are not allowed in patch paths: {:?}",
+                current
+            ),
+            Err(error) if error.kind() == ErrorKind::NotFound => break,
+            Err(error) => {
+                return Err(error).with_context(|| format!("Failed to inspect {:?}", current));
+            }
+        }
+    }
+
+    Ok(())
+}
+
+/// Resolves an existing path and rejects traversal or symbolic-link escapes.
+pub async fn resolve_safe_existing_path(
+    root: impl AsRef<Path>,
+    user_path: impl AsRef<Path>,
+) -> Result<PathBuf> {
+    let root = canonicalize_root(root).await?;
+    let path = resolve_safe_path(&root, user_path)?;
+    reject_symlink_components(&root, &path).await?;
+    let canonical = fs::canonicalize(&path)
+        .await
+        .with_context(|| format!("Path does not exist: {:?}", path))?;
+    anyhow::ensure!(
+        canonical.starts_with(&root),
+        "Path {:?} is outside working directory {:?}",
+        canonical,
+        root
+    );
+    Ok(canonical)
+}
+
+/// Resolves a potential destination and verifies its existing parent chain.
+pub async fn resolve_safe_write_path(
+    root: impl AsRef<Path>,
+    user_path: impl AsRef<Path>,
+) -> Result<PathBuf> {
+    let root = canonicalize_root(root).await?;
+    let path = resolve_safe_path(&root, user_path)?;
+    reject_symlink_components(&root, &path).await?;
+
+    let mut parent = path.parent();
+    while let Some(candidate) = parent {
+        match fs::canonicalize(candidate).await {
+            Ok(canonical) => {
+                anyhow::ensure!(
+                    canonical.starts_with(&root),
+                    "Path {:?} is outside working directory {:?}",
+                    path,
+                    root
+                );
+                return Ok(path);
+            }
+            Err(error) if error.kind() == ErrorKind::NotFound => {
+                parent = candidate.parent();
+            }
+            Err(error) => {
+                return Err(error)
+                    .with_context(|| format!("Failed to resolve parent of {:?}", path));
+            }
+        }
+    }
+
+    anyhow::bail!("Unable to resolve a safe parent for {:?}", path)
 }
 
 /// Checks if a path exists.
@@ -287,6 +380,37 @@ mod tests {
         let read_data: TestData = read_json(&file_path).await?;
 
         assert_eq!(data, read_data);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn safe_write_path_rejects_parent_traversal() -> Result<()> {
+        let dir = tempdir()?;
+        let result = resolve_safe_write_path(dir.path(), "../outside.txt").await;
+        assert!(result.is_err());
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn safe_existing_path_resolves_inside_root() -> Result<()> {
+        let dir = tempdir()?;
+        let path = dir.path().join("inside.txt");
+        fs::write(&path, "inside").await?;
+        let resolved = resolve_safe_existing_path(dir.path(), "inside.txt").await?;
+        assert_eq!(resolved, fs::canonicalize(path).await?);
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn safe_write_path_rejects_symlink_components() -> Result<()> {
+        use std::os::unix::fs::symlink;
+
+        let root = tempdir()?;
+        let outside = tempdir()?;
+        symlink(outside.path(), root.path().join("escape"))?;
+        let result = resolve_safe_write_path(root.path(), "escape/file.txt").await;
+        assert!(result.is_err());
         Ok(())
     }
 }

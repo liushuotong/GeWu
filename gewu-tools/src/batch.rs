@@ -9,7 +9,7 @@ use std::error::Error;
 use std::sync::Arc;
 use tokio::task::JoinSet;
 
-const DISALLOWED: &[&str] = &["batch", "invalid", "patch"];
+const DISALLOWED: &[&str] = &["batch"];
 const MAX_TOOLS: usize = 25;
 
 #[derive(Debug, Deserialize, Serialize, schemars::JsonSchema)]
@@ -40,7 +40,7 @@ impl Tool for BatchTool {
     }
 
     fn description(&self) -> &str {
-        "Execute multiple tools in parallel. Use this to run independent tool calls simultaneously for better performance."
+        "Execute independent tool calls in parallel. Shell and mutation tools are allowed, but nested batch calls are not."
     }
 
     fn schema(&self) -> schemars::schema::RootSchema {
@@ -50,7 +50,7 @@ impl Tool for BatchTool {
     async fn execute(
         &self,
         args: Value,
-        _ctx: &ToolContext,
+        ctx: &ToolContext,
     ) -> Result<ToolResult, Box<dyn Error + Send + Sync>> {
         let batch_args: BatchArgs = serde_json::from_value(args).map_err(into_tool_error)?;
 
@@ -64,7 +64,7 @@ impl Tool for BatchTool {
         let available_tools = self.registry.list_tools();
         let allowed_tools = available_tools
             .iter()
-            .filter(|t| !DISALLOWED.contains(&t.as_str()))
+            .filter(|tool| !DISALLOWED.contains(&tool.as_str()))
             .cloned()
             .collect::<std::collections::HashSet<_>>();
 
@@ -75,6 +75,7 @@ impl Tool for BatchTool {
             let params = call.parameters.clone();
             let registry = self.registry.clone();
             let allowed = allowed_tools.clone();
+            let ctx = ctx.clone();
 
             if tool_name.is_empty() {
                 let tool_name_clone = tool_name.clone();
@@ -82,7 +83,6 @@ impl Tool for BatchTool {
                 continue;
             }
 
-            let ctx = ToolContext::new("batch", "batch");
             join_set.spawn(async move {
                 let result = async {
                     if DISALLOWED.contains(&tool_name.as_str()) {
@@ -182,8 +182,11 @@ impl Tool for BatchTool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::atomic::{AtomicUsize, Ordering};
 
-    struct TestRegistry;
+    struct TestRegistry {
+        calls: AtomicUsize,
+    }
 
     #[async_trait]
     impl ToolRegistry for TestRegistry {
@@ -193,17 +196,27 @@ mod tests {
             _args: Value,
             _ctx: &ToolContext,
         ) -> Result<ToolResult, Box<dyn Error + Send + Sync>> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
             Ok(ToolResult::new(name, "search result content"))
         }
 
         fn list_tools(&self) -> Vec<String> {
-            vec!["websearch".to_string()]
+            vec![
+                "websearch".to_string(),
+                "apply_patch".to_string(),
+                "bash".to_string(),
+                "task".to_string(),
+                "write_file".to_string(),
+                "batch".to_string(),
+            ]
         }
     }
 
     #[tokio::test]
     async fn includes_successful_tool_output() {
-        let tool = BatchTool::new(Arc::new(TestRegistry));
+        let tool = BatchTool::new(Arc::new(TestRegistry {
+            calls: AtomicUsize::new(0),
+        }));
         let result = tool
             .execute(
                 serde_json::json!({
@@ -219,5 +232,50 @@ mod tests {
 
         assert!(result.output.contains("## websearch"));
         assert!(result.output.contains("search result content"));
+    }
+
+    #[tokio::test]
+    async fn allows_shell_and_mutation_tools() {
+        let registry = Arc::new(TestRegistry {
+            calls: AtomicUsize::new(0),
+        });
+        let tool = BatchTool::new(registry.clone());
+        let result = tool
+            .execute(
+                serde_json::json!({
+                    "tool_calls": [
+                        {"tool": "apply_patch", "parameters": {}},
+                        {"tool": "bash", "parameters": {"command": "true"}},
+                        {"tool": "task", "parameters": {}},
+                        {"tool": "write_file", "parameters": {}}
+                    ]
+                }),
+                &ToolContext::new("test", "test"),
+            )
+            .await
+            .unwrap();
+
+        assert!(result.output.contains("All 4 tools executed successfully"));
+        assert_eq!(registry.calls.load(Ordering::SeqCst), 4);
+    }
+
+    #[tokio::test]
+    async fn rejects_nested_batch() {
+        let registry = Arc::new(TestRegistry {
+            calls: AtomicUsize::new(0),
+        });
+        let tool = BatchTool::new(registry.clone());
+        let result = tool
+            .execute(
+                serde_json::json!({
+                    "tool_calls": [{"tool": "batch", "parameters": {}}]
+                }),
+                &ToolContext::new("test", "test"),
+            )
+            .await
+            .unwrap();
+
+        assert!(result.output.contains("not allowed in batch"));
+        assert_eq!(registry.calls.load(Ordering::SeqCst), 0);
     }
 }

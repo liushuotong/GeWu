@@ -59,9 +59,9 @@ use std::sync::Arc;
 use tracing::{info, trace};
 use uuid::Uuid;
 
-use self::execution::{execute_tool_call, DoomLoopDetector, LlmResponseAggregator};
-use crate::compaction::prune;
+use self::execution::{DoomLoopDetector, LlmResponseAggregator, execute_tool_call};
 use crate::agent::media::extract_media_parts;
+use crate::compaction::prune;
 
 /// The main runtime that orchestrates conversation flow, tool execution, and context management.
 ///
@@ -273,25 +273,33 @@ impl Agent {
 
                     let tool = self.tools.iter().find(|t| t.name() == tool_name);
 
-                    let result_content = if let Some(t) = tool {
+                    let result = if let Some(t) = tool {
                         match execute_tool_call(t.clone(), call, ctx, &self.truncation).await {
-                            Ok(output) => output,
+                            Ok(result) => result,
                             Err(e) => {
                                 yield AgentEvent::Error { error: e.to_string() };
                                 continue;
                             }
                         }
                     } else {
-                        format!("Tool not found: {}", tool_name)
+                        ToolResult::new(
+                            tool_name.clone(),
+                            format!("Tool not found: {}", tool_name),
+                        )
                     };
 
-                    yield AgentEvent::ToolFinish { tool: tool_name.clone(), output: result_content.clone() };
+                    yield AgentEvent::ToolFinish {
+                        tool: tool_name.clone(),
+                        title: result.title.clone(),
+                        output: result.output.clone(),
+                        metadata: result.metadata.clone(),
+                    };
 
-                    let media_parts = extract_media_parts(&result_content);
+                    let media_parts = extract_media_parts(&result.output);
                     self.memory.add_message(Message::Tool {
                         tool_call_id: call_id,
                         tool_name: Some(tool_name.clone()),
-                        content: result_content,
+                        content: result.output,
                         media: media_parts,
                     }).await;
                 }

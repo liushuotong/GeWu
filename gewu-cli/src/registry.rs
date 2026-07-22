@@ -6,12 +6,23 @@ use gewu_core::traits::{LlmProvider, Tool, ToolRegistry};
 use gewu_core::types::{ToolContext, ToolResult};
 use gewu_storage::SqliteMemory;
 use gewu_tools::{
-    BashTool, BatchTool, CodeSearchTool, EditFileTool, GlobTool, GrepTool, ListTool, ReadFileTool,
-    TodoItem, TodoReadTool, TodoWriteTool, WebFetchTool, WebSearchTool, WriteFileTool,
+    ApplyPatchTool, BashTool, BatchTool, CodeSearchTool, EditFileTool, GlobTool, GrepTool,
+    ListTool, ReadFileTool, TodoItem, TodoReadTool, TodoWriteTool, WebFetchTool, WebSearchTool,
+    WriteFileTool,
 };
 use serde_json::Value;
 use sqlx::SqlitePool;
 use std::sync::{Arc, Mutex};
+
+const RESERVED_ADDITIONAL_TOOL_NAMES: &[&str] = &[
+    "apply_patch",
+    "write_file",
+    "edit_file",
+    "task",
+    "todowrite",
+    "todoread",
+    "batch",
+];
 
 pub struct AgentConfig {
     pub name: String,
@@ -74,6 +85,9 @@ fn build_tool_registry_and_list(
                 Box::new(ReadFileTool {
                     working_directory: working_directory.clone(),
                 }),
+                Box::new(ApplyPatchTool {
+                    working_directory: working_directory.clone(),
+                }),
                 Box::new(WriteFileTool {
                     working_directory: working_directory.clone(),
                 }),
@@ -130,6 +144,9 @@ fn build_tool_registry_and_list(
                 Box::new(ReadFileTool {
                     working_directory: working_directory.clone(),
                 }),
+                Box::new(ApplyPatchTool {
+                    working_directory: working_directory.clone(),
+                }),
                 Box::new(WriteFileTool {
                     working_directory: working_directory.clone(),
                 }),
@@ -163,6 +180,22 @@ fn build_tool_registry_and_list(
         .into_iter()
         .map(|t| Arc::from(t) as Arc<dyn Tool>)
         .collect();
+    let mut names = tools_arc
+        .iter()
+        .map(|tool| tool.name().to_string())
+        .collect::<std::collections::HashSet<_>>();
+    for tool in &additional_tools {
+        anyhow::ensure!(
+            !RESERVED_ADDITIONAL_TOOL_NAMES.contains(&tool.name()),
+            "Additional tool name '{}' is reserved",
+            tool.name()
+        );
+        anyhow::ensure!(
+            names.insert(tool.name().to_string()),
+            "Duplicate tool name: {}",
+            tool.name()
+        );
+    }
     tools_arc.extend(additional_tools);
 
     let registry: Arc<dyn ToolRegistry> = Arc::new(ToolRegistryImpl {
@@ -218,4 +251,127 @@ pub async fn create_agent(
     };
 
     Ok((agent, registry))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use futures::stream::BoxStream;
+    use gewu_core::types::{Message, ProviderEvent};
+    use std::error::Error;
+    use tempfile::tempdir;
+
+    struct DummyLlm;
+
+    struct NamedTool(&'static str);
+
+    #[async_trait]
+    impl Tool for NamedTool {
+        fn name(&self) -> &str {
+            self.0
+        }
+
+        fn description(&self) -> &str {
+            "test tool"
+        }
+
+        fn schema(&self) -> schemars::schema::RootSchema {
+            schemars::schema_for!(serde_json::Value)
+        }
+
+        async fn execute(
+            &self,
+            _args: Value,
+            _ctx: &ToolContext,
+        ) -> Result<ToolResult, Box<dyn Error + Send + Sync>> {
+            Ok(ToolResult::new(self.0, "ok"))
+        }
+    }
+
+    #[async_trait]
+    impl LlmProvider for DummyLlm {
+        async fn stream_response<'a>(
+            &'a self,
+            _messages: &[Message],
+            _tools: &[Arc<dyn Tool>],
+        ) -> Result<
+            BoxStream<'a, Result<ProviderEvent, Box<dyn Error + Send + Sync>>>,
+            Box<dyn Error + Send + Sync>,
+        > {
+            Err("Not implemented".into())
+        }
+
+        async fn list_models(&self) -> Result<Vec<String>, Box<dyn Error + Send + Sync>> {
+            Ok(Vec::new())
+        }
+    }
+
+    #[tokio::test]
+    async fn apply_patch_is_only_in_mutating_profiles() {
+        let pool = SqlitePool::connect_lazy("sqlite::memory:").unwrap();
+        let directory = tempdir().unwrap();
+        let provider: Arc<dyn LlmProvider> = Arc::new(DummyLlm);
+
+        for profile in ["build", "general"] {
+            let (_, tools) = build_tool_registry_and_list(
+                profile,
+                provider.clone(),
+                pool.clone(),
+                directory.path().to_path_buf(),
+                Vec::new(),
+            )
+            .unwrap();
+            assert!(tools.iter().any(|tool| tool.name() == "apply_patch"));
+        }
+
+        let (_, tools) = build_tool_registry_and_list(
+            "explore",
+            provider,
+            pool,
+            directory.path().to_path_buf(),
+            Vec::new(),
+        )
+        .unwrap();
+        assert!(!tools.iter().any(|tool| tool.name() == "apply_patch"));
+    }
+
+    #[tokio::test]
+    async fn additional_tools_cannot_inject_or_duplicate_builtin_names() {
+        let pool = SqlitePool::connect_lazy("sqlite::memory:").unwrap();
+        let directory = tempdir().unwrap();
+        let provider: Arc<dyn LlmProvider> = Arc::new(DummyLlm);
+
+        let reserved = build_tool_registry_and_list(
+            "explore",
+            provider.clone(),
+            pool.clone(),
+            directory.path().to_path_buf(),
+            vec![Arc::new(NamedTool("apply_patch"))],
+        );
+        assert!(reserved.err().unwrap().to_string().contains("reserved"));
+
+        let batch = build_tool_registry_and_list(
+            "explore",
+            provider.clone(),
+            pool.clone(),
+            directory.path().to_path_buf(),
+            vec![Arc::new(NamedTool("batch"))],
+        );
+        assert!(batch.err().unwrap().to_string().contains("reserved"));
+
+        let duplicate = build_tool_registry_and_list(
+            "build",
+            provider,
+            pool,
+            directory.path().to_path_buf(),
+            vec![Arc::new(NamedTool("websearch"))],
+        );
+        assert!(
+            duplicate
+                .err()
+                .unwrap()
+                .to_string()
+                .contains("Duplicate tool name")
+        );
+    }
 }

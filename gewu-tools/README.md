@@ -6,13 +6,13 @@
 
 ### Available Tools
 
-- **`FsTool`**: Provides file system operations (read, write, delete, list).
-- **`BashTool`**: Executes shell commands securely.
-- **`GrepTool`**: Searches for patterns in files.
-- **`WebFetchTool`**: Fetches content from URLs.
-- **`WebSearchTool`** (`websearch`): Performs web searches through Exa.
-- **`CodeSearchTool`** (`codesearch`): Performs semantic code searches through Exa.
-- **`ListTool`**: Lists files in directories.
+- **`ApplyPatchTool`** (`apply_patch`): Applies validated multi-file add, update, delete, and move operations.
+- **`ReadFileTool`**, **`WriteFileTool`**, and **`EditFileTool`**: Read and modify workspace files.
+- **`GlobTool`**, **`GrepTool`**, and **`ListTool`**: Search and inspect the workspace.
+- **`BashTool`**: Executes shell commands in a controlled working directory.
+- **`WebFetchTool`**, **`WebSearchTool`**, and **`CodeSearchTool`**: Fetch and search external information.
+- **`TodoReadTool`** and **`TodoWriteTool`**: Maintain an agent task list.
+- **`BatchTool`**: Executes independent tool calls concurrently, including shell and mutation tools; nested batches are rejected.
 
 ### MCP (Model Context Protocol)
 
@@ -20,20 +20,12 @@
 
 ## Usage
 
-To use these tools, simply add them to your agent's configuration:
+Tools implement `gewu_core::traits::Tool` and can be supplied through `AgentBuilder::with_tools`. Filesystem tools receive the working directory they are allowed to access:
 
 ```rust
-use gewu_tools::{FsTool, BashTool, GrepTool};
-use gewu_core::Tool;
+use gewu_tools::ApplyPatchTool;
 
-let tools = vec![
-    Box::new(FsTool::new()),
-    Box::new(BashTool::new()),
-    Box::new(GrepTool::new()),
-];
-
-let agent = Agent::builder()
-    .tools(tools)
-    // ...
-    .build()?;
+let tool = ApplyPatchTool {
+    working_directory: std::env::current_dir()?,
+};
 ```

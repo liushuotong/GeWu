@@ -17,7 +17,7 @@
 Start a session with a specific agent type:
 
 ```bash
-cargo run --bin gewu-cli -- --agent build
+cargo run -p gewu-cli -- run --agent build --interactive
 ```
 
 This will launch an interactive chat session with the `build` agent.
@@ -27,7 +27,27 @@ This will launch an interactive chat session with the `build` agent.
 You can provide an initial prompt to start the conversation:
 
 ```bash
-cargo run --bin gewu-cli -- --agent explore "Analyze the project structure"
+cargo run -p gewu-cli -- run --agent explore "Analyze the project structure"
+```
+
+### View Persistent Memory
+
+List stored sessions without initializing an LLM provider:
+
+```bash
+cargo run -p gewu-cli -- view
+```
+
+Display one session's messages:
+
+```bash
+cargo run -p gewu-cli -- view <SESSION_ID>
+```
+
+Use `--db-path` with either subcommand to select another database:
+
+```bash
+cargo run -p gewu-cli -- view <SESSION_ID> --db-path /path/to/gewu.db
 ```
 
 ### Configuration
@@ -42,9 +62,10 @@ If both `.json` and `.jsonc` exist in the same location, `.json` takes precedenc
 
 | Option | Description |
 |--------|-------------|
-| `endpoint` | Custom OpenAI Base URL (e.g., `http://localhost:8080/v1`) |
+| `base_url` | Custom provider base URL (e.g., `http://localhost:8080/v1`) |
 | `api_key` | API key for the LLM provider |
 | `model` | Model to use (default: `gpt-5.3-codex`) |
+| `provider` | Provider protocol: `openai` or `anthropic` |
 | `mcpServers` | MCP server configurations (see below) |
 
 **Environment variables** (take precedence over config file):
@@ -57,9 +78,10 @@ If both `.json` and `.jsonc` exist in the same location, `.json` takes precedenc
 ```jsonc
 {
   // LLM settings
-  "endpoint": "http://localhost:8080/v1",
+  "base_url": "http://localhost:8080/v1",
   "api_key": "sk-...",
   "model": "gpt-4o",
+  "provider": "openai",
 
   // MCP servers
   "mcpServers": {
@@ -71,10 +93,12 @@ If both `.json` and `.jsonc` exist in the same location, `.json` takes precedenc
 }
 ```
 
-### CLI Options
+### Run Options
 
 - `--llm-config <PATH>`: Load configuration from a specific file (overrides default search path).
 - `--list-agents`: List available agent types.
 - `--list-models`: List available models from the configured provider.
 - `--session-id <ID>`: Resume a specific session.
 - `--db-path <PATH>`: Use a custom database file.
+
+Show command-specific options with `gewu-cli run --help` or `gewu-cli view --help`.

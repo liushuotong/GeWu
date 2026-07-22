@@ -1,8 +1,8 @@
 use crate::state::AppState;
 use axum::{
+    Json,
     extract::{Query, State},
     response::sse::{Event, KeepAlive, Sse},
-    Json,
 };
 use futures::Stream;
 use futures::StreamExt;
@@ -49,10 +49,20 @@ impl SseEvent {
         }
     }
 
-    pub fn tool_finish(tool: String, output: String) -> Self {
+    pub fn tool_finish(
+        tool: String,
+        title: String,
+        output: String,
+        metadata: std::collections::HashMap<String, serde_json::Value>,
+    ) -> Self {
         Self {
             event_type: "tool_finish".to_string(),
-            data: serde_json::json!({ "tool": tool, "output": output }),
+            data: serde_json::json!({
+                "tool": tool,
+                "title": title,
+                "output": output,
+                "metadata": metadata,
+            }),
         }
     }
 
@@ -83,11 +93,15 @@ pub async fn handle_chat(
     Json(req): Json<ChatRequest>,
 ) -> Result<Sse<impl Stream<Item = Result<Event, std::convert::Infallible>>>, AppError> {
     info!("handle_chat called for session: {}", req.session_id);
-    
+
     let auth = app.auth_token.read().await;
-    let valid = query.token.as_ref().map(|t| auth.validate(t)).unwrap_or(false);
+    let valid = query
+        .token
+        .as_ref()
+        .map(|t| auth.validate(t))
+        .unwrap_or(false);
     drop(auth);
-    
+
     if !valid {
         warn!("Unauthorized chat attempt");
         return Err(AppError::Unauthorized);
@@ -95,18 +109,18 @@ pub async fn handle_chat(
 
     let agent_handle = app.get_agent(&req.session_id).await;
     let agent_handle = agent_handle.ok_or(AppError::SessionNotFound)?;
-    
+
     info!("Agent found for session: {}, starting chat", req.session_id);
 
     let (tx, rx) = tokio::sync::mpsc::channel(100);
     let message = req.message.clone();
-    
+
     tokio::spawn(async move {
         let mut agent = agent_handle.agent.lock().await;
         info!("Agent locked, calling ask() with message: {}", message);
         let stream = agent.ask(&message);
         futures::pin_mut!(stream);
-        
+
         let mut event_count = 0usize;
         while let Some(result) = stream.next().await {
             event_count += 1;
@@ -123,9 +137,14 @@ pub async fn handle_chat(
                         info!("tool_start: {} - {}", tool, input);
                         SseEvent::tool_start(tool, input).to_sse_event()
                     }
-                    gewu_core::types::AgentEvent::ToolFinish { tool, output } => {
+                    gewu_core::types::AgentEvent::ToolFinish {
+                        tool,
+                        title,
+                        output,
+                        metadata,
+                    } => {
                         info!("tool_finish: {} - {}", tool, output);
-                        SseEvent::tool_finish(tool, output).to_sse_event()
+                        SseEvent::tool_finish(tool, title, output, metadata).to_sse_event()
                     }
                     gewu_core::types::AgentEvent::Finish { response } => {
                         info!("finish: {}", response);
@@ -141,7 +160,11 @@ pub async fn handle_chat(
                     SseEvent::error(e.to_string()).to_sse_event()
                 }
             };
-            if tx.send(Ok::<Event, std::convert::Infallible>(sse_event)).await.is_err() {
+            if tx
+                .send(Ok::<Event, std::convert::Infallible>(sse_event))
+                .await
+                .is_err()
+            {
                 warn!("SSE channel closed, stopping stream");
                 break;
             }
@@ -180,5 +203,25 @@ impl axum::response::IntoResponse for AppError {
                 (axum::http::StatusCode::INTERNAL_SERVER_ERROR, msg).into_response()
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn tool_finish_preserves_title_and_metadata() {
+        let event = SseEvent::tool_finish(
+            "apply_patch".to_string(),
+            "Patch result".to_string(),
+            "updated".to_string(),
+            std::collections::HashMap::from([("diff".to_string(), serde_json::json!("patch"))]),
+        );
+
+        assert_eq!(event.data["tool"], "apply_patch");
+        assert_eq!(event.data["title"], "Patch result");
+        assert_eq!(event.data["output"], "updated");
+        assert_eq!(event.data["metadata"]["diff"], "patch");
     }
 }

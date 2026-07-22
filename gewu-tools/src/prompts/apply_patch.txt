@@ -1,0 +1,25 @@
+Apply a validated patch to one or more files inside the working directory.
+
+The patch must use this format:
+
+*** Begin Patch
+*** Add File: path/to/new.txt
++Every content line starts with +
+*** Update File: path/to/existing.txt
+*** Move to: path/to/new-name.txt
+@@ optional context anchor
+-old line
++new line
+ context retained in both versions
+*** Delete File: path/to/obsolete.txt
+*** End Patch
+
+Supported operations are Add File, Update File, Delete File, and an optional Move to immediately after Update File. Use *** End of File after an update chunk to require an EOF match. Related changes should be submitted in one patch so the complete change can be validated before files are modified.
+
+The patch may be supplied directly or wrapped in a `cat <<'PATCH'`/`<<PATCH` heredoc. A chunk containing only added lines appends them to the end of the file.
+
+Paths must remain inside the working directory. Add and move destinations must not already exist. Update and delete sources must be regular UTF-8 text files. Do not invoke apply_patch through batch.
+
+Once filesystem mutation begins, the transaction continues to completion even if the caller stops waiting. An explicit execution abort requests rollback at the next safe transaction boundary.
+
+Limits: patch text 1 MiB and 100,000 lines; 256 file operations; 4,096 chunks and 200,000 changed/context lines; 8 MiB and 500,000 lines per source or result file; 32 MiB total transaction content. Large diffs are omitted from metadata rather than generated without bounds.
