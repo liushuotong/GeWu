@@ -64,12 +64,17 @@ pub fn resolve_safe_path(root: impl AsRef<Path>, user_path: impl AsRef<Path>) ->
     let root = root.as_ref();
     let user_path = user_path.as_ref();
 
-    // If user_path is absolute, it must start with root.
+    // If user_path is absolute, it must still be within root.
     // If it is relative, we join it to root.
-    let joined = if user_path.is_absolute() {
-        let user_path_ref: &Path = user_path.as_ref();
-        if user_path_ref == Path::new("/") {
-            return Ok(root.join(".").into());
+    let joined: PathBuf = if user_path.is_absolute() {
+        // SECURITY: Absolute paths must start with root to prevent escaping
+        // via paths like /etc/passwd or /home/user/../root
+        if !user_path.starts_with(root) {
+            return Err(anyhow::anyhow!(
+                "Absolute path {:?} is outside of working directory {:?}",
+                user_path,
+                root
+            ));
         }
         user_path.to_path_buf()
     } else {
@@ -412,5 +417,88 @@ mod tests {
         let result = resolve_safe_write_path(root.path(), "escape/file.txt").await;
         assert!(result.is_err());
         Ok(())
+    }
+
+    // ============================================
+    // Tests for resolve_safe_path security fix
+    // ============================================
+
+    #[test]
+    fn resolve_safe_path_rejects_absolute_outside_root() {
+        // Absolute paths outside root should be rejected
+        let root = Path::new("/home/user/project");
+        let result = resolve_safe_path(root, "/etc/passwd");
+        assert!(result.is_err(), "Absolute path /etc/passwd should be rejected");
+
+        let result = resolve_safe_path(root, "/var/log");
+        assert!(result.is_err(), "Absolute path /var/log should be rejected");
+
+        let result = resolve_safe_path(root, "/home/user/../root");
+        assert!(result.is_err(), "Path with parent traversal should be rejected");
+    }
+
+    #[test]
+    fn resolve_safe_path_accepts_absolute_inside_root() {
+        // Absolute paths inside root should be accepted
+        let root = Path::new("/home/user/project");
+        let result = resolve_safe_path(root, "/home/user/project/src/main.rs");
+        assert!(result.is_ok(), "Absolute path inside root should be accepted");
+
+        let result = resolve_safe_path(root, "/home/user/project/./src");
+        assert!(result.is_ok(), "Absolute path with current dir should be accepted");
+    }
+
+    #[test]
+    fn resolve_safe_path_accepts_relative_paths() {
+        // Relative paths joined to root should work
+        let root = Path::new("/home/user/project");
+        let result = resolve_safe_path(root, "src/main.rs");
+        assert!(result.is_ok());
+
+        let result = resolve_safe_path(root, "./src/../src/lib.rs");
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn resolve_safe_path_rejects_parent_traversal_relative() {
+        // Parent traversal from relative paths should be rejected
+        let root = Path::new("/home/user/project");
+        let result = resolve_safe_path(root, "../outside.txt");
+        assert!(result.is_err(), "Parent traversal should be rejected");
+
+        let result = resolve_safe_path(root, "foo/../../bar");
+        assert!(result.is_err(), "Deep parent traversal should be rejected");
+    }
+
+    #[test]
+    fn resolve_safe_path_normalizes_dots() {
+        // Verify that the function properly normalizes paths
+        let root = Path::new("/home/user/project");
+
+        // ./foo becomes /home/user/project/foo
+        let result = resolve_safe_path(root, "./foo").unwrap();
+        assert_eq!(result, Path::new("/home/user/project/foo"));
+
+        // foo/./bar becomes /home/user/project/foo/bar
+        let result = resolve_safe_path(root, "foo/./bar").unwrap();
+        assert_eq!(result, Path::new("/home/user/project/foo/bar"));
+    }
+
+    #[test]
+    fn resolve_safe_path_edge_case_root() {
+        // Edge case: root is root itself
+        let root = Path::new("/");
+
+        // Absolute path outside / should be rejected
+        let result = resolve_safe_path(root, "/etc");
+        // Since / is root, /etc is not inside /
+        // Actually, all absolute paths start with / so they're "inside" /
+        // The check is: does /etc start with /? Yes it does.
+        // But after normalization, we should still be inside /
+        assert!(result.is_ok(), "/etc should be valid relative to /");
+
+        // Relative path should work
+        let result = resolve_safe_path(root, "home");
+        assert!(result.is_ok());
     }
 }
