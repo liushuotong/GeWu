@@ -320,6 +320,30 @@ async fn run(cli: RunArgs) -> Result<()> {
         None => None,
     };
 
+    // Discover skills from configured paths
+    let skill_paths: Vec<std::path::PathBuf> = file_config
+        .skills
+        .iter()
+        .flatten()
+        .map(|p| {
+            let path = std::path::PathBuf::from(p);
+            if path.is_absolute() {
+                path
+            } else {
+                env::current_dir()
+                    .map(|dir| dir.join(path))
+                    .unwrap_or_else(|_| std::path::PathBuf::from(p))
+            }
+        })
+        .collect();
+    let skills = if skill_paths.is_empty() {
+        Vec::new()
+    } else {
+        let found = gewu_tools::skill::discover(&skill_paths);
+        info!("Discovered {} skills", found.len());
+        found
+    };
+
     // Create Agent
     let (mut agent, _registry) = registry::create_agent(
         &cli.agent,
@@ -328,6 +352,7 @@ async fn run(cli: RunArgs) -> Result<()> {
         session_id,
         mcp_tools,
         log_writer,
+        skills,
     )
     .await?;
     info!("Initialized agent: {}", cli.agent);

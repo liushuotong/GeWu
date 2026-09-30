@@ -7,8 +7,8 @@ use gewu_storage::SqliteMemory;
 use gewu_tools::task::AgentFactory;
 use gewu_tools::{
     ApplyPatchTool, BashTool, BatchTool, CodeSearchTool, EditFileTool, GlobTool, GrepTool,
-    ListTool, ReadFileTool, TaskTool, TodoItem, TodoReadTool, TodoWriteTool, WebFetchTool,
-    WebSearchTool, WriteFileTool,
+    ListTool, ReadFileTool, SkillInfo, SkillTool, TaskTool, TodoItem, TodoReadTool, TodoWriteTool,
+    WebFetchTool, WebSearchTool, WriteFileTool,
 };
 use serde_json::Value;
 use sqlx::SqlitePool;
@@ -20,6 +20,7 @@ const RESERVED_ADDITIONAL_TOOL_NAMES: &[&str] = &[
     "write_file",
     "edit_file",
     "task",
+    "skill",
     "todowrite",
     "todoread",
     "batch",
@@ -75,6 +76,7 @@ impl ToolRegistry for ToolRegistryImpl {
 struct SqliteAgentFactory {
     provider: Arc<dyn LlmProvider>,
     pool: SqlitePool,
+    skills: Vec<SkillInfo>,
 }
 
 #[async_trait]
@@ -92,6 +94,7 @@ impl AgentFactory for SqliteAgentFactory {
             session_id.clone(),
             Vec::new(),
             None,
+            self.skills.clone(),
         )
         .await
         .map_err(|e| -> Box<dyn Error + Send + Sync> { e.to_string().into() })?;
@@ -100,10 +103,11 @@ impl AgentFactory for SqliteAgentFactory {
 }
 
 /// Builds the task tool wired to the CLI registry.
-fn task_tool(provider: Arc<dyn LlmProvider>, pool: SqlitePool) -> TaskTool {
+fn task_tool(provider: Arc<dyn LlmProvider>, pool: SqlitePool, skills: Vec<SkillInfo>) -> TaskTool {
     let factory = Arc::new(SqliteAgentFactory {
         provider,
         pool,
+        skills,
     });
     let agents = list_available_agents()
         .into_iter()
@@ -118,12 +122,13 @@ fn build_tool_registry_and_list(
     pool: SqlitePool,
     working_directory: std::path::PathBuf,
     additional_tools: Vec<Arc<dyn Tool>>,
+    skills: Vec<SkillInfo>,
 ) -> Result<(Arc<dyn ToolRegistry>, Vec<Arc<dyn Tool>>)> {
-    let tools: Vec<Box<dyn Tool>> = match name {
+    let mut tools: Vec<Box<dyn Tool>> = match name {
         "build" => {
             let todos = Arc::new(Mutex::new(Vec::<TodoItem>::new()));
             vec![
-                Box::new(task_tool(provider.clone(), pool.clone())),
+                Box::new(task_tool(provider.clone(), pool.clone(), skills.clone())),
                 Box::new(ReadFileTool {
                     working_directory: working_directory.clone(),
                 }),
@@ -182,7 +187,7 @@ fn build_tool_registry_and_list(
         "general" => {
             let todos = Arc::new(Mutex::new(Vec::<TodoItem>::new()));
             vec![
-                Box::new(task_tool(provider.clone(), pool.clone())),
+                Box::new(task_tool(provider.clone(), pool.clone(), skills.clone())),
                 Box::new(ReadFileTool {
                     working_directory: working_directory.clone(),
                 }),
@@ -217,6 +222,10 @@ fn build_tool_registry_and_list(
         }
         _ => return Err(anyhow!("Unknown agent type: {}", name)),
     };
+
+    if !skills.is_empty() {
+        tools.push(Box::new(SkillTool::new(skills)));
+    }
 
     let mut tools_arc: Vec<Arc<dyn Tool>> = tools
         .into_iter()
@@ -254,6 +263,7 @@ pub async fn create_agent(
     session_id: String,
     additional_tools: Vec<Arc<dyn Tool>>,
     log: Option<RequestLog>,
+    skills: Vec<SkillInfo>,
 ) -> Result<(Agent, Arc<dyn ToolRegistry>)> {
     let working_directory = std::env::current_dir()?;
 
@@ -265,24 +275,30 @@ pub async fn create_agent(
         pool,
         working_directory,
         additional_tools,
+        skills.clone(),
     )?;
 
     let batch_tool: Arc<dyn Tool> = Arc::new(BatchTool::new(registry.clone()));
     let mut all_tools = vec![batch_tool];
     all_tools.extend(tools_arc);
 
-    let system_prompt = match name {
+    let mut system_prompt = match name {
         "build" => include_str!("prompts/build.txt"),
         "explore" => include_str!("prompts/explore.txt"),
         "general" => include_str!("prompts/general.txt"),
         _ => return Err(anyhow!("Unknown agent type: {}", name)),
-    };
+    }
+    .to_string();
+    if !skills.is_empty() {
+        system_prompt.push_str("\n\n");
+        system_prompt.push_str(&gewu_tools::skill::available_skills_section(&skills));
+    }
 
     let mut builder = Agent::builder()
         .llm(provider)
         .with_tools(all_tools)
         .memory(Box::new(memory))
-        .system_prompt(system_prompt);
+        .system_prompt(&system_prompt);
     if let Some(log) = log {
         builder = builder.with_log(log);
     }
@@ -364,6 +380,7 @@ mod tests {
                 pool.clone(),
                 directory.path().to_path_buf(),
                 Vec::new(),
+                Vec::new(),
             )
             .unwrap();
             assert!(tools.iter().any(|tool| tool.name() == "apply_patch"));
@@ -374,6 +391,7 @@ mod tests {
             provider,
             pool,
             directory.path().to_path_buf(),
+            Vec::new(),
             Vec::new(),
         )
         .unwrap();
@@ -393,11 +411,41 @@ mod tests {
             "session".to_string(),
             Vec::new(),
             Some(log),
+            Vec::new(),
         )
         .await
         .expect("create_agent should accept a request log");
 
         assert!(!agent.list_tools().is_empty());
+    }
+
+    #[tokio::test]
+    async fn create_agent_registers_skill_tool_when_skills_exist() {
+        let pool = SqlitePool::connect_lazy("sqlite::memory:").unwrap();
+        let provider: Arc<dyn LlmProvider> = Arc::new(DummyLlm);
+        let directory = tempdir().unwrap();
+        let skill_dir = directory.path().join("demo");
+        std::fs::create_dir_all(&skill_dir).unwrap();
+        std::fs::write(
+            skill_dir.join("SKILL.md"),
+            "---\nname: demo\ndescription: Demo skill\n---\nDemo body",
+        )
+        .unwrap();
+        let skills = gewu_tools::skill::discover(&[directory.path().to_path_buf()]);
+
+        let (agent, _) = create_agent(
+            "build",
+            provider,
+            pool,
+            "session".to_string(),
+            Vec::new(),
+            None,
+            skills,
+        )
+        .await
+        .expect("create_agent should register the skill tool");
+
+        assert!(agent.list_tools().iter().any(|name| name == "skill"));
     }
 
     #[tokio::test]
@@ -412,6 +460,7 @@ mod tests {
             pool.clone(),
             directory.path().to_path_buf(),
             vec![Arc::new(NamedTool("apply_patch"))],
+            Vec::new(),
         );
         assert!(reserved.err().unwrap().to_string().contains("reserved"));
 
@@ -421,6 +470,7 @@ mod tests {
             pool.clone(),
             directory.path().to_path_buf(),
             vec![Arc::new(NamedTool("batch"))],
+            Vec::new(),
         );
         assert!(batch.err().unwrap().to_string().contains("reserved"));
 
@@ -430,6 +480,7 @@ mod tests {
             pool,
             directory.path().to_path_buf(),
             vec![Arc::new(NamedTool("websearch"))],
+            Vec::new(),
         );
         assert!(
             duplicate

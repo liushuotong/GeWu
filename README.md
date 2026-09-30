@@ -83,6 +83,7 @@ The CLI provides pre-configured agent types optimized for different use cases:
 | Todo Write | `todowrite` | Write/update the task list |
 | Batch | `batch` | Execute multiple tools in parallel |
 | Task | `task` | Launch sub-agents (build/explore/general) for complex tasks; resumable via `task_id` |
+| Skill | `skill` | Load skill instructions from config-declared skill directories into the conversation |
 
 ## Getting Started
 
@@ -116,6 +117,7 @@ The CLI uses a JSON config file. By default, it looks for `config.json` in the p
   "api_key": "sk-...",
   "model": "gpt-4",
   "log": "gewu-requests.jsonl",
+  "skills": ["skills"],
   "mcp_servers": []
 }
 ```
@@ -123,6 +125,12 @@ The CLI uses a JSON config file. By default, it looks for `config.json` in the p
 When `log` is set, every request sent to the LLM provider (including tool
 definitions) is recorded as one JSONL line in the file:
 `{"timestamp": "...", "request": {...}}`.
+
+When `skills` is set, each directory is scanned for `SKILL.md` files
+(`**/SKILL.md`) with `name` (required) and `description` frontmatter. Discovered
+skills are listed in the agent's system prompt and can be loaded with the
+`skill` tool, which returns the skill's markdown body plus up to 10 sampled
+companion files from its directory.
 
 **Configuration priority (highest to lowest):**
 1. CLI arguments (`--endpoint`, `--api-key`, `--model`, `--config`)

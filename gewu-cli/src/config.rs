@@ -13,6 +13,9 @@ pub struct Config {
     pub provider: Option<String>,
     /// Optional path to a log file recording every wire LLM request as JSONL.
     pub log: Option<String>,
+    /// Optional directories to scan for skills (files named `SKILL.md`).
+    #[serde(default)]
+    pub skills: Option<Vec<String>>,
     #[serde(rename = "mcpServers", default)]
     pub mcp_servers: std::collections::HashMap<String, McpServerConfig>,
 }
@@ -108,5 +111,21 @@ mod tests {
     fn log_is_optional() {
         let config: Config = serde_json::from_str("{}").unwrap();
         assert!(config.log.is_none());
+    }
+
+    #[test]
+    fn parses_skills_option() {
+        let config: Config =
+            serde_json::from_str(r#"{"skills": ["skills", "/abs/skills"]}"#).unwrap();
+        assert_eq!(
+            config.skills,
+            Some(vec!["skills".to_string(), "/abs/skills".to_string()])
+        );
+    }
+
+    #[test]
+    fn skills_is_optional() {
+        let config: Config = serde_json::from_str("{}").unwrap();
+        assert!(config.skills.is_none());
     }
 }

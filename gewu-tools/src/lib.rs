@@ -23,6 +23,7 @@
 //! | [`TodoWriteTool`](todo::TodoWriteTool) | `todowrite` | Write the task list |
 //! | [`BatchTool`](batch::BatchTool) | `batch` | Execute multiple tools at once |
 //! | [`TaskTool`](task::TaskTool) | `task` | Launch sub-agents for complex tasks |
+//! | [`SkillTool`](skill::SkillTool) | `skill` | Load skill instructions into the conversation |
 //!
 //! # MCP Tools
 //!
@@ -64,6 +65,7 @@ pub mod list;
 pub mod mcp;
 pub mod replacers;
 pub mod search;
+pub mod skill;
 pub mod task;
 pub mod todo;
 pub mod web_fetch;
@@ -75,6 +77,7 @@ pub use fs::{EditFileTool, GlobTool, ReadFileTool, WriteFileTool};
 pub use grep::GrepTool;
 pub use list::ListTool;
 pub use search::{CodeSearchTool, WebSearchTool};
+pub use skill::{SkillInfo, SkillTool};
 pub use task::{AgentFactory, TaskTool};
 pub use todo::{TodoItem, TodoReadTool, TodoWriteTool};
 pub use web_fetch::WebFetchTool;
