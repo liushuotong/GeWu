@@ -2,7 +2,6 @@ pub mod config;
 pub mod mcp_loader;
 mod memory_view;
 pub mod registry;
-pub mod tools;
 
 use anyhow::{Context, Result};
 use clap::{Args, Parser, Subcommand};

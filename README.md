@@ -82,6 +82,7 @@ The CLI provides pre-configured agent types optimized for different use cases:
 | Todo Read | `todoread` | Read the task list |
 | Todo Write | `todowrite` | Write/update the task list |
 | Batch | `batch` | Execute multiple tools in parallel |
+| Task | `task` | Launch sub-agents (build/explore/general) for complex tasks; resumable via `task_id` |
 
 ## Getting Started
 

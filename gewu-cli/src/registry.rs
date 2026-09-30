@@ -1,17 +1,18 @@
-use crate::tools::TaskTool;
 use anyhow::{Result, anyhow};
 use async_trait::async_trait;
 use gewu_core::Agent;
 use gewu_core::traits::{LlmProvider, RequestLog, Tool, ToolRegistry};
 use gewu_core::types::{ToolContext, ToolResult};
 use gewu_storage::SqliteMemory;
+use gewu_tools::task::AgentFactory;
 use gewu_tools::{
     ApplyPatchTool, BashTool, BatchTool, CodeSearchTool, EditFileTool, GlobTool, GrepTool,
-    ListTool, ReadFileTool, TodoItem, TodoReadTool, TodoWriteTool, WebFetchTool, WebSearchTool,
-    WriteFileTool,
+    ListTool, ReadFileTool, TaskTool, TodoItem, TodoReadTool, TodoWriteTool, WebFetchTool,
+    WebSearchTool, WriteFileTool,
 };
 use serde_json::Value;
 use sqlx::SqlitePool;
+use std::error::Error;
 use std::sync::{Arc, Mutex};
 
 const RESERVED_ADDITIONAL_TOOL_NAMES: &[&str] = &[
@@ -70,6 +71,47 @@ impl ToolRegistry for ToolRegistryImpl {
     }
 }
 
+/// Creates sub-agents through the CLI registry for the [`TaskTool`].
+struct SqliteAgentFactory {
+    provider: Arc<dyn LlmProvider>,
+    pool: SqlitePool,
+}
+
+#[async_trait]
+impl AgentFactory for SqliteAgentFactory {
+    async fn create(
+        &self,
+        subagent_type: &str,
+        resume: Option<String>,
+    ) -> Result<(Agent, String), Box<dyn Error + Send + Sync>> {
+        let session_id = resume.unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
+        let (agent, _registry) = create_agent(
+            subagent_type,
+            self.provider.clone(),
+            self.pool.clone(),
+            session_id.clone(),
+            Vec::new(),
+            None,
+        )
+        .await
+        .map_err(|e| -> Box<dyn Error + Send + Sync> { e.to_string().into() })?;
+        Ok((agent, session_id))
+    }
+}
+
+/// Builds the task tool wired to the CLI registry.
+fn task_tool(provider: Arc<dyn LlmProvider>, pool: SqlitePool) -> TaskTool {
+    let factory = Arc::new(SqliteAgentFactory {
+        provider,
+        pool,
+    });
+    let agents = list_available_agents()
+        .into_iter()
+        .map(|a| (a.name, a.description))
+        .collect();
+    TaskTool::new(factory, agents)
+}
+
 fn build_tool_registry_and_list(
     name: &str,
     provider: Arc<dyn LlmProvider>,
@@ -81,7 +123,7 @@ fn build_tool_registry_and_list(
         "build" => {
             let todos = Arc::new(Mutex::new(Vec::<TodoItem>::new()));
             vec![
-                Box::new(TaskTool::new(provider.clone(), pool.clone())),
+                Box::new(task_tool(provider.clone(), pool.clone())),
                 Box::new(ReadFileTool {
                     working_directory: working_directory.clone(),
                 }),
@@ -140,7 +182,7 @@ fn build_tool_registry_and_list(
         "general" => {
             let todos = Arc::new(Mutex::new(Vec::<TodoItem>::new()));
             vec![
-                Box::new(TaskTool::new(provider.clone(), pool.clone())),
+                Box::new(task_tool(provider.clone(), pool.clone())),
                 Box::new(ReadFileTool {
                     working_directory: working_directory.clone(),
                 }),

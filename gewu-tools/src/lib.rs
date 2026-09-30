@@ -22,6 +22,7 @@
 //! | [`TodoReadTool`](todo::TodoReadTool) | `todoread` | Read the task list |
 //! | [`TodoWriteTool`](todo::TodoWriteTool) | `todowrite` | Write the task list |
 //! | [`BatchTool`](batch::BatchTool) | `batch` | Execute multiple tools at once |
+//! | [`TaskTool`](task::TaskTool) | `task` | Launch sub-agents for complex tasks |
 //!
 //! # MCP Tools
 //!
@@ -63,6 +64,7 @@ pub mod list;
 pub mod mcp;
 pub mod replacers;
 pub mod search;
+pub mod task;
 pub mod todo;
 pub mod web_fetch;
 
@@ -73,5 +75,6 @@ pub use fs::{EditFileTool, GlobTool, ReadFileTool, WriteFileTool};
 pub use grep::GrepTool;
 pub use list::ListTool;
 pub use search::{CodeSearchTool, WebSearchTool};
+pub use task::{AgentFactory, TaskTool};
 pub use todo::{TodoItem, TodoReadTool, TodoWriteTool};
 pub use web_fetch::WebFetchTool;
