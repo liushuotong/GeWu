@@ -27,10 +27,17 @@ impl Error for MockError {}
 
 #[async_trait]
 impl LlmProvider for MockLlm {
-    async fn stream_response<'a>(
-        &'a self,
+    fn build(
+        &self,
         _messages: &[Message],
         _tools: &[Arc<dyn Tool>],
+    ) -> Result<Value, Box<dyn Error + Send + Sync>> {
+        Ok(serde_json::json!({ "model": "mock" }))
+    }
+
+    async fn send<'a>(
+        &'a self,
+        _request: Value,
     ) -> Result<
         BoxStream<'a, Result<ProviderEvent, Box<dyn Error + Send + Sync>>>,
         Box<dyn Error + Send + Sync>,

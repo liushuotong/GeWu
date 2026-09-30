@@ -48,7 +48,7 @@ pub use experiences::SearchExperiencesTool;
 pub use tools::execute_tool_with_panic_recovery;
 
 use crate::middleware::TruncationService;
-use crate::traits::{Experiences, LlmProvider, Memory, Tool, ToolRegistry};
+use crate::traits::{Experiences, LlmProvider, Memory, RequestLog, Tool, ToolRegistry};
 use crate::types::{AgentEvent, ContentPart, Message, ToolContext, ToolResult};
 use anyhow::{Context, Result};
 use async_trait::async_trait;
@@ -89,6 +89,9 @@ pub struct Agent {
     /// Optional experiences store for recording and retrieving past experiences.
     #[allow(dead_code)]
     experiences: Option<Arc<dyn Experiences>>,
+    /// Optional request log; when set, every LLM request is recorded by the
+    /// provider's `stream_response` (see [`crate::traits::RequestLog`]).
+    log: Option<RequestLog>,
 }
 
 /// Builder for constructing `Agent` instances.
@@ -107,6 +110,8 @@ pub struct AgentBuilder {
     context_limit: usize,
     /// Experiences store (optional).
     experiences: Option<Arc<dyn Experiences>>,
+    /// Request log for recording LLM requests (optional).
+    log: Option<RequestLog>,
 }
 
 /// Extracts a readable message from a panic payload.
@@ -143,6 +148,7 @@ impl Default for AgentBuilder {
             memory: None,
             context_limit: 128_000,
             experiences: None,
+            log: None,
         }
     }
 }
@@ -226,7 +232,10 @@ impl Agent {
                 trace!("LLM request messages: {:?}", messages);
 
                 let tools_clone = self.tools.clone();
-                let mut stream = self.llm.stream_response(&messages, tools_clone.as_slice()).await
+                let mut stream = self
+                    .llm
+                    .stream_response(&messages, tools_clone.as_slice(), self.log.as_ref())
+                    .await
                     .map_err(|e| anyhow::anyhow!(e))?;
 
                 while let Some(event_result) = stream.next().await {
@@ -391,6 +400,16 @@ impl AgentBuilder {
         self
     }
 
+    /// Sets the request log used to record every LLM request.
+    ///
+    /// When set, each request sent to the LLM provider is recorded as one JSONL
+    /// line: `{"timestamp": "...", "request": {...wire request...}}`. The log
+    /// handle can be shared with other agents (`RequestLog` is an `Arc`).
+    pub fn with_log(mut self, log: RequestLog) -> Self {
+        self.log = Some(log);
+        self
+    }
+
     /// Builds the `Agent` instance.
     ///
     /// # Errors
@@ -415,7 +434,199 @@ impl AgentBuilder {
             truncation: TruncationService::new(),
             session_id: Uuid::new_v4().to_string(),
             experiences: self.experiences,
+            log: self.log,
         };
         Ok(agent)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::types::ProviderEvent;
+    use futures::stream::BoxStream;
+    use serde_json::Value;
+    use std::io::Write;
+    use std::sync::Mutex;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    /// Records written bytes in a shared buffer for assertions.
+    #[derive(Clone, Default)]
+    struct SharedBuffer(Arc<Mutex<Vec<u8>>>);
+
+    impl SharedBuffer {
+        /// Returns a shareable request-log handle over this buffer.
+        fn handle(&self) -> RequestLog {
+            Arc::new(Mutex::new(Box::new(self.clone())))
+        }
+
+        fn contents(&self) -> String {
+            String::from_utf8(self.0.lock().unwrap().clone()).unwrap()
+        }
+    }
+
+    impl Write for SharedBuffer {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().unwrap().extend_from_slice(buf);
+            Ok(buf.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    /// A writer that always fails, for best-effort logging tests.
+    struct FailingWriter;
+
+    impl Write for FailingWriter {
+        fn write(&mut self, _buf: &[u8]) -> std::io::Result<usize> {
+            Err(std::io::Error::other("write failed"))
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Err(std::io::Error::other("flush failed"))
+        }
+    }
+
+    /// Builds a canned wire request and streams canned responses.
+    struct MockProvider {
+        responses: Vec<Vec<ProviderEvent>>,
+        call: AtomicUsize,
+    }
+
+    impl MockProvider {
+        fn new(responses: Vec<Vec<ProviderEvent>>) -> Self {
+            Self {
+                responses,
+                call: AtomicUsize::new(0),
+            }
+        }
+
+        fn single_content(delta: &str) -> Self {
+            Self::new(vec![vec![
+                ProviderEvent::ContentDelta {
+                    delta: delta.to_string(),
+                },
+                ProviderEvent::Finish { reason: None },
+            ]])
+        }
+    }
+
+    #[async_trait]
+    impl LlmProvider for MockProvider {
+        fn build(
+            &self,
+            messages: &[Message],
+            tools: &[Arc<dyn Tool>],
+        ) -> Result<Value, Box<dyn Error + Send + Sync>> {
+            Ok(serde_json::json!({
+                "model": "mock",
+                "messages": messages.len(),
+                "tools": tools.len(),
+            }))
+        }
+
+        async fn send<'a>(
+            &'a self,
+            _request: Value,
+        ) -> Result<
+            BoxStream<'a, Result<ProviderEvent, Box<dyn Error + Send + Sync>>>,
+            Box<dyn Error + Send + Sync>,
+        > {
+            let index = self.call.fetch_add(1, Ordering::SeqCst);
+            let events = self.responses.get(index).cloned().unwrap_or_default();
+            Ok(Box::pin(futures::stream::iter(events.into_iter().map(Ok))))
+        }
+
+        async fn list_models(&self) -> Result<Vec<String>, Box<dyn Error + Send + Sync>> {
+            Ok(Vec::new())
+        }
+    }
+
+    fn parse_log_entries(log: &str) -> Vec<serde_json::Value> {
+        log.lines()
+            .filter(|line| !line.is_empty())
+            .map(|line| serde_json::from_str(line).expect("log line must be valid JSON"))
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn test_with_log_records_turn_requests() -> Result<()> {
+        let buffer = SharedBuffer::default();
+        let mut agent = Agent::builder()
+            .llm(Arc::new(MockProvider::single_content("hi")))
+            .with_log(buffer.handle())
+            .build()?;
+
+        let events = agent.ask("hello world").collect::<Vec<_>>().await;
+        assert!(events.iter().all(|e| e.is_ok()));
+        assert!(events
+            .iter()
+            .any(|e| matches!(e.as_ref().unwrap(), AgentEvent::Finish { .. })));
+
+        let entries = parse_log_entries(&buffer.contents());
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0]["request"]["model"], "mock");
+        assert!(entries[0]["timestamp"].is_string());
+        let messages = entries[0]["request"]["messages"].as_u64().unwrap();
+        assert_eq!(messages, 1);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_with_log_records_compaction_requests() -> Result<()> {
+        let buffer = SharedBuffer::default();
+        let mut agent = Agent::builder()
+            .llm(Arc::new(MockProvider::single_content("summary")))
+            .context_limit(20_100)
+            .with_log(buffer.handle())
+            .build()?;
+
+        // usable = 20_100 - 20_000 buffer = 100 tokens; ~125 tokens overflows.
+        agent
+            .memory
+            .add_message(Message::User {
+                content: vec![ContentPart::Text {
+                    text: "x".repeat(500),
+                }],
+            })
+            .await;
+
+        let compacted = agent.compact_if_needed().await?;
+        assert!(compacted);
+
+        let entries = parse_log_entries(&buffer.contents());
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0]["request"]["model"], "mock");
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_log_write_failure_does_not_break_the_turn() -> Result<()> {
+        let log: RequestLog = Arc::new(Mutex::new(Box::new(FailingWriter)));
+        let mut agent = Agent::builder()
+            .llm(Arc::new(MockProvider::single_content("hi")))
+            .with_log(log)
+            .build()?;
+
+        let events = agent.ask("hello").collect::<Vec<_>>().await;
+        assert!(events.iter().all(|e| e.is_ok()));
+        assert!(events
+            .iter()
+            .any(|e| matches!(e.as_ref().unwrap(), AgentEvent::Finish { .. })));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_without_log_agent_still_works() -> Result<()> {
+        let mut agent = Agent::builder()
+            .llm(Arc::new(MockProvider::single_content("hi")))
+            .build()?;
+
+        let events = agent.ask("hello").collect::<Vec<_>>().await;
+        assert!(events.iter().all(|e| e.is_ok()));
+        assert!(events
+            .iter()
+            .any(|e| matches!(e.as_ref().unwrap(), AgentEvent::Finish { .. })));
+        Ok(())
     }
 }

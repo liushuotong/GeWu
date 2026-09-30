@@ -13,7 +13,6 @@ GeWu (格物) is a comprehensive framework for building and deploying AI agents.
 | **`gewu-storage`** | Persistent memory implementation using SQLite via `sqlx`. Enables multi-session support where conversations persist across process restarts. |
 | **`gewu-tools`** | Collection of built-in tools for filesystem operations, bash execution, web fetching, code search, and MCP (Model Context Protocol) integration. |
 | **`gewu-cli`** | Command-line interface for interacting with GeWu agents. Supports build, explore, and general agent profiles with configurable tools and permissions. |
-| **`gewu-web`** | Web UI built with Axum, providing a browser-based interface with SSE streaming for real-time agent interactions. |
 | **`gewu-graph`** | Stateful graph execution library for building complex workflow orchestration with conditional routing, parallel execution, and nested subgraphs. |
 | **`gewu-rag`** | RAG (Retrieval Augmented Generation) system with document processing (PDF, text), embedding generation, and vector storage integration (Qdrant). |
 | **`gewu-experience`** | Experience memory system with Qdrant vector embeddings for semantic recall of past problem-solving experiences. Includes experience store and recall tools. |
@@ -24,7 +23,6 @@ GeWu (格物) is a comprehensive framework for building and deploying AI agents.
 ```
 ┌─────────────────────────────────────────────────────────────┐
 │                         gewu-cli                            │
-│                         gewu-web                            │
 └─────────────────────────────────────────────────────────────┘
                               │
                               ▼
@@ -101,15 +99,9 @@ cargo run -p gewu-cli -- view
 cargo run -p gewu-cli -- view <SESSION_ID>
 ```
 
-### Running the Web UI
-
-```bash
-cargo run --bin gewu-web -- --port 8080
-```
-
 ### Configuration
 
-The CLI and Web UI use a JSON config file. By default, they look for `config.json` in the project root, or `~/.gewu/config.json`.
+The CLI uses a JSON config file. By default, it looks for `config.json` in the project root, or `~/.gewu/config.json`.
 
 **Config file location priority:**
 1. `--config <path>` CLI argument
@@ -122,9 +114,14 @@ The CLI and Web UI use a JSON config file. By default, they look for `config.jso
   "endpoint": "https://api.openai.com/v1",
   "api_key": "sk-...",
   "model": "gpt-4",
+  "log": "gewu-requests.jsonl",
   "mcp_servers": []
 }
 ```
+
+When `log` is set, every request sent to the LLM provider (including tool
+definitions) is recorded as one JSONL line in the file:
+`{"timestamp": "...", "request": {...}}`.
 
 **Configuration priority (highest to lowest):**
 1. CLI arguments (`--endpoint`, `--api-key`, `--model`, `--config`)

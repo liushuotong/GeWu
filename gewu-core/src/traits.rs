@@ -43,10 +43,13 @@
 
 use crate::types::{ExperienceQuery, Message, ProviderEvent, RecalledExperience, ToolContext, ToolResult};
 use async_trait::async_trait;
+use chrono::Utc;
 use futures::stream::BoxStream;
 use schemars::schema::RootSchema;
 use std::error::Error;
-use std::sync::Arc;
+use std::io::Write;
+use std::sync::{Arc, Mutex};
+use tracing::warn;
 
 /// Defines a tool that the agent can call during execution.
 ///
@@ -148,10 +151,36 @@ pub trait ToolRegistry: Send + Sync {
     fn list_tools(&self) -> Vec<String>;
 }
 
+/// Shareable handle to a request-log writer.
+///
+/// The writer is wrapped in `Arc<Mutex<...>>` so `LlmProvider::stream_response`
+/// can take `&self` and one handle can be shared across agents.
+pub type RequestLog = Arc<Mutex<Box<dyn Write + Send + Sync>>>;
+
+/// Records one wire request as a JSONL line. Generic across providers.
+///
+/// Best-effort: write failures emit a warning and never fail the request.
+fn log_wire_request(log: &RequestLog, request: &serde_json::Value) {
+    let entry = serde_json::json!({
+        "timestamp": Utc::now().to_rfc3339(),
+        "request": request,
+    });
+    if let Ok(mut writer) = log.lock()
+        && let Err(e) = writeln!(writer, "{entry}").and_then(|()| writer.flush())
+    {
+        warn!("Failed to write LLM request log: {}", e);
+    }
+}
+
 /// Provides access to a language model for generating responses.
 ///
 /// The `LlmProvider` trait abstracts over different LLM backends (OpenAI, Anthropic, etc.).
 /// Implement this trait to add support for new LLM providers.
+///
+/// Message building and message sending are isolated: `build` converts core
+/// messages and tools into the provider's wire request, and `send` delivers it.
+/// `stream_response` is generic across providers: it builds the request, logs
+/// it when a request log is supplied, then sends it.
 #[async_trait]
 pub trait LlmProvider: Send + Sync {
     /// Initializes the provider (optional).
@@ -165,12 +194,33 @@ pub trait LlmProvider: Send + Sync {
         Ok(())
     }
 
-    /// Streams a response from the LLM.
+    /// Builds the provider-specific wire request from core messages and tools.
+    ///
+    /// The returned JSON value is the exact request body sent to the
+    /// provider's API, and what gets recorded when a request log is supplied.
+    fn build(
+        &self,
+        messages: &[Message],
+        tools: &[Arc<dyn Tool>],
+    ) -> Result<serde_json::Value, Box<dyn Error + Send + Sync>>;
+
+    /// Sends a built wire request and streams the provider's response.
+    async fn send<'a>(
+        &'a self,
+        request: serde_json::Value,
+    ) -> Result<
+        BoxStream<'a, Result<ProviderEvent, Box<dyn Error + Send + Sync>>>,
+        Box<dyn Error + Send + Sync>,
+    >;
+
+    /// Streams a response from the LLM: build -> log -> send.
     ///
     /// # Arguments
     ///
     /// * `messages` - The conversation history to send to the LLM
     /// * `tools` - Available tools the LLM can call
+    /// * `log` - Optional request log; when supplied, the built wire request
+    ///   is recorded as one JSONL line before sending
     ///
     /// # Returns
     ///
@@ -179,10 +229,17 @@ pub trait LlmProvider: Send + Sync {
         &'a self,
         messages: &[Message],
         tools: &[Arc<dyn Tool>],
+        log: Option<&RequestLog>,
     ) -> Result<
         BoxStream<'a, Result<ProviderEvent, Box<dyn Error + Send + Sync>>>,
         Box<dyn Error + Send + Sync>,
-    >;
+    > {
+        let request = self.build(messages, tools)?;
+        if let Some(log) = log {
+            log_wire_request(log, &request);
+        }
+        self.send(request).await
+    }
 
     /// Lists available models for this provider.
     async fn list_models(&self) -> Result<Vec<String>, Box<dyn Error + Send + Sync>>;

@@ -15,19 +15,30 @@ struct MockLlmProvider {
 
 #[async_trait]
 impl LlmProvider for MockLlmProvider {
-    async fn stream_response<'a>(
-        &'a self,
+    fn build(
+        &self,
         messages: &[Message],
         _tools: &[Arc<dyn Tool>],
-    ) -> Result<BoxStream<'a, Result<ProviderEvent, Box<dyn Error + Send + Sync>>>, Box<dyn Error + Send + Sync>> {
+    ) -> Result<Value, Box<dyn Error + Send + Sync>> {
         let tool_response_count = messages
             .iter()
             .filter(|m| matches!(m, Message::Tool { .. }))
             .count();
+        Ok(serde_json::json!({
+            "tool_response_count": tool_response_count,
+            "behavior": self.tool_behavior,
+        }))
+    }
 
-        let behavior = self.tool_behavior;
+    async fn send<'a>(
+        &'a self,
+        request: Value,
+    ) -> Result<BoxStream<'a, Result<ProviderEvent, Box<dyn Error + Send + Sync>>>, Box<dyn Error + Send + Sync>> {
+        let tool_response_count = request["tool_response_count"].as_u64().unwrap_or(0) as usize;
+        let behavior = request["behavior"].as_str().unwrap_or("").to_string();
+
         let s = async_stream::try_stream! {
-            match behavior {
+            match behavior.as_str() {
                 "not_found" => {
                     yield ProviderEvent::ToolCallStart { id: "call_1".to_string(), name: "nonexistent_tool".to_string() };
                     yield ProviderEvent::ToolCallDelta { id: "call_1".to_string(), delta: "{}".to_string() };
@@ -118,10 +129,17 @@ async fn test_agent_reset_clears_memory() {
 
     #[async_trait]
     impl LlmProvider for DummyLlm {
-        async fn stream_response<'a>(
-            &'a self,
+        fn build(
+            &self,
             _messages: &[Message],
             _tools: &[Arc<dyn Tool>],
+        ) -> Result<Value, Box<dyn Error + Send + Sync>> {
+            Ok(Value::Null)
+        }
+
+        async fn send<'a>(
+            &'a self,
+            _request: Value,
         ) -> Result<BoxStream<'a, Result<ProviderEvent, Box<dyn Error + Send + Sync>>>, Box<dyn Error + Send + Sync>> {
             Err("Not implemented".into())
         }
@@ -211,10 +229,17 @@ async fn test_agent_reset_restores_system_prompt() {
 
     #[async_trait]
     impl LlmProvider for DummyLlm {
-        async fn stream_response<'a>(
-            &'a self,
+        fn build(
+            &self,
             _messages: &[Message],
             _tools: &[Arc<dyn Tool>],
+        ) -> Result<Value, Box<dyn Error + Send + Sync>> {
+            Ok(Value::Null)
+        }
+
+        async fn send<'a>(
+            &'a self,
+            _request: Value,
         ) -> Result<BoxStream<'a, Result<ProviderEvent, Box<dyn Error + Send + Sync>>>, Box<dyn Error + Send + Sync>> {
             Err("Not implemented".into())
         }

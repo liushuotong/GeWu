@@ -76,7 +76,7 @@ When constructing the summary, try to stick to this template:
 
         let provider = self.llm.clone();
         let mut stream = provider
-            .stream_response(&request_messages, &[])
+            .stream_response(&request_messages, &[], self.log.as_ref())
             .await
             .map_err(|e| anyhow!("Compaction failed: {}", e))?;
 

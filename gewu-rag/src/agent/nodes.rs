@@ -55,7 +55,7 @@ pub async fn summarize_history(
         },
     ];
 
-    let mut stream = llm.stream_response(&messages, &[]).await.unwrap_or_else(|_| {
+    let mut stream = llm.stream_response(&messages, &[], None).await.unwrap_or_else(|_| {
         Box::pin(futures::stream::once(async {
             Ok(ProviderEvent::Error {
                 error: "LLM error".to_string(),
@@ -105,7 +105,7 @@ pub async fn rewrite_query(
         Message::User { content: vec![ContentPart::Text { text: content.clone() }] },
     ];
 
-    let mut stream = llm.stream_response(&messages, &[]).await.unwrap_or_else(|_| {
+    let mut stream = llm.stream_response(&messages, &[], None).await.unwrap_or_else(|_| {
         Box::pin(futures::stream::once(async {
             Ok(ProviderEvent::Error {
                 error: "LLM error".to_string(),
@@ -237,7 +237,7 @@ pub async fn orchestrator(
         all_messages.extend(state.messages.clone());
     }
 
-    let stream = llm.stream_response(&all_messages, &tools).await;
+    let stream = llm.stream_response(&all_messages, &tools, None).await;
     if let Err(e) = stream {
         tracing::error!("[NODE #{}] orchestrator: stream_response error: {:?}", invocation_id, e);
         return PartialAgentState::default();
@@ -450,7 +450,7 @@ pub async fn compress_context(
         },
     ];
 
-    let mut stream = llm.stream_response(&messages, &[]).await.unwrap_or_else(|_| {
+    let mut stream = llm.stream_response(&messages, &[], None).await.unwrap_or_else(|_| {
         Box::pin(futures::stream::once(async {
             Ok(ProviderEvent::Error {
                 error: "LLM error".to_string(),
@@ -693,7 +693,7 @@ pub async fn aggregate_answers(
         },
     ];
 
-    let mut stream = llm.stream_response(&messages, &[]).await.unwrap_or_else(|_| {
+    let mut stream = llm.stream_response(&messages, &[], None).await.unwrap_or_else(|_| {
         Box::pin(futures::stream::once(async {
             Ok(ProviderEvent::Error {
                 error: "LLM error".to_string(),

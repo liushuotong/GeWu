@@ -3,6 +3,7 @@ use futures::stream::BoxStream;
 use gewu_core::agent::AgentBuilder;
 use gewu_core::traits::{LlmProvider, Tool};
 use gewu_core::types::{Message, ProviderEvent};
+use serde_json::Value;
 use std::error::Error;
 use std::sync::Arc;
 
@@ -10,10 +11,17 @@ struct DummyLlm;
 
 #[async_trait]
 impl LlmProvider for DummyLlm {
-    async fn stream_response<'a>(
-        &'a self,
+    fn build(
+        &self,
         _messages: &[Message],
         _tools: &[Arc<dyn Tool>],
+    ) -> Result<Value, Box<dyn Error + Send + Sync>> {
+        Ok(Value::Null)
+    }
+
+    async fn send<'a>(
+        &'a self,
+        _request: Value,
     ) -> Result<BoxStream<'a, Result<ProviderEvent, Box<dyn Error + Send + Sync>>>, Box<dyn Error + Send + Sync>> {
         Err("Not implemented".into())
     }

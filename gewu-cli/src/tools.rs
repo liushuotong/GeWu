@@ -108,6 +108,7 @@ impl Tool for TaskTool {
             self.pool.clone(),
             session_id.clone(),
             Vec::new(),
+            None,
         )
         .await
         .map_err(|e| format!("Failed to create agent: {}", e))?;

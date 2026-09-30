@@ -7,13 +7,13 @@ pub mod tools;
 use anyhow::{Context, Result};
 use clap::{Args, Parser, Subcommand};
 use futures::StreamExt;
-use gewu_core::traits::LlmProvider;
+use gewu_core::traits::{LlmProvider, RequestLog};
 use gewu_core::types::AgentEvent;
 use gewu_providers::{AnthropicProvider, OpenAIProvider};
 use sqlx::sqlite::SqlitePoolOptions;
 use std::env;
 use std::io::{Read, Write};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use tracing::{error, info};
 use uuid::Uuid;
 
@@ -307,9 +307,30 @@ async fn run(cli: RunArgs) -> Result<()> {
     // Load MCP tools
     let mcp_tools = mcp_loader::load_mcp_tools(loaded_config.config.mcp_servers.clone()).await?;
 
+    // Open the LLM request log file when configured
+    let log_writer: Option<RequestLog> = match &file_config.log {
+        Some(path) => {
+            let file = std::fs::OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(path)
+                .with_context(|| format!("Failed to open LLM request log file: {}", path))?;
+            info!("Logging LLM requests to: {}", path);
+            Some(Arc::new(Mutex::new(Box::new(file))))
+        }
+        None => None,
+    };
+
     // Create Agent
-    let (mut agent, _registry) =
-        registry::create_agent(&cli.agent, provider, pool, session_id, mcp_tools).await?;
+    let (mut agent, _registry) = registry::create_agent(
+        &cli.agent,
+        provider,
+        pool,
+        session_id,
+        mcp_tools,
+        log_writer,
+    )
+    .await?;
     info!("Initialized agent: {}", cli.agent);
 
     // Determine the prompt: from args, from stdin, or error

@@ -11,6 +11,8 @@ pub struct Config {
     pub api_key: Option<String>,
     pub model: Option<String>,
     pub provider: Option<String>,
+    /// Optional path to a log file recording every wire LLM request as JSONL.
+    pub log: Option<String>,
     #[serde(rename = "mcpServers", default)]
     pub mcp_servers: std::collections::HashMap<String, McpServerConfig>,
 }
@@ -89,4 +91,22 @@ fn resolve_config_path(config_path: Option<&str>) -> Result<PathBuf> {
     }
 
     Ok(home_json)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parses_log_option() {
+        let config: Config =
+            serde_json::from_str(r#"{"log": "gewu-requests.jsonl"}"#).unwrap();
+        assert_eq!(config.log.as_deref(), Some("gewu-requests.jsonl"));
+    }
+
+    #[test]
+    fn log_is_optional() {
+        let config: Config = serde_json::from_str("{}").unwrap();
+        assert!(config.log.is_none());
+    }
 }

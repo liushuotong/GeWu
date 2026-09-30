@@ -18,7 +18,6 @@
 //!
 //! - [`OpenAIProvider`] - OpenAI-compatible provider implementation
 //! - [`AnthropicProvider`] - Anthropic Claude provider implementation
-//! - [`RequestBuilder`] - Trait for building API requests
 //! - [`ResponseParser`] - Trait for parsing streaming responses
 
 use crate::openai::{
@@ -82,39 +81,6 @@ static TEXT_ONLY_CAP: Capabilities = Capabilities {
         pdf: false,
     },
 };
-
-/// Trait for building API requests from GeWu types.
-///
-/// Implement this trait to create custom request formats for different
-/// LLM APIs. The implementations handle converting GeWu's [`Message`] type
-/// into provider-specific request formats.
-///
-/// # Example
-///
-/// ```ignore
-/// impl RequestBuilder for MyCustomProvider {
-///     fn build(
-///         &self,
-///         messages: &[Message],
-///         tools: &[Arc<dyn Tool>],
-///     ) -> Result<MyRequest, Box<dyn Error + Send + Sync>> {
-///         // Convert messages and tools to your format
-///     }
-/// }
-/// ```
-pub trait RequestBuilder: Send + Sync {
-    /// Builds a provider-specific chat completion request.
-    ///
-    /// # Arguments
-    ///
-    /// * `messages` - The conversation messages to send.
-    /// * `tools` - The available tools for function calling.
-    fn build(
-        &self,
-        messages: &[Message],
-        tools: &[Arc<dyn Tool>],
-    ) -> Result<CreateChatCompletionRequest, Box<dyn Error + Send + Sync>>;
-}
 
 /// Trait for parsing streaming responses into provider events.
 ///
@@ -431,8 +397,9 @@ impl OpenAIProvider {
     }
 }
 
-impl RequestBuilder for OpenAIProvider {
-    fn build(
+impl OpenAIProvider {
+    /// Builds the typed OpenAI chat completion request from core messages and tools.
+    fn build_typed(
         &self,
         messages: &[Message],
         tools: &[Arc<dyn Tool>],
@@ -628,15 +595,24 @@ impl ResponseParser for OpenAIProvider {
 
 #[async_trait]
 impl LlmProvider for OpenAIProvider {
-    async fn stream_response<'a>(
-        &'a self,
+    fn build(
+        &self,
         messages: &[Message],
         tools: &[Arc<dyn Tool>],
+    ) -> Result<serde_json::Value, Box<dyn Error + Send + Sync>> {
+        let request = self.build_typed(messages, tools)?;
+        serde_json::to_value(&request).map_err(|e| Box::new(e) as Box<dyn Error + Send + Sync>)
+    }
+
+    async fn send<'a>(
+        &'a self,
+        request: serde_json::Value,
     ) -> Result<
         BoxStream<'a, Result<ProviderEvent, Box<dyn Error + Send + Sync>>>,
         Box<dyn Error + Send + Sync>,
     > {
-let request = self.build(messages, tools)?;
+        let request: CreateChatCompletionRequest = serde_json::from_value(request)
+            .map_err(|e| Box::new(e) as Box<dyn Error + Send + Sync>)?;
 
         let stream = self
             .client
@@ -864,7 +840,8 @@ impl AnthropicProvider {
         Ok(anthropic_tools)
     }
 
-    fn build(
+    /// Builds the typed Anthropic message request from core messages and tools.
+    fn build_typed(
         &self,
         messages: &[Message],
         tools: &[Arc<dyn Tool>],
@@ -1044,15 +1021,24 @@ impl AnthropicProvider {
 
 #[async_trait]
 impl LlmProvider for AnthropicProvider {
-    async fn stream_response<'a>(
-        &'a self,
+    fn build(
+        &self,
         messages: &[Message],
         tools: &[Arc<dyn Tool>],
+    ) -> Result<serde_json::Value, Box<dyn Error + Send + Sync>> {
+        let request = self.build_typed(messages, tools)?;
+        serde_json::to_value(&request).map_err(|e| Box::new(e) as Box<dyn Error + Send + Sync>)
+    }
+
+    async fn send<'a>(
+        &'a self,
+        request: serde_json::Value,
     ) -> Result<
         futures::stream::BoxStream<'a, Result<ProviderEvent, Box<dyn Error + Send + Sync>>>,
         Box<dyn Error + Send + Sync>,
     > {
-        let request = self.build(messages, tools)?;
+        let request: CreateMessageRequest = serde_json::from_value(request)
+            .map_err(|e| Box::new(e) as Box<dyn Error + Send + Sync>)?;
 
         let stream = self
             .client
@@ -1501,5 +1487,117 @@ mod tests {
         assert_eq!(converted.len(), 1);
         assert_eq!(converted[0].name, "get_weather");
         assert_eq!(converted[0].description, "Get weather for a city");
+    }
+
+    #[test]
+    fn openai_build_produces_wire_json_with_messages_and_tools() {
+        let provider = OpenAIProvider::new("test-key", "gpt-4o");
+        let messages = vec![Message::User {
+            content: vec![ContentPart::Text {
+                text: "hello".to_string(),
+            }],
+        }];
+        let tools: Vec<Arc<dyn Tool>> = vec![Arc::new(MockTool::new("get_weather", "Get weather"))];
+
+        let request = provider.build(&messages, &tools).expect("build success");
+
+        assert_eq!(request["model"], "gpt-4o");
+        assert_eq!(request["messages"].as_array().unwrap().len(), 1);
+        let wire_tools = request["tools"].as_array().unwrap();
+        assert_eq!(wire_tools.len(), 1);
+        assert_eq!(wire_tools[0]["type"], "function");
+        assert_eq!(wire_tools[0]["function"]["name"], "get_weather");
+    }
+
+    #[test]
+    fn anthropic_build_produces_wire_json_with_messages_and_tools() {
+        let provider = AnthropicProvider::new("test-key", "claude-3-5-sonnet");
+        let messages = vec![Message::User {
+            content: vec![ContentPart::Text {
+                text: "hello".to_string(),
+            }],
+        }];
+        let tools: Vec<Arc<dyn Tool>> = vec![Arc::new(MockTool::new("get_weather", "Get weather"))];
+
+        let request = provider.build(&messages, &tools).expect("build success");
+
+        assert_eq!(request["model"], "claude-3-5-sonnet");
+        assert_eq!(request["stream"], true);
+        let wire_tools = request["tools"].as_array().unwrap();
+        assert_eq!(wire_tools.len(), 1);
+        assert_eq!(wire_tools[0]["name"], "get_weather");
+        assert!(wire_tools[0]["input_schema"].is_object());
+    }
+
+    /// A request-log handle over a shared in-memory buffer.
+    #[derive(Clone, Default)]
+    struct SharedBuffer(Arc<std::sync::Mutex<Vec<u8>>>);
+
+    impl SharedBuffer {
+        fn handle(&self) -> gewu_core::traits::RequestLog {
+            Arc::new(std::sync::Mutex::new(Box::new(self.clone())))
+        }
+
+        fn contents(&self) -> String {
+            String::from_utf8(self.0.lock().unwrap().clone()).unwrap()
+        }
+    }
+
+    impl std::io::Write for SharedBuffer {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().unwrap().extend_from_slice(buf);
+            Ok(buf.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    fn parse_log_entries(log: &str) -> Vec<Value> {
+        log.lines()
+            .filter(|line| !line.is_empty())
+            .map(|line| serde_json::from_str(line).expect("log line must be valid JSON"))
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn stream_response_logs_wire_request_before_sending() {
+        // Unroutable endpoint: send fails, but the request is logged first.
+        let provider = OpenAIProvider::new_with_endpoint("test-key", "http://127.0.0.1:1", "gpt-4o");
+        let buffer = SharedBuffer::default();
+        let messages = vec![Message::User {
+            content: vec![ContentPart::Text {
+                text: "hello".to_string(),
+            }],
+        }];
+        let tools: Vec<Arc<dyn Tool>> = vec![Arc::new(MockTool::new("get_weather", "Get weather"))];
+
+        let result = provider
+            .stream_response(&messages, &tools, Some(&buffer.handle()))
+            .await;
+        assert!(result.is_err(), "send should fail against 127.0.0.1:1");
+
+        let entries = parse_log_entries(&buffer.contents());
+        assert_eq!(entries.len(), 1);
+        assert!(entries[0]["timestamp"].is_string());
+        assert_eq!(entries[0]["request"]["model"], "gpt-4o");
+        assert_eq!(entries[0]["request"]["messages"].as_array().unwrap().len(), 1);
+        assert_eq!(
+            entries[0]["request"]["tools"].as_array().unwrap().len(),
+            1
+        );
+    }
+
+    #[tokio::test]
+    async fn stream_response_without_log_sends_normally() {
+        let provider = OpenAIProvider::new_with_endpoint("test-key", "http://127.0.0.1:1", "gpt-4o");
+        let messages = vec![Message::User {
+            content: vec![ContentPart::Text {
+                text: "hello".to_string(),
+            }],
+        }];
+
+        let result = provider.stream_response(&messages, &[], None).await;
+        assert!(result.is_err(), "send should fail against 127.0.0.1:1");
     }
 }

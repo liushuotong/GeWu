@@ -66,6 +66,7 @@ If both `.json` and `.jsonc` exist in the same location, `.json` takes precedenc
 | `api_key` | API key for the LLM provider |
 | `model` | Model to use (default: `gpt-5.3-codex`) |
 | `provider` | Provider protocol: `openai` or `anthropic` |
+| `log` | Path to a log file where every raw LLM request is recorded as JSONL (append mode) |
 | `mcpServers` | MCP server configurations (see below) |
 
 **Environment variables** (take precedence over config file):

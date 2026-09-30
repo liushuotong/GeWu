@@ -3,11 +3,11 @@ members = ["gewu-cli",
     "gewu-core",
     "gewu-providers", "gewu-storage",
     "gewu-tools",
-    "gewu-web",
     "gewu-graph",
-    "gewu-rag",
-    "gewu-experience",
-    "gewu-evolve",
+#    "gewu-rag",
+#    "gewu-research",
+#    "gewu-experience",
+#    "gewu-evolve",
 ]
 exclude = ["opencode"]
 resolver = "2"

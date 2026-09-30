@@ -2,7 +2,7 @@ use crate::tools::TaskTool;
 use anyhow::{Result, anyhow};
 use async_trait::async_trait;
 use gewu_core::Agent;
-use gewu_core::traits::{LlmProvider, Tool, ToolRegistry};
+use gewu_core::traits::{LlmProvider, RequestLog, Tool, ToolRegistry};
 use gewu_core::types::{ToolContext, ToolResult};
 use gewu_storage::SqliteMemory;
 use gewu_tools::{
@@ -211,6 +211,7 @@ pub async fn create_agent(
     pool: SqlitePool,
     session_id: String,
     additional_tools: Vec<Arc<dyn Tool>>,
+    log: Option<RequestLog>,
 ) -> Result<(Agent, Arc<dyn ToolRegistry>)> {
     let working_directory = std::env::current_dir()?;
 
@@ -228,27 +229,22 @@ pub async fn create_agent(
     let mut all_tools = vec![batch_tool];
     all_tools.extend(tools_arc);
 
-    let agent = match name {
-        "build" => Agent::builder()
-            .llm(provider)
-            .with_tools(all_tools)
-            .memory(Box::new(memory))
-            .system_prompt(include_str!("prompts/build.txt"))
-            .build()?,
-        "explore" => Agent::builder()
-            .llm(provider)
-            .with_tools(all_tools)
-            .memory(Box::new(memory))
-            .system_prompt(include_str!("prompts/explore.txt"))
-            .build()?,
-        "general" => Agent::builder()
-            .llm(provider)
-            .with_tools(all_tools)
-            .memory(Box::new(memory))
-            .system_prompt(include_str!("prompts/general.txt"))
-            .build()?,
+    let system_prompt = match name {
+        "build" => include_str!("prompts/build.txt"),
+        "explore" => include_str!("prompts/explore.txt"),
+        "general" => include_str!("prompts/general.txt"),
         _ => return Err(anyhow!("Unknown agent type: {}", name)),
     };
+
+    let mut builder = Agent::builder()
+        .llm(provider)
+        .with_tools(all_tools)
+        .memory(Box::new(memory))
+        .system_prompt(system_prompt);
+    if let Some(log) = log {
+        builder = builder.with_log(log);
+    }
+    let agent = builder.build()?;
 
     Ok((agent, registry))
 }
@@ -290,10 +286,17 @@ mod tests {
 
     #[async_trait]
     impl LlmProvider for DummyLlm {
-        async fn stream_response<'a>(
-            &'a self,
+        fn build(
+            &self,
             _messages: &[Message],
             _tools: &[Arc<dyn Tool>],
+        ) -> Result<Value, Box<dyn Error + Send + Sync>> {
+            Ok(Value::Null)
+        }
+
+        async fn send<'a>(
+            &'a self,
+            _request: Value,
         ) -> Result<
             BoxStream<'a, Result<ProviderEvent, Box<dyn Error + Send + Sync>>>,
             Box<dyn Error + Send + Sync>,
@@ -333,6 +336,26 @@ mod tests {
         )
         .unwrap();
         assert!(!tools.iter().any(|tool| tool.name() == "apply_patch"));
+    }
+
+    #[tokio::test]
+    async fn create_agent_accepts_request_log() {
+        let pool = SqlitePool::connect_lazy("sqlite::memory:").unwrap();
+        let provider: Arc<dyn LlmProvider> = Arc::new(DummyLlm);
+        let log: RequestLog = Arc::new(Mutex::new(Box::new(Vec::<u8>::new())));
+
+        let (agent, _) = create_agent(
+            "build",
+            provider,
+            pool,
+            "session".to_string(),
+            Vec::new(),
+            Some(log),
+        )
+        .await
+        .expect("create_agent should accept a request log");
+
+        assert!(!agent.list_tools().is_empty());
     }
 
     #[tokio::test]

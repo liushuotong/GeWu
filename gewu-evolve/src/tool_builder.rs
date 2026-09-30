@@ -35,7 +35,7 @@ impl ToolBuilder {
             content: vec![gewu_core::types::ContentPart::Text { text: prompt }],
         }];
 
-        let mut stream = llm.stream_response(&messages, &[]).await
+        let mut stream = llm.stream_response(&messages, &[], None).await
             .map_err(|e| anyhow::anyhow!("LLM stream error: {}", e))?;
         let mut response_text = String::new();
 

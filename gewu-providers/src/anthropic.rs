@@ -87,7 +87,7 @@ pub struct Messages<'a> {
     client: &'a Client,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, Deserialize)]
 pub struct CreateMessageRequest {
     pub model: String,
     pub messages: Vec<AnthropicMessage>,
