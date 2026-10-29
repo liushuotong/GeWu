@@ -20,6 +20,15 @@ const RESET: &str = "\x1b[0m";
 const DIM: &str = "\x1b[90m";
 const SPINNER_FRAMES: [&str; 6] = ["·", "✢", "✳", "∗", "✻", "✽"];
 
+/// Extracts the exact command from a `bash` tool call's JSON arguments.
+fn extract_bash_command(input: &str) -> Option<String> {
+    serde_json::from_str::<serde_json::Value>(input)
+        .ok()?
+        .get("command")?
+        .as_str()
+        .map(str::to_string)
+}
+
 /// Clear the spinner line (if shown) and stop animating it.
 fn stop_spinner(spinner_active: &mut bool, is_tty: bool) -> Result<()> {
     if *spinner_active {
@@ -73,15 +82,20 @@ async fn run_agent(agent: &mut gewu_core::Agent, prompt: &str) -> Result<()> {
                                 spinner_frame = 0;
                             }
                         }
-                        AgentEvent::ToolStart { .. } => {
+                        AgentEvent::ToolStart { tool, input } => {
                             stop_spinner(&mut spinner_active, is_tty)?;
+                            if tool == "bash"
+                                && let Some(command) = extract_bash_command(&input)
+                            {
+                                println!("\n[Tool Start: bash] $ {}", command);
+                            } else {
+                                println!("\n[Tool Start: {}]", tool);
+                            }
                         }
                         AgentEvent::ToolFinish { tool, output, .. } => {
                             stop_spinner(&mut spinner_active, is_tty)?;
                             if output.starts_with("Error:") {
                                 eprintln!("\n[Tool Error: {}] {}", tool, output);
-                            } else {
-                                println!("\n[Tool Finish: {}]", tool);
                             }
                         }
                         AgentEvent::Finish { response: _ } => {
@@ -493,5 +507,21 @@ mod tests {
     #[test]
     fn rejects_legacy_top_level_prompt() {
         assert!(Cli::try_parse_from(["gewu-cli", "hello"]).is_err());
+    }
+
+    #[test]
+    fn extracts_bash_command_from_tool_input() {
+        let input = r#"{"command":"git status --short","timeout":5000}"#;
+        assert_eq!(
+            extract_bash_command(input),
+            Some("git status --short".to_string())
+        );
+    }
+
+    #[test]
+    fn bash_command_extraction_ignores_invalid_input() {
+        assert_eq!(extract_bash_command("not json"), None);
+        assert_eq!(extract_bash_command(r#"{"timeout":1000}"#), None);
+        assert_eq!(extract_bash_command(r#"{"command":42}"#), None);
     }
 }
