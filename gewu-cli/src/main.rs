@@ -17,62 +17,89 @@ use tracing::{error, info};
 use uuid::Uuid;
 
 const RESET: &str = "\x1b[0m";
+const DIM: &str = "\x1b[90m";
+const SPINNER_FRAMES: [&str; 6] = ["·", "✢", "✳", "∗", "✻", "✽"];
 
-async fn run_agent(agent: &mut gewu_core::Agent, prompt: &str) -> Result<()> {
-    let mut stream = Box::pin(agent.ask(prompt));
-    let mut reasoning_started = false;
-    let mut content_started = false;
-    while let Some(event_result) = stream.next().await {
-        match event_result {
-            Ok(event) => match event {
-                AgentEvent::ContentDelta { delta } => {
-                    if !content_started {
-                        content_started = true;
-                        if reasoning_started {
-                            print!("{}", RESET);
-                        }
-                        println!();
-                    }
-                    print!("{}", delta);
-                    std::io::stdout().flush()?;
-                }
-                AgentEvent::ReasoningDelta { delta } => {
-                    if !reasoning_started {
-                        reasoning_started = true;
-                        print!("\x1b[90m[thinking]\x1b[0m ");
-                        print!("\x1b[90m");
-                    }
-                    print!("{}", delta);
-                    std::io::stdout().flush()?;
-                }
-                AgentEvent::ToolStart { .. } => {
-                    if reasoning_started {
-                        print!("{}", RESET);
-                    }
-                }
-                AgentEvent::ToolFinish { tool, output, .. } => {
-                    if output.starts_with("Error:") {
-                        eprintln!("\n[Tool Error: {}] {}", tool, output);
-                    } else {
-                        println!("\n[Tool Finish: {}]", tool);
-                    }
-                }
-                AgentEvent::Finish { response: _ } => {
-                    if reasoning_started {
-                        print!("{}", RESET);
-                    }
-                    println!();
-                }
-                AgentEvent::Error { error } => {
-                    if reasoning_started {
-                        print!("{}", RESET);
-                    }
-                    error!("Error from agent: {}", error);
-                }
-            },
-            Err(e) => error!("Stream error: {}", e),
+/// Clear the spinner line (if shown) and stop animating it.
+fn stop_spinner(spinner_active: &mut bool, is_tty: bool) -> Result<()> {
+    if *spinner_active {
+        *spinner_active = false;
+        if is_tty {
+            print!("\r\x1b[K");
+            std::io::stdout().flush()?;
         }
     }
+    Ok(())
+}
+
+async fn run_agent(agent: &mut gewu_core::Agent, prompt: &str) -> Result<()> {
+    let is_tty = atty::is(atty::Stream::Stdout);
+
+    let mut stream = Box::pin(agent.ask(prompt));
+    let mut spinner_active = false;
+    let mut spinner_frame: usize = 0;
+    let mut content_started = false;
+    let mut tick = tokio::time::interval(std::time::Duration::from_millis(100));
+    tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+
+    loop {
+        tokio::select! {
+            _ = tick.tick(), if spinner_active && is_tty => {
+                print!(
+                    "\r\x1b[K{}{} thinking…{}",
+                    DIM,
+                    SPINNER_FRAMES[spinner_frame % SPINNER_FRAMES.len()],
+                    RESET
+                );
+                spinner_frame += 1;
+                std::io::stdout().flush()?;
+            }
+            event_result = stream.next() => {
+                let Some(event_result) = event_result else { break };
+                match event_result {
+                    Ok(event) => match event {
+                        AgentEvent::ContentDelta { delta } => {
+                            stop_spinner(&mut spinner_active, is_tty)?;
+                            if !content_started {
+                                content_started = true;
+                                println!();
+                            }
+                            print!("{}", delta);
+                            std::io::stdout().flush()?;
+                        }
+                        AgentEvent::ReasoningDelta { .. } => {
+                            if !spinner_active {
+                                spinner_active = true;
+                                spinner_frame = 0;
+                            }
+                        }
+                        AgentEvent::ToolStart { .. } => {
+                            stop_spinner(&mut spinner_active, is_tty)?;
+                        }
+                        AgentEvent::ToolFinish { tool, output, .. } => {
+                            stop_spinner(&mut spinner_active, is_tty)?;
+                            if output.starts_with("Error:") {
+                                eprintln!("\n[Tool Error: {}] {}", tool, output);
+                            } else {
+                                println!("\n[Tool Finish: {}]", tool);
+                            }
+                        }
+                        AgentEvent::Finish { response: _ } => {
+                            stop_spinner(&mut spinner_active, is_tty)?;
+                            println!();
+                        }
+                        AgentEvent::Error { error } => {
+                            stop_spinner(&mut spinner_active, is_tty)?;
+                            error!("Error from agent: {}", error);
+                        }
+                    },
+                    Err(e) => error!("Stream error: {}", e),
+                }
+            }
+        }
+    }
+
+    stop_spinner(&mut spinner_active, is_tty)?;
 
     Ok(())
 }
