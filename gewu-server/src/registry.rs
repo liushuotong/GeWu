@@ -48,6 +48,14 @@ pub fn list_available_agents() -> Vec<AgentConfig> {
     ]
 }
 
+/// Returns the names of the available agent profiles.
+pub fn list_agent_names() -> Vec<String> {
+    list_available_agents()
+        .into_iter()
+        .map(|a| a.name)
+        .collect()
+}
+
 struct ToolRegistryImpl {
     tools: Arc<Vec<Arc<dyn Tool>>>,
 }

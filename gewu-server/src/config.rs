@@ -102,8 +102,7 @@ mod tests {
 
     #[test]
     fn parses_log_option() {
-        let config: Config =
-            serde_json::from_str(r#"{"log": "gewu-requests.jsonl"}"#).unwrap();
+        let config: Config = serde_json::from_str(r#"{"log": "gewu-requests.jsonl"}"#).unwrap();
         assert_eq!(config.log.as_deref(), Some("gewu-requests.jsonl"));
     }
 

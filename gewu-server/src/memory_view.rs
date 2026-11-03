@@ -1,22 +1,9 @@
 use anyhow::{Context, Result, anyhow};
 use gewu_core::types::{ContentPart, Message};
+use gewu_storage::{list_sessions, load_session};
+use sqlx::SqlitePool;
 use sqlx::sqlite::{SqliteConnectOptions, SqlitePoolOptions};
-use sqlx::{Row, SqlitePool};
 use std::path::{Path, PathBuf};
-
-#[derive(Debug, PartialEq)]
-struct SessionSummary {
-    session_id: String,
-    message_count: i64,
-    updated_at: String,
-}
-
-#[derive(Debug)]
-struct StoredMessage {
-    id: i64,
-    created_at: String,
-    message: Message,
-}
 
 pub async fn execute(session_id: Option<&str>, db_path: Option<&str>) -> Result<()> {
     let path = resolve_db_path(db_path)?;
@@ -50,69 +37,6 @@ async fn open_read_only(path: &Path) -> Result<SqlitePool> {
         .connect_with(options)
         .await
         .with_context(|| format!("Failed to open memory database: {}", path.display()))
-}
-
-async fn list_sessions(pool: &SqlitePool) -> Result<Vec<SessionSummary>> {
-    let rows = sqlx::query(
-        r#"
-        SELECT
-            session_id,
-            COUNT(*) AS message_count,
-            datetime(MAX(created_at), 'unixepoch', 'localtime') AS updated_at
-        FROM memory_messages
-        GROUP BY session_id
-        ORDER BY MAX(created_at) DESC, session_id ASC
-        "#,
-    )
-    .fetch_all(pool)
-    .await
-    .context("Failed to list memory sessions; the database may not contain agent memory")?;
-
-    rows.into_iter()
-        .map(|row| {
-            Ok(SessionSummary {
-                session_id: row.try_get("session_id")?,
-                message_count: row.try_get("message_count")?,
-                updated_at: row
-                    .try_get::<Option<String>, _>("updated_at")?
-                    .unwrap_or_else(|| "unknown".to_string()),
-            })
-        })
-        .collect()
-}
-
-async fn load_session(pool: &SqlitePool, session_id: &str) -> Result<Vec<StoredMessage>> {
-    let rows = sqlx::query(
-        r#"
-        SELECT
-            id,
-            content,
-            datetime(created_at, 'unixepoch', 'localtime') AS created_at
-        FROM memory_messages
-        WHERE session_id = ?
-        ORDER BY id ASC
-        "#,
-    )
-    .bind(session_id)
-    .fetch_all(pool)
-    .await
-    .with_context(|| format!("Failed to load memory for session '{}'", session_id))?;
-
-    rows.into_iter()
-        .map(|row| {
-            let id: i64 = row.try_get("id")?;
-            let content: String = row.try_get("content")?;
-            let message = serde_json::from_str(&content)
-                .with_context(|| format!("Failed to deserialize memory message {}", id))?;
-            Ok(StoredMessage {
-                id,
-                created_at: row
-                    .try_get::<Option<String>, _>("created_at")?
-                    .unwrap_or_else(|| "unknown".to_string()),
-                message,
-            })
-        })
-        .collect()
 }
 
 async fn print_sessions(pool: &SqlitePool) -> Result<()> {

@@ -1,20 +1,18 @@
+pub mod bootstrap;
 pub mod config;
 pub mod mcp_loader;
 mod memory_view;
 pub mod registry;
+pub mod server;
 
 use anyhow::{Context, Result};
 use clap::{Args, Parser, Subcommand};
 use futures::StreamExt;
-use gewu_core::traits::{LlmProvider, RequestLog};
+use gewu_core::traits::LlmProvider;
 use gewu_core::types::AgentEvent;
-use gewu_providers::{AnthropicProvider, OpenAIProvider};
-use sqlx::sqlite::SqlitePoolOptions;
 use std::env;
 use std::io::{Read, Write};
-use std::sync::{Arc, Mutex};
 use tracing::{error, info};
-use uuid::Uuid;
 
 const RESET: &str = "\x1b[0m";
 const DIM: &str = "\x1b[90m";
@@ -119,9 +117,9 @@ async fn run_agent(agent: &mut gewu_core::Agent, prompt: &str) -> Result<()> {
 }
 
 #[derive(Parser)]
-#[command(name = "gewu-cli")]
+#[command(name = "gewu-server")]
 #[command(version = "0.1.0")]
-#[command(about = "GeWu CLI Agent", long_about = None)]
+#[command(about = "GeWu agent CLI and server", long_about = None)]
 struct Cli {
     #[command(subcommand)]
     command: Command,
@@ -131,6 +129,8 @@ struct Cli {
 enum Command {
     /// Run an agent with a prompt or in interactive mode
     Run(RunArgs),
+    /// Run an agent as a server other programs can connect to
+    Serve(ServeArgs),
     /// View persisted agent memory
     View(ViewArgs),
 }
@@ -141,33 +141,8 @@ struct RunArgs {
     #[arg(trailing_var_arg = true)]
     prompt: Option<Vec<String>>,
 
-    /// Custom OpenAI Base URL
-    #[arg(long, env = "OPENAI_BASE_URL")]
-    base_url: Option<String>,
-
-    /// OpenAI API Key
-    #[arg(long, env = "OPENAI_API_KEY")]
-    api_key: Option<String>,
-
-    /// OpenAI Endpoint URL
-    #[arg(long, env = "OPENAI_ENDPOINT")]
-    endpoint: Option<String>,
-
-    /// Custom Model Name
-    #[arg(long, short, env = "OPENAI_MODEL")]
-    model: Option<String>,
-
-    /// LLM Provider to use (openai or anthropic)
-    #[arg(long, env = "GEWU_PROVIDER")]
-    provider: Option<String>,
-
-    /// Initial Agent (default: build)
-    #[arg(long, default_value = "build")]
-    agent: String,
-
-    /// Log level
-    #[arg(long, default_value = "info")]
-    log_level: String,
+    #[command(flatten)]
+    common: bootstrap::CommonArgs,
 
     /// List available agents
     #[arg(long)]
@@ -181,17 +156,27 @@ struct RunArgs {
     #[arg(long)]
     session_id: Option<String>,
 
-    /// Path to SQLite database file
-    #[arg(long)]
-    db_path: Option<String>,
-
-    /// Path to LLM configuration file
-    #[arg(long)]
-    llm_config: Option<String>,
-
     /// Run in interactive mode
     #[arg(short, long)]
     interactive: bool,
+}
+
+#[derive(Args)]
+struct ServeArgs {
+    /// Host to bind both listeners to
+    #[arg(long, default_value = server::DEFAULT_HOST)]
+    host: String,
+
+    /// Port for the WebSocket listener
+    #[arg(long, default_value_t = server::DEFAULT_WS_PORT)]
+    ws_port: u16,
+
+    /// Port for the newline-delimited JSON TCP listener
+    #[arg(long, default_value_t = server::DEFAULT_TCP_PORT)]
+    tcp_port: u16,
+
+    #[command(flatten)]
+    common: bootstrap::CommonArgs,
 }
 
 #[derive(Args)]
@@ -210,26 +195,25 @@ async fn main() -> Result<()> {
 
     match Cli::parse().command {
         Command::Run(args) => run(args).await,
+        Command::Serve(args) => serve(args).await,
         Command::View(args) => {
             memory_view::execute(args.session_id.as_deref(), args.db_path.as_deref()).await
         }
     }
 }
 
+async fn serve(cli: ServeArgs) -> Result<()> {
+    let boot = bootstrap::bootstrap(&cli.common).await?;
+    info!(
+        "Starting gewu server (agent: {}, model: {}, provider: {})",
+        cli.common.agent, boot.model, boot.provider_name
+    );
+    server::serve(boot, &cli.host, cli.ws_port, cli.tcp_port).await
+}
+
 async fn run(cli: RunArgs) -> Result<()> {
     // Initialize logging
-    let log_level = match cli.log_level.to_lowercase().as_str() {
-        "error" => tracing::Level::ERROR,
-        "warn" => tracing::Level::WARN,
-        "info" => tracing::Level::INFO,
-        "debug" => tracing::Level::DEBUG,
-        "trace" => tracing::Level::TRACE,
-        _ => tracing::Level::INFO,
-    };
-
-    let subscriber = tracing_subscriber::fmt().with_max_level(log_level).finish();
-
-    tracing::subscriber::set_global_default(subscriber)?;
+    bootstrap::init_tracing(&cli.common.log_level)?;
 
     if cli.list_agents {
         println!("Available Agents:");
@@ -239,7 +223,7 @@ async fn run(cli: RunArgs) -> Result<()> {
         return Ok(());
     }
 
-    let loaded_config = config::LoadedConfig::load(cli.llm_config.as_deref())?;
+    let loaded_config = config::LoadedConfig::load(cli.common.llm_config.as_deref())?;
 
     if let Some(path) = &loaded_config.path {
         info!("Loaded config from: {}", path.display());
@@ -249,33 +233,33 @@ async fn run(cli: RunArgs) -> Result<()> {
 
     let file_config = &loaded_config.config;
 
-    let api_key = cli.api_key
-        .or_else(|| env::var("OPENAI_API_KEY").ok())
-        .or(file_config.api_key.clone())
-        .context("OPENAI_API_KEY not provided. Set via --api-key, OPENAI_API_KEY env var, or config.json")?;
-
-    let base_url = cli
-        .base_url
-        .clone()
-        .or_else(|| env::var("OPENAI_BASE_URL").ok())
-        .or(cli.endpoint.clone())
-        .or_else(|| env::var("OPENAI_ENDPOINT").ok())
-        .or(file_config.base_url.clone());
-
-    let provider_name = cli
-        .provider
-        .or_else(|| env::var("GEWU_PROVIDER").ok())
-        .or_else(|| file_config.provider.clone())
-        .unwrap_or_else(|| "openai".to_string());
-
     if cli.list_models {
         let model = cli
+            .common
             .model
+            .clone()
             .or_else(|| env::var("OPENAI_MODEL").ok())
             .or(file_config.model.clone())
             .unwrap_or_else(|| "gpt-5.3-codex".to_string());
-        let url = base_url.unwrap_or_else(|| "https://api.openai.com/v1".to_string());
-        let provider = OpenAIProvider::new_with_endpoint(&api_key, &url, &model);
+        let url = cli
+            .common
+            .base_url
+            .clone()
+            .or_else(|| env::var("OPENAI_BASE_URL").ok())
+            .or(cli.common.endpoint.clone())
+            .or_else(|| env::var("OPENAI_ENDPOINT").ok())
+            .or(file_config.base_url.clone())
+            .unwrap_or_else(|| "https://api.openai.com/v1".to_string());
+        let api_key = cli
+            .common
+            .api_key
+            .clone()
+            .or_else(|| env::var("OPENAI_API_KEY").ok())
+            .or(file_config.api_key.clone())
+            .context(
+                "OPENAI_API_KEY not provided. Set via --api-key, OPENAI_API_KEY env var, or config.json",
+            )?;
+        let provider = gewu_providers::OpenAIProvider::new_with_endpoint(&api_key, &url, &model);
         match provider.list_models().await {
             Ok(models) => {
                 println!("Available Models:");
@@ -290,113 +274,25 @@ async fn run(cli: RunArgs) -> Result<()> {
         return Ok(());
     }
 
-    let model = cli
-        .model
-        .or_else(|| env::var("OPENAI_MODEL").ok())
-        .or(file_config.model.clone())
-        .unwrap_or_else(|| "gpt-5.3-codex".to_string());
-
-    info!("Using model: {}", model);
-    info!("Using provider: {}", provider_name);
-
-    // Initialize Provider
-    let provider: Arc<dyn LlmProvider> = match provider_name.to_lowercase().as_str() {
-        "anthropic" => {
-            if let Some(url) = base_url {
-                Arc::new(AnthropicProvider::new_with_endpoint(&api_key, &url, &model))
-            } else {
-                Arc::new(AnthropicProvider::new(&api_key, &model))
-            }
-        }
-        "openai" | _ => {
-            if let Some(url) = base_url {
-                Arc::new(OpenAIProvider::new_with_endpoint(&api_key, &url, &model))
-            } else {
-                Arc::new(OpenAIProvider::new(&api_key, &model))
-            }
-        }
-    };
-
-    // Initialize SQLite Pool
-    let db_path = if let Some(path) = cli.db_path {
-        path
-    } else {
-        let home_dir = dirs::home_dir()
-            .context("Failed to determine home directory. Please provide --db-path explicitly.")?;
-        let gewu_dir = home_dir.join(".gewu");
-
-        // Ensure .gewu directory exists
-        if !gewu_dir.exists() {
-            std::fs::create_dir_all(&gewu_dir).context("Failed to create .gewu directory")?;
-        }
-
-        gewu_dir.join("gewu.db").to_string_lossy().to_string()
-    };
-
-    info!("Using database: {}", db_path);
-    let db_url = format!("sqlite://{}?mode=rwc", db_path);
-
-    let pool = SqlitePoolOptions::new()
-        .connect(&db_url)
-        .await
-        .context("Failed to connect to SQLite database")?;
+    let boot = bootstrap::bootstrap(&cli.common).await?;
+    info!("Using model: {}", boot.model);
+    info!("Using provider: {}", boot.provider_name);
 
     // Determine Session ID
-    let session_id = cli.session_id.unwrap_or_else(|| Uuid::new_v4().to_string());
-
-    // Load MCP tools
-    let mcp_tools = mcp_loader::load_mcp_tools(loaded_config.config.mcp_servers.clone()).await?;
-
-    // Open the LLM request log file when configured
-    let log_writer: Option<RequestLog> = match &file_config.log {
-        Some(path) => {
-            let file = std::fs::OpenOptions::new()
-                .create(true)
-                .append(true)
-                .open(path)
-                .with_context(|| format!("Failed to open LLM request log file: {}", path))?;
-            info!("Logging LLM requests to: {}", path);
-            Some(Arc::new(Mutex::new(Box::new(file))))
-        }
-        None => None,
-    };
-
-    // Discover skills from configured paths
-    let skill_paths: Vec<std::path::PathBuf> = file_config
-        .skills
-        .iter()
-        .flatten()
-        .map(|p| {
-            let path = std::path::PathBuf::from(p);
-            if path.is_absolute() {
-                path
-            } else {
-                env::current_dir()
-                    .map(|dir| dir.join(path))
-                    .unwrap_or_else(|_| std::path::PathBuf::from(p))
-            }
-        })
-        .collect();
-    let skills = if skill_paths.is_empty() {
-        Vec::new()
-    } else {
-        let found = gewu_tools::skill::discover(&skill_paths);
-        info!("Discovered {} skills", found.len());
-        found
-    };
+    let session_id = cli.session_id.unwrap_or_else(bootstrap::new_session_id);
 
     // Create Agent
     let (mut agent, _registry) = registry::create_agent(
-        &cli.agent,
-        provider,
-        pool,
+        &cli.common.agent,
+        boot.provider,
+        boot.pool,
         session_id,
-        mcp_tools,
-        log_writer,
-        skills,
+        boot.mcp_tools,
+        boot.log_writer,
+        boot.skills,
     )
     .await?;
-    info!("Initialized agent: {}", cli.agent);
+    info!("Initialized agent: {}", cli.common.agent);
 
     // Determine the prompt: from args, from stdin, or error
     let prompt_from_args = cli.prompt.clone();
@@ -446,7 +342,7 @@ async fn run(cli: RunArgs) -> Result<()> {
     // Interactive Loop (only if -i flag is set)
     if cli.interactive {
         use std::io::{self, Write};
-        println!("--- GeWu CLI (Agent: {}) ---", cli.agent);
+        println!("--- GeWu CLI (Agent: {}) ---", cli.common.agent);
         println!("Type 'exit' or 'quit' to end.");
 
         loop {
@@ -480,33 +376,73 @@ mod tests {
 
     #[test]
     fn parses_run_command() {
-        let cli = Cli::try_parse_from(["gewu-cli", "run", "hello", "world"]).unwrap();
+        let cli = Cli::try_parse_from(["gewu-server", "run", "hello", "world"]).unwrap();
         match cli.command {
             Command::Run(args) => {
                 assert_eq!(args.prompt, Some(vec!["hello".into(), "world".into()]))
             }
-            Command::View(_) => panic!("expected run command"),
+            _ => panic!("expected run command"),
         }
     }
 
     #[test]
     fn parses_view_commands() {
-        let list = Cli::try_parse_from(["gewu-cli", "view"]).unwrap();
+        let list = Cli::try_parse_from(["gewu-server", "view"]).unwrap();
         match list.command {
             Command::View(args) => assert_eq!(args.session_id, None),
-            Command::Run(_) => panic!("expected view command"),
+            _ => panic!("expected view command"),
         }
 
-        let show = Cli::try_parse_from(["gewu-cli", "view", "session-1"]).unwrap();
+        let show = Cli::try_parse_from(["gewu-server", "view", "session-1"]).unwrap();
         match show.command {
             Command::View(args) => assert_eq!(args.session_id.as_deref(), Some("session-1")),
-            Command::Run(_) => panic!("expected view command"),
+            _ => panic!("expected view command"),
+        }
+    }
+
+    #[test]
+    fn parses_serve_command_with_defaults() {
+        let cli = Cli::try_parse_from(["gewu-server", "serve"]).unwrap();
+        match cli.command {
+            Command::Serve(args) => {
+                assert_eq!(args.host, server::DEFAULT_HOST);
+                assert_eq!(args.ws_port, server::DEFAULT_WS_PORT);
+                assert_eq!(args.tcp_port, server::DEFAULT_TCP_PORT);
+                assert_eq!(args.common.agent, "build");
+            }
+            _ => panic!("expected serve command"),
+        }
+    }
+
+    #[test]
+    fn parses_serve_command_with_overrides() {
+        let cli = Cli::try_parse_from([
+            "gewu-server",
+            "serve",
+            "--host",
+            "0.0.0.0",
+            "--ws-port",
+            "9000",
+            "--tcp-port",
+            "9001",
+            "--agent",
+            "explore",
+        ])
+        .unwrap();
+        match cli.command {
+            Command::Serve(args) => {
+                assert_eq!(args.host, "0.0.0.0");
+                assert_eq!(args.ws_port, 9000);
+                assert_eq!(args.tcp_port, 9001);
+                assert_eq!(args.common.agent, "explore");
+            }
+            _ => panic!("expected serve command"),
         }
     }
 
     #[test]
     fn rejects_legacy_top_level_prompt() {
-        assert!(Cli::try_parse_from(["gewu-cli", "hello"]).is_err());
+        assert!(Cli::try_parse_from(["gewu-server", "hello"]).is_err());
     }
 
     #[test]

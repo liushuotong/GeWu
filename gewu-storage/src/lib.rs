@@ -50,6 +50,105 @@ use gewu_core::types::Message;
 use sqlx::{Row, sqlite::SqlitePool};
 use tracing::{error, info};
 
+/// One stored message together with its database identity.
+#[derive(Debug, Clone)]
+pub struct StoredMessage {
+    /// Auto-incrementing row id (insertion order).
+    pub id: i64,
+    /// Human-readable local timestamp of the row.
+    pub created_at: String,
+    /// The deserialized conversation message.
+    pub message: Message,
+}
+
+/// Whether the persistent-memory table has been created yet.
+///
+/// A fresh database has no table until the first agent session is created, so
+/// history queries must treat "missing" as "no sessions" rather than error.
+async fn memory_table_exists(pool: &SqlitePool) -> Result<bool> {
+    let row = sqlx::query(
+        "SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'memory_messages'",
+    )
+    .fetch_optional(pool)
+    .await
+    .context("Failed to inspect the memory database schema")?;
+    Ok(row.is_some())
+}
+
+/// List persisted conversation sessions, newest first.
+///
+/// Sessions are derived from the `memory_messages` table, so a session exists
+/// once it has at least one stored message.
+pub async fn list_sessions(pool: &SqlitePool) -> Result<Vec<gewu_protocol::SessionSummary>> {
+    if !memory_table_exists(pool).await? {
+        return Ok(Vec::new());
+    }
+    let rows = sqlx::query(
+        r#"
+        SELECT
+            session_id,
+            COUNT(*) AS message_count,
+            datetime(MAX(created_at), 'unixepoch', 'localtime') AS updated_at
+        FROM memory_messages
+        GROUP BY session_id
+        ORDER BY MAX(created_at) DESC, session_id ASC
+        "#,
+    )
+    .fetch_all(pool)
+    .await
+    .context("Failed to list memory sessions; the database may not contain agent memory")?;
+
+    rows.into_iter()
+        .map(|row| {
+            Ok(gewu_protocol::SessionSummary {
+                session_id: row.try_get("session_id")?,
+                message_count: row.try_get("message_count")?,
+                updated_at: row
+                    .try_get::<Option<String>, _>("updated_at")?
+                    .unwrap_or_else(|| "unknown".to_string()),
+            })
+        })
+        .collect()
+}
+
+/// Load every message stored for one session, oldest first.
+pub async fn load_session(pool: &SqlitePool, session_id: &str) -> Result<Vec<StoredMessage>> {
+    if !memory_table_exists(pool).await? {
+        return Ok(Vec::new());
+    }
+    let rows = sqlx::query(
+        r#"
+        SELECT
+            id,
+            content,
+            datetime(created_at, 'unixepoch', 'localtime') AS created_at
+        FROM memory_messages
+        WHERE session_id = ?
+        ORDER BY id ASC
+        "#,
+    )
+    .bind(session_id)
+    .fetch_all(pool)
+    .await
+    .with_context(|| format!("Failed to load memory for session '{}'", session_id))?;
+
+    rows.into_iter()
+        .map(|row| {
+            let id: i64 = row.try_get("id")?;
+            let content: String = row.try_get("content")?;
+            let message = serde_json::from_str(&content)
+                .with_context(|| format!("Failed to deserialize memory message {}", id))?;
+            Ok(StoredMessage {
+                id,
+                created_at: row
+                    .try_get::<Option<String>, _>("created_at")?
+                    .unwrap_or_else(|| "unknown".to_string()),
+                message,
+            })
+        })
+        .collect()
+}
+
 /// SQLite-backed implementation of [`Memory`] for persistent storage.
 ///
 /// SqliteMemory stores conversation messages in a SQLite database, allowing
@@ -299,6 +398,76 @@ mod tests {
             _ => panic!("Wrong type"),
         }
 
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn lists_and_loads_sessions() -> Result<()> {
+        let pool = SqlitePoolOptions::new().connect("sqlite::memory:").await?;
+        sqlx::query(
+            r#"
+            CREATE TABLE memory_messages (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                session_id TEXT NOT NULL,
+                content TEXT NOT NULL,
+                created_at INTEGER NOT NULL
+            )
+            "#,
+        )
+        .execute(&pool)
+        .await?;
+
+        let user = Message::User {
+            content: vec![ContentPart::Text {
+                text: "first".to_string(),
+            }],
+        };
+        let assistant = Message::Assistant {
+            content: Some("second".to_string()),
+            tool_calls: None,
+        };
+        for (session, message, at) in [
+            ("older", &user, 1),
+            ("newer", &user, 2),
+            ("newer", &assistant, 3),
+        ] {
+            sqlx::query(
+                "INSERT INTO memory_messages (session_id, content, created_at) VALUES (?, ?, ?)",
+            )
+            .bind(session)
+            .bind(serde_json::to_string(message)?)
+            .bind(at)
+            .execute(&pool)
+            .await?;
+        }
+
+        let sessions = list_sessions(&pool).await?;
+        assert_eq!(sessions.len(), 2);
+        assert_eq!(sessions[0].session_id, "newer");
+        assert_eq!(sessions[0].message_count, 2);
+        assert_eq!(sessions[1].session_id, "older");
+
+        let stored = load_session(&pool, "newer").await?;
+        assert_eq!(stored.len(), 2);
+        assert!(stored[0].id < stored[1].id);
+        assert_eq!(
+            serde_json::to_value(&stored[0].message)?,
+            serde_json::to_value(&user)?
+        );
+        assert_eq!(
+            serde_json::to_value(&stored[1].message)?,
+            serde_json::to_value(&assistant)?
+        );
+
+        assert!(load_session(&pool, "missing").await?.is_empty());
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn a_fresh_database_has_no_sessions() -> Result<()> {
+        let pool = SqlitePoolOptions::new().connect("sqlite::memory:").await?;
+        assert!(list_sessions(&pool).await?.is_empty());
+        assert!(load_session(&pool, "anything").await?.is_empty());
         Ok(())
     }
 }
