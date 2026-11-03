@@ -147,6 +147,18 @@ pub(crate) fn pong_line(id: &str) -> String {
     serde_json::json!({ "type": "pong", "id": id }).to_string()
 }
 
+/// Convenience: an `info` frame line.
+pub(crate) fn info_line(id: &str, model: &str, provider: &str) -> String {
+    let id: serde_json::Value = serde_json::from_str(id).unwrap_or_else(|_| id.into());
+    serde_json::json!({
+        "type": "info",
+        "id": id,
+        "model": model,
+        "provider": provider,
+    })
+    .to_string()
+}
+
 /// Convenience: a `tools` frame line.
 pub(crate) fn tools_line(id: &str, tools: &[&str]) -> String {
     let id: serde_json::Value = serde_json::from_str(id).unwrap_or_else(|_| id.into());

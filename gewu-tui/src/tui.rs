@@ -5,15 +5,41 @@
 //! lives in [`crate::session::SessionModel`], shared with graphical clients.
 //! [`App`] adds the terminal-specific input box and scroll state on top.
 
+use std::collections::HashSet;
+
 use gewu_protocol::AgentEvent;
+use ratatui::layout::Rect;
+use ratatui::text::Line;
 
 pub use gewu_client::session::{Block, Phase, SessionModel};
+
+/// What clicking a transcript line toggles.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Toggle {
+    /// A run of consecutive tool calls, keyed by the run's first block index.
+    Group(usize),
+    /// One tool call's full output, keyed by its block index.
+    Output(usize),
+}
+
+/// A cached, width-wrapped Markdown render of one transcript block.
+#[derive(Debug, Clone)]
+pub struct RenderedBlock {
+    /// Hash of the source text, to detect a block being rewritten in place.
+    pub hash: u64,
+    /// Width (in columns) the block was wrapped to.
+    pub width: u16,
+    /// Rendered lines, ready to append to the transcript.
+    pub lines: Vec<Line<'static>>,
+}
 
 /// Terminal UI state for the chat client.
 #[derive(Debug)]
 pub struct App {
     /// Conversation state shared with other front-ends.
     pub model: SessionModel,
+    /// Server model as `provider/model`, shown in the status line.
+    pub model_label: Option<String>,
     pub input: String,
     /// Cursor position (in chars) within `input`.
     pub cursor: usize,
@@ -21,6 +47,23 @@ pub struct App {
     pub scroll: usize,
     /// Follow new output by keeping the transcript scrolled to the end.
     pub follow: bool,
+    /// Rendered Markdown, indexed by transcript block. Invalidated by width
+    /// changes (stored per entry) and by transcript replacement.
+    pub rendered: Vec<Option<RenderedBlock>>,
+    /// Tool runs the user expanded (keyed by the run's first block index).
+    pub expanded_groups: HashSet<usize>,
+    /// Tool calls whose full output the user expanded (block index).
+    pub expanded_outputs: HashSet<usize>,
+    /// Clickable transcript lines from the last frame (absolute line index →
+    /// toggle target). Rebuilt on every draw.
+    pub click_map: Vec<Option<Toggle>>,
+    /// Screen area of the transcript widget in the last frame.
+    pub transcript_area: Rect,
+    /// Absolute index of the first transcript line shown in the last frame.
+    pub viewport_top: usize,
+    /// Line to keep at the same screen row across the next draw, set by a
+    /// click that changes the transcript height: `(absolute line, row)`.
+    pub anchor: Option<(usize, u16)>,
 }
 
 impl Default for App {
@@ -33,10 +76,18 @@ impl App {
     pub fn new() -> Self {
         Self {
             model: SessionModel::new(),
+            model_label: None,
             input: String::new(),
             cursor: 0,
             scroll: 0,
             follow: true,
+            rendered: Vec::new(),
+            expanded_groups: HashSet::new(),
+            expanded_outputs: HashSet::new(),
+            click_map: Vec::new(),
+            transcript_area: Rect::default(),
+            viewport_top: 0,
+            anchor: None,
         }
     }
 
@@ -99,6 +150,21 @@ impl App {
         self.model.finish_ask();
     }
 
+    /// Drop the conversation, session identity, composer, and scroll state so
+    /// the next prompt starts a fresh server-side session.
+    pub fn new_chat(&mut self) {
+        self.model.clear();
+        self.rendered.clear();
+        self.expanded_groups.clear();
+        self.expanded_outputs.clear();
+        self.click_map.clear();
+        self.input.clear();
+        self.cursor = 0;
+        self.scroll = 0;
+        self.follow = true;
+        self.note("new chat");
+    }
+
     pub fn set_session(&mut self, session_id: Option<String>) {
         self.model.set_session(session_id);
     }
@@ -125,6 +191,64 @@ impl App {
         }
     }
 
+    /// Jump to the top of the transcript, unpinning follow.
+    ///
+    /// The exact offset depends on the rendered line count, which only the
+    /// view knows, so this uses a saturating maximum and lets the view clamp
+    /// it to the real number of hidden lines on the next draw.
+    pub fn scroll_to_top(&mut self) {
+        self.follow = false;
+        self.scroll = usize::MAX;
+    }
+
+    /// Jump back to the newest output and resume following.
+    pub fn scroll_to_bottom(&mut self) {
+        self.follow = true;
+        self.scroll = 0;
+    }
+
+    // -- tool disclosure ----------------------------------------------------
+
+    /// Handle a left click at terminal coordinates `(column, row)`.
+    ///
+    /// Clicks inside the transcript toggle the tool output or tool run drawn
+    /// on that line. Clicks elsewhere (input box, status line, border) are
+    /// ignored. Returns `true` when something was toggled, so callers can
+    /// avoid treating the click as a selection.
+    pub fn click_at(&mut self, column: u16, row: u16) -> bool {
+        let area = self.transcript_area;
+        if area.width < 2 || area.height < 2 {
+            return false;
+        }
+        let content = Rect {
+            x: area.x + 1,
+            y: area.y + 1,
+            width: area.width - 2,
+            height: area.height - 2,
+        };
+        if column < content.x
+            || column >= content.right()
+            || row < content.y
+            || row >= content.bottom()
+        {
+            return false;
+        }
+
+        let index = self.viewport_top + (row - content.y) as usize;
+        let target = self.click_map.get(index).copied().flatten();
+        match target {
+            Some(Toggle::Group(first)) => toggle(&mut self.expanded_groups, first),
+            Some(Toggle::Output(block)) => toggle(&mut self.expanded_outputs, block),
+            None => return false,
+        }
+        // Expansion only adds lines below the clicked row, so pinning that
+        // line keeps a scrolled-up viewport from jumping.
+        if !self.follow {
+            self.anchor = Some((index, row - content.y));
+        }
+        true
+    }
+
     /// The prompt to send, if the input is non-empty.
     pub fn take_prompt(&mut self) -> Option<String> {
         let prompt = self.input.trim().to_string();
@@ -133,6 +257,13 @@ impl App {
         } else {
             Some(prompt)
         }
+    }
+}
+
+/// Insert `value` into `set` if absent, remove it otherwise.
+fn toggle(set: &mut HashSet<usize>, value: usize) {
+    if !set.remove(&value) {
+        set.insert(value);
     }
 }
 
@@ -208,6 +339,54 @@ mod tests {
         a.scroll_down(10);
         assert_eq!(a.scroll, 0);
         assert!(a.follow);
+    }
+
+    #[test]
+    fn scroll_jumps_to_top_and_bottom() {
+        let mut a = app();
+        a.scroll_to_top();
+        assert!(!a.follow);
+        assert_eq!(a.scroll, usize::MAX);
+        a.scroll_to_bottom();
+        assert!(a.follow);
+        assert_eq!(a.scroll, 0);
+    }
+
+    #[test]
+    fn scrolling_works_while_busy() {
+        let mut a = app();
+        a.submit("hi".into());
+        assert_eq!(a.model.phase, Phase::Busy);
+        a.scroll_up(3);
+        assert_eq!(a.scroll, 3);
+        assert!(!a.follow);
+        a.scroll_to_bottom();
+        assert!(a.follow);
+    }
+
+    #[test]
+    fn new_chat_clears_transcript_session_and_input() {
+        let mut a = app();
+        a.submit("hi".into());
+        a.apply_event(&AgentEvent::ContentDelta {
+            delta: "there".into(),
+        });
+        a.set_session(Some("abc".into()));
+        a.scroll_up(5);
+        a.rendered.push(None);
+        a.push_char('d');
+
+        a.new_chat();
+
+        assert_eq!(a.model.phase, Phase::Idle);
+        assert_eq!(a.model.session_id, None);
+        assert_eq!(a.model.blocks.len(), 1, "only the new-chat note remains");
+        assert!(matches!(a.model.blocks[0], Block::Info(_)));
+        assert!(a.rendered.is_empty());
+        assert!(a.input.is_empty());
+        assert_eq!(a.cursor, 0);
+        assert!(a.follow);
+        assert_eq!(a.scroll, 0);
     }
 
     #[test]

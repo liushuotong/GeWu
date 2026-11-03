@@ -6,6 +6,7 @@
 //! cargo run -p gewu-tui
 //! ```
 
+mod resume;
 mod tui;
 mod tui_view;
 
@@ -15,8 +16,10 @@ use futures::StreamExt;
 use gewu_client::Client;
 use gewu_protocol::{AgentEvent, ServerMessage};
 use ratatui::crossterm::event::{
-    Event as TermEvent, EventStream, KeyCode, KeyEventKind, KeyModifiers,
+    DisableMouseCapture, EnableMouseCapture, Event as TermEvent, EventStream, KeyCode,
+    KeyEventKind, KeyModifiers, MouseButton, MouseEventKind,
 };
+use ratatui::crossterm::execute;
 use ratatui::{init as tui_init, restore as tui_restore};
 use std::io::Write;
 use tui::{App, Phase};
@@ -40,6 +43,10 @@ struct Cli {
     /// Resume a specific session (also via GEWU_SESSION_ID)
     #[arg(long, env = "GEWU_SESSION_ID")]
     session_id: Option<String>,
+
+    /// Start a fresh conversation instead of resuming the most recent session
+    #[arg(long)]
+    new: bool,
 }
 
 #[tokio::main]
@@ -50,14 +57,20 @@ async fn main() -> Result<()> {
         .await
         .context("failed to connect to the gewu server (is `gewu-server serve` running?)")?;
 
+    // Replay the last conversation before entering the alternate screen so the
+    // first frame already shows history. `--session-id` wins over `--new`.
     let mut app = App::new();
-    if let Some(session) = &cli.session_id {
-        app.set_session(Some(session.clone()));
-        app.note(format!("resuming session {session}"));
+    resume::load_startup_session(&client, &mut app, cli.session_id.as_deref(), !cli.new).await;
+
+    // Show which model the server runs. Non-fatal: the status line simply
+    // omits it when unavailable.
+    match client.info().await {
+        Ok(info) => app.model_label = Some(format!("{}/{}", info.provider, info.model)),
+        Err(e) => app.note(format!("could not read server info: {e}")),
     }
 
-    let result = run(client.clone(), &mut app).await;
-    tui_restore();
+    let result = run(client, &mut app, &cli.host, cli.tcp_port).await;
+    restore_terminal();
     result?;
 
     // Surface the session id after a normal exit so it can be resumed.
@@ -67,10 +80,35 @@ async fn main() -> Result<()> {
     Ok(())
 }
 
+/// Enter the alternate screen and ask the terminal for mouse events.
+///
+/// Mouse capture is what makes touchpad/wheel scrolling reach the app instead
+/// of scrolling the terminal's own (alternate-screen) history — important
+/// over SSH, where there is no local scrollback to fall back on.
+fn init_terminal() -> ratatui::DefaultTerminal {
+    let terminal = tui_init();
+    let _ = execute!(std::io::stdout(), EnableMouseCapture);
+
+    // Chain onto ratatui's restore-before-panic hook so mouse mode is
+    // released even if the app panics.
+    let previous = std::panic::take_hook();
+    std::panic::set_hook(Box::new(move |info| {
+        let _ = execute!(std::io::stdout(), DisableMouseCapture);
+        previous(info);
+    }));
+    terminal
+}
+
+/// Release mouse mode, then restore the terminal.
+fn restore_terminal() {
+    let _ = execute!(std::io::stdout(), DisableMouseCapture);
+    tui_restore();
+}
+
 /// Terminal event loop: routes crossterm events and ask-stream frames into
 /// the [`App`], redrawing on every change.
-async fn run(client: Client, app: &mut App) -> Result<()> {
-    let mut terminal = tui_init();
+async fn run(mut client: Client, app: &mut App, host: &str, port: u16) -> Result<()> {
+    let mut terminal = init_terminal();
     let mut events = EventStream::new();
 
     // Liveness check; surfaces connection problems before the first prompt.
@@ -93,48 +131,91 @@ async fn run(client: Client, app: &mut App) -> Result<()> {
         draw_once(&mut terminal, app);
 
         tokio::select! {
-            // -- keyboard ----------------------------------------------------
+            // -- keyboard / mouse --------------------------------------------
             maybe_event = events.next() => {
                 let Some(event) = maybe_event else { break };
-                let TermEvent::Key(key) = event? else { continue };
-                // Only act on key presses (not terminal-reported releases).
-                if key.kind != KeyEventKind::Press {
-                    continue;
-                }
-                match key.code {
-                    KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => break,
-                    KeyCode::Char('d') if key.modifiers.contains(KeyModifiers::CONTROL)
-                        && app.model.phase == Phase::Idle && app.input.is_empty() => break,
-                    KeyCode::Esc => {
-                        if app.model.phase == Phase::Busy {
-                            let _ = client.interrupt().await;
+                match event? {
+                    TermEvent::Key(key) => {
+                        // Only act on key presses (not terminal-reported releases).
+                        if key.kind != KeyEventKind::Press {
+                            continue;
                         }
-                    }
-                    KeyCode::Enter if app.model.phase == Phase::Idle => {
-                        if let Some(prompt) = app.take_prompt() {
-                            let mut builder = client.ask(prompt.clone());
-                            if let Some(session) = app.model.session_id.clone() {
-                                builder = builder.session_id(session);
+                        match key.code {
+                            KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => break,
+                            KeyCode::Char('d') if key.modifiers.contains(KeyModifiers::CONTROL)
+                                && app.model.phase == Phase::Idle && app.input.is_empty() => break,
+                            KeyCode::Esc => {
+                                if app.model.phase == Phase::Busy {
+                                    let _ = client.interrupt().await;
+                                }
                             }
-                            app.submit(prompt);
-                            active_ask = Some(builder.send().await?);
+                            // The server pins a session per connection, so a
+                            // new chat needs a fresh connection. Keep the old
+                            // client until the new one is up.
+                            KeyCode::Char('n') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                                if active_ask.is_some() {
+                                    let _ = client.interrupt().await;
+                                    active_ask = None;
+                                }
+                                match Client::tcp(host, port).await {
+                                    Ok(fresh) => {
+                                        client.close().await;
+                                        client = fresh;
+                                        app.new_chat();
+                                    }
+                                    Err(e) => {
+                                        app.fail(format!("could not start a new chat: {e}"));
+                                    }
+                                }
+                            }
+                            KeyCode::Enter if app.model.phase == Phase::Idle => {
+                                if let Some(prompt) = app.take_prompt() {
+                                    let mut builder = client.ask(prompt.clone());
+                                    if let Some(session) = app.model.session_id.clone() {
+                                        builder = builder.session_id(session);
+                                    }
+                                    app.submit(prompt);
+                                    active_ask = Some(builder.send().await?);
+                                }
+                            }
+                            KeyCode::Backspace => app.backspace(),
+                            KeyCode::Delete => app.delete(),
+                            KeyCode::Left => app.move_left(),
+                            KeyCode::Right => app.move_right(),
+                            // With an empty composer these scroll the transcript;
+                            // otherwise they move the input cursor.
+                            KeyCode::Home if app.input.is_empty() => app.scroll_to_top(),
+                            KeyCode::End if app.input.is_empty() => app.scroll_to_bottom(),
+                            KeyCode::Home => app.move_home(),
+                            KeyCode::End => app.move_end(),
+                            KeyCode::Up if app.input.is_empty() => {
+                                app.scroll_up(SCROLL_STEP);
+                            }
+                            KeyCode::Down if app.input.is_empty() => {
+                                app.scroll_down(SCROLL_STEP);
+                            }
+                            KeyCode::PageUp => app.scroll_up(10),
+                            KeyCode::PageDown => app.scroll_down(10),
+                            KeyCode::Char(c) => app.push_char(c),
+                            _ => {}
                         }
                     }
-                    KeyCode::Backspace => app.backspace(),
-                    KeyCode::Delete => app.delete(),
-                    KeyCode::Left => app.move_left(),
-                    KeyCode::Right => app.move_right(),
-                    KeyCode::Home => app.move_home(),
-                    KeyCode::End => app.move_end(),
-                    KeyCode::Up if app.model.phase == Phase::Idle && app.input.is_empty() => {
-                        app.scroll_up(SCROLL_STEP);
-                    }
-                    KeyCode::Down if app.model.phase == Phase::Idle && app.input.is_empty() => {
-                        app.scroll_down(SCROLL_STEP);
-                    }
-                    KeyCode::PageUp => app.scroll_up(10),
-                    KeyCode::PageDown => app.scroll_down(10),
-                    KeyCode::Char(c) => app.push_char(c),
+                    // Touchpad/wheel scrolling arrives as mouse events once
+                    // capture is on; route them into the transcript in any
+                    // phase, including while a reply streams. A plain left
+                    // click toggles tool output/disclosure; Shift+click is
+                    // left to the terminal for text selection.
+                    TermEvent::Mouse(mouse) => match mouse.kind {
+                        MouseEventKind::ScrollUp => app.scroll_up(SCROLL_STEP),
+                        MouseEventKind::ScrollDown => app.scroll_down(SCROLL_STEP),
+                        MouseEventKind::Down(MouseButton::Left)
+                            if !mouse.modifiers.contains(KeyModifiers::SHIFT) =>
+                        {
+                            app.click_at(mouse.column, mouse.row);
+                        }
+                        _ => {}
+                    },
+                    // Resize and focus events just trigger a redraw.
                     _ => {}
                 }
             }
@@ -211,6 +292,13 @@ mod tests {
         assert_eq!(cli.host, "127.0.0.1");
         assert_eq!(cli.tcp_port, 8421);
         assert_eq!(cli.session_id, None);
+        assert!(!cli.new);
+    }
+
+    #[test]
+    fn cli_accepts_new_flag() {
+        let cli = Cli::try_parse_from(["gewu-tui", "--new"]).unwrap();
+        assert!(cli.new);
     }
 
     #[test]

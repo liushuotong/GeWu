@@ -62,7 +62,8 @@ echoed on every reply.
 {"id": "4", "op": "list_agents"}
 {"id": "5", "op": "list_sessions"}      // persisted conversations, newest first
 {"id": "6", "op": "get_session", "session_id": "s1"}  // one session's messages
-{"id": "7", "op": "ping"}
+{"id": "7", "op": "info"}               // model + provider the server runs
+{"id": "8", "op": "ping"}
 ```
 
 **Server → Client:**
@@ -74,7 +75,8 @@ echoed on every reply.
 {"type": "result", "id": null, "request_id": "c3f1...", "session_id": "s1", "response": "Done."}
 {"type": "interrupted", "id": "2", "request_id": "c3f1..."}
 {"type": "error", "id": "1", "error": "an ask is already in progress"}
-{"type": "pong", "id": "7"}
+{"type": "pong", "id": "8"}
+{"type": "info", "id": "7", "model": "gpt-4o", "provider": "openai"}
 {"type": "tools", "id": "3", "tools": ["read_file", "bash", "..."]}
 {"type": "agents", "id": "4", "agents": ["build", "explore", "general"]}
 {"type": "sessions", "id": "5", "sessions": [{"session_id": "s1", "message_count": 12, "updated_at": "2026-11-03 10:42:00"}]}

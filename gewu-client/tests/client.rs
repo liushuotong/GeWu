@@ -16,13 +16,26 @@ async fn connect(server: &FakeServer) -> Client {
 
 #[tokio::test]
 async fn ping_round_trip() {
+    let server = fake::spawn(|| VecDeque::from([Step::Reply(vec![fake::pong_line("1")])])).await;
+    let client = connect(&server).await;
+
+    client.ping().await.expect("pong");
+
+    client.close().await;
+    server.stop().await;
+}
+
+#[tokio::test]
+async fn info_round_trip() {
     let server = fake::spawn(|| {
-        VecDeque::from([Step::Reply(vec![fake::pong_line("1")])])
+        VecDeque::from([Step::Reply(vec![fake::info_line("1", "gpt-4o", "openai")])])
     })
     .await;
     let client = connect(&server).await;
 
-    client.ping().await.expect("pong");
+    let info = client.info().await.expect("info");
+    assert_eq!(info.model, "gpt-4o");
+    assert_eq!(info.provider, "openai");
 
     client.close().await;
     server.stop().await;
@@ -145,7 +158,14 @@ async fn final_response_short_circuits_streaming() {
     .await;
     let client = connect(&server).await;
 
-    let response = client.ask("hi").send().await.unwrap().final_response().await.unwrap();
+    let response = client
+        .ask("hi")
+        .send()
+        .await
+        .unwrap()
+        .final_response()
+        .await
+        .unwrap();
     assert_eq!(response, "Hi there");
 
     client.close().await;
@@ -211,12 +231,14 @@ async fn interrupt_aborts_running_ask() {
                     serde_json::json!({"type": "content_delta", "delta": "working..."}),
                 ),
             ]),
-            Step::Reply(vec![serde_json::json!({
-                "type": "interrupted",
-                "id": 2,
-                "request_id": "req-1",
-            })
-            .to_string()]),
+            Step::Reply(vec![
+                serde_json::json!({
+                    "type": "interrupted",
+                    "id": 2,
+                    "request_id": "req-1",
+                })
+                .to_string(),
+            ]),
             // After interrupt, the ask's stream is closed by the server
             // (aborted without a terminal frame) — the client treats a
             // subsequent request normally.
@@ -373,12 +395,14 @@ async fn interrupted_ask_stream_ends_and_next_ask_works() {
                     serde_json::json!({"type": "content_delta", "delta": "working..."}),
                 ),
             ]),
-            Step::Reply(vec![serde_json::json!({
-                "type": "interrupted",
-                "id": 2,
-                "request_id": "req-1",
-            })
-            .to_string()]),
+            Step::Reply(vec![
+                serde_json::json!({
+                    "type": "interrupted",
+                    "id": 2,
+                    "request_id": "req-1",
+                })
+                .to_string(),
+            ]),
             Step::Reply(vec![
                 fake::ready_line("3", "req-2", "sess-1"),
                 fake::result_line("req-2", "sess-1", "after interrupt"),

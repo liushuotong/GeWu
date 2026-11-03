@@ -279,6 +279,12 @@ async fn handle_request(
     match request.op {
         Op::Ping => Ok(Handled::Reply(ServerMessage::Pong { id: request.id })),
 
+        Op::Info => Ok(Handled::Reply(ServerMessage::Info {
+            id: request.id,
+            model: state.bootstrap.model.clone(),
+            provider: state.bootstrap.provider_name.clone(),
+        })),
+
         Op::ListAgents => {
             let agents = registry::list_available_agents()
                 .into_iter()
@@ -1053,6 +1059,25 @@ mod tests {
         let agents = recv_json(&mut out_rx).await;
         assert_eq!(agents["type"], "agents");
         assert!(agents["agents"].as_array().unwrap().len() >= 3);
+
+        drop(in_tx);
+        handle.await.unwrap().unwrap();
+    }
+
+    #[tokio::test]
+    async fn connection_reports_model_and_provider() {
+        let state = server_state_with(TestLlm::plain());
+        let (in_tx, mut out_rx, handle) = spawn_connection(state).await;
+
+        in_tx
+            .send(r#"{"id": 1, "op": "info"}"#.to_string())
+            .await
+            .unwrap();
+        let info = recv_json(&mut out_rx).await;
+        assert_eq!(info["type"], "info");
+        assert_eq!(info["id"], 1);
+        assert_eq!(info["model"], "test-model");
+        assert_eq!(info["provider"], "test");
 
         drop(in_tx);
         handle.await.unwrap().unwrap();

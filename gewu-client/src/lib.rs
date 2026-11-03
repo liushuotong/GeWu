@@ -52,6 +52,15 @@ use inner::Command;
 /// Alias for a [`Result`](std::result::Result) with this crate's error type.
 pub type Result<T> = std::result::Result<T, Error>;
 
+/// Model and provider the server was started with.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ServerInfo {
+    /// Model name, e.g. `gpt-4o`.
+    pub model: String,
+    /// Provider name, e.g. `openai`.
+    pub provider: String,
+}
+
 /// Errors produced by the client.
 #[derive(Debug, Clone, thiserror::Error)]
 pub enum Error {
@@ -189,6 +198,17 @@ impl Client {
     pub async fn ping(&self) -> Result<()> {
         let request = ClientRequest::ping(self.next_correlation_id());
         self.request(request).await.map(|_| ())
+    }
+
+    /// The model and provider the server was started with.
+    pub async fn info(&self) -> Result<ServerInfo> {
+        let request = ClientRequest::info(self.next_correlation_id());
+        match self.request(request).await? {
+            ServerMessage::Info {
+                model, provider, ..
+            } => Ok(ServerInfo { model, provider }),
+            other => Err(unexpected(other, "info")),
+        }
     }
 
     /// The session id handling this connection's conversation, once known

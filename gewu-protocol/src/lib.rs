@@ -60,6 +60,8 @@ pub enum Op {
     /// Load one persisted session's messages. The session id is carried in
     /// [`ClientRequest::session_id`].
     GetSession,
+    /// Report the model and provider the server was started with.
+    Info,
     /// Liveness check.
     Ping,
 }
@@ -102,6 +104,7 @@ impl Serialize for ClientRequest {
             Op::ListAgents => map.serialize_entry("op", "list_agents")?,
             Op::ListSessions => map.serialize_entry("op", "list_sessions")?,
             Op::GetSession => map.serialize_entry("op", "get_session")?,
+            Op::Info => map.serialize_entry("op", "info")?,
             Op::Ping => map.serialize_entry("op", "ping")?,
         }
         if let Some(session_id) = &self.session_id {
@@ -171,6 +174,11 @@ impl ClientRequest {
         Self::simple(id, Op::Ping)
     }
 
+    /// Build an `info` request (server model + provider).
+    pub fn info(id: impl Into<Value>) -> Self {
+        Self::simple(id, Op::Info)
+    }
+
     fn simple(id: impl Into<Value>, op: Op) -> Self {
         Self {
             id: id.into(),
@@ -184,9 +192,7 @@ impl ClientRequest {
     /// WebSocket, `serde_json::to_string` produces the same bytes without a
     /// trailing newline; `to_line` also does not append one.
     pub fn to_line(&self) -> String {
-        serde_json::to_string(self).unwrap_or_else(|_| {
-            r#"{"id":null,"op":"ping"}"#.to_string()
-        })
+        serde_json::to_string(self).unwrap_or_else(|_| r#"{"id":null,"op":"ping"}"#.to_string())
     }
 }
 
@@ -253,6 +259,7 @@ pub fn parse_request(line: &str) -> Result<ClientRequest, RequestError> {
             Op::GetSession
         }
         "ping" => Op::Ping,
+        "info" => Op::Info,
         other => {
             return Err(RequestError::Invalid(format!("unknown op '{}'", other)));
         }
@@ -363,6 +370,15 @@ pub enum ServerMessage {
         /// Echo of the client request id.
         id: Value,
     },
+    /// Reply to an `info` request: the model/provider the server runs.
+    Info {
+        /// Echo of the client request id.
+        id: Value,
+        /// Model name (e.g. `gpt-4o`).
+        model: String,
+        /// Provider name (e.g. `openai`).
+        provider: String,
+    },
     /// Reply to a `list_tools` request.
     Tools {
         /// Echo of the client request id.
@@ -398,9 +414,8 @@ pub enum ServerMessage {
 impl ServerMessage {
     /// Serialize to a single-line JSON string (for the TCP transport).
     pub fn to_line(&self) -> String {
-        serde_json::to_string(self).unwrap_or_else(|_| {
-            r#"{"type":"error","error":"serialization failed"}"#.to_string()
-        })
+        serde_json::to_string(self)
+            .unwrap_or_else(|_| r#"{"type":"error","error":"serialization failed"}"#.to_string())
     }
 
     /// The message's `"type"` tag, e.g. `"event"`, `"result"`, `"error"`.
@@ -412,6 +427,7 @@ impl ServerMessage {
             ServerMessage::Interrupted { .. } => "interrupted",
             ServerMessage::Error { .. } => "error",
             ServerMessage::Pong { .. } => "pong",
+            ServerMessage::Info { .. } => "info",
             ServerMessage::Tools { .. } => "tools",
             ServerMessage::Agents { .. } => "agents",
             ServerMessage::Sessions { .. } => "sessions",
@@ -427,13 +443,12 @@ impl ServerMessage {
         match self {
             ServerMessage::Ready { id, .. }
             | ServerMessage::Pong { id }
+            | ServerMessage::Info { id, .. }
             | ServerMessage::Tools { id, .. }
             | ServerMessage::Agents { id, .. }
             | ServerMessage::Sessions { id, .. }
             | ServerMessage::Session { id, .. } => Some(id),
-            ServerMessage::Interrupted { id, .. } | ServerMessage::Error { id, .. } => {
-                id.as_ref()
-            }
+            ServerMessage::Interrupted { id, .. } | ServerMessage::Error { id, .. } => id.as_ref(),
             ServerMessage::Event { .. } | ServerMessage::Result { .. } => None,
         }
     }
@@ -462,7 +477,12 @@ mod tests {
     fn parses_ask_request() {
         let req = parse_request(r#"{"id": 7, "op": "ask", "prompt": "hi"}"#).unwrap();
         assert_eq!(req.id, Value::Number(7.into()));
-        assert_eq!(req.op, Op::Ask { prompt: "hi".to_string() });
+        assert_eq!(
+            req.op,
+            Op::Ask {
+                prompt: "hi".to_string()
+            }
+        );
         assert_eq!(req.session_id, None);
         assert_eq!(req.agent, None);
     }
@@ -485,6 +505,7 @@ mod tests {
             (r#"{"id": "a", "op": "list_tools"}"#, Op::ListTools),
             (r#"{"id": "a", "op": "list_agents"}"#, Op::ListAgents),
             (r#"{"id": "a", "op": "list_sessions"}"#, Op::ListSessions),
+            (r#"{"id": "a", "op": "info"}"#, Op::Info),
         ] {
             let req = parse_request(line).unwrap();
             assert_eq!(req.op, expected, "failed for {}", line);
@@ -505,6 +526,25 @@ mod tests {
     fn get_session_requires_a_session_id() {
         let err = parse_request(r#"{"id": 1, "op": "get_session"}"#).unwrap_err();
         assert!(err.to_string().contains("session_id"), "{err}");
+    }
+
+    #[test]
+    fn info_request_and_reply_round_trip() {
+        assert_eq!(
+            ClientRequest::info("a").to_line(),
+            r#"{"id":"a","op":"info"}"#
+        );
+
+        let info = ServerMessage::Info {
+            id: Value::Number(1.into()),
+            model: "gpt-4o".into(),
+            provider: "openai".into(),
+        };
+        assert_eq!(info.kind(), "info");
+        assert!(info.correlation_id().is_some());
+        let decoded: ServerMessage =
+            serde_json::from_str(&serde_json::to_string(&info).unwrap()).unwrap();
+        assert_eq!(decoded, info);
     }
 
     #[test]
@@ -562,8 +602,14 @@ mod tests {
         let line = ClientRequest::ask(7, "hello").to_line();
         assert_eq!(line, r#"{"id":7,"op":"ask","prompt":"hello"}"#);
 
-        let line = ClientRequest::ask("1", "hi").with_session("s1").with_agent("explore").to_line();
-        assert_eq!(line, r#"{"id":"1","op":"ask","prompt":"hi","session_id":"s1","agent":"explore"}"#);
+        let line = ClientRequest::ask("1", "hi")
+            .with_session("s1")
+            .with_agent("explore")
+            .to_line();
+        assert_eq!(
+            line,
+            r#"{"id":"1","op":"ask","prompt":"hi","session_id":"s1","agent":"explore"}"#
+        );
 
         let line = ClientRequest::ping("5").to_line();
         assert_eq!(line, r#"{"id":"5","op":"ping"}"#);
@@ -582,7 +628,9 @@ mod tests {
     fn constructed_requests_round_trip_through_parser() {
         for req in [
             ClientRequest::ask(7, "hello"),
-            ClientRequest::ask("1", "hi").with_session("s1").with_agent("explore"),
+            ClientRequest::ask("1", "hi")
+                .with_session("s1")
+                .with_agent("explore"),
             ClientRequest::ping("5"),
             ClientRequest::interrupt(2),
             ClientRequest::list_tools("3"),
@@ -598,7 +646,10 @@ mod tests {
 
     #[test]
     fn extract_id_works_on_malformed_messages() {
-        assert_eq!(extract_id(r#"{"id": 9, "op": "nope"}"#), Some(Value::Number(9.into())));
+        assert_eq!(
+            extract_id(r#"{"id": 9, "op": "nope"}"#),
+            Some(Value::Number(9.into()))
+        );
         assert_eq!(extract_id("not json"), None);
         assert_eq!(extract_id(r#"{"op": "ping"}"#), None);
         assert_eq!(extract_id(r#"[1,2]"#), None);
@@ -622,7 +673,9 @@ mod tests {
 
     #[test]
     fn serializes_event_message_with_agent_event() {
-        let agent_event = AgentEvent::ContentDelta { delta: "hi".to_string() };
+        let agent_event = AgentEvent::ContentDelta {
+            delta: "hi".to_string(),
+        };
         let msg = ServerMessage::Event {
             id: Value::Null,
             request_id: "req-1".to_string(),
@@ -663,7 +716,10 @@ mod tests {
 
     #[test]
     fn serializes_error_message() {
-        let msg = ServerMessage::Error { id: None, error: "boom".to_string() };
+        let msg = ServerMessage::Error {
+            id: None,
+            error: "boom".to_string(),
+        };
         let json = serde_json::to_value(&msg).unwrap();
         assert_eq!(json["type"], "error");
         assert_eq!(json["error"], "boom");
@@ -676,7 +732,10 @@ mod tests {
             serde_json::from_str(r#"{"type":"error","id":7,"error":"boom"}"#).unwrap();
         assert_eq!(
             with_id,
-            ServerMessage::Error { id: Some(Value::Number(7.into())), error: "boom".to_string() }
+            ServerMessage::Error {
+                id: Some(Value::Number(7.into())),
+                error: "boom".to_string()
+            }
         );
     }
 
@@ -697,7 +756,9 @@ mod tests {
 
     #[test]
     fn to_line_produces_single_line_json() {
-        let msg = ServerMessage::Pong { id: Value::String("x".to_string()) };
+        let msg = ServerMessage::Pong {
+            id: Value::String("x".to_string()),
+        };
         let line = msg.to_line();
         assert_eq!(line, r#"{"type":"pong","id":"x"}"#);
         assert!(!line.contains('\n'));
@@ -724,7 +785,10 @@ mod tests {
         };
         assert_eq!(result.is_ask_terminal(), Some(true));
 
-        let error = ServerMessage::Error { id: None, error: "x".to_string() };
+        let error = ServerMessage::Error {
+            id: None,
+            error: "x".to_string(),
+        };
         assert_eq!(error.is_ask_terminal(), Some(false));
     }
 }

@@ -6,58 +6,533 @@ use ratatui::layout::{Constraint, Layout};
 use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Paragraph};
+use tui_markdown::{Options, StyleSheet};
 
-use crate::tui::{App, Block as Msg, Phase};
+use crate::tui::{App, Block as Msg, Phase, RenderedBlock, Toggle};
+
+/// Lines of tool output shown below a tool row before collapsing.
+const TOOL_PREVIEW_LINES: usize = 6;
+/// Defensive cap on expanded tool output (the session model already trims).
+const TOOL_MAX_LINES: usize = 500;
 
 /// Colors for each transcript speaker.
 fn label_style(label: &str) -> Style {
     match label {
         "you" => Style::new().cyan().bold(),
         "gewu" => Style::new().green().bold(),
-        "tool" => Style::new().yellow(),
         "error" => Style::new().red().bold(),
         _ => Style::new().dim(),
     }
 }
 
-/// Render one transcript block as styled lines (label + wrapped body).
-fn block_lines(block: &Msg, width: u16) -> Vec<Line<'static>> {
+/// Markdown styles aligned with the TUI palette: important text keeps the
+/// terminal's default foreground, supporting detail is dimmed.
+#[derive(Clone, Copy, Debug)]
+struct GewuStyles;
+
+impl StyleSheet for GewuStyles {
+    fn heading(&self, level: u8) -> Style {
+        // Mirror OpenCode's TUI: headings are accent-colored and bold, with
+        // H1 additionally underlined (terminals have no font sizes).
+        if level == 1 {
+            Style::new().cyan().bold().underlined()
+        } else {
+            Style::new().cyan().bold()
+        }
+    }
+
+    fn heading_marker(&self, _level: u8) -> &str {
+        // Conceal `#`/`##` markers; the styled text carries the heading.
+        ""
+    }
+
+    fn code(&self) -> Style {
+        Style::new().cyan()
+    }
+
+    fn link(&self) -> Style {
+        Style::new().blue().underlined()
+    }
+
+    fn blockquote(&self) -> Style {
+        Style::new().dim()
+    }
+
+    fn list_marker(&self) -> Style {
+        Style::new().dim()
+    }
+
+    fn table_header(&self) -> Style {
+        Style::new().bold()
+    }
+
+    fn table_border(&self) -> Style {
+        Style::new().dim()
+    }
+}
+
+/// Transcript lines plus the click target of each line.
+struct Lines {
+    lines: Vec<Line<'static>>,
+    clicks: Vec<Option<Toggle>>,
+    width: u16,
+}
+
+impl Lines {
+    fn new(width: u16) -> Self {
+        Self {
+            lines: Vec::new(),
+            clicks: Vec::new(),
+            width,
+        }
+    }
+
+    fn push(&mut self, line: Line<'static>, click: Option<Toggle>) {
+        self.lines.push(line);
+        self.clicks.push(click);
+    }
+
+    fn blank(&mut self) {
+        self.push(Line::from(""), None);
+    }
+
+    /// Columns available for text indented by `indent` (leaving a right margin).
+    fn avail(&self, indent: usize) -> usize {
+        (self.width as usize).saturating_sub(indent + 2).max(1)
+    }
+
+    /// Wrap `text` at `indent`, styling every line the same and making each
+    /// one clickable when `click` is set.
+    fn wrapped(&mut self, indent: usize, text: &str, style: Style, click: Option<Toggle>) {
+        let pad = " ".repeat(indent);
+        for raw in wrap_text(text, self.avail(indent)) {
+            self.push(
+                Line::from(Span::styled(format!("{pad}{raw}"), style)),
+                click,
+            );
+        }
+    }
+}
+
+/// Render one transcript block as styled lines (label + body).
+///
+/// Finished assistant replies render as Markdown; the in-flight reply stays
+/// raw so partially-typed syntax (e.g. an unclosed code fence) doesn't
+/// flicker. Rendered Markdown is cached in `rendered` (indexed by block).
+/// Tool blocks are handled by [`tool_block`] / [`tool_run`].
+fn block_lines(
+    block: &Msg,
+    width: u16,
+    streaming: bool,
+    index: usize,
+    rendered: &mut [Option<RenderedBlock>],
+    out: &mut Lines,
+) {
     let label = block.label();
-    let mut lines = vec![Line::from(Span::styled(
-        label.to_string(),
-        label_style(label),
-    ))];
+    out.push(
+        Line::from(Span::styled(label.to_string(), label_style(label))),
+        None,
+    );
 
     let body_width = width.saturating_sub(3).max(1) as usize;
     match block {
-        // Tool blocks show the invocation first (`$ cmd`), then the output —
-        // mirroring gewu-server's `[Tool Start: bash] $ cmd` convention.
-        Msg::Tool { input, output, .. } => {
-            for raw in wrap_text(&format!("$ {input}"), body_width) {
-                lines.push(Line::from(Span::raw(format!("  {raw}"))));
-            }
-            let text = output.as_deref().unwrap_or("running…");
-            for raw in wrap_text(text, body_width) {
-                lines.push(Line::from(Span::styled(
-                    format!("  {raw}"),
-                    Style::new().dim(),
-                )));
+        // Tools are rendered by `tool_run`, which owns grouping and clicks.
+        Msg::Tool { .. } => {}
+        Msg::Assistant(text) if !streaming => {
+            for line in markdown_block(rendered, index, text, body_width) {
+                out.push(line, None);
             }
         }
         _ => {
             let text = block.text();
-            let style = if label == "you" {
-                Style::new()
-            } else {
+            // Important text (user prompts, streaming replies, errors) uses
+            // the terminal's default foreground; only informational notes are
+            // dimmed.
+            let style = if matches!(block, Msg::Info(_)) {
                 Style::new().dim()
+            } else {
+                Style::new()
             };
             for raw in wrap_text(text, body_width) {
-                lines.push(Line::from(Span::styled(format!("  {raw}"), style)));
+                out.push(Line::from(Span::styled(format!("  {raw}"), style)), None);
             }
         }
     }
-    lines.push(Line::from(""));
+    out.blank();
+}
+
+/// Icon and title for a tool invocation row, mirroring OpenCode's TUI
+/// (`$` shell, `→` read, `←` write/edit, `✱` search, `⚙` fallback).
+fn tool_row(tool: &str, input: &str) -> (&'static str, String) {
+    let (icon, known) = match tool {
+        "bash" | "shell" => ("$", true),
+        "read_file" | "read" | "list" => ("→", true),
+        "write_file" | "write" | "edit_file" | "edit" | "apply_patch" | "patch" => ("←", true),
+        "glob" | "grep" | "search" => ("✱", true),
+        "webfetch" | "web_fetch" => ("%", true),
+        "websearch" | "web_search" => ("◈", true),
+        _ => ("⚙", false),
+    };
+    let title = if input.is_empty() {
+        // History can hold a tool call whose output never arrived.
+        tool.to_string()
+    } else if known {
+        input.to_string()
+    } else {
+        format!("{tool} {input}")
+    };
+    (icon, title)
+}
+
+/// Display name of a tool inside a grouped summary (OpenCode's canonical
+/// names: bash → shell, grep/glob → search, webfetch → fetch).
+fn group_name(tool: &str) -> &str {
+    match tool {
+        "bash" | "shell" => "shell",
+        "read_file" | "read" => "read",
+        "write_file" | "write" | "edit_file" | "edit" | "apply_patch" | "patch" => "write",
+        "glob" | "grep" | "search" | "websearch" | "web_search" => "search",
+        "webfetch" | "web_fetch" => "fetch",
+        "list" => "list",
+        other => other,
+    }
+}
+
+/// One tool row (`✱ pattern`) plus its output, collapsed unless expanded.
+fn tool_block(
+    out: &mut Lines,
+    index: usize,
+    tool: &str,
+    input: &str,
+    output: Option<&str>,
+    expanded: bool,
+    indent: usize,
+) {
+    let (icon, title) = tool_row(tool, input);
+    let suffix = if output.is_none() { " …" } else { "" };
+    let target = Some(Toggle::Output(index));
+    out.wrapped(
+        indent,
+        &format!("{icon} {title}{suffix}"),
+        Style::new().dim(),
+        target,
+    );
+
+    let Some(output) = output else {
+        return;
+    };
+    let lines: Vec<&str> = output.trim_end().lines().collect();
+    if lines.is_empty() {
+        return;
+    }
+    let shown = if expanded {
+        lines.len().min(TOOL_MAX_LINES)
+    } else {
+        lines.len().min(TOOL_PREVIEW_LINES)
+    };
+    for line in &lines[..shown] {
+        out.wrapped(indent + 2, line, Style::new().dim(), target);
+    }
+    if lines.len() > shown {
+        let hidden = lines.len() - shown;
+        out.wrapped(
+            indent + 2,
+            &format!("… +{hidden} line{}", if hidden == 1 { "" } else { "s" }),
+            Style::new().dim(),
+            target,
+        );
+    }
+}
+
+/// Render a run of consecutive tool blocks.
+///
+/// A single call renders as its own row. Two or more collapse into an
+/// `Explored: …` summary row (OpenCode's grouped exploration) that reveals
+/// the individual rows when expanded.
+fn tool_run(
+    out: &mut Lines,
+    run: &[Msg],
+    first: usize,
+    group_expanded: bool,
+    expanded_outputs: &std::collections::HashSet<usize>,
+) {
+    let tools: Vec<(&str, &str, Option<&str>)> = run
+        .iter()
+        .filter_map(|block| match block {
+            Msg::Tool {
+                tool,
+                input,
+                output,
+            } => Some((tool.as_str(), input.as_str(), output.as_deref())),
+            _ => None,
+        })
+        .collect();
+
+    if tools.len() == 1 {
+        let (tool, input, output) = tools[0];
+        let expanded = expanded_outputs.contains(&first);
+        tool_block(out, first, tool, input, output, expanded, 2);
+        out.blank();
+        return;
+    }
+
+    let glyph = if group_expanded { "−" } else { "+" };
+    out.wrapped(
+        2,
+        &format!("{glyph} {}", group_label(run)),
+        Style::new().dim(),
+        Some(Toggle::Group(first)),
+    );
+    if group_expanded {
+        for (offset, (tool, input, output)) in tools.iter().enumerate() {
+            let index = first + offset;
+            tool_block(
+                out,
+                index,
+                tool,
+                input,
+                *output,
+                expanded_outputs.contains(&index),
+                4,
+            );
+        }
+    }
+    out.blank();
+}
+
+/// `Explored: 2 shells, 1 read` (or `Exploring: …` while a tool runs).
+fn group_label(run: &[Msg]) -> String {
+    let mut counts: Vec<(&str, usize)> = Vec::new();
+    let mut complete = true;
+    for block in run {
+        let Msg::Tool { tool, output, .. } = block else {
+            continue;
+        };
+        if output.is_none() {
+            complete = false;
+        }
+        let name = group_name(tool);
+        match counts.iter_mut().find(|(n, _)| *n == name) {
+            Some((_, count)) => *count += 1,
+            None => counts.push((name, 1)),
+        }
+    }
+    let parts: Vec<String> = counts
+        .iter()
+        .map(|(name, count)| format!("{count} {}", plural(name, *count)))
+        .collect();
+    format!(
+        "{}: {}",
+        if complete { "Explored" } else { "Exploring" },
+        parts.join(", ")
+    )
+}
+
+/// `1 read`, `2 reads`, `2 searches`, `2 fetches`.
+fn plural(name: &str, count: usize) -> String {
+    if count == 1 {
+        name.to_string()
+    } else if name == "search" || name == "fetch" {
+        format!("{name}es")
+    } else {
+        format!("{name}s")
+    }
+}
+
+/// Render (or reuse a cached render of) one assistant message as Markdown.
+fn markdown_block(
+    cache: &mut [Option<RenderedBlock>],
+    index: usize,
+    text: &str,
+    width: usize,
+) -> Vec<Line<'static>> {
+    let hash = text_hash(text);
+    let width = width.max(1) as u16;
+    if let Some(Some(entry)) = cache.get(index)
+        && entry.hash == hash
+        && entry.width == width
+    {
+        return entry.lines.clone();
+    }
+
+    let lines = render_markdown(text, width);
+    if let Some(slot) = cache.get_mut(index) {
+        *slot = Some(RenderedBlock {
+            hash,
+            width,
+            lines: lines.clone(),
+        });
+    }
     lines
+}
+
+/// Hash of a block's source text, so in-place rewrites invalidate the cache.
+fn text_hash(text: &str) -> u64 {
+    use std::hash::{Hash, Hasher};
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    text.hash(&mut hasher);
+    hasher.finish()
+}
+
+/// Markdown → wrapped, two-space-indented terminal lines.
+fn render_markdown(text: &str, width: u16) -> Vec<Line<'static>> {
+    let options = Options::new(GewuStyles).table_width(width);
+    let rendered = tui_markdown::from_str_with_options(text, &options);
+    let mut out = Vec::new();
+    for line in rendered.lines {
+        // Lines that already fit are passed through verbatim so tables keep
+        // their column alignment and code keeps its exact spacing.
+        if line.width() <= width as usize {
+            out.push(prefix_line(own_line(line), "  "));
+        } else {
+            for wrapped in wrap_line(&line, width as usize) {
+                out.push(prefix_line(wrapped, "  "));
+            }
+        }
+    }
+    if out.is_empty() {
+        out.push(Line::from("  "));
+    }
+    out
+}
+
+/// Prepend `prefix` to a line without disturbing its spans or base style.
+fn prefix_line(line: Line<'static>, prefix: &'static str) -> Line<'static> {
+    let style = line.style;
+    let mut spans = Vec::with_capacity(line.spans.len() + 1);
+    spans.push(Span::raw(prefix));
+    spans.extend(line.spans);
+    Line::from(spans).style(style)
+}
+
+/// Convert a line borrowing from the Markdown source into an owned line.
+fn own_line(line: Line<'_>) -> Line<'static> {
+    let style = line.style;
+    let spans = line
+        .spans
+        .into_iter()
+        .map(|span| Span::styled(span.content.into_owned(), span.style))
+        .collect::<Vec<_>>();
+    Line::from(spans).style(style)
+}
+
+/// Wrap a styled line to `width` columns, preserving per-span styles.
+///
+/// Markdown output keeps source line breaks but does not wrap paragraphs, so
+/// the view wraps them itself to keep scroll offsets in logical lines.
+/// Continuation lines reuse the original line's indentation.
+fn wrap_line(line: &Line<'_>, width: usize) -> Vec<Line<'static>> {
+    let width = width.max(1);
+    let mut cells: Vec<(char, Style)> = Vec::new();
+    for span in &line.spans {
+        // The line's own style (e.g. a heading) is a base that spans patch;
+        // flatten it into every cell so rebuilt lines keep it.
+        let style = line.style.patch(span.style);
+        for c in span.content.chars() {
+            cells.push((c, style));
+        }
+    }
+    if cells.is_empty() {
+        return vec![Line::from("")];
+    }
+
+    let indent = cells
+        .iter()
+        .take_while(|(c, _)| *c == ' ')
+        .count()
+        .min(width.saturating_sub(1));
+    let indent_style = cells[0].1;
+
+    // Split into words; runs of spaces are separators (collapsed on wrap).
+    let mut words: Vec<Vec<(char, Style)>> = Vec::new();
+    let mut word: Vec<(char, Style)> = Vec::new();
+    for (c, style) in cells {
+        if c == ' ' {
+            if !word.is_empty() {
+                words.push(std::mem::take(&mut word));
+            }
+        } else {
+            word.push((c, style));
+        }
+    }
+    if !word.is_empty() {
+        words.push(word);
+    }
+    if words.is_empty() {
+        return vec![Line::from("")];
+    }
+
+    let mut out: Vec<Line<'static>> = Vec::new();
+    let start_line = |indent: usize, style: Style| {
+        let mut line: Vec<(char, Style)> = Vec::new();
+        for _ in 0..indent {
+            line.push((' ', style));
+        }
+        (line, indent)
+    };
+    let (mut current, mut current_len) = start_line(indent, indent_style);
+
+    for word in words {
+        let word_len = word.len();
+        let separator = usize::from(current_len > indent);
+        if current_len + separator + word_len <= width {
+            if separator == 1 {
+                current.push((' ', word[0].1));
+                current_len += 1;
+            }
+            current.extend(word);
+            current_len += word_len;
+            continue;
+        }
+
+        // Flush the current line if it holds more than indentation.
+        if current_len > indent {
+            out.push(to_line(&current));
+            (current, current_len) = start_line(indent, indent_style);
+        }
+
+        // Append the word, hard-breaking anything longer than the width.
+        let mut rest = &word[..];
+        loop {
+            let available = width.saturating_sub(current_len);
+            if rest.len() <= available {
+                current.extend_from_slice(rest);
+                current_len += rest.len();
+                break;
+            }
+            current.extend_from_slice(&rest[..available]);
+            out.push(to_line(&current));
+            (current, current_len) = start_line(indent, indent_style);
+            rest = &rest[available..];
+        }
+    }
+    if current_len > 0 {
+        out.push(to_line(&current));
+    }
+    if out.is_empty() {
+        out.push(Line::from(""));
+    }
+    out
+}
+
+/// Collapse styled characters into spans, merging equal adjacent styles.
+fn to_line(cells: &[(char, Style)]) -> Line<'static> {
+    let mut spans: Vec<Span<'static>> = Vec::new();
+    let mut text = String::new();
+    let mut style = Style::default();
+    for (c, cell_style) in cells {
+        if text.is_empty() {
+            style = *cell_style;
+        } else if *cell_style != style {
+            spans.push(Span::styled(std::mem::take(&mut text), style));
+            style = *cell_style;
+        }
+        text.push(*c);
+    }
+    if !text.is_empty() {
+        spans.push(Span::styled(text, style));
+    }
+    Line::from(spans)
 }
 
 /// Greedy word wrap for plain text (no styling inside the body).
@@ -126,9 +601,13 @@ fn status_line(app: &App) -> Line<'static> {
         }
         None => Span::raw(""),
     };
+    let model = match &app.model_label {
+        Some(label) => Span::styled(format!("  {label}"), Style::new().dim()),
+        None => Span::raw(""),
+    };
     let keys = match app.model.phase {
         Phase::Busy => Span::styled("  Esc interrupt", Style::new().dim()),
-        Phase::Idle => Span::styled("  Enter send  Ctrl+D quit", Style::new().dim()),
+        Phase::Idle => Span::styled("  Enter send  Ctrl+N new  Ctrl+D quit", Style::new().dim()),
     };
     // The scroll hint precedes the key hints so it stays visible on narrow
     // terminals (the status line is clipped, not wrapped).
@@ -137,7 +616,7 @@ fn status_line(app: &App) -> Line<'static> {
     } else {
         Span::styled(format!("  ↑{} more", app.scroll), Style::new().yellow())
     };
-    Line::from(vec![phase, session, scroll_hint, keys])
+    Line::from(vec![phase, model, session, scroll_hint, keys])
 }
 
 /// Draw the whole UI for one frame.
@@ -152,26 +631,97 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
 
     // -- transcript ----------------------------------------------------------
     let width = transcript_area.width;
-    let mut lines: Vec<Line<'static>> = Vec::new();
-    for block in &app.model.blocks {
-        lines.extend(block_lines(block, width));
+    let phase = app.model.phase;
+    let mut transcript = Lines::new(width);
+    {
+        // Split borrows so the render cache can be written while iterating.
+        let App {
+            model,
+            rendered,
+            expanded_groups,
+            expanded_outputs,
+            ..
+        } = app;
+        if rendered.len() > model.blocks.len() {
+            rendered.clear();
+        }
+        rendered.resize_with(model.blocks.len(), || None);
+
+        let busy = phase == Phase::Busy;
+        let last = model.blocks.len().saturating_sub(1);
+        let mut index = 0;
+        while index < model.blocks.len() {
+            if matches!(model.blocks[index], Msg::Tool { .. }) {
+                let run_len = model.blocks[index..]
+                    .iter()
+                    .take_while(|block| matches!(block, Msg::Tool { .. }))
+                    .count();
+                tool_run(
+                    &mut transcript,
+                    &model.blocks[index..index + run_len],
+                    index,
+                    expanded_groups.contains(&index),
+                    expanded_outputs,
+                );
+                index += run_len;
+            } else {
+                let streaming = busy && index == last;
+                block_lines(
+                    &model.blocks[index],
+                    width,
+                    streaming,
+                    index,
+                    rendered,
+                    &mut transcript,
+                );
+                index += 1;
+            }
+        }
     }
-    if lines.is_empty() {
-        lines.push(Line::from(Span::styled(
-            "connected — type a message and press Enter",
-            Style::new().dim(),
-        )));
+    if transcript.lines.is_empty() {
+        transcript.push(
+            Line::from(Span::styled(
+                "connected — type a message and press Enter",
+                Style::new().dim(),
+            )),
+            None,
+        );
     }
+    let Lines { lines, clicks, .. } = transcript;
 
     let total = lines.len();
     let visible = transcript_area.height.saturating_sub(2) as usize; // borders
     let hidden = total.saturating_sub(visible);
+    // A toggling click pins the clicked line to the same screen row: expansion
+    // only inserts lines below it, so its absolute index is still valid.
+    if let Some((line, row)) = app.anchor.take() {
+        let top = line.saturating_sub(row as usize);
+        app.scroll = hidden.saturating_sub(top);
+        if app.scroll == 0 {
+            app.follow = true;
+        }
+    }
+    // `scroll_to_top` uses a sentinel; clamp it to the real hidden-line count
+    // so the status indicator shows a meaningful number. A transcript that
+    // fits entirely on screen has nothing to pin, so resume following.
+    if !app.follow {
+        app.scroll = app.scroll.min(hidden);
+        if app.scroll == 0 {
+            app.follow = true;
+        }
+    }
     let offset = if app.follow {
         hidden
     } else {
         hidden.saturating_sub(app.scroll)
     };
     let show: Vec<Line<'static>> = lines.into_iter().skip(offset).take(visible).collect();
+
+    // Remember where the transcript landed so a click can be mapped back to
+    // the line (and therefore the tool) under the pointer.
+    app.transcript_area = transcript_area;
+    app.viewport_top = offset;
+    app.click_map = clicks;
 
     let transcript = Paragraph::new(show).block(Block::default().borders(Borders::ALL).title(
         Span::styled(" gewu ", Style::new().bold().add_modifier(Modifier::DIM)),
@@ -205,6 +755,7 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use ratatui::style::Color;
     use ratatui::{Terminal, backend::TestBackend};
 
     fn render(app: &mut App, width: u16, height: u16) -> String {
@@ -238,6 +789,19 @@ mod tests {
     }
 
     #[test]
+    fn status_line_shows_provider_and_model() {
+        let mut app = App::new();
+        app.model_label = Some("openai/gpt-4o".to_string());
+        let screen = render(&mut app, 70, 10);
+        assert!(screen.contains("openai/gpt-4o"), "status line: {screen}");
+
+        // Unknown until the server reports it.
+        let mut app = App::new();
+        let screen = render(&mut app, 70, 10);
+        assert!(!screen.contains("openai/"), "no label: {screen}");
+    }
+
+    #[test]
     fn busy_phase_shows_interrupt_hint() {
         let mut app = App::new();
         app.submit("go".into());
@@ -263,7 +827,43 @@ mod tests {
     }
 
     #[test]
-    fn tool_block_renders_command() {
+    fn scroll_to_top_clamps_and_shows_counts() {
+        let mut app = App::new();
+        for i in 0..20 {
+            app.model.blocks.push(Msg::Assistant(format!("line {i}")));
+        }
+        app.scroll_to_top();
+        let screen = render(&mut app, 40, 10);
+        assert!(screen.contains("line 0"), "top visible: {screen}");
+        assert!(screen.contains("more"), "hint shown: {screen}");
+        // The sentinel must be clamped to the real hidden-line count.
+        assert!(
+            !screen.contains(&usize::MAX.to_string()),
+            "unclamped sentinel leaked into status: {screen}"
+        );
+        assert!(app.scroll < usize::MAX, "scroll was clamped");
+
+        app.scroll_to_bottom();
+        let screen = render(&mut app, 40, 10);
+        assert!(screen.contains("line 19"), "bottom visible: {screen}");
+        assert!(
+            !screen.contains("more"),
+            "no hint while following: {screen}"
+        );
+    }
+
+    #[test]
+    fn scroll_to_top_with_short_transcript_resumes_follow() {
+        let mut app = App::new();
+        app.model.blocks.push(Msg::Assistant("only line".into()));
+        app.scroll_to_top();
+        let _ = render(&mut app, 40, 20);
+        assert!(app.follow, "nothing to pin in a short transcript");
+        assert_eq!(app.scroll, 0);
+    }
+
+    #[test]
+    fn tool_block_renders_command_without_label() {
         let mut app = App::new();
         app.model.blocks.push(Msg::Tool {
             tool: "bash".into(),
@@ -271,8 +871,408 @@ mod tests {
             output: Some("total 0".into()),
         });
         let screen = render(&mut app, 40, 10);
-        assert!(screen.contains("tool"));
-        assert!(screen.contains("ls -la"));
+        assert!(screen.contains("$ ls -la"), "command row: {screen}");
+        assert!(screen.contains("total 0"), "output: {screen}");
+        assert!(
+            !screen.contains("tool"),
+            "tool calls should not carry a speaker label: {screen}"
+        );
+    }
+
+    #[test]
+    fn tool_rows_use_opencode_icons() {
+        assert_eq!(tool_row("bash", "ls -la"), ("$", "ls -la".to_string()));
+        assert_eq!(
+            tool_row("read_file", "src/a.rs"),
+            ("→", "src/a.rs".to_string())
+        );
+        assert_eq!(tool_row("write_file", "src/a.rs").0, "←");
+        assert_eq!(tool_row("edit_file", "src/a.rs").0, "←");
+        assert_eq!(tool_row("grep", "TODO").0, "✱");
+        assert_eq!(tool_row("glob", "*.rs").0, "✱");
+        assert_eq!(tool_row("list", "src").0, "→");
+        assert_eq!(tool_row("webfetch", "https://x.test").0, "%");
+        // Unknown tools keep their name so the row is still informative.
+        assert_eq!(
+            tool_row("custom_tool", "{\"a\":1}"),
+            ("⚙", "custom_tool {\"a\":1}".to_string())
+        );
+        // A history-loaded call without input falls back to the tool name.
+        assert_eq!(tool_row("bash", ""), ("$", "bash".to_string()));
+    }
+
+    #[test]
+    fn running_tool_shows_trailing_ellipsis() {
+        let mut app = App::new();
+        app.model.blocks.push(Msg::Tool {
+            tool: "bash".into(),
+            input: "sleep 1".into(),
+            output: None,
+        });
+        let screen = render(&mut app, 40, 10);
+        assert!(screen.contains("$ sleep 1 …"), "{screen}");
+    }
+
+    #[test]
+    fn tool_output_collapses_and_a_click_expands_it() {
+        let mut app = App::new();
+        let output = (1..=10)
+            .map(|n| format!("line {n}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        app.model.blocks.push(Msg::Tool {
+            tool: "bash".into(),
+            input: "seq 10".into(),
+            output: Some(output),
+        });
+
+        let screen = render(&mut app, 50, 20);
+        assert!(screen.contains("line 6"), "preview lines: {screen}");
+        assert!(
+            !screen.contains("line 10"),
+            "collapsed tail hidden: {screen}"
+        );
+        assert!(screen.contains("… +4 lines"), "overflow hint: {screen}");
+
+        let y = row_of(&mut app, 50, 20, "$ seq 10");
+        assert!(app.click_at(3, y), "click on the tool row toggles it");
+
+        let screen = render(&mut app, 50, 20);
+        assert!(screen.contains("line 10"), "expanded output: {screen}");
+        assert!(!screen.contains("+4 lines"), "hint gone: {screen}");
+
+        // Clicking again collapses.
+        let y = row_of(&mut app, 50, 20, "$ seq 10");
+        assert!(app.click_at(3, y));
+        let screen = render(&mut app, 50, 20);
+        assert!(screen.contains("… +4 lines"), "collapsed again: {screen}");
+    }
+
+    #[test]
+    fn consecutive_tools_group_into_a_summary_row() {
+        let mut app = App::new();
+        app.model.blocks.push(Msg::Tool {
+            tool: "bash".into(),
+            input: "ls".into(),
+            output: Some("a".into()),
+        });
+        app.model.blocks.push(Msg::Tool {
+            tool: "read_file".into(),
+            input: "src/main.rs".into(),
+            output: Some("b".into()),
+        });
+
+        let screen = render(&mut app, 60, 16);
+        assert!(
+            screen.contains("+ Explored: 1 shell, 1 read"),
+            "group summary: {screen}"
+        );
+        assert!(
+            !screen.contains("src/main.rs"),
+            "individual rows stay hidden: {screen}"
+        );
+
+        let y = row_of(&mut app, 60, 16, "Explored");
+        assert!(app.click_at(3, y), "clicking the summary expands it");
+
+        let screen = render(&mut app, 60, 16);
+        assert!(
+            screen.contains("− Explored: 1 shell, 1 read"),
+            "expanded summary: {screen}"
+        );
+        assert!(screen.contains("src/main.rs"), "rows revealed: {screen}");
+        assert!(screen.contains("$ ls"), "rows revealed: {screen}");
+    }
+
+    #[test]
+    fn running_group_says_exploring() {
+        let mut app = App::new();
+        app.model.blocks.push(Msg::Tool {
+            tool: "bash".into(),
+            input: "ls".into(),
+            output: None,
+        });
+        app.model.blocks.push(Msg::Tool {
+            tool: "grep".into(),
+            input: "TODO".into(),
+            output: None,
+        });
+        let screen = render(&mut app, 60, 16);
+        assert!(
+            screen.contains("+ Exploring: 1 shell, 1 search"),
+            "in-progress summary: {screen}"
+        );
+    }
+
+    #[test]
+    fn clicks_outside_the_transcript_do_nothing() {
+        let mut app = App::new();
+        app.model.blocks.push(Msg::Tool {
+            tool: "bash".into(),
+            input: "ls".into(),
+            output: Some("a".into()),
+        });
+        let _ = render(&mut app, 40, 12);
+        assert!(!app.click_at(0, 0), "transcript border is not clickable");
+        assert!(!app.click_at(5, 11), "input/status area is not clickable");
+    }
+
+    /// Screen row containing `needle` after drawing at the given size.
+    fn row_of(app: &mut App, width: u16, height: u16, needle: &str) -> u16 {
+        let backend = TestBackend::new(width, height);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal.draw(|f| draw(f, app)).unwrap();
+        let buffer = terminal.backend().buffer();
+        for y in 0..buffer.area.height {
+            let row: String = (0..buffer.area.width)
+                .map(|x| buffer[(x, y)].symbol().to_string())
+                .collect();
+            if row.contains(needle) {
+                return y;
+            }
+        }
+        panic!("row containing {needle:?} not found");
+    }
+
+    /// Modifier of the first character of `needle` on the row containing it.
+    fn modifier_of_row(app: &mut App, needle: &str) -> Modifier {
+        let backend = TestBackend::new(60, 14);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal.draw(|f| draw(f, app)).unwrap();
+        let buffer = terminal.backend().buffer();
+        for y in 0..buffer.area.height {
+            let row: String = (0..buffer.area.width)
+                .map(|x| buffer[(x, y)].symbol().to_string())
+                .collect();
+            if let Some(pos) = row.find(needle) {
+                let x = row[..pos].chars().count() as u16;
+                return buffer[(x, y)].modifier;
+            }
+        }
+        panic!("row containing {needle:?} not found");
+    }
+
+    #[test]
+    fn assistant_text_is_not_dimmed() {
+        let mut app = App::new();
+        app.model
+            .blocks
+            .push(Msg::Assistant("important answer".into()));
+        let modifier = modifier_of_row(&mut app, "important answer");
+        assert!(
+            !modifier.contains(Modifier::DIM),
+            "assistant body should be default color, got {modifier:?}"
+        );
+    }
+
+    #[test]
+    fn tool_output_stays_dim() {
+        let mut app = App::new();
+        app.model.blocks.push(Msg::Tool {
+            tool: "bash".into(),
+            input: "ls".into(),
+            output: Some("supporting output".into()),
+        });
+        let modifier = modifier_of_row(&mut app, "supporting output");
+        assert!(
+            modifier.contains(Modifier::DIM),
+            "tool output should stay dim, got {modifier:?}"
+        );
+    }
+
+    #[test]
+    fn info_notes_stay_dim() {
+        let mut app = App::new();
+        app.note("connected");
+        let modifier = modifier_of_row(&mut app, "connected");
+        assert!(
+            modifier.contains(Modifier::DIM),
+            "info notes should stay dim, got {modifier:?}"
+        );
+    }
+
+    /// Render a single finished assistant block as Markdown.
+    fn markdown_screen(markdown: &str, width: u16) -> (App, String) {
+        let mut app = App::new();
+        app.model.blocks.push(Msg::Assistant(markdown.into()));
+        let screen = render(&mut app, width, 24);
+        (app, screen)
+    }
+
+    /// The cell holding the first character of `needle`.
+    fn cell_at(app: &mut App, needle: &str) -> ratatui::buffer::Cell {
+        let backend = TestBackend::new(70, 24);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal.draw(|f| draw(f, app)).unwrap();
+        let buffer = terminal.backend().buffer();
+        for y in 0..buffer.area.height {
+            let row: String = (0..buffer.area.width)
+                .map(|x| buffer[(x, y)].symbol().to_string())
+                .collect();
+            if let Some(pos) = row.find(needle) {
+                let x = row[..pos].chars().count() as u16;
+                return buffer[(x, y)].clone();
+            }
+        }
+        panic!("{needle:?} not on screen");
+    }
+
+    #[test]
+    fn markdown_heading_has_no_markers_and_is_accented() {
+        let (mut app, screen) = markdown_screen("# Release notes", 60);
+        assert!(screen.contains("Release notes"), "{screen}");
+        assert!(
+            !screen.contains('#'),
+            "heading markers must be concealed: {screen}"
+        );
+        let cell = cell_at(&mut app, "Release notes");
+        assert_eq!(cell.fg, Color::Cyan, "heading accent: {screen}");
+        assert!(
+            cell.modifier.contains(Modifier::BOLD),
+            "heading should be bold, got {:?}",
+            cell.modifier
+        );
+        assert!(
+            cell.modifier.contains(Modifier::UNDERLINED),
+            "H1 should be underlined, got {:?}",
+            cell.modifier
+        );
+    }
+
+    #[test]
+    fn markdown_h2_is_bold_but_not_underlined() {
+        let (mut app, screen) = markdown_screen("## Second level", 60);
+        assert!(!screen.contains('#'), "markers concealed: {screen}");
+        let cell = cell_at(&mut app, "Second level");
+        assert_eq!(cell.fg, Color::Cyan, "heading accent: {screen}");
+        assert!(
+            cell.modifier.contains(Modifier::BOLD),
+            "H2 should be bold, got {:?}",
+            cell.modifier
+        );
+        assert!(
+            !cell.modifier.contains(Modifier::UNDERLINED),
+            "H2 should not be underlined, got {:?}",
+            cell.modifier
+        );
+    }
+
+    #[test]
+    fn markdown_inline_code_is_styled_without_backticks() {
+        let (mut app, screen) = markdown_screen("Run `cargo test` now", 60);
+        assert!(screen.contains("cargo test"), "{screen}");
+        assert!(
+            !screen.contains("`cargo test`"),
+            "backticks should be stripped: {screen}"
+        );
+        let cell = cell_at(&mut app, "cargo test");
+        assert_eq!(cell.fg, Color::Cyan, "inline code color: {screen}");
+    }
+
+    #[test]
+    fn markdown_fenced_code_preserves_content() {
+        let (_app, screen) = markdown_screen("```rust\nfn main() { println!(\"hi\"); }\n```", 70);
+        assert!(screen.contains("```rust"), "fence: {screen}");
+        assert!(screen.contains("fn main()"), "code body: {screen}");
+        assert!(screen.contains("println!"), "code body: {screen}");
+    }
+
+    #[test]
+    fn markdown_lists_render_bullets() {
+        let (_app, screen) = markdown_screen("- alpha\n- beta", 50);
+        assert!(screen.contains("- alpha"), "{screen}");
+        assert!(screen.contains("- beta"), "{screen}");
+    }
+
+    #[test]
+    fn markdown_paragraph_wraps_to_width() {
+        let text = "The quick brown fox jumps over the lazy dog and keeps on running far away.";
+        let lines = render_markdown(text, 20);
+        assert!(lines.len() > 1, "paragraph should wrap: {lines:?}");
+        for line in &lines {
+            assert!(
+                line.width() <= 22,
+                "wrapped line exceeds body+indent width: {line:?}"
+            );
+        }
+        let joined: String = lines
+            .iter()
+            .map(ToString::to_string)
+            .collect::<Vec<_>>()
+            .join(" ");
+        assert_eq!(
+            joined.split_whitespace().collect::<Vec<_>>(),
+            text.split_whitespace().collect::<Vec<_>>(),
+            "wrapping must preserve every word"
+        );
+    }
+
+    #[test]
+    fn markdown_table_fits_pane_width() {
+        let md = "| Name | Value |\n| --- | --- |\n| alpha | a fairly long cell value |";
+        let lines = render_markdown(md, 30);
+        for line in &lines {
+            assert!(
+                line.width() <= 32,
+                "table line too wide ({}): {line:?}",
+                line.width()
+            );
+        }
+    }
+
+    #[test]
+    fn markdown_table_columns_stay_aligned() {
+        let md = "| Name | Value |\n| --- | --- |\n| alpha | beta |";
+        let lines = render_markdown(md, 30);
+        let rows: Vec<&Line<'static>> = lines.iter().filter(|line| line.width() > 2).collect();
+        assert!(rows.len() >= 5, "expected a bordered table, got {lines:?}");
+        let width = rows[0].width();
+        assert!(
+            rows.iter().all(|row| row.width() == width),
+            "table rows must stay aligned: {rows:?}"
+        );
+    }
+
+    #[test]
+    fn markdown_code_block_keeps_indentation() {
+        let lines = render_markdown("```\n    indented\n```", 40);
+        let texts: Vec<String> = lines.iter().map(ToString::to_string).collect();
+        assert!(
+            texts.iter().any(|text| text == "      indented"),
+            "code indentation lost: {texts:?}"
+        );
+    }
+
+    #[test]
+    fn streaming_assistant_renders_raw_then_markdown() {
+        let mut app = App::new();
+        app.submit("hi".into());
+        app.model.blocks.push(Msg::Assistant("**bold**".into()));
+
+        let raw = render(&mut app, 60, 12);
+        assert!(raw.contains("**bold**"), "raw while streaming: {raw}");
+
+        app.finish_ask();
+        let done = render(&mut app, 60, 12);
+        assert!(done.contains("bold"), "{done}");
+        assert!(
+            !done.contains("**bold**"),
+            "finished reply should render as Markdown: {done}"
+        );
+    }
+
+    #[test]
+    fn rendered_markdown_is_cached_and_width_aware() {
+        let mut app = App::new();
+        app.model.blocks.push(Msg::Assistant("# cached".into()));
+
+        let _ = render(&mut app, 50, 12);
+        assert_eq!(app.rendered.len(), 1);
+        assert_eq!(app.rendered[0].as_ref().unwrap().width, 47);
+
+        // A resize re-renders at the new body width.
+        let _ = render(&mut app, 60, 12);
+        assert_eq!(app.rendered[0].as_ref().unwrap().width, 57);
     }
 
     #[test]
