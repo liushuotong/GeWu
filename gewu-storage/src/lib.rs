@@ -111,6 +111,22 @@ pub async fn list_sessions(pool: &SqlitePool) -> Result<Vec<gewu_protocol::Sessi
         .collect()
 }
 
+/// Delete every stored message of one session.
+///
+/// Returns the number of removed rows (0 for an unknown session). A fresh
+/// database without the memory table simply has nothing to delete.
+pub async fn delete_session(pool: &SqlitePool, session_id: &str) -> Result<u64> {
+    if !memory_table_exists(pool).await? {
+        return Ok(0);
+    }
+    let result = sqlx::query("DELETE FROM memory_messages WHERE session_id = ?")
+        .bind(session_id)
+        .execute(pool)
+        .await
+        .with_context(|| format!("Failed to delete session '{}'", session_id))?;
+    Ok(result.rows_affected())
+}
+
 /// Load every message stored for one session, oldest first.
 pub async fn load_session(pool: &SqlitePool, session_id: &str) -> Result<Vec<StoredMessage>> {
     if !memory_table_exists(pool).await? {
@@ -460,6 +476,57 @@ mod tests {
         );
 
         assert!(load_session(&pool, "missing").await?.is_empty());
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn deletes_a_session() -> Result<()> {
+        let pool = SqlitePoolOptions::new().connect("sqlite::memory:").await?;
+        sqlx::query(
+            r#"
+            CREATE TABLE memory_messages (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                session_id TEXT NOT NULL,
+                content TEXT NOT NULL,
+                created_at INTEGER NOT NULL
+            )
+            "#,
+        )
+        .execute(&pool)
+        .await?;
+
+        let user = Message::User {
+            content: vec![ContentPart::Text {
+                text: "doomed".to_string(),
+            }],
+        };
+        for (session, at) in [("gone", 1), ("kept", 2)] {
+            sqlx::query(
+                "INSERT INTO memory_messages (session_id, content, created_at) VALUES (?, ?, ?)",
+            )
+            .bind(session)
+            .bind(serde_json::to_string(&user)?)
+            .bind(at)
+            .execute(&pool)
+            .await?;
+        }
+
+        assert_eq!(delete_session(&pool, "gone").await?, 1);
+        assert_eq!(delete_session(&pool, "gone").await?, 0, "already gone");
+
+        let remaining: Vec<String> = list_sessions(&pool)
+            .await?
+            .into_iter()
+            .map(|s| s.session_id)
+            .collect();
+        assert_eq!(remaining, vec!["kept"]);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn deleting_from_a_fresh_database_is_a_noop() -> Result<()> {
+        let pool = SqlitePoolOptions::new().connect("sqlite::memory:").await?;
+        assert_eq!(delete_session(&pool, "anything").await?, 0);
         Ok(())
     }
 

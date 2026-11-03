@@ -60,8 +60,14 @@ pub enum Op {
     /// Load one persisted session's messages. The session id is carried in
     /// [`ClientRequest::session_id`].
     GetSession,
+    /// Delete one persisted session's messages. The session id is carried in
+    /// [`ClientRequest::session_id`].
+    DeleteSession,
     /// Report the model and provider the server was started with.
     Info,
+    /// Report the current session's context usage (estimated tokens vs the
+    /// agent's context limit). Creates the session when `session_id` is set.
+    Usage,
     /// Liveness check.
     Ping,
 }
@@ -104,7 +110,9 @@ impl Serialize for ClientRequest {
             Op::ListAgents => map.serialize_entry("op", "list_agents")?,
             Op::ListSessions => map.serialize_entry("op", "list_sessions")?,
             Op::GetSession => map.serialize_entry("op", "get_session")?,
+            Op::DeleteSession => map.serialize_entry("op", "delete_session")?,
             Op::Info => map.serialize_entry("op", "info")?,
+            Op::Usage => map.serialize_entry("op", "usage")?,
             Op::Ping => map.serialize_entry("op", "ping")?,
         }
         if let Some(session_id) = &self.session_id {
@@ -165,8 +173,15 @@ impl ClientRequest {
     }
 
     /// Build a `get_session` request for one stored session.
+    /// Build a `get_session` request (one stored conversation).
     pub fn get_session(id: impl Into<Value>, session_id: impl Into<String>) -> Self {
         Self::simple(id, Op::GetSession).with_session(session_id)
+    }
+
+    /// Build a `delete_session` request (remove a stored conversation). The
+    /// session id is carried in `session_id`, as with `get_session`.
+    pub fn delete_session(id: impl Into<Value>, session_id: impl Into<String>) -> Self {
+        Self::simple(id, Op::DeleteSession).with_session(session_id)
     }
 
     /// Build a `ping` request.
@@ -177,6 +192,12 @@ impl ClientRequest {
     /// Build an `info` request (server model + provider).
     pub fn info(id: impl Into<Value>) -> Self {
         Self::simple(id, Op::Info)
+    }
+
+    /// Build a `usage` request (context tokens vs limit). Pass the session id
+    /// to have the server create/load that session before measuring.
+    pub fn usage(id: impl Into<Value>) -> Self {
+        Self::simple(id, Op::Usage)
     }
 
     fn simple(id: impl Into<Value>, op: Op) -> Self {
@@ -258,8 +279,17 @@ pub fn parse_request(line: &str) -> Result<ClientRequest, RequestError> {
             }
             Op::GetSession
         }
+        "delete_session" => {
+            if obj.get("session_id").and_then(Value::as_str).is_none() {
+                return Err(RequestError::Invalid(
+                    "op 'delete_session' requires a 'session_id' string".to_string(),
+                ));
+            }
+            Op::DeleteSession
+        }
         "ping" => Op::Ping,
         "info" => Op::Info,
+        "usage" => Op::Usage,
         other => {
             return Err(RequestError::Invalid(format!("unknown op '{}'", other)));
         }
@@ -379,6 +409,16 @@ pub enum ServerMessage {
         /// Provider name (e.g. `openai`).
         provider: String,
     },
+    /// Reply to a `usage` request: the session's context usage.
+    Usage {
+        /// Echo of the client request id.
+        id: Value,
+        /// Estimated tokens in the conversation (the same estimate compaction
+        /// uses). `0` when the connection has no session to measure.
+        used_tokens: u64,
+        /// The agent's context window in tokens. `0` when unknown.
+        context_limit: u64,
+    },
     /// Reply to a `list_tools` request.
     Tools {
         /// Echo of the client request id.
@@ -409,6 +449,14 @@ pub enum ServerMessage {
         /// Stored messages, oldest first.
         messages: Vec<Message>,
     },
+    /// Reply to a `delete_session` request: the session's messages were
+    /// removed from the store.
+    Deleted {
+        /// Echo of the client request id.
+        id: Value,
+        /// Session that was deleted.
+        session_id: String,
+    },
 }
 
 impl ServerMessage {
@@ -428,10 +476,12 @@ impl ServerMessage {
             ServerMessage::Error { .. } => "error",
             ServerMessage::Pong { .. } => "pong",
             ServerMessage::Info { .. } => "info",
+            ServerMessage::Usage { .. } => "usage",
             ServerMessage::Tools { .. } => "tools",
             ServerMessage::Agents { .. } => "agents",
             ServerMessage::Sessions { .. } => "sessions",
             ServerMessage::Session { .. } => "session",
+            ServerMessage::Deleted { .. } => "deleted",
         }
     }
 
@@ -444,10 +494,12 @@ impl ServerMessage {
             ServerMessage::Ready { id, .. }
             | ServerMessage::Pong { id }
             | ServerMessage::Info { id, .. }
+            | ServerMessage::Usage { id, .. }
             | ServerMessage::Tools { id, .. }
             | ServerMessage::Agents { id, .. }
             | ServerMessage::Sessions { id, .. }
-            | ServerMessage::Session { id, .. } => Some(id),
+            | ServerMessage::Session { id, .. }
+            | ServerMessage::Deleted { id, .. } => Some(id),
             ServerMessage::Interrupted { id, .. } | ServerMessage::Error { id, .. } => id.as_ref(),
             ServerMessage::Event { .. } | ServerMessage::Result { .. } => None,
         }
@@ -506,6 +558,7 @@ mod tests {
             (r#"{"id": "a", "op": "list_agents"}"#, Op::ListAgents),
             (r#"{"id": "a", "op": "list_sessions"}"#, Op::ListSessions),
             (r#"{"id": "a", "op": "info"}"#, Op::Info),
+            (r#"{"id": "a", "op": "usage"}"#, Op::Usage),
         ] {
             let req = parse_request(line).unwrap();
             assert_eq!(req.op, expected, "failed for {}", line);
@@ -529,6 +582,39 @@ mod tests {
     }
 
     #[test]
+    fn parses_and_serializes_delete_session() {
+        let req =
+            parse_request(r#"{"id": "a", "op": "delete_session", "session_id": "s1"}"#).unwrap();
+        assert_eq!(req.op, Op::DeleteSession);
+        assert_eq!(req.session_id.as_deref(), Some("s1"));
+
+        let line = ClientRequest::delete_session("a", "s1").to_line();
+        assert_eq!(
+            line,
+            r#"{"id":"a","op":"delete_session","session_id":"s1"}"#
+        );
+    }
+
+    #[test]
+    fn delete_session_requires_a_session_id() {
+        let err = parse_request(r#"{"id": 1, "op": "delete_session"}"#).unwrap_err();
+        assert!(err.to_string().contains("session_id"), "{err}");
+    }
+
+    #[test]
+    fn deleted_reply_round_trip() {
+        let deleted = ServerMessage::Deleted {
+            id: Value::Number(1.into()),
+            session_id: "s1".into(),
+        };
+        assert_eq!(deleted.kind(), "deleted");
+        assert!(deleted.correlation_id().is_some());
+        let decoded: ServerMessage =
+            serde_json::from_str(&serde_json::to_string(&deleted).unwrap()).unwrap();
+        assert_eq!(decoded, deleted);
+    }
+
+    #[test]
     fn info_request_and_reply_round_trip() {
         assert_eq!(
             ClientRequest::info("a").to_line(),
@@ -545,6 +631,29 @@ mod tests {
         let decoded: ServerMessage =
             serde_json::from_str(&serde_json::to_string(&info).unwrap()).unwrap();
         assert_eq!(decoded, info);
+    }
+
+    #[test]
+    fn usage_request_and_reply_round_trip() {
+        assert_eq!(
+            ClientRequest::usage("a").to_line(),
+            r#"{"id":"a","op":"usage"}"#
+        );
+        assert_eq!(
+            ClientRequest::usage("a").with_session("s1").to_line(),
+            r#"{"id":"a","op":"usage","session_id":"s1"}"#
+        );
+
+        let usage = ServerMessage::Usage {
+            id: Value::Number(1.into()),
+            used_tokens: 34_000,
+            context_limit: 128_000,
+        };
+        assert_eq!(usage.kind(), "usage");
+        assert!(usage.correlation_id().is_some());
+        let decoded: ServerMessage =
+            serde_json::from_str(&serde_json::to_string(&usage).unwrap()).unwrap();
+        assert_eq!(decoded, usage);
     }
 
     #[test]

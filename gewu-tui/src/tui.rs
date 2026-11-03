@@ -40,6 +40,9 @@ pub struct App {
     pub model: SessionModel,
     /// Server model as `provider/model`, shown in the status line.
     pub model_label: Option<String>,
+    /// Context usage `(used tokens, context limit)` for the current session,
+    /// shown right-aligned in the status line. `None` hides it.
+    pub context: Option<(usize, usize)>,
     pub input: String,
     /// Cursor position (in chars) within `input`.
     pub cursor: usize,
@@ -77,6 +80,7 @@ impl App {
         Self {
             model: SessionModel::new(),
             model_label: None,
+            context: None,
             input: String::new(),
             cursor: 0,
             scroll: 0,
@@ -148,21 +152,6 @@ impl App {
     /// An ask finished (success or terminal error).
     pub fn finish_ask(&mut self) {
         self.model.finish_ask();
-    }
-
-    /// Drop the conversation, session identity, composer, and scroll state so
-    /// the next prompt starts a fresh server-side session.
-    pub fn new_chat(&mut self) {
-        self.model.clear();
-        self.rendered.clear();
-        self.expanded_groups.clear();
-        self.expanded_outputs.clear();
-        self.click_map.clear();
-        self.input.clear();
-        self.cursor = 0;
-        self.scroll = 0;
-        self.follow = true;
-        self.note("new chat");
     }
 
     pub fn set_session(&mut self, session_id: Option<String>) {
@@ -362,31 +351,6 @@ mod tests {
         assert!(!a.follow);
         a.scroll_to_bottom();
         assert!(a.follow);
-    }
-
-    #[test]
-    fn new_chat_clears_transcript_session_and_input() {
-        let mut a = app();
-        a.submit("hi".into());
-        a.apply_event(&AgentEvent::ContentDelta {
-            delta: "there".into(),
-        });
-        a.set_session(Some("abc".into()));
-        a.scroll_up(5);
-        a.rendered.push(None);
-        a.push_char('d');
-
-        a.new_chat();
-
-        assert_eq!(a.model.phase, Phase::Idle);
-        assert_eq!(a.model.session_id, None);
-        assert_eq!(a.model.blocks.len(), 1, "only the new-chat note remains");
-        assert!(matches!(a.model.blocks[0], Block::Info(_)));
-        assert!(a.rendered.is_empty());
-        assert!(a.input.is_empty());
-        assert_eq!(a.cursor, 0);
-        assert!(a.follow);
-        assert_eq!(a.scroll, 0);
     }
 
     #[test]

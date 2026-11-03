@@ -61,6 +61,16 @@ pub struct ServerInfo {
     pub provider: String,
 }
 
+/// The session's context usage against the agent's context window.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Usage {
+    /// Estimated tokens in the conversation (the same estimate compaction
+    /// uses); `0` when the server has no session to measure.
+    pub used_tokens: u64,
+    /// The agent's context window in tokens; `0` when unknown.
+    pub context_limit: u64,
+}
+
 /// Errors produced by the client.
 #[derive(Debug, Clone, thiserror::Error)]
 pub enum Error {
@@ -194,6 +204,15 @@ impl Client {
         }
     }
 
+    /// Delete a persisted session's messages from the store.
+    pub async fn delete_session(&self, session_id: impl Into<String>) -> Result<()> {
+        let request = ClientRequest::delete_session(self.next_correlation_id(), session_id);
+        match self.request(request).await? {
+            ServerMessage::Deleted { .. } => Ok(()),
+            other => Err(unexpected(other, "deleted")),
+        }
+    }
+
     /// Liveness check.
     pub async fn ping(&self) -> Result<()> {
         let request = ClientRequest::ping(self.next_correlation_id());
@@ -208,6 +227,29 @@ impl Client {
                 model, provider, ..
             } => Ok(ServerInfo { model, provider }),
             other => Err(unexpected(other, "info")),
+        }
+    }
+
+    /// The session's context usage against the agent's context window.
+    ///
+    /// Pass the session id to have the server create/load that session before
+    /// measuring (so a resumed conversation reports real numbers). While an
+    /// ask is streaming the reply carries zeros — query when idle.
+    pub async fn usage(&self, session_id: Option<&str>) -> Result<Usage> {
+        let mut request = ClientRequest::usage(self.next_correlation_id());
+        if let Some(session_id) = session_id {
+            request = request.with_session(session_id);
+        }
+        match self.request(request).await? {
+            ServerMessage::Usage {
+                used_tokens,
+                context_limit,
+                ..
+            } => Ok(Usage {
+                used_tokens,
+                context_limit,
+            }),
+            other => Err(unexpected(other, "usage")),
         }
     }
 

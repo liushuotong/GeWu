@@ -2,13 +2,16 @@
 //! state to widgets; no I/O, so views are testable with `TestBackend`.
 
 use ratatui::Frame;
-use ratatui::layout::{Constraint, Layout};
+use ratatui::layout::{Constraint, Layout, Rect};
 use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Paragraph};
 use tui_markdown::{Options, StyleSheet};
 
 use crate::tui::{App, Block as Msg, Phase, RenderedBlock, Toggle};
+use crate::workspace::{
+    NEW_BUTTON, SEPARATOR, TabMeta, TabStrip, Workspace, layout_strip, tab_title,
+};
 
 /// Lines of tool output shown below a tool row before collapsing.
 const TOOL_PREVIEW_LINES: usize = 6;
@@ -112,6 +115,25 @@ impl Lines {
             );
         }
     }
+
+    /// A two-tone row: dim `name`, default-color `title`, wrapped together.
+    fn row(&mut self, indent: usize, name: &str, title: &str, click: Option<Toggle>) {
+        let line = Line::from(vec![
+            Span::raw(" ".repeat(indent)),
+            Span::styled(name.to_string(), Style::new().dim()),
+            Span::raw("  "),
+            Span::raw(title.to_string()),
+        ]);
+        // `avail` leaves the right margin; wrapping counts the indent too.
+        let width = self.avail(indent) + indent;
+        if line.width() <= width {
+            self.push(line, click);
+        } else {
+            for wrapped in wrap_line(&line, width) {
+                self.push(wrapped, click);
+            }
+        }
+    }
 }
 
 /// Render one transcript block as styled lines (label + body).
@@ -161,44 +183,36 @@ fn block_lines(
     out.blank();
 }
 
-/// Icon and title for a tool invocation row, mirroring OpenCode's TUI
-/// (`$` shell, `→` read, `←` write/edit, `✱` search, `⚙` fallback).
-fn tool_row(tool: &str, input: &str) -> (&'static str, String) {
-    let (icon, known) = match tool {
-        "bash" | "shell" => ("$", true),
-        "read_file" | "read" | "list" => ("→", true),
-        "write_file" | "write" | "edit_file" | "edit" | "apply_patch" | "patch" => ("←", true),
-        "glob" | "grep" | "search" => ("✱", true),
-        "webfetch" | "web_fetch" => ("%", true),
-        "websearch" | "web_search" => ("◈", true),
-        _ => ("⚙", false),
-    };
-    let title = if input.is_empty() {
-        // History can hold a tool call whose output never arrived.
-        tool.to_string()
-    } else if known {
-        input.to_string()
-    } else {
-        format!("{tool} {input}")
-    };
-    (icon, title)
-}
-
-/// Display name of a tool inside a grouped summary (OpenCode's canonical
-/// names: bash → shell, grep/glob → search, webfetch → fetch).
-fn group_name(tool: &str) -> &str {
+/// Readable display name for a tool: the actual name, with only the verbose
+/// aliases shortened (`read_file` → `read`). Words beat glyphs here — a row
+/// reads `bash  git status` rather than `$ git status`.
+fn tool_name(tool: &str) -> &str {
     match tool {
-        "bash" | "shell" => "shell",
         "read_file" | "read" => "read",
-        "write_file" | "write" | "edit_file" | "edit" | "apply_patch" | "patch" => "write",
-        "glob" | "grep" | "search" | "websearch" | "web_search" => "search",
+        "write_file" | "write" => "write",
+        "edit_file" | "edit" => "edit",
+        "apply_patch" | "patch" => "patch",
         "webfetch" | "web_fetch" => "fetch",
-        "list" => "list",
+        "websearch" | "web_search" => "search",
+        "shell" => "bash",
         other => other,
     }
 }
 
-/// One tool row (`✱ pattern`) plus its output, collapsed unless expanded.
+/// Name and title for a tool invocation row.
+fn tool_row<'a>(tool: &'a str, input: &str) -> (&'a str, String) {
+    let title = if input.is_empty() {
+        // History can hold a tool call whose output never arrived.
+        tool.to_string()
+    } else {
+        input.to_string()
+    };
+    (tool_name(tool), title)
+}
+
+/// One tool row (`bash  git status`) plus its output, collapsed unless
+/// expanded. The name is dim; the command/path is default foreground so the
+/// actionable part stands out.
 fn tool_block(
     out: &mut Lines,
     index: usize,
@@ -208,15 +222,12 @@ fn tool_block(
     expanded: bool,
     indent: usize,
 ) {
-    let (icon, title) = tool_row(tool, input);
-    let suffix = if output.is_none() { " …" } else { "" };
+    let (name, mut title) = tool_row(tool, input);
+    if output.is_none() {
+        title.push_str(" …");
+    }
     let target = Some(Toggle::Output(index));
-    out.wrapped(
-        indent,
-        &format!("{icon} {title}{suffix}"),
-        Style::new().dim(),
-        target,
-    );
+    out.row(indent, name, &title, target);
 
     let Some(output) = output else {
         return;
@@ -300,7 +311,7 @@ fn tool_run(
     out.blank();
 }
 
-/// `Explored: 2 shells, 1 read` (or `Exploring: …` while a tool runs).
+/// `Explored: 2 bash, 1 read` (or `Exploring: …` while a tool runs).
 fn group_label(run: &[Msg]) -> String {
     let mut counts: Vec<(&str, usize)> = Vec::new();
     let mut complete = true;
@@ -311,7 +322,7 @@ fn group_label(run: &[Msg]) -> String {
         if output.is_none() {
             complete = false;
         }
-        let name = group_name(tool);
+        let name = tool_name(tool);
         match counts.iter_mut().find(|(n, _)| *n == name) {
             Some((_, count)) => *count += 1,
             None => counts.push((name, 1)),
@@ -328,11 +339,11 @@ fn group_label(run: &[Msg]) -> String {
     )
 }
 
-/// `1 read`, `2 reads`, `2 searches`, `2 fetches`.
+/// `1 read`, `2 reads`, `2 searches`, `2 bashes`? — no: `bash` stays `bash`.
 fn plural(name: &str, count: usize) -> String {
-    if count == 1 {
+    if count == 1 || name == "bash" {
         name.to_string()
-    } else if name == "search" || name == "fetch" {
+    } else if name.ends_with('s') || name.ends_with("ch") || name.ends_with("sh") {
         format!("{name}es")
     } else {
         format!("{name}s")
@@ -588,8 +599,18 @@ fn wrap_text(text: &str, width: usize) -> Vec<String> {
     out
 }
 
-/// The bottom status line.
-fn status_line(app: &App) -> Line<'static> {
+/// `812` → `812`, `34_567` → `35k`.
+fn format_k(tokens: usize) -> String {
+    if tokens >= 1000 {
+        format!("{}k", (tokens + 500) / 1000)
+    } else {
+        tokens.to_string()
+    }
+}
+
+/// The bottom status line: phase/model/session/scroll on the left, the
+/// context usage (`34k (27%)`) right-aligned, key hints between them.
+fn status_line(app: &App, width: u16) -> Line<'static> {
     let phase = match app.model.phase {
         Phase::Idle => Span::styled("idle", Style::new().dim()),
         Phase::Busy => Span::styled("thinking…", Style::new().cyan()),
@@ -607,7 +628,7 @@ fn status_line(app: &App) -> Line<'static> {
     };
     let keys = match app.model.phase {
         Phase::Busy => Span::styled("  Esc interrupt", Style::new().dim()),
-        Phase::Idle => Span::styled("  Enter send  Ctrl+N new  Ctrl+D quit", Style::new().dim()),
+        Phase::Idle => Span::styled("  Enter send  Ctrl+T tab  Ctrl+D quit", Style::new().dim()),
     };
     // The scroll hint precedes the key hints so it stays visible on narrow
     // terminals (the status line is clipped, not wrapped).
@@ -616,11 +637,72 @@ fn status_line(app: &App) -> Line<'static> {
     } else {
         Span::styled(format!("  ↑{} more", app.scroll), Style::new().yellow())
     };
-    Line::from(vec![phase, model, session, scroll_hint, keys])
+    let mut spans = vec![phase, model, session, scroll_hint];
+    let width = width as usize;
+    let len = |spans: &[Span]| {
+        spans
+            .iter()
+            .map(|s| s.content.chars().count())
+            .sum::<usize>()
+    };
+
+    if let Some((used, limit)) = app.context.filter(|(used, limit)| *used > 0 && *limit > 0) {
+        let pct = used * 100 / limit;
+        // Nearing the window means compaction is imminent; flag it.
+        let style = if pct >= 80 {
+            Style::new().yellow()
+        } else {
+            Style::new().dim()
+        };
+        let usage = format!("{} ({}%)", format_k(used), pct);
+        // Drop the key hints (least critical) rather than crowd the usage
+        // segment off a narrow terminal.
+        if len(&spans) + keys.content.chars().count() + usage.chars().count() + 2 <= width {
+            spans.push(keys);
+        }
+        let pad = width.saturating_sub(len(&spans) + usage.chars().count());
+        spans.push(Span::raw(" ".repeat(pad.max(2))));
+        spans.push(Span::styled(usage, style));
+    } else {
+        spans.push(keys);
+    }
+    Line::from(spans)
 }
 
 /// Draw the whole UI for one frame.
-pub fn draw(frame: &mut Frame, app: &mut App) {
+/// Full-workspace draw: tab bar on top, then the active tab's chat view.
+pub fn draw(frame: &mut Frame, ws: &mut Workspace) {
+    let root = frame.area();
+    let [tab_area, chat] =
+        Layout::vertical([Constraint::Length(1), Constraint::Min(4)]).areas(root);
+    let [transcript_area, input_area, status_area] = Layout::vertical([
+        Constraint::Min(3),
+        Constraint::Length(3),
+        Constraint::Length(1),
+    ])
+    .areas(chat);
+
+    let metas: Vec<TabMeta> = ws
+        .tabs
+        .iter()
+        .map(|tab| {
+            let mut label = tab_title(&tab.app);
+            if tab.app.model.phase == Phase::Busy {
+                label.push_str(" …");
+            }
+            TabMeta { id: tab.id, label }
+        })
+        .collect();
+    ws.strip = layout_strip(&metas, ws.active, tab_area.width);
+    render_strip(frame, &ws.strip, tab_area);
+
+    let app = &mut ws.active_tab().app;
+    render_chat(frame, app, transcript_area, input_area, status_area);
+}
+
+/// Single-conversation draw without the tab bar (used by the unit tests).
+#[cfg(test)]
+pub fn draw_app(frame: &mut Frame, app: &mut App) {
     let root = frame.area();
     let [transcript_area, input_area, status_area] = Layout::vertical([
         Constraint::Min(3),
@@ -628,7 +710,61 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
         Constraint::Length(1),
     ])
     .areas(root);
+    render_chat(frame, app, transcript_area, input_area, status_area);
+}
 
+/// The one-row tab bar: `… label × │ label × │ … │ +`. The active tab's
+/// label is cyan, bold, and underlined; everything else is dim, with a cyan
+/// `…` marking tabs whose ask is still streaming. Hit regions live in the
+/// strip (see [`crate::workspace`]).
+fn render_strip(frame: &mut Frame, strip: &TabStrip, area: Rect) {
+    let dim = Style::new().dim();
+    let accent = Style::new().cyan().bold();
+    let mut spans: Vec<Span> = Vec::new();
+    let (lo, hi) = strip.window;
+    if !strip.metas.is_empty() {
+        if lo > 0 {
+            spans.push(Span::styled("…", dim));
+        }
+        for (index, meta) in strip.metas.iter().enumerate().take(hi + 1).skip(lo) {
+            let active = index == strip.active;
+            // A busy tab's trailing " …" is styled separately, so a running
+            // background tab stays noticeable even while dimmed. Splitting
+            // keeps the label's column width identical either way.
+            let (label, busy) = match meta.label.strip_suffix(" …") {
+                Some(base) => (base, true),
+                None => (meta.label.as_str(), false),
+            };
+            let label_style = if active {
+                Style::new().cyan().bold().underlined()
+            } else {
+                dim
+            };
+            spans.push(Span::styled(format!(" {label} "), label_style));
+            if busy {
+                spans.push(Span::styled("… ", Style::new().cyan()));
+            }
+            spans.push(Span::styled("× ", if active { accent } else { dim }));
+            spans.push(Span::styled(SEPARATOR, dim));
+        }
+        if hi + 1 < strip.metas.len() {
+            spans.push(Span::styled("…", dim));
+        }
+    }
+    // OpenCode-style: the `+` button sits directly after the last rendered
+    // tab (or the right overflow marker), not pinned to the terminal edge.
+    spans.push(Span::styled(NEW_BUTTON, Style::new().dim().bold()));
+    frame.render_widget(Paragraph::new(Line::from(spans)), area);
+}
+
+/// Transcript, composer, and status line for one conversation.
+fn render_chat(
+    frame: &mut Frame,
+    app: &mut App,
+    transcript_area: Rect,
+    input_area: Rect,
+    status_area: Rect,
+) {
     // -- transcript ----------------------------------------------------------
     let width = transcript_area.width;
     let phase = app.model.phase;
@@ -749,19 +885,24 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
     }
 
     // -- status --------------------------------------------------------------
-    frame.render_widget(Paragraph::new(status_line(app)), status_area);
+    frame.render_widget(
+        Paragraph::new(status_line(app, status_area.width)),
+        status_area,
+    );
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::workspace::TabClick;
+    use gewu_protocol::{ContentPart, Message};
     use ratatui::style::Color;
     use ratatui::{Terminal, backend::TestBackend};
 
     fn render(app: &mut App, width: u16, height: u16) -> String {
         let backend = TestBackend::new(width, height);
         let mut terminal = Terminal::new(backend).unwrap();
-        terminal.draw(|f| draw(f, app)).unwrap();
+        terminal.draw(|f| draw_app(f, app)).unwrap();
         let buffer = terminal.backend().buffer();
         (0..buffer.area.height)
             .map(|y| {
@@ -771,6 +912,152 @@ mod tests {
             })
             .collect::<Vec<_>>()
             .join("\n")
+    }
+
+    fn render_ws(ws: &mut Workspace, width: u16, height: u16) -> String {
+        let backend = TestBackend::new(width, height);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal.draw(|f| draw(f, ws)).unwrap();
+        let buffer = terminal.backend().buffer();
+        (0..buffer.area.height)
+            .map(|y| {
+                (0..buffer.area.width)
+                    .map(|x| buffer[(x, y)].symbol().to_string())
+                    .collect::<String>()
+            })
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    fn tab_row(screen: &str) -> &str {
+        screen.lines().next().unwrap_or("")
+    }
+
+    #[test]
+    fn tab_bar_shows_labels_close_marks_and_plus() {
+        let mut ws = Workspace::new();
+        ws.open_session(
+            "aaaaaaaa1111",
+            &[Message::User {
+                content: vec![ContentPart::Text {
+                    text: "first chat".to_string(),
+                }],
+            }],
+        );
+        ws.open_session("bbbbbbbb2222", &[]);
+
+        let screen = render_ws(&mut ws, 80, 12);
+        let row = tab_row(&screen);
+        assert!(row.contains("first chat"), "label from first prompt: {row}");
+        assert!(row.contains("bbbbbb…"), "short-id fallback: {row}");
+        assert!(row.matches('×').count() == 2, "one × per tab: {row}");
+        assert_eq!(row.matches('│').count(), 2, "one │ rule per tab: {row}");
+        // Tabs are 14 + 1 + 13 + 1 columns; `+` follows the last rule.
+        let plus_col = row.chars().position(|c| c == '+');
+        assert_eq!(plus_col, Some(30), "+ after the last tab: {row:?}");
+        assert!(row.trim_end().ends_with('+'), "no right-edge pad: {row:?}");
+    }
+
+    #[test]
+    fn active_tab_is_highlighted() {
+        let mut ws = Workspace::new();
+        ws.open_session("aaaaaaaa1111", &[]);
+        ws.open_session("bbbbbbbb2222", &[]);
+
+        let backend = TestBackend::new(80, 12);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal.draw(|f| draw(f, &mut ws)).unwrap();
+        let buffer = terminal.backend().buffer().clone();
+
+        // The active tab's label is cyan, bold, and underlined (no reversed
+        // block); the inactive tab is plain dim.
+        let cyan = (0..80)
+            .filter(|&x| buffer[(x, 0)].fg == Color::Cyan)
+            .count();
+        assert!(cyan > 0, "the active tab is cyan-accented");
+        let underlined = (0..80)
+            .filter(|&x| {
+                buffer[(x, 0)]
+                    .modifier
+                    .contains(ratatui::style::Modifier::UNDERLINED)
+            })
+            .count();
+        assert!(underlined > 0, "the active tab label is underlined");
+        let reversed = (0..80)
+            .filter(|&x| {
+                buffer[(x, 0)]
+                    .modifier
+                    .contains(ratatui::style::Modifier::REVERSED)
+            })
+            .count();
+        assert_eq!(reversed, 0, "no inverted blocks: {reversed}");
+    }
+
+    #[test]
+    fn busy_marker_is_cyan_even_in_background_tabs() {
+        let mut ws = Workspace::new();
+        ws.open_session(
+            "aaaaaaaa1111",
+            &[Message::User {
+                content: vec![ContentPart::Text {
+                    text: "hello".to_string(),
+                }],
+            }],
+        );
+        ws.open_session("bbbbbbbb2222", &[]);
+        // The first tab streams in the background while the second is focused.
+        ws.tabs[0].app.model.phase = Phase::Busy;
+
+        let backend = TestBackend::new(80, 12);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal.draw(|f| draw(f, &mut ws)).unwrap();
+        let buffer = terminal.backend().buffer().clone();
+
+        // Row: ` hello … × │ bbbbbbbb… × │ + `. The label's ellipsis is the
+        // first one on the row ("hello" is not truncated).
+        let marker = (0..80)
+            .find(|&x| buffer[(x, 0)].symbol() == "…")
+            .expect("busy marker on the bar");
+        assert_eq!(buffer[(marker, 0)].fg, Color::Cyan, "busy … is cyan");
+        // The busy tab itself stays dim (it is not the focused one).
+        assert!(
+            buffer[(2, 0)]
+                .modifier
+                .contains(ratatui::style::Modifier::DIM),
+            "background label is dim"
+        );
+    }
+
+    #[test]
+    fn tab_bar_clicks_map_through_the_drawn_strip() {
+        let mut ws = Workspace::new();
+        ws.open_session("aaaaaaaa1111", &[]);
+        ws.open_blank();
+
+        render_ws(&mut ws, 80, 12);
+        // Draw stored the hit regions; simulate the event loop's routing.
+        match ws.click(2, 0) {
+            TabClick::Switch(0) => ws.switch_to(0),
+            other => panic!("expected a tab switch, got {other:?}"),
+        }
+        assert_eq!(ws.active, 0);
+
+        // `+` sits right after the two tabs (13 + 7 cols incl. rules).
+        match ws.click(23, 0) {
+            TabClick::New => {
+                ws.open_blank();
+            }
+            other => panic!("expected the + button, got {other:?}"),
+        }
+        assert_eq!(ws.tabs.len(), 3);
+
+        // The close hit carries the tab's id, for delete-and-close. The first
+        // tab's label is 9 chars, so its `×` sits at columns 11-12.
+        let id = match ws.click(11, 0) {
+            TabClick::Close(id) => id,
+            other => panic!("expected a close click, got {other:?}"),
+        };
+        assert!(ws.tab(id).is_some());
     }
 
     #[test]
@@ -799,6 +1086,64 @@ mod tests {
         let mut app = App::new();
         let screen = render(&mut app, 70, 10);
         assert!(!screen.contains("openai/"), "no label: {screen}");
+    }
+
+    #[test]
+    fn status_line_shows_context_usage_right_aligned() {
+        let mut app = App::new();
+        app.context = Some((34_000, 128_000));
+        let screen = render(&mut app, 80, 10);
+        assert!(screen.contains("34k (26%)"), "usage segment: {screen}");
+        let row = screen
+            .lines()
+            .find(|line| line.contains("34k"))
+            .expect("usage row");
+        assert!(
+            row.trim_end().ends_with("34k (26%)"),
+            "usage is right-aligned: {row:?}"
+        );
+
+        // Hidden until the server reports usage.
+        let mut app = App::new();
+        let screen = render(&mut app, 80, 10);
+        assert!(!screen.contains('%'), "no usage segment: {screen}");
+    }
+
+    #[test]
+    fn status_line_usage_wins_over_key_hints_when_crowded() {
+        // Mimics an 80-column terminal with a long model + session label.
+        let mut app = App::new();
+        app.model_label = Some("openai/smoke-model".to_string());
+        app.set_session(Some("seeded-session".to_string()));
+        app.context = Some((40, 128_000));
+        let screen = render(&mut app, 80, 10);
+        assert!(screen.contains("(0%)"), "usage stays visible: {screen}");
+        assert!(
+            !screen.contains("Enter send"),
+            "key hints yield to the usage: {screen}"
+        );
+
+        // With room to spare the key hints stay.
+        let mut app = App::new();
+        app.context = Some((40, 128_000));
+        let screen = render(&mut app, 120, 10);
+        assert!(screen.contains("Enter send"), "key hints kept: {screen}");
+        assert!(screen.contains("(0%)"), "usage right-aligned: {screen}");
+    }
+
+    #[test]
+    fn status_line_usage_turns_yellow_near_the_limit() {
+        // 110k of 128k = 85%: compaction is imminent.
+        let mut app = App::new();
+        app.context = Some((110_000, 128_000));
+        let cell = cell_at(&mut app, "(85%)");
+        assert_eq!(cell.fg, Color::Yellow, "warning color: {cell:?}");
+
+        // Comfortably inside the window: dim like the rest of the line.
+        let mut app = App::new();
+        app.context = Some((34_000, 128_000));
+        let cell = cell_at(&mut app, "(26%)");
+        assert_eq!(cell.fg, Color::Reset, "default dim segment: {cell:?}");
     }
 
     #[test]
@@ -871,7 +1216,7 @@ mod tests {
             output: Some("total 0".into()),
         });
         let screen = render(&mut app, 40, 10);
-        assert!(screen.contains("$ ls -la"), "command row: {screen}");
+        assert!(screen.contains("bash  ls -la"), "command row: {screen}");
         assert!(screen.contains("total 0"), "output: {screen}");
         assert!(
             !screen.contains("tool"),
@@ -880,25 +1225,49 @@ mod tests {
     }
 
     #[test]
-    fn tool_rows_use_opencode_icons() {
-        assert_eq!(tool_row("bash", "ls -la"), ("$", "ls -la".to_string()));
+    fn tool_rows_use_readable_names() {
+        assert_eq!(tool_row("bash", "ls -la"), ("bash", "ls -la".to_string()));
         assert_eq!(
             tool_row("read_file", "src/a.rs"),
-            ("→", "src/a.rs".to_string())
+            ("read", "src/a.rs".to_string())
         );
-        assert_eq!(tool_row("write_file", "src/a.rs").0, "←");
-        assert_eq!(tool_row("edit_file", "src/a.rs").0, "←");
-        assert_eq!(tool_row("grep", "TODO").0, "✱");
-        assert_eq!(tool_row("glob", "*.rs").0, "✱");
-        assert_eq!(tool_row("list", "src").0, "→");
-        assert_eq!(tool_row("webfetch", "https://x.test").0, "%");
-        // Unknown tools keep their name so the row is still informative.
+        assert_eq!(
+            tool_row("write_file", "src/a.rs"),
+            ("write", "src/a.rs".to_string())
+        );
+        assert_eq!(tool_row("edit_file", "src/a.rs").0, "edit");
+        assert_eq!(tool_row("apply_patch", "p.diff").0, "patch");
+        assert_eq!(tool_row("grep", "TODO").0, "grep");
+        assert_eq!(tool_row("glob", "*.rs").0, "glob");
+        assert_eq!(tool_row("list", "src").0, "list");
+        assert_eq!(tool_row("webfetch", "https://x.test").0, "fetch");
+        // Unknown tools keep their own name.
         assert_eq!(
             tool_row("custom_tool", "{\"a\":1}"),
-            ("⚙", "custom_tool {\"a\":1}".to_string())
+            ("custom_tool", "{\"a\":1}".to_string())
         );
         // A history-loaded call without input falls back to the tool name.
-        assert_eq!(tool_row("bash", ""), ("$", "bash".to_string()));
+        assert_eq!(tool_row("bash", ""), ("bash", "bash".to_string()));
+    }
+
+    #[test]
+    fn tool_name_is_dim_and_title_is_bright() {
+        let mut app = App::new();
+        app.model.blocks.push(Msg::Tool {
+            tool: "bash".into(),
+            input: "git status".into(),
+            output: Some("ok".into()),
+        });
+        let name = modifier_of_row(&mut app, "bash");
+        assert!(
+            name.contains(Modifier::DIM),
+            "tool name should be dim, got {name:?}"
+        );
+        let title = modifier_of_row(&mut app, "git status");
+        assert!(
+            !title.contains(Modifier::DIM),
+            "the command should be default color, got {title:?}"
+        );
     }
 
     #[test]
@@ -910,7 +1279,7 @@ mod tests {
             output: None,
         });
         let screen = render(&mut app, 40, 10);
-        assert!(screen.contains("$ sleep 1 …"), "{screen}");
+        assert!(screen.contains("bash  sleep 1 …"), "{screen}");
     }
 
     #[test]
@@ -934,7 +1303,7 @@ mod tests {
         );
         assert!(screen.contains("… +4 lines"), "overflow hint: {screen}");
 
-        let y = row_of(&mut app, 50, 20, "$ seq 10");
+        let y = row_of(&mut app, 50, 20, "bash  seq 10");
         assert!(app.click_at(3, y), "click on the tool row toggles it");
 
         let screen = render(&mut app, 50, 20);
@@ -942,7 +1311,7 @@ mod tests {
         assert!(!screen.contains("+4 lines"), "hint gone: {screen}");
 
         // Clicking again collapses.
-        let y = row_of(&mut app, 50, 20, "$ seq 10");
+        let y = row_of(&mut app, 50, 20, "bash  seq 10");
         assert!(app.click_at(3, y));
         let screen = render(&mut app, 50, 20);
         assert!(screen.contains("… +4 lines"), "collapsed again: {screen}");
@@ -964,7 +1333,7 @@ mod tests {
 
         let screen = render(&mut app, 60, 16);
         assert!(
-            screen.contains("+ Explored: 1 shell, 1 read"),
+            screen.contains("+ Explored: 1 bash, 1 read"),
             "group summary: {screen}"
         );
         assert!(
@@ -977,11 +1346,11 @@ mod tests {
 
         let screen = render(&mut app, 60, 16);
         assert!(
-            screen.contains("− Explored: 1 shell, 1 read"),
+            screen.contains("− Explored: 1 bash, 1 read"),
             "expanded summary: {screen}"
         );
         assert!(screen.contains("src/main.rs"), "rows revealed: {screen}");
-        assert!(screen.contains("$ ls"), "rows revealed: {screen}");
+        assert!(screen.contains("bash  ls"), "rows revealed: {screen}");
     }
 
     #[test]
@@ -999,7 +1368,7 @@ mod tests {
         });
         let screen = render(&mut app, 60, 16);
         assert!(
-            screen.contains("+ Exploring: 1 shell, 1 search"),
+            screen.contains("+ Exploring: 1 bash, 1 grep"),
             "in-progress summary: {screen}"
         );
     }
@@ -1021,7 +1390,7 @@ mod tests {
     fn row_of(app: &mut App, width: u16, height: u16, needle: &str) -> u16 {
         let backend = TestBackend::new(width, height);
         let mut terminal = Terminal::new(backend).unwrap();
-        terminal.draw(|f| draw(f, app)).unwrap();
+        terminal.draw(|f| draw_app(f, app)).unwrap();
         let buffer = terminal.backend().buffer();
         for y in 0..buffer.area.height {
             let row: String = (0..buffer.area.width)
@@ -1038,7 +1407,7 @@ mod tests {
     fn modifier_of_row(app: &mut App, needle: &str) -> Modifier {
         let backend = TestBackend::new(60, 14);
         let mut terminal = Terminal::new(backend).unwrap();
-        terminal.draw(|f| draw(f, app)).unwrap();
+        terminal.draw(|f| draw_app(f, app)).unwrap();
         let buffer = terminal.backend().buffer();
         for y in 0..buffer.area.height {
             let row: String = (0..buffer.area.width)
@@ -1103,7 +1472,7 @@ mod tests {
     fn cell_at(app: &mut App, needle: &str) -> ratatui::buffer::Cell {
         let backend = TestBackend::new(70, 24);
         let mut terminal = Terminal::new(backend).unwrap();
-        terminal.draw(|f| draw(f, app)).unwrap();
+        terminal.draw(|f| draw_app(f, app)).unwrap();
         let buffer = terminal.backend().buffer();
         for y in 0..buffer.area.height {
             let row: String = (0..buffer.area.width)

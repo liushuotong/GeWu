@@ -159,6 +159,29 @@ pub(crate) fn info_line(id: &str, model: &str, provider: &str) -> String {
     .to_string()
 }
 
+/// Convenience: a `deleted` frame line.
+pub(crate) fn deleted_line(id: &str, session_id: &str) -> String {
+    let id: serde_json::Value = serde_json::from_str(id).unwrap_or_else(|_| id.into());
+    serde_json::json!({
+        "type": "deleted",
+        "id": id,
+        "session_id": session_id,
+    })
+    .to_string()
+}
+
+/// Convenience: a `usage` frame line.
+pub(crate) fn usage_line(id: &str, used_tokens: u64, context_limit: u64) -> String {
+    let id: serde_json::Value = serde_json::from_str(id).unwrap_or_else(|_| id.into());
+    serde_json::json!({
+        "type": "usage",
+        "id": id,
+        "used_tokens": used_tokens,
+        "context_limit": context_limit,
+    })
+    .to_string()
+}
+
 /// Convenience: a `tools` frame line.
 pub(crate) fn tools_line(id: &str, tools: &[&str]) -> String {
     let id: serde_json::Value = serde_json::from_str(id).unwrap_or_else(|_| id.into());

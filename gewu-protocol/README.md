@@ -7,12 +7,12 @@ Every message in both directions is a single JSON object: newline-delimited
 on TCP (one object per line), one text frame per object on WebSocket.
 
 - **Client → Server:** requests (`ask`, `interrupt`, `list_tools`,
-  `list_agents`, `list_sessions`, `get_session`, `info`, `ping`) with a
-  client-chosen correlation `id` echoed on every reply. Built with
-  `ClientRequest::ask`/`interrupt`/`...` + `to_line()`, parsed with
-  `parse_request`.
+  `list_agents`, `list_sessions`, `get_session`, `delete_session`, `info`,
+  `usage`, `ping`) with a client-chosen correlation `id` echoed on every
+  reply. Built with `ClientRequest::ask`/`interrupt`/`...` + `to_line()`,
+  parsed with `parse_request`.
 - **Server → Client:** `ready`, `event`, `result`, `interrupted`, `error`,
-  `pong`, `info`, `tools`, `agents`, `sessions`, `session` frames
+  `pong`, `info`, `usage`, `tools`, `agents`, `sessions`, `session` frames
   (`ServerMessage`, serde-tagged with `"type"`). Streamed `event`/`result`
   frames carry `id: null` because they are emitted by the background ask task;
   clients demux them by connection state (one in-flight ask per connection).

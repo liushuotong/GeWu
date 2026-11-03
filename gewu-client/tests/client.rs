@@ -26,6 +26,33 @@ async fn ping_round_trip() {
 }
 
 #[tokio::test]
+async fn usage_round_trip() {
+    let server =
+        fake::spawn(|| VecDeque::from([Step::Reply(vec![fake::usage_line("1", 34_000, 128_000)])]))
+            .await;
+    let client = connect(&server).await;
+
+    let usage = client.usage(Some("s1")).await.expect("usage");
+    assert_eq!(usage.used_tokens, 34_000);
+    assert_eq!(usage.context_limit, 128_000);
+
+    client.close().await;
+    server.stop().await;
+}
+
+#[tokio::test]
+async fn delete_session_round_trip() {
+    let server =
+        fake::spawn(|| VecDeque::from([Step::Reply(vec![fake::deleted_line("1", "s1")])])).await;
+    let client = connect(&server).await;
+
+    client.delete_session("s1").await.expect("deleted");
+
+    client.close().await;
+    server.stop().await;
+}
+
+#[tokio::test]
 async fn info_round_trip() {
     let server = fake::spawn(|| {
         VecDeque::from([Step::Reply(vec![fake::info_line("1", "gpt-4o", "openai")])])

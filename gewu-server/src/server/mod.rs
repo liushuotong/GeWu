@@ -285,6 +285,43 @@ async fn handle_request(
             provider: state.bootstrap.provider_name.clone(),
         })),
 
+        Op::Usage => {
+            // Measure the conversation against the agent's context window —
+            // the same estimate the compaction logic acts on. With no session
+            // (and none requested) there is nothing to measure; report zeros.
+            if session.is_none() && request.session_id.is_none() {
+                return Ok(Handled::Reply(ServerMessage::Usage {
+                    id: request.id,
+                    used_tokens: 0,
+                    context_limit: 0,
+                }));
+            }
+            let conn = state
+                .get_or_create_session(session, request.session_id, request.agent)
+                .await
+                .map_err(|e| RequestError::Failed(e.to_string()))?;
+            // Never block on a running ask (the agent lock is held for the
+            // whole ask): report "unknown" instead.
+            let Ok(agent) = conn.agent.try_lock() else {
+                return Ok(Handled::Reply(ServerMessage::Usage {
+                    id: request.id,
+                    used_tokens: 0,
+                    context_limit: 0,
+                }));
+            };
+            let used_tokens: usize = agent
+                .memory
+                .messages()
+                .iter()
+                .map(gewu_core::compaction::estimate_message_tokens)
+                .sum();
+            Ok(Handled::Reply(ServerMessage::Usage {
+                id: request.id,
+                used_tokens: used_tokens as u64,
+                context_limit: agent.context_limit as u64,
+            }))
+        }
+
         Op::ListAgents => {
             let agents = registry::list_available_agents()
                 .into_iter()
@@ -333,6 +370,22 @@ async fn handle_request(
                 id: request.id,
                 session_id,
                 messages: stored.into_iter().map(|stored| stored.message).collect(),
+            }))
+        }
+
+        Op::DeleteSession => {
+            let Some(session_id) = request.session_id else {
+                return Err(RequestError::Invalid(
+                    "op 'delete_session' requires a 'session_id' string".to_string(),
+                ));
+            };
+            gewu_storage::delete_session(&state.bootstrap.pool, &session_id)
+                .await
+                .map_err(|e| RequestError::Failed(e.to_string()))?;
+            info!("Deleted session {}", session_id);
+            Ok(Handled::Reply(ServerMessage::Deleted {
+                id: request.id,
+                session_id,
             }))
         }
 
@@ -1065,6 +1118,46 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn connection_reports_context_usage() {
+        let state = server_state_with(TestLlm::plain());
+        let (in_tx, mut out_rx, handle) = spawn_connection(state).await;
+
+        // No session yet: nothing to measure.
+        in_tx
+            .send(r#"{"id": 1, "op": "usage"}"#.to_string())
+            .await
+            .unwrap();
+        let usage = recv_json(&mut out_rx).await;
+        assert_eq!(usage["type"], "usage");
+        assert_eq!(usage["used_tokens"], 0);
+        assert_eq!(usage["context_limit"], 0);
+
+        // After an ask the conversation has measurable content.
+        in_tx
+            .send(r#"{"id": 2, "op": "ask", "prompt": "hello"}"#.to_string())
+            .await
+            .unwrap();
+        let _ready = recv_json(&mut out_rx).await;
+        let _event = recv_json(&mut out_rx).await;
+        let _result = recv_json(&mut out_rx).await;
+
+        in_tx
+            .send(r#"{"id": 3, "op": "usage"}"#.to_string())
+            .await
+            .unwrap();
+        let usage = recv_json(&mut out_rx).await;
+        assert_eq!(usage["type"], "usage");
+        assert!(
+            usage["used_tokens"].as_u64().unwrap() > 0,
+            "ask history should count: {usage}"
+        );
+        assert_eq!(usage["context_limit"], 128_000);
+
+        drop(in_tx);
+        handle.await.unwrap().unwrap();
+    }
+
+    #[tokio::test]
     async fn connection_reports_model_and_provider() {
         let state = server_state_with(TestLlm::plain());
         let (in_tx, mut out_rx, handle) = spawn_connection(state).await;
@@ -1207,6 +1300,70 @@ mod tests {
         assert_eq!(result["type"], "result");
         assert_eq!(result["response"], "Hello from test");
         assert_eq!(result["request_id"], request_id.as_str());
+
+        drop(in_tx);
+        handle.await.unwrap().unwrap();
+    }
+
+    #[tokio::test]
+    async fn connection_deletes_a_session_from_the_store() {
+        let state = server_state_with(TestLlm::plain());
+        let (in_tx, mut out_rx, handle) = spawn_connection(state).await;
+
+        // Produce a stored session.
+        in_tx
+            .send(r#"{"id": 1, "op": "ask", "prompt": "hello"}"#.to_string())
+            .await
+            .unwrap();
+        let _ready = recv_json(&mut out_rx).await;
+        let _event = recv_json(&mut out_rx).await;
+        let result = recv_json(&mut out_rx).await;
+        assert_eq!(result["type"], "result");
+        let session_id = result["session_id"].as_str().unwrap().to_string();
+
+        in_tx
+            .send(r#"{"id": 2, "op": "list_sessions"}"#.to_string())
+            .await
+            .unwrap();
+        let sessions = recv_json(&mut out_rx).await;
+        assert_eq!(sessions["sessions"].as_array().unwrap().len(), 1);
+
+        in_tx
+            .send(
+                format!(r#"{{"id": 3, "op": "delete_session", "session_id": "{session_id}"}}"#)
+                    .to_string(),
+            )
+            .await
+            .unwrap();
+        let deleted = recv_json(&mut out_rx).await;
+        assert_eq!(deleted["type"], "deleted");
+        assert_eq!(deleted["session_id"], session_id.as_str());
+
+        in_tx
+            .send(r#"{"id": 4, "op": "list_sessions"}"#.to_string())
+            .await
+            .unwrap();
+        let sessions = recv_json(&mut out_rx).await;
+        assert_eq!(sessions["sessions"].as_array().unwrap().len(), 0);
+
+        in_tx
+            .send(
+                format!(r#"{{"id": 5, "op": "get_session", "session_id": "{session_id}"}}"#)
+                    .to_string(),
+            )
+            .await
+            .unwrap();
+        let empty = recv_json(&mut out_rx).await;
+        assert_eq!(empty["messages"].as_array().unwrap().len(), 0);
+
+        // Malformed request: missing session id.
+        in_tx
+            .send(r#"{"id": 6, "op": "delete_session"}"#.to_string())
+            .await
+            .unwrap();
+        let err = recv_json(&mut out_rx).await;
+        assert_eq!(err["type"], "error");
+        assert!(err["error"].as_str().unwrap().contains("session_id"));
 
         drop(in_tx);
         handle.await.unwrap().unwrap();
