@@ -51,6 +51,10 @@ struct Cli {
     /// Focus a fresh session tab instead of the most recent conversation
     #[arg(long)]
     new: bool,
+
+    /// Shared token when the server runs with --token (also GEWU_SERVE_TOKEN)
+    #[arg(long, env = "GEWU_SERVE_TOKEN")]
+    token: Option<String>,
 }
 
 /// Per-tab connection state: the tab's own server connection (created the
@@ -74,7 +78,7 @@ async fn main() -> Result<()> {
 
     // Admin connection: session listing/loading at startup, deletions later.
     // It is never used for asks, so the server does not pin a session to it.
-    let admin = Client::tcp(&cli.host, cli.tcp_port)
+    let admin = Client::tcp_with_token(&cli.host, cli.tcp_port, cli.token.as_deref())
         .await
         .context("failed to connect to the gewu server (is `gewu-server serve` running?)")?;
 
@@ -140,7 +144,7 @@ async fn main() -> Result<()> {
     }
 
     // Context usage for the initially focused session (connects its tab).
-    activate_tab(&mut ws, &mut conns, &cli.host, cli.tcp_port).await;
+    activate_tab(&mut ws, &mut conns, &cli.host, cli.tcp_port, cli.token.as_deref()).await;
 
     let result = run(
         admin,
@@ -148,6 +152,7 @@ async fn main() -> Result<()> {
         &mut conns,
         &cli.host,
         cli.tcp_port,
+        cli.token.as_deref(),
         model_label,
     )
     .await;
@@ -214,22 +219,29 @@ async fn ensure_client(
     tab_id: u64,
     host: &str,
     port: u16,
+    token: Option<&str>,
 ) -> Result<(), ClientError> {
     let conn = conns.entry(tab_id).or_default();
     if conn.client.is_none() {
-        conn.client = Some(Client::tcp(host, port).await?);
+        conn.client = Some(Client::tcp_with_token(host, port, token).await?);
     }
     Ok(())
 }
 
 /// On focusing a tab: make sure it has a connection and refresh its context
 /// usage. Failures are noted in the tab, never fatal.
-async fn activate_tab(ws: &mut Workspace, conns: &mut HashMap<u64, Conn>, host: &str, port: u16) {
+async fn activate_tab(
+    ws: &mut Workspace,
+    conns: &mut HashMap<u64, Conn>,
+    host: &str,
+    port: u16,
+    token: Option<&str>,
+) {
     let tab_id = ws.active_tab().id;
     if ws.active_tab().app.model.session_id.is_none() {
         return;
     }
-    if let Err(e) = ensure_client(conns, tab_id, host, port).await {
+    if let Err(e) = ensure_client(conns, tab_id, host, port, token).await {
         let app = &mut ws.active_tab().app;
         app.note(format!("context usage unavailable: {e}"));
         return;
@@ -308,6 +320,7 @@ async fn run(
     conns: &mut HashMap<u64, Conn>,
     host: &str,
     port: u16,
+    token: Option<&str>,
     model_label: Option<String>,
 ) -> Result<()> {
     let mut terminal = init_terminal();
@@ -366,16 +379,16 @@ async fn run(
                             }
                             KeyCode::PageUp if key.modifiers.contains(KeyModifiers::CONTROL) => {
                                 ws.switch_prev();
-                                activate_tab(ws, conns, host, port).await;
+                                activate_tab(ws, conns, host, port, token).await;
                             }
                             KeyCode::PageDown if key.modifiers.contains(KeyModifiers::CONTROL) => {
                                 ws.switch_next();
-                                activate_tab(ws, conns, host, port).await;
+                                activate_tab(ws, conns, host, port, token).await;
                             }
                             KeyCode::Char(c) if key.modifiers.contains(KeyModifiers::ALT)
                                 && c.is_ascii_digit() => {
                                 ws.switch_to(c.to_digit(10).unwrap_or(0).saturating_sub(1) as usize);
-                                activate_tab(ws, conns, host, port).await;
+                                activate_tab(ws, conns, host, port, token).await;
                             }
                             KeyCode::Esc => {
                                 if ws.active_tab().app.model.phase == tui::Phase::Busy
@@ -390,7 +403,7 @@ async fn run(
                                 let tab_id = ws.active_tab().id;
                                 let app = &mut ws.active_tab().app;
                                 if let Some(prompt) = app.take_prompt() {
-                                    match ensure_client(conns, tab_id, host, port).await {
+                                    match ensure_client(conns, tab_id, host, port, token).await {
                                         Ok(()) => {
                                             let session = app.model.session_id.clone();
                                             let client = conns
@@ -454,7 +467,7 @@ async fn run(
                             match ws.click(mouse.column, mouse.row) {
                                 TabClick::Switch(index) => {
                                     ws.switch_to(index);
-                                    activate_tab(ws, conns, host, port).await;
+                                    activate_tab(ws, conns, host, port, token).await;
                                 }
                                 TabClick::Close(id) => {
                                     close_tab(ws, conns, &admin, id).await;

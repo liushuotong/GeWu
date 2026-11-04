@@ -57,7 +57,7 @@ pub async fn run(cli: Cli) -> Result<()> {
 
     // Fail early with a clear message instead of accepting browsers and then
     // failing per connection. The probe connection is closed immediately.
-    match endpoint.connect().await {
+    match endpoint.connect_with_token(cli.server_token.as_deref()).await {
         Ok(probe) => probe.close().await,
         Err(e) => {
             return Err(anyhow::Error::new(e)).with_context(|| {
@@ -81,7 +81,16 @@ pub async fn run(cli: Cli) -> Result<()> {
         open_browser(&url);
     }
 
-    let state = AppState { endpoint, token };
+    let state = AppState {
+        endpoint,
+        token,
+        server_token: cli
+            .server_token
+            .as_deref()
+            .map(str::trim)
+            .filter(|t| !t.is_empty())
+            .map(str::to_string),
+    };
     server::serve(listener, state).await
 }
 

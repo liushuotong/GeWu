@@ -41,6 +41,7 @@ struct TabEvent {
 /// One browser's isolated GUI session.
 pub struct GuiSession {
     endpoint: Endpoint,
+    server_token: Option<String>,
     admin: Client,
     workspace: Workspace,
     conns: HashMap<u64, Conn>,
@@ -54,13 +55,16 @@ enum Incoming {
 
 impl GuiSession {
     /// Connect upstream and load the stored sessions into tabs.
-    pub async fn new(endpoint: &Endpoint) -> Result<Self> {
-        let admin = endpoint.connect().await.with_context(|| {
-            format!(
-                "failed to connect to the gewu server at {} (is `gewu-server serve` running?)",
-                endpoint.display()
-            )
-        })?;
+    pub async fn new(endpoint: &Endpoint, server_token: Option<&str>) -> Result<Self> {
+        let admin = endpoint
+            .connect_with_token(server_token)
+            .await
+            .with_context(|| {
+                format!(
+                    "failed to connect to the gewu server at {} (is `gewu-server serve` running?)",
+                    endpoint.display()
+                )
+            })?;
 
         let model_label = match admin.info().await {
             Ok(info) => Some(format!("{}/{}", info.provider, info.model)),
@@ -113,6 +117,7 @@ impl GuiSession {
 
         Ok(Self {
             endpoint: endpoint.clone(),
+            server_token: server_token.map(str::to_string),
             admin,
             workspace,
             conns: HashMap::new(),
@@ -272,7 +277,7 @@ impl GuiSession {
             return Ok(());
         }
         let endpoint = self.endpoint.clone();
-        let client = endpoint.connect().await?;
+        let client = endpoint.connect_with_token(self.server_token.as_deref()).await?;
         self.conns.entry(tab_id).or_default().client = Some(client);
         Ok(())
     }

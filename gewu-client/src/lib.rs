@@ -69,6 +69,11 @@ pub struct Usage {
     pub used_tokens: u64,
     /// The agent's context window in tokens; `0` when unknown.
     pub context_limit: u64,
+    /// Whether an ask is currently running on the connection. When `true`,
+    /// the numeric fields are `0` because the running ask holds the agent
+    /// lock; query again once it finishes. `0/0` with `busy: false` means
+    /// the connection has no session yet.
+    pub busy: bool,
 }
 
 /// Errors produced by the client.
@@ -86,6 +91,9 @@ pub enum Error {
     /// An ask is already running on this connection; interrupt it first.
     #[error("an ask is already in progress; interrupt it first")]
     Busy,
+    /// The server rejected the authentication token.
+    #[error("authentication failed: {0}")]
+    Auth(String),
     /// The ask was aborted by [`Client::interrupt`](Client::interrupt); the
     /// server does not send a terminal frame for it, so the ask's stream
     /// ends with this error instead.
@@ -115,14 +123,28 @@ impl Client {
     /// Connect over TCP (newline-delimited JSON; the server listens on
     /// port 8421 by default).
     pub async fn tcp(host: &str, port: u16) -> Result<Self> {
+        Self::tcp_with_token(host, port, None).await
+    }
+
+    /// Connect over TCP, authenticating with `token` when the server runs
+    /// with `--token`.
+    pub async fn tcp_with_token(host: &str, port: u16, token: Option<&str>) -> Result<Self> {
         let conn = connection::Connection::tcp(&format!("{host}:{port}")).await?;
+        let conn = authenticate(conn, token).await?;
         Ok(Self::spawn(conn))
     }
 
     /// Connect over WebSocket (`ws://` or `wss://`; the server listens on
     /// port 8420 by default).
     pub async fn websocket(url: &str) -> Result<Self> {
+        Self::websocket_with_token(url, None).await
+    }
+
+    /// Connect over WebSocket, authenticating with `token` when the server
+    /// runs with `--token`.
+    pub async fn websocket_with_token(url: &str, token: Option<&str>) -> Result<Self> {
         let conn = connection::Connection::websocket(url).await?;
+        let conn = authenticate(conn, token).await?;
         Ok(Self::spawn(conn))
     }
 
@@ -234,7 +256,8 @@ impl Client {
     ///
     /// Pass the session id to have the server create/load that session before
     /// measuring (so a resumed conversation reports real numbers). While an
-    /// ask is streaming the reply carries zeros — query when idle.
+    /// ask is streaming the reply carries zeros with `busy: true` — query
+    /// when idle, or check [`Usage::busy`].
     pub async fn usage(&self, session_id: Option<&str>) -> Result<Usage> {
         let mut request = ClientRequest::usage(self.next_correlation_id());
         if let Some(session_id) = session_id {
@@ -244,10 +267,12 @@ impl Client {
             ServerMessage::Usage {
                 used_tokens,
                 context_limit,
+                busy,
                 ..
             } => Ok(Usage {
                 used_tokens,
                 context_limit,
+                busy,
             }),
             other => Err(unexpected(other, "usage")),
         }
@@ -338,4 +363,39 @@ fn unexpected(msg: ServerMessage, expected: &str) -> Error {
         expected,
         msg.kind()
     ))
+}
+
+/// Perform the `auth` handshake on a fresh connection, when a token is set.
+///
+/// No-op when `token` is `None` (servers without `--token` accept any first
+/// request). Consumes and returns the connection so it can be handed to the
+/// connection actor only after authentication succeeded.
+async fn authenticate(
+    mut conn: connection::Connection,
+    token: Option<&str>,
+) -> Result<connection::Connection> {
+    let Some(token) = token.filter(|t| !t.is_empty()) else {
+        return Ok(conn);
+    };
+    let request = ClientRequest::auth(0u64, token);
+    conn.send(&request.to_line()).await?;
+    loop {
+        match conn.next_message().await {
+            Some(Ok(line)) => match serde_json::from_str::<ServerMessage>(&line) {
+                Ok(ServerMessage::Auth { ok: true, .. }) => return Ok(conn),
+                Ok(ServerMessage::Auth { .. }) => {
+                    return Err(Error::Auth("the server rejected the token".to_string()));
+                }
+                // Unrelated frames before the auth reply are ignored.
+                Ok(_) => continue,
+                Err(_) => continue,
+            },
+            Some(Err(e)) => return Err(e),
+            None => {
+                return Err(Error::Connection(
+                    "connection closed during authentication".to_string(),
+                ));
+            }
+        }
+    }
 }

@@ -67,6 +67,12 @@ pub struct Bootstrap {
 }
 
 /// Initialize tracing from the `--log-level` flag.
+///
+/// Idempotent: safe to call from both a subcommand handler and the shared
+/// `bootstrap()` path. When a global dispatcher is already installed (e.g.
+/// `run` initialized it before calling `bootstrap()`), the call is a no-op
+/// instead of failing with "a global default trace dispatcher has already
+/// been set".
 pub fn init_tracing(log_level: &str) -> Result<()> {
     let level = match log_level.to_lowercase().as_str() {
         "error" => tracing::Level::ERROR,
@@ -77,7 +83,9 @@ pub fn init_tracing(log_level: &str) -> Result<()> {
         _ => tracing::Level::INFO,
     };
     let subscriber = tracing_subscriber::fmt().with_max_level(level).finish();
-    tracing::subscriber::set_global_default(subscriber)?;
+    if tracing::subscriber::set_global_default(subscriber).is_err() {
+        tracing::debug!("tracing already initialized; keeping the existing dispatcher");
+    }
     Ok(())
 }
 
@@ -240,4 +248,18 @@ pub async fn bootstrap(args: &CommonArgs) -> Result<Bootstrap> {
 /// Default session ID generation shared by subcommands.
 pub fn new_session_id() -> String {
     Uuid::new_v4().to_string()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn init_tracing_is_idempotent() {
+        // Regression: `run` called init_tracing and then bootstrap() called
+        // it again, which failed with "a global default trace dispatcher has
+        // already been set" and killed every `run` invocation.
+        init_tracing("info").unwrap();
+        init_tracing("debug").unwrap();
+    }
 }

@@ -19,7 +19,15 @@
 //! `id` is a client-chosen correlation ID (any JSON value) echoed on every
 //! reply. `session_id` and `agent` are optional and only honored when the
 //! connection's session is first created (by the first request that needs
-//! one); later requests reuse the session.
+//! one); later requests reuse the session — a later request with a
+//! *different* `session_id`/`agent` is rejected.
+//!
+//! When the server was started with a token (`gewu-server serve --token …`),
+//! a connection must authenticate before any other operation:
+//!
+//! ```json
+//! {"id": "0", "op": "auth", "token": "secret"}
+//! ```
 //!
 //! # Server → Client
 //!
@@ -33,6 +41,7 @@
 //! {"type": "pong", "id": "5"}
 //! {"type": "tools", "id": "3", "tools": ["read_file", "bash", "..."]}
 //! {"type": "agents", "id": "4", "agents": ["build", "explore", "general"]}
+//! {"type": "auth", "id": "0", "ok": true}
 //! ```
 //!
 //! `event` payloads are serialized [`AgentEvent`]s (tagged with `"type"`:
@@ -70,6 +79,9 @@ pub enum Op {
     Usage,
     /// Liveness check.
     Ping,
+    /// Authenticate the connection with the server's shared token. Required
+    /// before any other operation when the server runs with `--token`.
+    Auth { token: String },
 }
 
 /// A request sent by a client, or received by the server.
@@ -97,13 +109,17 @@ impl Serialize for ClientRequest {
         use serde::ser::SerializeMap;
         let extra = self.session_id.is_some() as usize
             + self.agent.is_some() as usize
-            + matches!(self.op, Op::Ask { .. }) as usize;
+            + matches!(self.op, Op::Ask { .. } | Op::Auth { .. }) as usize;
         let mut map = serializer.serialize_map(Some(2 + extra))?;
         map.serialize_entry("id", &self.id)?;
         match &self.op {
             Op::Ask { prompt } => {
                 map.serialize_entry("op", "ask")?;
                 map.serialize_entry("prompt", prompt)?;
+            }
+            Op::Auth { token } => {
+                map.serialize_entry("op", "auth")?;
+                map.serialize_entry("token", token)?;
             }
             Op::Interrupt => map.serialize_entry("op", "interrupt")?,
             Op::ListTools => map.serialize_entry("op", "list_tools")?,
@@ -200,6 +216,19 @@ impl ClientRequest {
         Self::simple(id, Op::Usage)
     }
 
+    /// Build an `auth` request (required before other ops on token-protected
+    /// servers).
+    pub fn auth(id: impl Into<Value>, token: impl Into<String>) -> Self {
+        Self {
+            id: id.into(),
+            op: Op::Auth {
+                token: token.into(),
+            },
+            session_id: None,
+            agent: None,
+        }
+    }
+
     fn simple(id: impl Into<Value>, op: Op) -> Self {
         Self {
             id: id.into(),
@@ -290,6 +319,16 @@ pub fn parse_request(line: &str) -> Result<ClientRequest, RequestError> {
         "ping" => Op::Ping,
         "info" => Op::Info,
         "usage" => Op::Usage,
+        "auth" => {
+            let token = obj
+                .get("token")
+                .and_then(Value::as_str)
+                .ok_or_else(|| {
+                    RequestError::Invalid("op 'auth' requires a 'token' string".to_string())
+                })?
+                .to_string();
+            Op::Auth { token }
+        }
         other => {
             return Err(RequestError::Invalid(format!("unknown op '{}'", other)));
         }
@@ -418,6 +457,20 @@ pub enum ServerMessage {
         used_tokens: u64,
         /// The agent's context window in tokens. `0` when unknown.
         context_limit: u64,
+        /// Whether an ask is currently running on this connection. When
+        /// `true`, `used_tokens`/`context_limit` are `0` because the agent
+        /// lock is held by the running ask and cannot be measured; `0/0`
+        /// with `busy: false` instead means no session exists yet.
+        #[serde(default)]
+        busy: bool,
+    },
+    /// Reply to an `auth` request. When `ok` is `false` the server closes
+    /// the connection right after this frame.
+    Auth {
+        /// Echo of the client request id.
+        id: Value,
+        /// Whether the token was accepted.
+        ok: bool,
     },
     /// Reply to a `list_tools` request.
     Tools {
@@ -477,6 +530,7 @@ impl ServerMessage {
             ServerMessage::Pong { .. } => "pong",
             ServerMessage::Info { .. } => "info",
             ServerMessage::Usage { .. } => "usage",
+            ServerMessage::Auth { .. } => "auth",
             ServerMessage::Tools { .. } => "tools",
             ServerMessage::Agents { .. } => "agents",
             ServerMessage::Sessions { .. } => "sessions",
@@ -495,6 +549,7 @@ impl ServerMessage {
             | ServerMessage::Pong { id }
             | ServerMessage::Info { id, .. }
             | ServerMessage::Usage { id, .. }
+            | ServerMessage::Auth { id, .. }
             | ServerMessage::Tools { id, .. }
             | ServerMessage::Agents { id, .. }
             | ServerMessage::Sessions { id, .. }
@@ -648,12 +703,46 @@ mod tests {
             id: Value::Number(1.into()),
             used_tokens: 34_000,
             context_limit: 128_000,
+            busy: false,
         };
         assert_eq!(usage.kind(), "usage");
         assert!(usage.correlation_id().is_some());
         let decoded: ServerMessage =
             serde_json::from_str(&serde_json::to_string(&usage).unwrap()).unwrap();
         assert_eq!(decoded, usage);
+
+        // `busy` defaults to false when decoding frames from older servers.
+        let legacy: ServerMessage =
+            serde_json::from_str(r#"{"type":"usage","id":1,"used_tokens":5,"context_limit":6}"#)
+                .unwrap();
+        match legacy {
+            ServerMessage::Usage { busy, .. } => assert!(!busy),
+            other => panic!("expected usage, got {}", other.kind()),
+        }
+    }
+
+    #[test]
+    fn auth_round_trips() {
+        let req = parse_request(r#"{"id": 0, "op": "auth", "token": "secret"}"#).unwrap();
+        assert_eq!(req.op, Op::Auth { token: "secret".into() });
+        assert_eq!(
+            ClientRequest::auth(0, "secret").to_line(),
+            r#"{"id":0,"op":"auth","token":"secret"}"#
+        );
+
+        let err = parse_request(r#"{"id": 1, "op": "auth"}"#).unwrap_err();
+        assert!(err.to_string().contains("token"), "{err}");
+
+        let ok = ServerMessage::Auth {
+            id: Value::Number(0.into()),
+            ok: true,
+        };
+        assert_eq!(ok.kind(), "auth");
+        assert!(ok.correlation_id().is_some());
+        assert_eq!(ok.is_ask_terminal(), None);
+        let decoded: ServerMessage =
+            serde_json::from_str(&serde_json::to_string(&ok).unwrap()).unwrap();
+        assert_eq!(decoded, ok);
     }
 
     #[test]

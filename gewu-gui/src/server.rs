@@ -58,6 +58,8 @@ pub struct AppState {
     pub endpoint: Endpoint,
     /// Required browser token; `None` means loopback-only anonymous access.
     pub token: Option<String>,
+    /// Token for the upstream gewu server, when it requires one.
+    pub server_token: Option<String>,
 }
 
 /// Serve the GUI until the listener fails.
@@ -159,7 +161,7 @@ async fn handle_socket(mut socket: WebSocket, state: AppState) {
         }
     }
 
-    match GuiSession::new(&state.endpoint).await {
+    match GuiSession::new(&state.endpoint, state.server_token.as_deref()).await {
         Ok(session) => {
             if let Err(e) = session.run(socket).await {
                 warn!("browser session ended with an error: {e:#}");
@@ -257,6 +259,7 @@ mod tests {
                 port: 8421,
             },
             token: token.map(str::to_string),
+            server_token: None,
         }
     }
 
@@ -433,6 +436,7 @@ mod tests {
                 port: upstream.port(),
             },
             token: Some("secret".to_string()),
+            server_token: None,
         })
         .await;
         let (mut ws, _) = tokio_tungstenite::connect_async(format!("ws://{addr}/ws"))
@@ -456,6 +460,7 @@ mod tests {
                 port: upstream.port(),
             },
             token: None,
+            server_token: None,
         })
         .await;
 

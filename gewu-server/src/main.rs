@@ -5,12 +5,10 @@ mod memory_view;
 pub mod registry;
 pub mod server;
 
-use anyhow::{Context, Result};
+use anyhow::Result;
 use clap::{Args, Parser, Subcommand};
 use futures::StreamExt;
-use gewu_core::traits::LlmProvider;
 use gewu_core::types::AgentEvent;
-use std::env;
 use std::io::{Read, Write};
 use tracing::{error, info};
 
@@ -175,6 +173,16 @@ struct ServeArgs {
     #[arg(long, default_value_t = server::DEFAULT_TCP_PORT)]
     tcp_port: u16,
 
+    /// Shared token clients must authenticate with (also GEWU_SERVE_TOKEN).
+    /// Required when binding a non-loopback host unless --allow-anonymous.
+    #[arg(long, env = "GEWU_SERVE_TOKEN")]
+    token: Option<String>,
+
+    /// Allow binding a non-loopback host without a token. Dangerous: the
+    /// agent can run shell commands on this machine.
+    #[arg(long)]
+    allow_anonymous: bool,
+
     #[command(flatten)]
     common: bootstrap::CommonArgs,
 }
@@ -203,12 +211,35 @@ async fn main() -> Result<()> {
 }
 
 async fn serve(cli: ServeArgs) -> Result<()> {
+    // Guard remote exposure: an unauthenticated, non-loopback server would
+    // hand shell access to anyone who can reach the ports.
+    if !is_loopback(&cli.host) && cli.token.is_none() && !cli.allow_anonymous {
+        anyhow::bail!(
+            "refusing to bind non-loopback host '{}' without --token; \
+             pass --token <secret> (clients then authenticate with the 'auth' op), \
+             or --allow-anonymous to accept the risk",
+            cli.host
+        );
+    }
+
     let boot = bootstrap::bootstrap(&cli.common).await?;
     info!(
         "Starting gewu server (agent: {}, model: {}, provider: {})",
         cli.common.agent, boot.model, boot.provider_name
     );
-    server::serve(boot, &cli.host, cli.ws_port, cli.tcp_port).await
+    server::serve(
+        boot,
+        &cli.host,
+        cli.ws_port,
+        cli.tcp_port,
+        cli.token.filter(|t| !t.is_empty()),
+    )
+    .await
+}
+
+/// Whether a bind host is reachable only from this machine.
+fn is_loopback(host: &str) -> bool {
+    matches!(host, "127.0.0.1" | "localhost" | "::1" | "[::1]")
 }
 
 async fn run(cli: RunArgs) -> Result<()> {
@@ -234,32 +265,10 @@ async fn run(cli: RunArgs) -> Result<()> {
     let file_config = &loaded_config.config;
 
     if cli.list_models {
-        let model = cli
-            .common
-            .model
-            .clone()
-            .or_else(|| env::var("OPENAI_MODEL").ok())
-            .or(file_config.model.clone())
-            .unwrap_or_else(|| "gpt-5.3-codex".to_string());
-        let url = cli
-            .common
-            .base_url
-            .clone()
-            .or_else(|| env::var("OPENAI_BASE_URL").ok())
-            .or(cli.common.endpoint.clone())
-            .or_else(|| env::var("OPENAI_ENDPOINT").ok())
-            .or(file_config.base_url.clone())
-            .unwrap_or_else(|| "https://api.openai.com/v1".to_string());
-        let api_key = cli
-            .common
-            .api_key
-            .clone()
-            .or_else(|| env::var("OPENAI_API_KEY").ok())
-            .or(file_config.api_key.clone())
-            .context(
-                "OPENAI_API_KEY not provided. Set via --api-key, OPENAI_API_KEY env var, or config.json",
-            )?;
-        let provider = gewu_providers::OpenAIProvider::new_with_endpoint(&api_key, &url, &model);
+        // Dispatch on the configured provider exactly like `build_provider`
+        // does, instead of always building an OpenAIProvider (which 404s
+        // against, e.g., an Anthropic-compatible endpoint).
+        let (provider, _provider_name, _model) = bootstrap::build_provider(&cli.common, file_config)?;
         match provider.list_models().await {
             Ok(models) => {
                 println!("Available Models:");
@@ -268,7 +277,8 @@ async fn run(cli: RunArgs) -> Result<()> {
                 }
             }
             Err(e) => {
-                eprintln!("Error listing models: {}", e);
+                // Exit non-zero so scripts can detect the failure.
+                return Err(anyhow::anyhow!("listing models failed: {}", e));
             }
         }
         return Ok(());

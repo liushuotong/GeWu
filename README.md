@@ -107,13 +107,17 @@ cargo run -p gewu-server -- view <SESSION_ID>
 
 Run an agent as a server other programs can connect to (WebSocket on port
 8420, newline-delimited JSON TCP on port 8421 — see `gewu-server/README.md`
-for the wire protocol):
+for the wire protocol). Pass `--token` (or `GEWU_SERVE_TOKEN`) to require
+clients to authenticate; binding a non-loopback host without a token is
+refused:
 
 ```bash
 cargo run -p gewu-server -- serve
+cargo run -p gewu-server -- serve --host 0.0.0.0 --token "$(openssl rand -hex 16)"
 ```
 
-Connect from the terminal with the `gewu-tui` TUI:
+Connect from the terminal with the `gewu-tui` TUI (pass the same `--token`
+when the server requires one):
 
 ```bash
 cargo run -p gewu-tui                    # full-screen chat TUI
@@ -121,7 +125,8 @@ cargo run -p gewu-tui -- --session-id <ID>   # resume a conversation
 ```
 
 Or from a browser with the `gewu-gui` web UI (open
-<http://127.0.0.1:8430>):
+<http://127.0.0.1:8430>; `--server-token` when the upstream server requires
+one):
 
 ```bash
 cargo run -p gewu-gui                              # local GUI

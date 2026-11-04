@@ -11,11 +11,21 @@
 //! session-needing request and reused for the life of the connection, so
 //! conversation context persists across requests on that connection.
 //! Clients may pass an explicit `session_id` (e.g. one produced by a
-//! previous CLI run) to resume an existing conversation.
+//! previous CLI run) to resume an existing conversation. A later request
+//! naming a *different* `session_id`/`agent` is rejected instead of silently
+//! ignored.
 //!
-//! One `ask` runs at a time per connection. While an ask is running the
-//! connection can still send `interrupt`, which aborts the running task
-//! and patches the conversation history so it stays consistent.
+//! One `ask` runs at a time per connection — and per session across
+//! connections: a session busy with an ask on one connection rejects asks
+//! from other connections. While an ask is running the connection can still
+//! send `interrupt`, which aborts the running task, repairs the
+//! conversation history (dropping the unanswered prompt), and keeps it
+//! consistent.
+//!
+//! When started with a token, every connection must send an `auth` request
+//! before any other operation. TCP lines longer than [`MAX_LINE_BYTES`] and
+//! lines that are not valid UTF-8 are rejected with an error frame; the
+//! connection stays alive.
 
 use anyhow::{Context, Result};
 use futures::{SinkExt, StreamExt};
@@ -24,9 +34,10 @@ use gewu_core::types::{AgentEvent, Message};
 pub use gewu_protocol as protocol;
 use registry::create_agent;
 use serde_json::Value;
+use std::collections::HashSet;
 use std::net::SocketAddr;
 use std::sync::Arc;
-use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::{Mutex, mpsc};
 use tokio::task::{JoinHandle, JoinSet};
@@ -44,12 +55,23 @@ pub const DEFAULT_WS_PORT: u16 = 8420;
 /// Default port for the TCP listener.
 pub const DEFAULT_TCP_PORT: u16 = 8421;
 
+/// Maximum accepted inbound TCP line length. Larger lines (and lines that
+/// never terminate within this budget) are rejected with an error frame
+/// instead of being buffered without bound.
+pub const MAX_LINE_BYTES: usize = 1024 * 1024;
+
 /// Default agent profile used when the client does not specify one.
 const DEFAULT_AGENT: &str = "build";
 
 /// Shared server context handed to each connection handler.
 struct ServerState {
     bootstrap: Bootstrap,
+    /// When set, connections must authenticate with an `auth` request
+    /// carrying this token before any other operation.
+    token: Option<String>,
+    /// Session ids with an ask currently running, across all connections.
+    /// Guards one conversation from concurrent writes by two connections.
+    busy_sessions: Mutex<HashSet<String>>,
 }
 
 /// Per-connection session: one agent plus its identity.
@@ -67,11 +89,19 @@ struct ConnectionSession {
 /// A currently running ask on a connection.
 struct RunningAsk {
     request_id: String,
+    /// Session claimed in `ServerState::busy_sessions` for this ask.
+    session_id: String,
     handle: JoinHandle<()>,
 }
 
 /// Run the server until shutdown is requested or Ctrl+C is received.
-pub async fn serve(bootstrap: Bootstrap, host: &str, ws_port: u16, tcp_port: u16) -> Result<()> {
+pub async fn serve(
+    bootstrap: Bootstrap,
+    host: &str,
+    ws_port: u16,
+    tcp_port: u16,
+    token: Option<String>,
+) -> Result<()> {
     let ws_addr: SocketAddr = format!("{}:{}", host, ws_port)
         .parse()
         .context("Invalid WebSocket bind address")?;
@@ -86,30 +116,71 @@ pub async fn serve(bootstrap: Bootstrap, host: &str, ws_port: u16, tcp_port: u16
         .await
         .with_context(|| format!("Failed to bind TCP listener on {}", tcp_addr))?;
 
-    let state = Arc::new(ServerState { bootstrap });
+    let state = Arc::new(ServerState {
+        bootstrap,
+        token,
+        busy_sessions: Mutex::new(HashSet::new()),
+    });
 
     info!("gewu server listening:");
     info!("  WebSocket: ws://{}", ws_addr);
     info!("  TCP (newline-delimited JSON): {}", tcp_addr);
+    if state.token.is_some() {
+        info!("authentication required (clients send the 'auth' op first)");
+    }
+
+    // Per-connection handlers are spawned into a shared tracking set so
+    // shutdown can abort and drain them together with the listeners.
+    let mut connections: JoinSet<()> = JoinSet::new();
+    let (conn_tx, mut conn_rx) = mpsc::unbounded_channel::<JoinHandle<()>>();
 
     let mut tasks = JoinSet::new();
     tasks.spawn(accept_loop(
         ws_listener,
         state.clone(),
         Transport::WebSocket,
+        conn_tx.clone(),
     ));
-    tasks.spawn(accept_loop(tcp_listener, state.clone(), Transport::Tcp));
+    tasks.spawn(accept_loop(
+        tcp_listener,
+        state.clone(),
+        Transport::Tcp,
+        conn_tx.clone(),
+    ));
+    drop(conn_tx); // accept loops hold the remaining senders
 
-    // Run until Ctrl+C. (Programmatic shutdown is available via the
-    // `shutdown_server` helper used in tests; the CLI process exits on
-    // SIGINT/SIGTERM.)
-    tokio::signal::ctrl_c()
-        .await
-        .context("Failed to listen for Ctrl+C")?;
-    info!("Received Ctrl+C, shutting down");
+    // Run until Ctrl+C (or until both accept loops exit). Connection
+    // handles arriving from the accept loops are moved into the tracking
+    // set as they are created.
+    let ctrl_c = tokio::signal::ctrl_c();
+    tokio::pin!(ctrl_c);
+    loop {
+        tokio::select! {
+            result = &mut ctrl_c => {
+                result.context("Failed to listen for Ctrl+C")?;
+                info!("Received Ctrl+C, shutting down");
+                break;
+            }
+            handle = conn_rx.recv() => {
+                match handle {
+                    Some(handle) => {
+                        connections.spawn(async move {
+                            let _ = handle.await;
+                        });
+                    }
+                    // Both accept loops are gone; nothing left to serve.
+                    None => break,
+                }
+            }
+        }
+    }
 
+    // Abort listeners first (no new connections), then abort and drain every
+    // tracked connection task so nothing outlives the shutdown.
     tasks.abort_all();
     while tasks.join_next().await.is_some() {}
+    connections.abort_all();
+    while connections.join_next().await.is_some() {}
     Ok(())
 }
 
@@ -120,13 +191,19 @@ enum Transport {
     Tcp,
 }
 
-/// Accept connections on one listener forever.
-async fn accept_loop(listener: TcpListener, state: Arc<ServerState>, transport: Transport) {
+/// Accept connections on one listener forever, forwarding each connection
+/// task's handle to the tracker.
+async fn accept_loop(
+    listener: TcpListener,
+    state: Arc<ServerState>,
+    transport: Transport,
+    conn_tx: mpsc::UnboundedSender<JoinHandle<()>>,
+) {
     loop {
         match listener.accept().await {
             Ok((stream, peer)) => {
                 let state = state.clone();
-                tokio::spawn(async move {
+                let handle = tokio::spawn(async move {
                     let result = match transport {
                         Transport::WebSocket => handle_ws_connection(stream, peer, state).await,
                         Transport::Tcp => handle_tcp_connection(stream, peer, state).await,
@@ -135,6 +212,7 @@ async fn accept_loop(listener: TcpListener, state: Arc<ServerState>, transport: 
                         warn!("Connection {} error: {}", peer, e);
                     }
                 });
+                let _ = conn_tx.send(handle);
             }
             Err(e) => {
                 warn!("Accept failed: {}", e);
@@ -152,7 +230,9 @@ impl ServerState {
     /// Get or create the per-connection session.
     ///
     /// `session_id` and `agent_name` only apply when the session is first
-    /// created; subsequent calls on the same connection reuse it.
+    /// created; subsequent calls on the same connection reuse it. A later
+    /// request naming a *different* `session_id` or `agent` is rejected so
+    /// mismatches surface as errors instead of being silently ignored.
     async fn get_or_create_session(
         &self,
         current: &mut Option<ConnectionSession>,
@@ -160,6 +240,26 @@ impl ServerState {
         agent_name: Option<String>,
     ) -> Result<ConnectionSession> {
         if let Some(existing) = current {
+            if let Some(requested) = &session_id
+                && requested != &existing.session_id
+            {
+                anyhow::bail!(
+                    "session mismatch: this connection is bound to session '{}'; \
+                     requested '{}'. Open a new connection to use another session.",
+                    existing.session_id,
+                    requested
+                );
+            }
+            if let Some(requested) = &agent_name
+                && requested != &existing.agent_name
+            {
+                anyhow::bail!(
+                    "agent mismatch: this connection is bound to agent '{}'; \
+                     requested '{}'. Open a new connection to use another agent.",
+                    existing.agent_name,
+                    requested
+                );
+            }
             return Ok(existing.clone());
         }
 
@@ -193,6 +293,18 @@ impl ServerState {
         };
         *current = Some(entry.clone());
         Ok(entry)
+    }
+
+    /// Claim a session for an ask. Returns `false` when another connection
+    /// is already running an ask on that session.
+    async fn claim_session(&self, session_id: &str) -> bool {
+        self.busy_sessions.lock().await.insert(session_id.to_string())
+    }
+
+    /// Release a session claim after its ask finished, failed, or was
+    /// interrupted. Idempotent.
+    async fn release_session(&self, session_id: &str) {
+        self.busy_sessions.lock().await.remove(session_id);
     }
 }
 
@@ -249,6 +361,22 @@ async fn patch_dangling_tool_calls(agent: &mut gewu_core::Agent) {
     }
 }
 
+/// Drop the user prompt of an aborted ask when it produced no output.
+///
+/// If an ask is interrupted before the model responded, the only trace of it
+/// is the trailing user message the ask appended; leaving it in the history
+/// would steer the next ask towards the cancelled instruction. When the
+/// aborted exchange already produced assistant/tool output, the history is
+/// kept (and only repaired by [`patch_dangling_tool_calls`]) so executed
+/// work is not lost.
+async fn drop_dangling_prompt(agent: &mut gewu_core::Agent) {
+    if matches!(agent.memory.messages().last(), Some(Message::User { .. })) {
+        let mut kept = agent.memory.messages().to_vec();
+        kept.pop();
+        agent.memory.replace(kept).await;
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Request handling
 // ---------------------------------------------------------------------------
@@ -261,6 +389,7 @@ enum Handled {
     Ask {
         ready: ServerMessage,
         request_id: String,
+        session_id: String,
         prompt: String,
     },
 }
@@ -279,6 +408,13 @@ async fn handle_request(
     match request.op {
         Op::Ping => Ok(Handled::Reply(ServerMessage::Pong { id: request.id })),
 
+        // Auth is normally consumed by the connection loop's auth gate; if a
+        // client authenticates twice, accept it idempotently.
+        Op::Auth { .. } => Ok(Handled::Reply(ServerMessage::Auth {
+            id: request.id,
+            ok: true,
+        })),
+
         Op::Info => Ok(Handled::Reply(ServerMessage::Info {
             id: request.id,
             model: state.bootstrap.model.clone(),
@@ -294,6 +430,7 @@ async fn handle_request(
                     id: request.id,
                     used_tokens: 0,
                     context_limit: 0,
+                    busy: false,
                 }));
             }
             let conn = state
@@ -301,12 +438,14 @@ async fn handle_request(
                 .await
                 .map_err(|e| RequestError::Failed(e.to_string()))?;
             // Never block on a running ask (the agent lock is held for the
-            // whole ask): report "unknown" instead.
+            // whole ask): report "unknown" as zeros and flag the reply busy
+            // so clients can tell this apart from "no session yet".
             let Ok(agent) = conn.agent.try_lock() else {
                 return Ok(Handled::Reply(ServerMessage::Usage {
                     id: request.id,
                     used_tokens: 0,
                     context_limit: 0,
+                    busy: true,
                 }));
             };
             let used_tokens: usize = agent
@@ -319,6 +458,7 @@ async fn handle_request(
                 id: request.id,
                 used_tokens: used_tokens as u64,
                 context_limit: agent.context_limit as u64,
+                busy: false,
             }))
         }
 
@@ -392,12 +532,17 @@ async fn handle_request(
         Op::Interrupt => {
             let request_id = running.as_ref().map(|r| r.request_id.clone());
             if let Some(running) = running.take() {
-                abort_ask(running).await;
+                abort_ask(running.handle).await;
+                // Release the cross-connection claim on this session.
+                state.release_session(&running.session_id).await;
                 // Repair the conversation history so the next LLM request is
-                // well-formed even though the ask was cut short.
+                // well-formed even though the ask was cut short, and drop a
+                // prompt that produced no output so it cannot steer the next
+                // ask.
                 if let Some(session) = session {
                     let mut agent = session.agent.lock().await;
                     patch_dangling_tool_calls(&mut agent).await;
+                    drop_dangling_prompt(&mut agent).await;
                 }
             }
             Ok(Handled::Reply(ServerMessage::Interrupted {
@@ -416,6 +561,14 @@ async fn handle_request(
                 .get_or_create_session(session, request.session_id, request.agent)
                 .await
                 .map_err(|e| RequestError::Failed(e.to_string()))?;
+            // Claim the session across connections so two connections cannot
+            // interleave writes into one conversation.
+            if !state.claim_session(&session.session_id).await {
+                return Err(RequestError::Failed(format!(
+                    "session '{}' is busy with an ask on another connection",
+                    session.session_id
+                )));
+            }
             let request_id = crate::bootstrap::new_session_id();
             Ok(Handled::Ask {
                 ready: ServerMessage::Ready {
@@ -425,6 +578,7 @@ async fn handle_request(
                     agent: session.agent_name.clone(),
                 },
                 request_id,
+                session_id: session.session_id.clone(),
                 prompt,
             })
         }
@@ -520,15 +674,13 @@ fn spawn_ask(
     })
 }
 
-/// Abort a running ask and return its request id.
+/// Abort a running ask and await its task.
 ///
 /// Awaiting the aborted handle guarantees the agent lock has been released
 /// before the caller proceeds to patch memory / start a new ask.
-async fn abort_ask(running: RunningAsk) -> String {
-    let request_id = running.request_id;
-    running.handle.abort();
-    let _ = running.handle.await;
-    request_id
+async fn abort_ask(handle: JoinHandle<()>) {
+    handle.abort();
+    let _ = handle.await;
 }
 
 // ---------------------------------------------------------------------------
@@ -547,14 +699,16 @@ async fn drive_connection(
 ) -> Result<()> {
     let mut session: Option<ConnectionSession> = None;
     let mut running: Option<RunningAsk> = None;
+    // Token-protected servers require an `auth` request first.
+    let mut authenticated = state.token.is_none();
     // Completion signals from ask tasks. The loop-side sender keeps this
     // channel open when no ask is running, so recv() simply stays pending.
     let (done_tx, mut done_rx) = mpsc::unbounded_channel::<()>();
 
-    loop {
+    let result = loop {
         tokio::select! {
             incoming = incoming.recv() => {
-                let Some(raw) = incoming else { break };
+                let Some(raw) = incoming else { break Ok(()) };
                 let trimmed = raw.trim();
                 if trimmed.is_empty() {
                     continue;
@@ -575,6 +729,41 @@ async fn drive_connection(
                 // Remember the correlation id so error replies can echo it.
                 let request_id_value = request.id.clone();
 
+                // Gate every operation behind authentication when the server
+                // runs with a token.
+                if !authenticated {
+                    match request.op {
+                        Op::Auth { token } => {
+                            // Deliberately naive comparison: the threat model
+                            // is casual remote access, not timing attacks.
+                            let ok = state.token.as_deref() == Some(token.as_str());
+                            out.send(
+                                ServerMessage::Auth { id: request.id, ok }.to_line(),
+                            )
+                            .await?;
+                            if ok {
+                                info!("client authenticated");
+                                authenticated = true;
+                            } else {
+                                warn!("client failed authentication; closing connection");
+                                break Ok(());
+                            }
+                        }
+                        _ => {
+                            out.send(
+                                ServerMessage::Error {
+                                    id: Some(request_id_value),
+                                    error: "authentication required: send {\"op\":\"auth\",\"token\":\"...\"} first"
+                                        .to_string(),
+                                }
+                                .to_line(),
+                            )
+                            .await?;
+                        }
+                    }
+                    continue;
+                }
+
                 // An interrupt request aborts + awaits the running ask inside
                 // handle_request, so the agent lock is released before any
                 // further request is handled.
@@ -582,13 +771,14 @@ async fn drive_connection(
                     Ok(Handled::Reply(msg)) => {
                         out.send(msg.to_line()).await?;
                     }
-                    Ok(Handled::Ask { ready, request_id, prompt }) => {
+                    Ok(Handled::Ask { ready, request_id, session_id, prompt }) => {
                         out.send(ready.to_line()).await?;
                         let session = session
                             .clone()
                             .expect("session created by handle_request");
                         running = Some(RunningAsk {
                             request_id: request_id.clone(),
+                            session_id,
                             handle: spawn_ask(session, request_id, prompt, out.clone(), done_tx.clone()),
                         });
                     }
@@ -602,16 +792,19 @@ async fn drive_connection(
                 }
             }
             _ = done_rx.recv() => {
-                // The running ask finished on its own.
-                running = None;
+                // The running ask finished on its own; release its claim.
+                if let Some(running) = running.take() {
+                    state.release_session(&running.session_id).await;
+                }
             }
         }
-    }
+    };
 
     if let Some(running) = running.take() {
-        abort_ask(running).await;
+        abort_ask(running.handle).await;
+        state.release_session(&running.session_id).await;
     }
-    Ok(())
+    result
 }
 
 // ---------------------------------------------------------------------------
@@ -624,7 +817,11 @@ async fn handle_ws_connection(
     peer: SocketAddr,
     state: Arc<ServerState>,
 ) -> Result<()> {
-    let ws = tokio_tungstenite::accept_async(stream)
+    // Cap inbound messages instead of relying on tungstenite's 64 MB default.
+    let mut config = tokio_tungstenite::tungstenite::protocol::WebSocketConfig::default();
+    config.max_message_size = Some(MAX_LINE_BYTES);
+    config.max_frame_size = Some(MAX_LINE_BYTES);
+    let ws = tokio_tungstenite::accept_async_with_config(stream, Some(config))
         .await
         .context("WebSocket handshake failed")?;
     info!("WebSocket client connected: {}", peer);
@@ -677,7 +874,6 @@ async fn handle_tcp_connection(
 ) -> Result<()> {
     info!("TCP client connected: {}", peer);
     let (reader_half, mut writer_half) = stream.into_split();
-    let mut lines = BufReader::new(reader_half).lines();
 
     let (out_tx, mut out_rx) = mpsc::channel::<String>(256);
     let (in_tx, in_rx) = mpsc::channel::<String>(64);
@@ -694,18 +890,15 @@ async fn handle_tcp_connection(
         }
     });
 
-    // Reader task: pushes incoming lines into `in_tx`.
-    let reader = tokio::spawn(async move {
-        while let Ok(Some(line)) = lines.next_line().await {
-            if in_tx.send(line).await.is_err() {
-                break;
-            }
-        }
-    });
+    // Reader task: pushes validated lines into `in_tx`, answering protocol
+    // violations (over-long lines, invalid UTF-8) with an error frame so
+    // the client learns why its line was dropped and can keep talking.
+    let err_tx = out_tx.clone();
+    let reader = tokio::spawn(tcp_reader(reader_half, in_tx, err_tx));
 
     let result = drive_connection(state, in_rx, out_tx).await;
 
-    drop(reader); // reader ends when the client disconnects
+    reader.abort();
     let _ = writer.await;
     if let Err(e) = &result {
         warn!("TCP client {} error: {}", peer, e);
@@ -713,6 +906,100 @@ async fn handle_tcp_connection(
         info!("TCP client disconnected: {}", peer);
     }
     result
+}
+
+/// Read newline-delimited lines from `stream`, enforcing [`MAX_LINE_BYTES`]
+/// and UTF-8 validity.
+///
+/// Valid lines are forwarded on `in_tx`. Over-long lines and lines that are
+/// not valid UTF-8 are answered with an error frame on `err_tx` and skipped;
+/// the stream keeps reading, so a bad line no longer kills the connection
+/// and no line can buffer without bound.
+async fn tcp_reader<R: AsyncRead + Unpin>(
+    mut stream: R,
+    in_tx: mpsc::Sender<String>,
+    err_tx: mpsc::Sender<String>,
+) {
+    let mut buf: Vec<u8> = Vec::with_capacity(8192);
+    let mut chunk = [0u8; 8192];
+    // Set while the bytes of an over-long line are being discarded up to
+    // (and including) its terminating newline.
+    let mut discarding = false;
+
+    let line_too_long = || {
+        ServerMessage::Error {
+            id: None,
+            error: format!(
+                "line exceeds the maximum of {} bytes; skipped",
+                MAX_LINE_BYTES
+            ),
+        }
+        .to_line()
+    };
+
+    loop {
+        // Deliver complete buffered lines.
+        while let Some(pos) = buf.iter().position(|&b| b == b'\n') {
+            let line = buf.drain(..=pos).collect::<Vec<u8>>();
+            let line = &line[..line.len() - 1]; // strip '\n'
+            let line = line.strip_suffix(b"\r").unwrap_or(line); // tolerate CRLF
+            if discarding {
+                // Reached the end of an over-long line: resume normal reads.
+                discarding = false;
+                continue;
+            }
+            if line.len() > MAX_LINE_BYTES {
+                if err_tx.send(line_too_long()).await.is_err() {
+                    return;
+                }
+                continue;
+            }
+            match String::from_utf8(line.to_vec()) {
+                Ok(text) => {
+                    if in_tx.send(text).await.is_err() {
+                        return;
+                    }
+                }
+                Err(_) => {
+                    let msg = ServerMessage::Error {
+                        id: None,
+                        error: "line is not valid UTF-8; skipped".to_string(),
+                    }
+                    .to_line();
+                    if err_tx.send(msg).await.is_err() {
+                        return;
+                    }
+                }
+            }
+        }
+        if discarding {
+            buf.clear();
+        }
+
+        match stream.read(&mut chunk).await {
+            Ok(0) => return, // EOF
+            Ok(n) => {
+                buf.extend_from_slice(&chunk[..n]);
+                // Enforce the cap between newlines. When the pending bytes
+                // exceed the limit with no newline in sight, drop them and
+                // keep discarding until the line ends (the error frame is
+                // sent once, here). When a newline is already buffered,
+                // leave the data alone: the delivery loop will reject the
+                // over-long line and keep any following lines intact.
+                if !discarding && buf.len() > MAX_LINE_BYTES && !buf.contains(&b'\n') {
+                    discarding = true;
+                    buf.clear();
+                    if err_tx.send(line_too_long()).await.is_err() {
+                        return;
+                    }
+                }
+            }
+            Err(e) => {
+                warn!("TCP read error: {}", e);
+                return;
+            }
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -833,6 +1120,83 @@ mod tests {
                 for event in events {
                     yield event;
                 }
+            };
+            Ok(Box::pin(s))
+        }
+
+        async fn list_models(
+            &self,
+        ) -> std::result::Result<Vec<String>, Box<dyn Error + Send + Sync>> {
+            Ok(Vec::new())
+        }
+    }
+
+    /// LLM that records the user prompts it is asked with, and delays before
+    /// responding (so asks are interruptible). Used to observe exactly what
+    /// history reaches the model.
+    struct RecordingLlm {
+        delay_ms: u64,
+        user_prompts: std::sync::Mutex<Vec<String>>,
+    }
+
+    impl RecordingLlm {
+        fn slow() -> Arc<Self> {
+            Arc::new(Self {
+                delay_ms: 500,
+                user_prompts: std::sync::Mutex::new(Vec::new()),
+            })
+        }
+
+        fn prompts(&self) -> Vec<String> {
+            self.user_prompts.lock().unwrap().clone()
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl gewu_core::traits::LlmProvider for RecordingLlm {
+        fn build(
+            &self,
+            messages: &[Message],
+            _tools: &[Arc<dyn gewu_core::traits::Tool>],
+        ) -> std::result::Result<Value, Box<dyn Error + Send + Sync>> {
+            for message in messages {
+                if let Message::User { content } = message {
+                    let text = content
+                        .iter()
+                        .filter_map(|part| match part {
+                            ContentPart::Text { text } => Some(text.clone()),
+                            _ => None,
+                        })
+                        .collect::<Vec<_>>()
+                        .join(" ");
+                    if !text.is_empty() {
+                        self.user_prompts.lock().unwrap().push(text);
+                    }
+                }
+            }
+            Ok(serde_json::json!({}))
+        }
+
+        async fn send<'a>(
+            &'a self,
+            _request: Value,
+        ) -> std::result::Result<
+            futures::stream::BoxStream<
+                'a,
+                std::result::Result<gewu_core::types::ProviderEvent, Box<dyn Error + Send + Sync>>,
+            >,
+            Box<dyn Error + Send + Sync>,
+        > {
+            if self.delay_ms > 0 {
+                tokio::time::sleep(std::time::Duration::from_millis(self.delay_ms)).await;
+            }
+            let s = async_stream::try_stream! {
+                yield gewu_core::types::ProviderEvent::ContentDelta {
+                    delta: "ok".to_string(),
+                };
+                yield gewu_core::types::ProviderEvent::Finish {
+                    reason: Some("stop".to_string()),
+                };
             };
             Ok(Box::pin(s))
         }
@@ -1086,6 +1450,13 @@ mod tests {
     }
 
     fn server_state_with(provider: Arc<dyn gewu_core::traits::LlmProvider>) -> Arc<ServerState> {
+        server_state_with_token(provider, None)
+    }
+
+    fn server_state_with_token(
+        provider: Arc<dyn gewu_core::traits::LlmProvider>,
+        token: Option<&str>,
+    ) -> Arc<ServerState> {
         Arc::new(ServerState {
             bootstrap: Bootstrap {
                 provider,
@@ -1098,6 +1469,8 @@ mod tests {
                 model: "test-model".to_string(),
                 provider_name: "test".to_string(),
             },
+            token: token.map(str::to_string),
+            busy_sessions: Mutex::new(HashSet::new()),
         })
     }
 
@@ -1228,6 +1601,8 @@ mod tests {
                 model: "test-model".to_string(),
                 provider_name: "test".to_string(),
             },
+            token: None,
+            busy_sessions: Mutex::new(HashSet::new()),
         });
         let (in_tx, mut out_rx, handle) = spawn_connection(state).await;
 
@@ -1651,6 +2026,403 @@ mod tests {
             }
         }
         assert!(saw_result, "first ask should complete");
+
+        drop(in_tx);
+        handle.await.unwrap().unwrap();
+    }
+
+    // -- usage busy flag (Bug 2) ---------------------------------------------
+
+    #[tokio::test]
+    async fn usage_reports_busy_during_running_ask() {
+        let state = server_state_with(TestLlm::slow_tool_call());
+        let (in_tx, mut out_rx, handle) = spawn_connection(state).await;
+
+        in_tx
+            .send(r#"{"id": 1, "op": "ask", "prompt": "go"}"#.to_string())
+            .await
+            .unwrap();
+        let ready = recv_json(&mut out_rx).await;
+        assert_eq!(ready["type"], "ready");
+
+        // While the ask holds the agent lock, usage is 0/0 *and* busy.
+        in_tx
+            .send(r#"{"id": 2, "op": "usage"}"#.to_string())
+            .await
+            .unwrap();
+        let mut usage = None;
+        for _ in 0..10 {
+            let msg = recv_json(&mut out_rx).await;
+            if msg["type"] == "usage" {
+                usage = Some(msg);
+                break;
+            }
+        }
+        let usage = usage.expect("usage reply while ask running");
+        assert_eq!(usage["used_tokens"], 0);
+        assert_eq!(usage["context_limit"], 0);
+        assert_eq!(usage["busy"], true, "busy ask must be flagged: {usage}");
+
+        // No session at all stays 0/0 with busy: false.
+        let state2 = server_state_with(TestLlm::plain());
+        let (in_tx2, mut out_rx2, handle2) = spawn_connection(state2).await;
+        in_tx2
+            .send(r#"{"id": 1, "op": "usage"}"#.to_string())
+            .await
+            .unwrap();
+        let usage = recv_json(&mut out_rx2).await;
+        assert_eq!(usage["used_tokens"], 0);
+        assert_eq!(usage["context_limit"], 0);
+        assert_eq!(usage["busy"], false);
+
+        drop(in_tx);
+        let _ = handle.await.unwrap();
+        drop(in_tx2);
+        let _ = handle2.await.unwrap();
+    }
+
+    // -- TCP reader hardening (Bugs 3 and 6) ---------------------------------
+
+    #[tokio::test]
+    async fn tcp_reader_skips_invalid_utf8_and_keeps_reading() {
+        let (mut client, server) = tokio::io::duplex(65_536);
+        let (in_tx, mut in_rx) = mpsc::channel::<String>(16);
+        let (err_tx, mut err_rx) = mpsc::channel::<String>(16);
+        tokio::spawn(tcp_reader(server, in_tx, err_tx));
+
+        use tokio::io::AsyncWriteExt;
+        client
+            .write_all(b"{\"id\":1,\"op\":\"ping\"}\n")
+            .await
+            .unwrap();
+        client.write_all(b"\xff\xfe bad\n").await.unwrap();
+        client
+            .write_all(b"{\"id\":2,\"op\":\"ping\"}\n")
+            .await
+            .unwrap();
+
+        let good = in_rx.recv().await.unwrap();
+        assert!(good.contains("\"id\":1"), "{good}");
+        let err = err_rx.recv().await.unwrap();
+        assert!(err.contains("UTF-8"), "{err}");
+        // The connection is still usable after the bad line.
+        let good2 = in_rx.recv().await.unwrap();
+        assert!(good2.contains("\"id\":2"), "{good2}");
+    }
+
+    #[tokio::test]
+    async fn tcp_reader_rejects_overlong_lines_and_keeps_reading() {
+        let (mut client, server) = tokio::io::duplex(65_536);
+        let (in_tx, mut in_rx) = mpsc::channel::<String>(16);
+        let (err_tx, mut err_rx) = mpsc::channel::<String>(16);
+        tokio::spawn(tcp_reader(server, in_tx, err_tx));
+
+        use tokio::io::AsyncWriteExt;
+        // A line far over the cap, written in pieces, then a normal line.
+        let pad = vec![b'x'; MAX_LINE_BYTES + 4096];
+        client.write_all(&pad).await.unwrap();
+        client.write_all(b"\n").await.unwrap();
+        client
+            .write_all(b"{\"id\":2,\"op\":\"ping\"}\n")
+            .await
+            .unwrap();
+
+        let err = err_rx.recv().await.unwrap();
+        assert!(err.contains("maximum"), "{err}");
+        let good = in_rx.recv().await.unwrap();
+        assert!(good.contains("\"id\":2"), "{good}");
+        // Exactly one error frame for the one bad line.
+        assert!(err_rx.try_recv().is_err());
+    }
+
+    // -- auth (Bug 5) ---------------------------------------------------------
+
+    #[tokio::test]
+    async fn token_protected_server_requires_auth_first() {
+        let state = server_state_with_token(TestLlm::plain(), Some("secret"));
+        let (in_tx, mut out_rx, handle) = spawn_connection(state).await;
+
+        // Any other op is rejected until auth succeeds.
+        in_tx
+            .send(r#"{"id": 1, "op": "ping"}"#.to_string())
+            .await
+            .unwrap();
+        let err = recv_json(&mut out_rx).await;
+        assert_eq!(err["type"], "error");
+        assert!(err["error"].as_str().unwrap().contains("authentication"));
+
+        // Correct token unlocks the connection.
+        in_tx
+            .send(r#"{"id": 2, "op": "auth", "token": "secret"}"#.to_string())
+            .await
+            .unwrap();
+        let auth = recv_json(&mut out_rx).await;
+        assert_eq!(auth["type"], "auth");
+        assert_eq!(auth["ok"], true);
+        assert_eq!(auth["id"], 2);
+
+        in_tx
+            .send(r#"{"id": 3, "op": "ping"}"#.to_string())
+            .await
+            .unwrap();
+        let pong = recv_json(&mut out_rx).await;
+        assert_eq!(pong["type"], "pong");
+
+        drop(in_tx);
+        handle.await.unwrap().unwrap();
+    }
+
+    #[tokio::test]
+    async fn token_protected_server_rejects_wrong_token_and_closes() {
+        let state = server_state_with_token(TestLlm::plain(), Some("secret"));
+        let (in_tx, mut out_rx, handle) = spawn_connection(state).await;
+
+        in_tx
+            .send(r#"{"id": 1, "op": "auth", "token": "wrong"}"#.to_string())
+            .await
+            .unwrap();
+        let auth = recv_json(&mut out_rx).await;
+        assert_eq!(auth["type"], "auth");
+        assert_eq!(auth["ok"], false);
+
+        // The connection is closed after a failed auth attempt.
+        let closed = tokio::time::timeout(std::time::Duration::from_secs(2), handle).await;
+        assert!(closed.is_ok(), "connection should close after bad auth");
+        assert!(closed.unwrap().unwrap().is_ok());
+    }
+
+    // -- session binding (Bug 9) ----------------------------------------------
+
+    #[tokio::test]
+    async fn session_mismatch_is_rejected() {
+        let state = server_state_with(TestLlm::plain());
+        let (in_tx, mut out_rx, handle) = spawn_connection(state).await;
+
+        // Bind the connection to session s1.
+        in_tx
+            .send(r#"{"id": 1, "op": "ask", "prompt": "hi", "session_id": "s1"}"#.to_string())
+            .await
+            .unwrap();
+        let ready = recv_json(&mut out_rx).await;
+        assert_eq!(ready["session_id"], "s1");
+        loop {
+            if recv_json(&mut out_rx).await["type"] == "result" {
+                break;
+            }
+        }
+
+        // A different session_id is now an error, not a silent ignore.
+        in_tx
+            .send(
+                r#"{"id": 2, "op": "list_tools", "session_id": "other"}"#.to_string(),
+            )
+            .await
+            .unwrap();
+        let err = recv_json(&mut out_rx).await;
+        assert_eq!(err["type"], "error");
+        assert!(
+            err["error"].as_str().unwrap().contains("session mismatch"),
+            "{err}"
+        );
+
+        // So is a different agent.
+        in_tx
+            .send(r#"{"id": 3, "op": "list_tools", "agent": "explore"}"#.to_string())
+            .await
+            .unwrap();
+        let err = recv_json(&mut out_rx).await;
+        assert_eq!(err["type"], "error");
+        assert!(
+            err["error"].as_str().unwrap().contains("agent mismatch"),
+            "{err}"
+        );
+
+        drop(in_tx);
+        handle.await.unwrap().unwrap();
+    }
+
+    // -- cross-connection session locking (Bug 4) ------------------------------
+
+    #[tokio::test]
+    async fn second_connection_cannot_ask_a_busy_session() {
+        let state = server_state_with(TestLlm::slow_tool_call());
+        let (in_a, mut out_a, handle_a) = spawn_connection(state.clone()).await;
+        let (in_b, mut out_b, handle_b) = spawn_connection(state.clone()).await;
+
+        // Connection A starts an ask, creating session s1.
+        in_a
+            .send(r#"{"id": 1, "op": "ask", "prompt": "go", "session_id": "s1"}"#.to_string())
+            .await
+            .unwrap();
+        let ready = recv_json(&mut out_a).await;
+        assert_eq!(ready["type"], "ready");
+
+        // Connection B targets the same session and is rejected.
+        in_b
+            .send(r#"{"id": 1, "op": "ask", "prompt": "me too", "session_id": "s1"}"#.to_string())
+            .await
+            .unwrap();
+        let mut rejected = false;
+        for _ in 0..10 {
+            let msg = recv_json(&mut out_b).await;
+            if msg["type"] == "error" {
+                assert!(
+                    msg["error"].as_str().unwrap().contains("busy"),
+                    "{msg}"
+                );
+                rejected = true;
+                break;
+            }
+        }
+        assert!(rejected, "second connection should be rejected");
+
+        // A finishes; the claim is released.
+        loop {
+            if recv_json(&mut out_a).await["type"] == "result" {
+                break;
+            }
+        }
+
+        // B can now run an ask on the same session.
+        in_b
+            .send(r#"{"id": 2, "op": "ask", "prompt": "me too", "session_id": "s1"}"#.to_string())
+            .await
+            .unwrap();
+        let ready_b = recv_json(&mut out_b).await;
+        assert_eq!(ready_b["type"], "ready", "claim should be released: {ready_b}");
+        loop {
+            if recv_json(&mut out_b).await["type"] == "result" {
+                break;
+            }
+        }
+
+        drop(in_a);
+        drop(in_b);
+        handle_a.await.unwrap().unwrap();
+        handle_b.await.unwrap().unwrap();
+    }
+
+    // -- interrupted prompt handling (Bug 11) ---------------------------------
+
+    #[tokio::test]
+    async fn interrupt_drops_prompt_without_output() {
+        let mut agent = gewu_core::Agent::builder()
+            .llm(TestLlm::plain())
+            .with_tools(vec![])
+            .build()
+            .unwrap();
+
+        // Simulate an ask that was aborted before the model responded: the
+        // prompt is the last message in the history.
+        agent
+            .memory
+            .add_message(Message::User {
+                content: vec![ContentPart::Text {
+                    text: "write an essay".to_string(),
+                }],
+            })
+            .await;
+
+        drop_dangling_prompt(&mut agent).await;
+
+        assert!(
+            agent
+                .memory
+                .messages()
+                .iter()
+                .all(|m| !matches!(m, Message::User { .. })),
+            "the unanswered prompt should be dropped: {:?}",
+            agent.memory.messages()
+        );
+    }
+
+    #[tokio::test]
+    async fn drop_prompt_keeps_exchanges_that_produced_output() {
+        let mut agent = gewu_core::Agent::builder()
+            .llm(TestLlm::plain())
+            .with_tools(vec![])
+            .build()
+            .unwrap();
+
+        // An aborted exchange that already ran a tool: user, assistant tool
+        // call, and (after the interrupt patch) the synthetic tool result.
+        agent
+            .memory
+            .add_message(Message::User {
+                content: vec![ContentPart::Text {
+                    text: "do the thing".to_string(),
+                }],
+            })
+            .await;
+        agent
+            .memory
+            .add_message(Message::Assistant {
+                content: None,
+                tool_calls: Some(vec![gewu_core::types::ToolCall {
+                    id: "call-1".to_string(),
+                    r#type: "function".to_string(),
+                    function: gewu_core::types::FunctionCall {
+                        name: "echo".to_string(),
+                        arguments: "{}".to_string(),
+                    },
+                }]),
+            })
+            .await;
+        patch_dangling_tool_calls(&mut agent).await;
+        drop_dangling_prompt(&mut agent).await;
+
+        let messages = agent.memory.messages();
+        assert_eq!(messages.len(), 3, "history with output is kept");
+        assert!(matches!(messages[0], Message::User { .. }));
+        assert!(matches!(
+            messages.last().unwrap(),
+            Message::Tool { .. }
+        ));
+    }
+
+    #[tokio::test]
+    async fn interrupt_drops_prompt_across_full_connection() {
+        // The next ask must not be steered by an interrupted prompt that
+        // never produced output (Bug 11).
+        let llm = RecordingLlm::slow();
+        let state = server_state_with(llm.clone() as Arc<dyn gewu_core::traits::LlmProvider>);
+        let (in_tx, mut out_rx, handle) = spawn_connection(state).await;
+
+        in_tx
+            .send(r#"{"id": 1, "op": "ask", "prompt": "write an essay"}"#.to_string())
+            .await
+            .unwrap();
+        let ready = recv_json(&mut out_rx).await;
+        assert_eq!(ready["type"], "ready");
+
+        // Interrupt before the (delayed) LLM produced anything.
+        in_tx
+            .send(r#"{"id": 2, "op": "interrupt"}"#.to_string())
+            .await
+            .unwrap();
+        let interrupted = recv_json(&mut out_rx).await;
+        assert_eq!(interrupted["type"], "interrupted");
+
+        // The next ask's LLM request must not contain the aborted prompt.
+        in_tx
+            .send(r#"{"id": 3, "op": "ask", "prompt": "Say ok"}"#.to_string())
+            .await
+            .unwrap();
+        loop {
+            if recv_json(&mut out_rx).await["type"] == "result" {
+                break;
+            }
+        }
+
+        let prompts = llm.prompts();
+        assert!(
+            !prompts.iter().any(|p| p.contains("essay")),
+            "aborted prompt leaked into the next LLM request: {prompts:?}"
+        );
+        assert!(
+            prompts.iter().any(|p| p.contains("Say ok")),
+            "the new prompt should reach the LLM: {prompts:?}"
+        );
 
         drop(in_tx);
         handle.await.unwrap().unwrap();
