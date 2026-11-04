@@ -73,19 +73,22 @@ fn render_block(out: &mut String, block: &Block, index: usize, streaming: bool) 
         Block::Tool { .. } => return,
     };
     let _ = writeln!(out, "<div class=\"block {class}\" data-block=\"{index}\">");
+    write_block_body(out, block, streaming);
+    out.push_str("</div>\n");
+}
+
+/// Render the inner `.body` div of one block (between the `.block` wrapper).
+fn write_block_body(out: &mut String, block: &Block, streaming: bool) {
     match block {
-        Block::Assistant(text) if !streaming => {
-            let _ = writeln!(
-                out,
-                "<div class=\"body markdown\">{}</div>",
-                markdown_to_html(text)
-            );
-        }
+        // Streaming and final assistant bodies are both Markdown; streaming
+        // only adds a class (the blinking cursor) so the text formats in
+        // real time and settles into the identical form once done.
         Block::Assistant(text) => {
             let _ = writeln!(
                 out,
-                "<div class=\"body streaming\"><span class=\"streaming-text\" data-block=\"{index}\">{}</span></div>",
-                escape(text)
+                "<div class=\"body markdown{}\">{}</div>",
+                if streaming { " streaming" } else { "" },
+                markdown_to_html(text)
             );
         }
         _ => {
@@ -96,7 +99,31 @@ fn render_block(out: &mut String, block: &Block, index: usize, streaming: bool) 
             );
         }
     }
-    out.push_str("</div>\n");
+}
+
+/// Render one block as a standalone `.block` div, for targeted appends.
+pub fn block_html(tab: &Tab, index: usize) -> Option<String> {
+    let block = tab.model.blocks.get(index)?;
+    if matches!(block, Block::Tool { .. }) {
+        return None;
+    }
+    let streaming = tab.busy() && index == tab.model.blocks.len() - 1;
+    let mut out = String::new();
+    render_block(&mut out, block, index, streaming);
+    Some(out)
+}
+
+/// Render the Markdown body of an assistant block, either in its streaming
+/// form (with the cursor class) or final form, for in-place swaps.
+pub fn assistant_body_html(tab: &Tab, index: usize, streaming: bool) -> Option<String> {
+    match tab.model.blocks.get(index) {
+        Some(Block::Assistant(text)) => Some(format!(
+            "<div class=\"body markdown{}\">{}</div>",
+            if streaming { " streaming" } else { "" },
+            markdown_to_html(text)
+        )),
+        _ => None,
+    }
 }
 
 /// Render just the tool card that starts at block `first`, for targeted
@@ -507,15 +534,15 @@ mod tests {
     }
 
     #[test]
-    fn streaming_assistant_is_raw_and_escaped() {
+    fn streaming_assistant_is_markdown_and_escaped() {
         let (mut ws, id) = tab_with_blocks(vec![Block::Assistant("<b>partial".into())]);
         ws.tab_mut(id).unwrap().model.phase = Phase::Busy;
         let html = transcript_html(ws.tab(id).unwrap());
-        assert!(html.contains("class=\"body streaming\""), "{html}");
+        assert!(html.contains("class=\"body markdown streaming\""), "{html}");
         assert!(!html.contains("class=\"label\""), "{html}");
         assert!(!html.contains(">gewu<"), "{html}");
         assert!(html.contains("&lt;b&gt;partial"), "{html}");
-        assert!(!html.contains("<strong>"), "streaming is not Markdown");
+        assert!(!html.contains("<b>partial"), "raw HTML must stay escaped");
     }
 
     #[test]
@@ -596,6 +623,43 @@ mod tests {
         assert!(tool_card_html(ws.tab(id).unwrap(), 9).is_none());
     }
 
+    #[test]
+    fn block_html_renders_one_block() {
+        let (mut ws, id) = tab_with_blocks(vec![
+            Block::User("hi".into()),
+            Block::Assistant("streaming".into()),
+        ]);
+        let tab = {
+            let tab = ws.tab_mut(id).unwrap();
+            tab.model.phase = Phase::Busy;
+            tab
+        };
+        let html = block_html(tab, 0).expect("user block");
+        assert!(html.contains("class=\"block user\" data-block=\"0\""), "{html}");
+        assert!(!html.contains("streaming"), "{html}");
+
+        let html = block_html(tab, 1).expect("assistant block");
+        assert!(html.contains("class=\"block assistant\" data-block=\"1\""), "{html}");
+        assert!(html.contains("body markdown streaming"), "{html}");
+
+        assert!(block_html(tab, 9).is_none());
+    }
+
+    #[test]
+    fn assistant_body_html_renders_final_markdown() {
+        let (ws, id) = tab_with_blocks(vec![
+            Block::User("hi".into()),
+            Block::Assistant("**done**".into()),
+        ]);
+        let html = assistant_body_html(ws.tab(id).unwrap(), 1, false).expect("body");
+        assert!(html.contains("class=\"body markdown\""), "{html}");
+        assert!(html.contains("<strong>done</strong>"), "{html}");
+        assert!(!html.contains("streaming"), "{html}");
+
+        // Only assistant blocks have a final body.
+        assert!(assistant_body_html(ws.tab(id).unwrap(), 0, false).is_none());
+        assert!(assistant_body_html(ws.tab(id).unwrap(), 9, false).is_none());
+    }
     #[test]
     fn tool_output_collapses_with_expand_button() {
         let output = (1..=10)

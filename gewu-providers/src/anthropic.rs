@@ -76,7 +76,7 @@ impl Client {
     pub fn with_config(config: AnthropicConfig) -> Self {
         Self {
             config,
-            http_client: HttpClient::new(),
+            http_client: crate::http::client(),
         }
     }
 

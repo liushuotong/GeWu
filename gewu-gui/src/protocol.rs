@@ -57,8 +57,20 @@ pub enum ServerMsg {
     /// Replace one tool card in the active transcript (`first` is its run's
     /// starting block index).
     ToolCard { first: usize, html: String },
-    /// Append streamed assistant text to one block.
-    TextDelta { block: usize, delta: String },
+    /// Append a fresh tool card at the end of the transcript (start of a new
+    /// tool run). `assistant` optionally carries the preceding assistant
+    /// block's index and final Markdown body, converting it out of its
+    /// streaming form.
+    ToolCardStart {
+        first: usize,
+        html: String,
+        assistant: Option<(usize, String)>,
+    },
+    /// Append one rendered block at the end of the transcript.
+    BlockAppend { index: usize, html: String },
+    /// Replace one streaming block's rendered Markdown body in place
+    /// (throttled to roughly ten updates per second).
+    StreamingBody { index: usize, html: String },
     /// Replace the status line.
     Status { html: String },
     /// A protocol or upstream error to surface as a toast.
@@ -96,13 +108,13 @@ mod tests {
 
     #[test]
     fn serializes_server_messages_with_type_tags() {
-        let msg = ServerMsg::TextDelta {
-            block: 2,
-            delta: "hello".to_string(),
+        let msg = ServerMsg::StreamingBody {
+            index: 2,
+            html: "<div class=\"body markdown\"></div>".to_string(),
         };
         let json = serde_json::to_value(&msg).unwrap();
-        assert_eq!(json["type"], "text_delta");
-        assert_eq!(json["block"], 2);
+        assert_eq!(json["type"], "streaming_body");
+        assert_eq!(json["index"], 2);
 
         let msg = ServerMsg::Tabs {
             tabs: vec![TabInfo {
@@ -137,5 +149,23 @@ mod tests {
         assert_eq!(json["type"], "tool_card");
         assert_eq!(json["first"], 4);
         assert_eq!(json["html"], "<div></div>");
+
+        let msg = ServerMsg::ToolCardStart {
+            first: 4,
+            html: "<div></div>".to_string(),
+            assistant: Some((3, "<div class=\"body markdown\"></div>".to_string())),
+        };
+        let json = serde_json::to_value(&msg).unwrap();
+        assert_eq!(json["type"], "tool_card_start");
+        assert_eq!(json["first"], 4);
+        assert_eq!(json["assistant"][0], 3);
+
+        let msg = ServerMsg::BlockAppend {
+            index: 2,
+            html: "<div class=\"block\"></div>".to_string(),
+        };
+        let json = serde_json::to_value(&msg).unwrap();
+        assert_eq!(json["type"], "block_append");
+        assert_eq!(json["index"], 2);
     }
 }

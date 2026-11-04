@@ -6,6 +6,7 @@
 //! messages carrying rendered HTML instead of ratatui frames.
 
 use std::collections::HashMap;
+use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
 use axum::extract::ws::{Message, WebSocket};
@@ -30,12 +31,55 @@ type Sender = SplitSink<WebSocket, Message>;
 struct Conn {
     client: Option<Client>,
     task: Option<JoinHandle<()>>,
+    /// When the streaming Markdown body was last pushed, throttling
+    /// re-renders to [`STREAM_INTERVAL`]. `None` means the next delta is due.
+    last_stream_render: Option<Instant>,
 }
+
+/// Minimum time between full Markdown re-renders of a streaming block.
+const STREAM_INTERVAL: Duration = Duration::from_millis(100);
 
 /// A frame forwarded from a tab's ask stream; `None` marks the stream's end.
 struct TabEvent {
     tab_id: u64,
     frame: Option<gewu_client::Result<ServerMessage>>,
+}
+
+/// What one tab event changed, driving the browser update. Targeted updates
+/// avoid re-rendering the whole transcript on every streamed frame.
+enum TabUpdate {
+    /// Nothing visible changed.
+    None,
+    /// Rebuild the whole transcript (terminal frames, notes, unknown shapes).
+    Full,
+    /// Append one rendered block at the transcript's end.
+    BlockAppend(usize),
+    /// Replace one tool card's contents in place (`run` is the run's first
+    /// block index).
+    ToolCard(usize),
+    /// Append a new tool card at the transcript's end (start of a tool run).
+    ToolCardStart(usize),
+    /// Replace one streaming block's rendered Markdown body in place.
+    StreamingBody(usize),
+}
+
+/// The targeted update for a tool event: replace the run's card, or start a
+/// new one when the run itself just started. Falls back to a full render
+/// when the shape is unexpected.
+fn tool_update(blocks: &[Block], affected: Option<usize>, appended: bool) -> TabUpdate {
+    let Some(index) = affected else {
+        return TabUpdate::Full;
+    };
+    let Some(run_start) = tool_run_start(blocks, index) else {
+        return TabUpdate::Full;
+    };
+    let new_run =
+        appended && (index == 0 || !matches!(blocks[index - 1], Block::Tool { .. }));
+    if new_run {
+        TabUpdate::ToolCardStart(run_start)
+    } else {
+        TabUpdate::ToolCard(run_start)
+    }
 }
 
 /// One browser's isolated GUI session.
@@ -486,15 +530,39 @@ impl GuiSession {
 
         match builder.send().await {
             Ok(stream) => {
-                self.workspace
-                    .tab_mut(tab_id)
-                    .expect("tab exists")
-                    .model
-                    .submit(prompt);
+                let user_block = {
+                    let tab = self.workspace.tab_mut(tab_id).expect("tab exists");
+                    tab.model.submit(prompt);
+                    tab.model.blocks.len() - 1
+                };
                 let task = spawn_ask_forwarder(tab_id, stream, tab_tx.clone());
                 if let Some(conn) = self.conns.get_mut(&tab_id) {
                     conn.task = Some(task);
                 }
+                // Push just the new user block: every streaming update that
+                // follows is targeted, so no full transcript render is needed.
+                let active = self.workspace.active_id() == tab_id;
+                if active {
+                    let html = self
+                        .workspace
+                        .tab(tab_id)
+                        .and_then(|tab| view::block_html(tab, user_block));
+                    match html {
+                        Some(html) => {
+                            send_msg(
+                                sender,
+                                &ServerMsg::BlockAppend {
+                                    index: user_block,
+                                    html,
+                                },
+                            )
+                            .await?;
+                        }
+                        None => self.send_transcript(sender).await?,
+                    }
+                    self.send_status(sender).await?;
+                }
+                self.send_tabs(sender).await?;
             }
             Err(e) => {
                 self.workspace
@@ -502,9 +570,10 @@ impl GuiSession {
                     .expect("tab exists")
                     .model
                     .fail(format!("could not send: {e}"));
+                self.send_after_tab_change(tab_id, sender).await?;
             }
         }
-        self.send_after_tab_change(tab_id, sender).await
+        Ok(())
     }
 
     async fn send_after_tab_change(&self, tab_id: u64, sender: &mut Sender) -> Result<()> {
@@ -551,12 +620,22 @@ impl GuiSession {
         }
     }
 
+    /// Whether enough time has passed since the tab's last streaming render
+    /// to push a fresh one.
+    fn stream_update_due(&self, tab_id: u64) -> bool {
+        self.conns
+            .get(&tab_id)
+            .and_then(|conn| conn.last_stream_render)
+            .is_none_or(|last| last.elapsed() >= STREAM_INTERVAL)
+    }
+
     async fn handle_tab_event(&mut self, event: TabEvent, sender: &mut Sender) -> Result<()> {
         let active_id = self.workspace.active_id();
-        let mut structural = false;
-        let mut delta: Option<(usize, String)> = None;
+        let mut update = TabUpdate::None;
         let mut terminal = false;
         let mut usage_updated = false;
+        // Decide the throttle before borrowing the tab below.
+        let stream_due = self.stream_update_due(event.tab_id);
 
         {
             let Some(tab) = self.workspace.tab_mut(event.tab_id) else {
@@ -567,19 +646,22 @@ impl GuiSession {
             match event.frame {
                 None => {
                     terminal = true;
-                    structural = true;
+                    update = TabUpdate::Full;
                 }
                 Some(Ok(ServerMessage::Event { event, .. })) => {
                     match serde_json::from_value::<AgentEvent>(event) {
                         Ok(AgentEvent::ContentDelta { delta: text }) => {
-                            tab.model.apply_event(&AgentEvent::ContentDelta {
-                                delta: text.clone(),
-                            });
+                            let affected = tab.model.apply_event(&AgentEvent::ContentDelta { delta: text });
                             if tab.model.blocks.len() != before {
-                                structural = true;
-                            } else {
-                                delta = Some((tab.model.blocks.len() - 1, text));
+                                // A fresh block: render it immediately; the
+                                // throttle window starts on its first update.
+                                update = affected.map_or(TabUpdate::Full, TabUpdate::BlockAppend);
+                            } else if stream_due {
+                                update = affected
+                                    .map_or(TabUpdate::Full, TabUpdate::StreamingBody);
                             }
+                            // Otherwise the delta is only in the model and
+                            // rides along with the next due render.
                         }
                         Ok(AgentEvent::Usage {
                             used_tokens,
@@ -592,36 +674,42 @@ impl GuiSession {
                         }
                         // Reasoning is not shown; Finish is followed by Result.
                         Ok(AgentEvent::ReasoningDelta { .. }) | Ok(AgentEvent::Finish { .. }) => {}
+                        Ok(AgentEvent::Error { error }) => {
+                            let affected = tab.model.apply_event(&AgentEvent::Error { error });
+                            update = affected.map_or(TabUpdate::Full, TabUpdate::BlockAppend);
+                        }
                         Ok(agent_event) => {
-                            tab.model.apply_event(&agent_event);
-                            structural = true;
+                            // ToolStart / ToolFinish: update just the run's card.
+                            let affected = tab.model.apply_event(&agent_event);
+                            let appended = tab.model.blocks.len() != before;
+                            update = tool_update(&tab.model.blocks, affected, appended);
                         }
                         Err(e) => {
                             tab.model.note(format!("unrecognized event: {e}"));
-                            structural = true;
+                            update = TabUpdate::Full;
                         }
                     }
                 }
                 Some(Ok(ServerMessage::Result { session_id, .. })) => {
                     tab.model.set_session(Some(session_id));
                     terminal = true;
-                    structural = true;
+                    update = TabUpdate::Full;
                 }
                 Some(Ok(ServerMessage::Error { error, .. })) => {
                     tab.model.fail(error);
                     terminal = true;
-                    structural = true;
+                    update = TabUpdate::Full;
                 }
                 Some(Ok(_)) => {}
                 Some(Err(ClientError::Interrupted)) => {
                     tab.model.note("interrupted");
                     terminal = true;
-                    structural = true;
+                    update = TabUpdate::Full;
                 }
                 Some(Err(e)) => {
                     tab.model.fail(e.to_string());
                     terminal = true;
-                    structural = true;
+                    update = TabUpdate::Full;
                 }
             }
 
@@ -632,27 +720,84 @@ impl GuiSession {
 
         if terminal && let Some(conn) = self.conns.get_mut(&event.tab_id) {
             conn.task = None;
+            conn.last_stream_render = None;
+        }
+
+        // Correct any drift with the authoritative server-side usage before
+        // the terminal status is rendered.
+        if terminal {
+            self.refresh_usage(event.tab_id).await;
         }
 
         let active = active_id == event.tab_id;
-        if active {
-            if structural {
-                self.send_transcript(sender).await?;
-            } else if let Some((block, delta)) = delta {
-                send_msg(sender, &ServerMsg::TextDelta { block, delta }).await?;
+        match update {
+            TabUpdate::None => {}
+            TabUpdate::Full => {
+                if active {
+                    self.send_transcript(sender).await?;
+                    self.send_status(sender).await?;
+                }
+                self.send_tabs(sender).await?;
             }
+            TabUpdate::BlockAppend(index) if active => {
+                let html = self
+                    .workspace
+                    .tab(event.tab_id)
+                    .and_then(|tab| view::block_html(tab, index));
+                match html {
+                    Some(html) => {
+                        send_msg(sender, &ServerMsg::BlockAppend { index, html }).await?;
+                    }
+                    None => self.send_transcript(sender).await?,
+                }
+            }
+            TabUpdate::ToolCard(run_start) if active => {
+                self.send_tool_card(event.tab_id, run_start, sender).await?;
+            }
+            TabUpdate::ToolCardStart(run_start) if active => {
+                let tab = self.workspace.tab(event.tab_id).expect("active tab");
+                let html = view::tool_card_html(tab, run_start);
+                let assistant = if run_start > 0 {
+                    view::assistant_body_html(tab, run_start - 1, false)
+                } else {
+                    None
+                };
+                match html {
+                    Some(html) => {
+                        let assistant = assistant.map(|body| (run_start - 1, body));
+                        send_msg(
+                            sender,
+                            &ServerMsg::ToolCardStart {
+                                first: run_start,
+                                html,
+                                assistant,
+                            },
+                        )
+                        .await?;
+                    }
+                    None => self.send_transcript(sender).await?,
+                }
+            }
+            TabUpdate::StreamingBody(index) if active => {
+                let tab = self.workspace.tab(event.tab_id).expect("active tab");
+                match view::assistant_body_html(tab, index, true) {
+                    Some(html) => {
+                        if let Some(conn) = self.conns.get_mut(&event.tab_id) {
+                            conn.last_stream_render = Some(Instant::now());
+                        }
+                        send_msg(sender, &ServerMsg::StreamingBody { index, html }).await?;
+                    }
+                    None => self.send_transcript(sender).await?,
+                }
+            }
+            // Background tabs are not rendered; their DOM is rebuilt from a
+            // full transcript when the tab is focused.
+            _ => {}
         }
-        if structural {
-            self.send_tabs(sender).await?;
-        }
-        if active && (structural || usage_updated) {
+        // A usage event leaves `update` untouched, so it needs its own
+        // status push.
+        if usage_updated && active {
             self.send_status(sender).await?;
-        }
-        if terminal {
-            self.refresh_usage(event.tab_id).await;
-            if active {
-                self.send_status(sender).await?;
-            }
         }
         Ok(())
     }
@@ -736,5 +881,61 @@ mod tests {
         assert!(set.contains(&3));
         toggle(&mut set, 3);
         assert!(!set.contains(&3));
+    }
+
+    fn tool(tool: &str, output: Option<&str>) -> Block {
+        Block::Tool {
+            tool: tool.into(),
+            input: String::new(),
+            output: output.map(str::to_string),
+        }
+    }
+
+    #[test]
+    fn tool_update_replaces_the_run_card() {
+        // A fill on an existing run replaces its card.
+        let blocks = vec![
+            Block::User("hi".into()),
+            tool("bash", None),
+            tool("bash", Some("out")),
+        ];
+        assert!(matches!(
+            tool_update(&blocks, Some(2), false),
+            TabUpdate::ToolCard(1)
+        ));
+
+        // A ToolStart extending the run replaces the same card.
+        assert!(matches!(
+            tool_update(&blocks, Some(2), true),
+            TabUpdate::ToolCard(1)
+        ));
+    }
+
+    #[test]
+    fn tool_update_starts_a_card_for_a_new_run() {
+        // First tool block after a non-tool block: the run is new.
+        let blocks = vec![Block::User("hi".into()), tool("bash", None)];
+        assert!(matches!(
+            tool_update(&blocks, Some(1), true),
+            TabUpdate::ToolCardStart(1)
+        ));
+
+        // A new run that follows an earlier run starts its own card.
+        let blocks = vec![tool("bash", Some("out")), Block::Assistant("done".into()), tool("grep", None)];
+        assert!(matches!(
+            tool_update(&blocks, Some(2), true),
+            TabUpdate::ToolCardStart(2)
+        ));
+    }
+
+    #[test]
+    fn tool_update_falls_back_to_full_render_on_unexpected_shapes() {
+        let blocks = vec![Block::User("hi".into())];
+        assert!(matches!(tool_update(&blocks, None, true), TabUpdate::Full));
+        // A non-tool affected block cannot be located as a card.
+        assert!(matches!(
+            tool_update(&blocks, Some(0), false),
+            TabUpdate::Full
+        ));
     }
 }

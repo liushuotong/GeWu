@@ -138,7 +138,7 @@ impl App {
 
     /// Apply one decoded agent event to the transcript.
     pub fn apply_event(&mut self, event: &AgentEvent) {
-        self.model.apply_event(event);
+        let _ = self.model.apply_event(event);
     }
 
     /// Record a user prompt, reset the input box, and enter the busy phase.

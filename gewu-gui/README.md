@@ -90,6 +90,15 @@ Scrolling up pins the history; scrolling back to the bottom re-follows streamed
 output. A dropped GUI connection reconnects with backoff and asks for a fresh
 snapshot; an `unauthorized` error returns to the token prompt.
 
+## Incremental updates
+
+The GUI avoids re-rendering the transcript while an ask streams. Submitting a
+prompt appends the user block; the first assistant delta appends a streaming
+block and later deltas append text in place; tool runs append their card and
+fill its output in place; only the terminal frame (and tab switches) re-render
+the whole transcript. When a targeted update does not match the browser's DOM,
+it falls back to a full refresh.
+
 ## Rendering and safety
 
 Server-rendered HTML fragments are the only thing inserted with `innerHTML`.

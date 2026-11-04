@@ -30,11 +30,11 @@ use crate::openai::{
     CreateChatCompletionRequest, FunctionCall as OpenAIFunctionCall,
     FunctionObjectArgs, ImageUrl, OpenAIConfig, AssistantMessage as OpenAIAssistantMessage,
     ChatCompletionRequestMessageContentPartText, FileData,
-    ChatCompletionRequestMessageContentPartFile, OpenAIClient,
+    ChatCompletionRequestMessageContentPartFile, OpenAIClient, OpenAIError,
 };
 use crate::anthropic::{
-    AnthropicChunk, AnthropicConfig, AnthropicMessage, AnthropicStream, AnthropicTool,
-    ContentBlock, ContentBlockDeltaChunk, ContentBlockStart,
+    AnthropicChunk, AnthropicConfig, AnthropicError, AnthropicMessage, AnthropicStream,
+    AnthropicTool, ContentBlock, ContentBlockDeltaChunk, ContentBlockStart,
     ContentBlockStartChunk, ContentDelta, CreateMessageRequest,
     MessageStartChunk, UserMessage,
     AssistantMessage as AnthropicAssistantMessage, Client as AnthropicClient,
@@ -47,6 +47,7 @@ use gewu_core::types::{Capabilities, ContentPart, Message, ProviderEvent};
 use serde_json::Value;
 use std::error::Error;
 use std::sync::Arc;
+use std::time::Duration;
 
 static MULTIMODAL_CAP: Capabilities = Capabilities {
     input: gewu_core::types::InputCapabilities {
@@ -132,6 +133,7 @@ pub struct OpenAIProvider {
     client: OpenAIClient,
     model: String,
     capabilities: Capabilities,
+    retry_backoff: Duration,
 }
 
 impl OpenAIProvider {
@@ -148,6 +150,7 @@ impl OpenAIProvider {
             client: OpenAIClient::with_config(config),
             model: model.to_string(),
             capabilities,
+            retry_backoff: crate::http::RETRY_BACKOFF,
         }
     }
 
@@ -168,7 +171,15 @@ impl OpenAIProvider {
             client: OpenAIClient::with_config(config),
             model: model.to_string(),
             capabilities,
+            retry_backoff: crate::http::RETRY_BACKOFF,
         }
+    }
+
+    /// Overrides the base delay between retries of a failed request setup
+    /// (each retry waits four times longer than the previous one).
+    pub fn with_retry_backoff(mut self, backoff: Duration) -> Self {
+        self.retry_backoff = backoff;
+        self
     }
 
     /// Determines capabilities based on model name.
@@ -612,15 +623,25 @@ impl LlmProvider for OpenAIProvider {
         BoxStream<'a, Result<ProviderEvent, Box<dyn Error + Send + Sync>>>,
         Box<dyn Error + Send + Sync>,
     > {
-        let request: CreateChatCompletionRequest = serde_json::from_value(request)
-            .map_err(|e| Box::new(e) as Box<dyn Error + Send + Sync>)?;
-
-        let stream = self
-            .client
-            .chat()
-            .create_stream(request)
-            .await
-            .map_err(|e| Box::new(e) as Box<dyn Error + Send + Sync>)?;
+        // Retry the request-setup phase on transport-level failures (connect
+        // errors, read timeouts on a stalled connection). The wire request is
+        // re-parsed per attempt because `create_stream` consumes it; parse
+        // failures are permanent and never retried.
+        let stream = crate::http::with_retries(
+            self.retry_backoff,
+            || {
+                let request = request.clone();
+                async move {
+                    let request: CreateChatCompletionRequest =
+                        serde_json::from_value(request)
+                            .map_err(|e| OpenAIError::Build(e.to_string()))?;
+                    self.client.chat().create_stream(request).await
+                }
+            },
+            |e| matches!(e, OpenAIError::Http(_)),
+        )
+        .await
+        .map_err(|e| Box::new(e) as Box<dyn Error + Send + Sync>)?;
 
         let parsed_stream = self.parse_stream(stream);
 
@@ -664,6 +685,7 @@ pub struct AnthropicProvider {
     model: String,
     #[allow(dead_code)]
     capabilities: Capabilities,
+    retry_backoff: Duration,
 }
 
 impl AnthropicProvider {
@@ -680,6 +702,7 @@ impl AnthropicProvider {
             client: AnthropicClient::with_config(config),
             model: model.to_string(),
             capabilities,
+            retry_backoff: crate::http::RETRY_BACKOFF,
         }
     }
 
@@ -700,7 +723,15 @@ impl AnthropicProvider {
             client: AnthropicClient::with_config(config),
             model: model.to_string(),
             capabilities,
+            retry_backoff: crate::http::RETRY_BACKOFF,
         }
+    }
+
+    /// Overrides the base delay between retries of a failed request setup
+    /// (each retry waits four times longer than the previous one).
+    pub fn with_retry_backoff(mut self, backoff: Duration) -> Self {
+        self.retry_backoff = backoff;
+        self
     }
 
     /// Enables extended thinking for supported models.
@@ -1038,15 +1069,23 @@ impl LlmProvider for AnthropicProvider {
         futures::stream::BoxStream<'a, Result<ProviderEvent, Box<dyn Error + Send + Sync>>>,
         Box<dyn Error + Send + Sync>,
     > {
-        let request: CreateMessageRequest = serde_json::from_value(request)
-            .map_err(|e| Box::new(e) as Box<dyn Error + Send + Sync>)?;
-
-        let stream = self
-            .client
-            .messages()
-            .create_stream(request)
-            .await
-            .map_err(|e| Box::new(e) as Box<dyn Error + Send + Sync>)?;
+        // Retry the request-setup phase on transport-level failures; see the
+        // OpenAI `send` for rationale. Parse failures are permanent and never
+        // retried.
+        let stream = crate::http::with_retries(
+            self.retry_backoff,
+            || {
+                let request = request.clone();
+                async move {
+                    let request: CreateMessageRequest = serde_json::from_value(request)
+                        .map_err(|e| AnthropicError::Api(format!("build error: {e}")))?;
+                    self.client.messages().create_stream(request).await
+                }
+            },
+            |e| matches!(e, AnthropicError::Http(_)),
+        )
+        .await
+        .map_err(|e| Box::new(e) as Box<dyn Error + Send + Sync>)?;
 
         let parsed_stream = self.parse_stream(stream);
 
@@ -1561,10 +1600,14 @@ mod tests {
             .collect()
     }
 
+    // The provider uses a millisecond backoff so the two retries against the
+    // unroutable endpoint don't slow the suite down.
     #[tokio::test]
     async fn stream_response_logs_wire_request_before_sending() {
         // Unroutable endpoint: send fails, but the request is logged first.
-        let provider = OpenAIProvider::new_with_endpoint("test-key", "http://127.0.0.1:1", "gpt-4o");
+        let provider =
+            OpenAIProvider::new_with_endpoint("test-key", "http://127.0.0.1:1", "gpt-4o")
+                .with_retry_backoff(std::time::Duration::from_millis(1));
         let buffer = SharedBuffer::default();
         let messages = vec![Message::User {
             content: vec![ContentPart::Text {
@@ -1591,7 +1634,9 @@ mod tests {
 
     #[tokio::test]
     async fn stream_response_without_log_sends_normally() {
-        let provider = OpenAIProvider::new_with_endpoint("test-key", "http://127.0.0.1:1", "gpt-4o");
+        let provider =
+            OpenAIProvider::new_with_endpoint("test-key", "http://127.0.0.1:1", "gpt-4o")
+                .with_retry_backoff(std::time::Duration::from_millis(1));
         let messages = vec![Message::User {
             content: vec![ContentPart::Text {
                 text: "hello".to_string(),

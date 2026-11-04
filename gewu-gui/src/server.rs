@@ -324,6 +324,12 @@ mod tests {
                             .map(|n| format!("line {n}"))
                             .collect::<Vec<_>>()
                             .join("\n");
+                        // Text before the tool call exercises the assistant
+                        // body swap in `tool_card_start`.
+                        replies.push(json!({
+                            "type": "event", "id": null, "request_id": request_id,
+                            "event": {"type": "content_delta", "delta": "Working"},
+                        }));
                         replies.push(json!({
                             "type": "event", "id": null, "request_id": request_id,
                             "event": {"type": "tool_start", "tool": "bash", "input": "seq 10"},
@@ -340,6 +346,9 @@ mod tests {
                         "type": "event", "id": null, "request_id": request_id,
                         "event": {"type": "content_delta", "delta": "hello "},
                     }));
+                    // Pause past the GUI's streaming-Markdown throttle so the
+                    // next delta is pushed as a full rendered body.
+                    replies.push(json!({"__sleep_ms": 150}));
                     replies.push(json!({
                         "type": "event", "id": null, "request_id": request_id,
                         "event": {"type": "content_delta", "delta": "world"},
@@ -359,6 +368,12 @@ mod tests {
                 _ => Vec::new(),
             };
             for reply in replies {
+                // Internal marker: pause before sending the next frame, to
+                // exercise timing-dependent paths in the GUI.
+                if let Some(ms) = reply.get("__sleep_ms").and_then(Value::as_u64) {
+                    tokio::time::sleep(Duration::from_millis(ms)).await;
+                    continue;
+                }
                 let mut line = reply.to_string();
                 line.push('\n');
                 if writer.write_all(line.as_bytes()).await.is_err() {
@@ -519,6 +534,7 @@ mod tests {
             .unwrap();
 
         let mut saw_streaming_text = false;
+        let mut saw_user_block = false;
         let mut saw_delta = false;
         let mut final_transcript = false;
         let mut usage = false;
@@ -527,19 +543,33 @@ mod tests {
         for _ in 0..60 {
             let value = next_json(&mut ws).await;
             match value["type"].as_str().unwrap_or("") {
-                "transcript" => {
+                // Streaming updates arrive as targeted appends, not as full
+                // transcript re-renders.
+                "block_append" => {
                     let html = value["html"].as_str().unwrap();
-                    if html.contains("class=\"body streaming\"") && html.contains("hello") {
+                    if html.contains("class=\"block user\"") {
+                        saw_user_block = true;
+                    }
+                    if html.contains("body markdown streaming") && html.contains("hello") {
                         saw_streaming_text = true;
                     }
-                    if html.contains("<p>hello world</p>") && !html.contains("streaming-text") {
+                }
+                "streaming_body" => {
+                    assert_eq!(value["index"], 2);
+                    assert!(
+                        value["html"].as_str().unwrap().contains("<p>hello world</p>"),
+                        "{}",
+                        value["html"]
+                    );
+                    saw_delta = true;
+                }
+                "transcript" => {
+                    let html = value["html"].as_str().unwrap();
+                    if html.contains("<p>hello world</p>")
+                        && !html.contains("body markdown streaming")
+                    {
                         final_transcript = true;
                     }
-                }
-                "text_delta" => {
-                    assert_eq!(value["block"], 2);
-                    assert_eq!(value["delta"], "world");
-                    saw_delta = true;
                 }
                 "status" => {
                     let html = value["html"].as_str().unwrap();
@@ -562,12 +592,26 @@ mod tests {
                 }
                 _ => {}
             }
-            if saw_streaming_text && saw_delta && final_transcript && usage && streamed_usage && final_tabs {
+            if saw_streaming_text
+                && saw_user_block
+                && saw_delta
+                && final_transcript
+                && usage
+                && streamed_usage
+                && final_tabs
+            {
                 break;
             }
         }
-        assert!(saw_streaming_text, "first delta should render a transcript");
-        assert!(saw_delta, "later deltas should stream as text_delta");
+        assert!(saw_user_block, "the prompt should append as a user block");
+        assert!(
+            saw_streaming_text,
+            "first delta should append a streaming Markdown block"
+        );
+        assert!(
+            saw_delta,
+            "later deltas should stream as rendered Markdown bodies"
+        );
         assert!(
             final_transcript,
             "the final Markdown transcript should arrive"
@@ -665,5 +709,79 @@ mod tests {
             }
         }
         panic!("expected a tool_card message");
+    }
+
+    #[tokio::test]
+    async fn tool_events_send_only_card_updates() {
+        let upstream = spawn_fake_upstream().await;
+        let addr = spawn_gui(AppState {
+            endpoint: Endpoint::Tcp {
+                host: "127.0.0.1".to_string(),
+                port: upstream.port(),
+            },
+            token: None,
+            server_token: None,
+        })
+        .await;
+
+        let (mut ws, _) = tokio_tungstenite::connect_async(format!("ws://{addr}/ws"))
+            .await
+            .unwrap();
+        let snapshot = next_json(&mut ws).await;
+        assert_eq!(snapshot["type"], "snapshot");
+
+        ws.send(WsMessage::text(
+            json!({"op": "ask", "tab": 1, "prompt": "run a tool"}).to_string(),
+        ))
+        .await
+        .unwrap();
+
+        let mut saw_card_start = false;
+        let mut saw_assistant_swap = false;
+        let mut saw_card_fill = false;
+        let mut transcripts = 0;
+        for _ in 0..80 {
+            let value = next_json(&mut ws).await;
+            match value["type"].as_str().unwrap_or("") {
+                "tool_card_start" => {
+                    saw_card_start = true;
+                    assert_eq!(value["first"], 3);
+                    let html = value["html"].as_str().unwrap();
+                    assert!(html.contains("data-card=\"3\""), "{html}");
+                    assert!(html.contains("seq 10 …"), "{html}");
+                    // The assistant block before the run swaps to its final
+                    // Markdown form.
+                    if let Some(assistant) = value["assistant"].as_array() {
+                        assert_eq!(assistant[0], 2);
+                        assert!(assistant[1].as_str().unwrap().contains(">Working<"));
+                        saw_assistant_swap = true;
+                    }
+                }
+                "tool_card" => {
+                    saw_card_fill = true;
+                    assert_eq!(value["first"], 3);
+                    let html = value["html"].as_str().unwrap();
+                    assert!(html.contains("+4 lines"), "{html}");
+                }
+                "transcript" => transcripts += 1,
+                "tabs" => {
+                    let tab = &value["tabs"][0];
+                    if tab["session_id"] == "sess-1" && tab["busy"] == false {
+                        break;
+                    }
+                }
+                _ => {}
+            }
+        }
+        assert!(saw_card_start, "a new tool run should append its card");
+        assert!(
+            saw_assistant_swap,
+            "tool_card_start should carry the assistant body swap"
+        );
+        assert!(saw_card_fill, "the tool output should fill the card in place");
+        assert_eq!(
+            transcripts, 1,
+            "only the terminal frame may re-render the transcript"
+        );
     }
 }

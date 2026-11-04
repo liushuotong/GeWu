@@ -251,8 +251,14 @@
       case "tool_card":
         replaceToolCard(message.first, message.html);
         break;
-      case "text_delta":
-        appendDelta(message.block, message.delta);
+      case "tool_card_start":
+        startToolCard(message.first, message.html, message.assistant);
+        break;
+      case "block_append":
+        appendBlock(message.index, message.html);
+        break;
+      case "streaming_body":
+        updateStreamingBody(message.index, message.html);
         break;
       case "status":
         setStatus(message.html);
@@ -346,16 +352,24 @@
     if (shouldScroll) scrollToBottom();
   }
 
-  function appendDelta(block, delta) {
-    const node = el.transcript.querySelector(
-      `.streaming-text[data-block="${block}"]`,
+  // Replace one streaming block's rendered Markdown body in place: keeping
+  // the `.block` node avoids re-triggering its entry animation or moving the
+  // scroll position.
+  function updateStreamingBody(index, html) {
+    const block = el.transcript.querySelector(
+      `.block[data-block="${Number(index)}"]`,
     );
-    if (!node) {
+    if (!block) {
+      requestRefresh();
+      return;
+    }
+    const body = fromHtml(html);
+    if (!body) {
       requestRefresh();
       return;
     }
     const shouldScroll = nearBottom();
-    node.textContent += delta;
+    block.replaceChildren(body);
     if (shouldScroll) scrollToBottom();
   }
 
@@ -381,6 +395,60 @@
       return;
     }
     card.replaceChildren(...fresh.childNodes);
+  }
+
+  // Append one rendered block (user message, streaming assistant block,
+  // error note) at the end of the transcript.
+  function appendBlock(index, html) {
+    // A block that is already there means the DOM has drifted.
+    if (el.transcript.querySelector(`.block[data-block="${Number(index)}"]`)) {
+      requestRefresh();
+      return;
+    }
+    const node = fromHtml(html);
+    if (!node) {
+      requestRefresh();
+      return;
+    }
+    const shouldScroll = nearBottom();
+    el.transcript.querySelector(".empty")?.remove();
+    el.transcript.appendChild(node);
+    if (shouldScroll) scrollToBottom();
+  }
+
+  // Start of a new tool run: convert the preceding assistant block out of
+  // its streaming form, then append the card at the end of the transcript.
+  function startToolCard(first, html, assistant) {
+    if (assistant) {
+      const [index, bodyHtml] = assistant;
+      const block = el.transcript.querySelector(
+        `.block[data-block="${Number(index)}"]`,
+      );
+      const body = fromHtml(bodyHtml);
+      if (!block || !body) {
+        requestRefresh();
+        return;
+      }
+      // Swap only the body: keeping the `.block` node avoids re-triggering
+      // its entry animation.
+      block.replaceChildren(body);
+    }
+    const card = fromHtml(html);
+    if (!card) {
+      requestRefresh();
+      return;
+    }
+    const shouldScroll = nearBottom();
+    el.transcript.querySelector(".empty")?.remove();
+    el.transcript.appendChild(card);
+    if (shouldScroll) scrollToBottom();
+  }
+
+  // Parse trusted server-rendered HTML into the first element.
+  function fromHtml(html) {
+    const template = document.createElement("template");
+    template.innerHTML = html;
+    return template.content.firstElementChild;
   }
 
   // The streaming block can be missing if a delta raced a tab switch.

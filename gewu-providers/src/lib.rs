@@ -22,6 +22,7 @@
 //! ```
 
 mod anthropic;
+mod http;
 mod providers;
 mod openai;
 

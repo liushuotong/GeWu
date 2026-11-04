@@ -106,21 +106,26 @@ impl SessionModel {
     }
 
     /// Apply one decoded [`AgentEvent`] to the transcript.
-    pub fn apply_event(&mut self, event: &AgentEvent) {
+    ///
+    /// Returns the index of the block the event affected, if any — callers
+    /// can re-render just that block instead of the whole transcript.
+    pub fn apply_event(&mut self, event: &AgentEvent) -> Option<usize> {
         match event {
             AgentEvent::ContentDelta { delta } => {
                 let idx = self.open_assistant();
                 if let Block::Assistant(text) = &mut self.blocks[idx] {
                     text.push_str(delta);
                 }
+                Some(idx)
             }
-            AgentEvent::ReasoningDelta { .. } => {}
+            AgentEvent::ReasoningDelta { .. } => None,
             AgentEvent::ToolStart { tool, input } => {
                 self.blocks.push(Block::Tool {
                     tool: tool.clone(),
                     input: summarize_tool_input(tool, input),
                     output: None,
                 });
+                Some(self.blocks.len() - 1)
             }
             AgentEvent::ToolFinish { tool, output, .. } => {
                 if !self.fill_open_tool(Some(tool), output) {
@@ -129,12 +134,25 @@ impl SessionModel {
                         input: String::new(),
                         output: Some(tool_output(output)),
                     });
+                    return Some(self.blocks.len() - 1);
                 }
+                // `fill_open_tool` filled a block inside the trailing run; a
+                // run renders as one card, so any index inside it identifies
+                // the same card.
+                let start = self
+                    .blocks
+                    .iter()
+                    .rposition(|b| !matches!(b, Block::Tool { .. }))
+                    .map_or(0, |i| i + 1);
+                (start..self.blocks.len())
+                    .find(|&i| matches!(&self.blocks[i], Block::Tool { output: Some(_), .. }))
+                    .or(Some(self.blocks.len() - 1))
             }
-            AgentEvent::Finish { response: _ } => {}
-            AgentEvent::Usage { .. } => {}
+            AgentEvent::Finish { response: _ } => None,
+            AgentEvent::Usage { .. } => None,
             AgentEvent::Error { error } => {
                 self.blocks.push(Block::Error(error.clone()));
+                Some(self.blocks.len() - 1)
             }
         }
     }
@@ -351,21 +369,21 @@ mod tests {
     #[test]
     fn content_deltas_accumulate_in_one_block() {
         let mut m = model();
-        m.apply_event(&AgentEvent::ContentDelta {
+        let _ = m.apply_event(&AgentEvent::ContentDelta {
             delta: "Hel".into(),
         });
-        m.apply_event(&AgentEvent::ContentDelta { delta: "lo".into() });
+        let _ = m.apply_event(&AgentEvent::ContentDelta { delta: "lo".into() });
         assert_eq!(m.blocks, vec![Block::Assistant("Hello".into())]);
     }
 
     #[test]
     fn tool_start_then_finish_fills_output() {
         let mut m = model();
-        m.apply_event(&AgentEvent::ToolStart {
+        let _ = m.apply_event(&AgentEvent::ToolStart {
             tool: "bash".into(),
             input: r#"{"command":"ls"}"#.into(),
         });
-        m.apply_event(&AgentEvent::ToolFinish {
+        let _ = m.apply_event(&AgentEvent::ToolFinish {
             tool: "bash".into(),
             title: String::new(),
             output: "file.rs".into(),
@@ -389,11 +407,11 @@ mod tests {
             .collect::<Vec<_>>()
             .join("\n");
         assert!(output.len() > 400);
-        m.apply_event(&AgentEvent::ToolStart {
+        let _ = m.apply_event(&AgentEvent::ToolStart {
             tool: "bash".into(),
             input: r#"{"command":"seq 60"}"#.into(),
         });
-        m.apply_event(&AgentEvent::ToolFinish {
+        let _ = m.apply_event(&AgentEvent::ToolFinish {
             tool: "bash".into(),
             title: String::new(),
             output: output.clone(),
@@ -413,20 +431,20 @@ mod tests {
     #[test]
     fn tool_start_after_content_starts_new_block() {
         let mut m = model();
-        m.apply_event(&AgentEvent::ContentDelta {
+        let _ = m.apply_event(&AgentEvent::ContentDelta {
             delta: "let me check".into(),
         });
-        m.apply_event(&AgentEvent::ToolStart {
+        let _ = m.apply_event(&AgentEvent::ToolStart {
             tool: "bash".into(),
             input: "{}".into(),
         });
-        m.apply_event(&AgentEvent::ToolFinish {
+        let _ = m.apply_event(&AgentEvent::ToolFinish {
             tool: "bash".into(),
             title: String::new(),
             output: "ok".into(),
             metadata: Default::default(),
         });
-        m.apply_event(&AgentEvent::ContentDelta {
+        let _ = m.apply_event(&AgentEvent::ContentDelta {
             delta: "done".into(),
         });
         assert_eq!(m.blocks.len(), 3);
@@ -443,6 +461,57 @@ mod tests {
         });
         m.finish_ask();
         assert_eq!(m.phase, Phase::Idle);
+    }
+
+    #[test]
+    fn apply_event_reports_the_affected_block() {
+        let mut m = model();
+
+        // First delta creates block 0; later deltas touch the same block.
+        assert_eq!(
+            m.apply_event(&AgentEvent::ContentDelta { delta: "a".into() }),
+            Some(0)
+        );
+        assert_eq!(
+            m.apply_event(&AgentEvent::ContentDelta { delta: "b".into() }),
+            Some(0)
+        );
+
+        // ToolStart appends block 1; its ToolFinish fills it.
+        assert_eq!(
+            m.apply_event(&AgentEvent::ToolStart {
+                tool: "bash".into(),
+                input: "{}".into(),
+            }),
+            Some(1)
+        );
+        assert_eq!(
+            m.apply_event(&AgentEvent::ToolFinish {
+                tool: "bash".into(),
+                title: String::new(),
+                output: "ok".into(),
+                metadata: Default::default(),
+            }),
+            Some(1)
+        );
+
+        // Non-transcript events report nothing.
+        assert_eq!(
+            m.apply_event(&AgentEvent::Usage {
+                used_tokens: 10,
+                context_limit: 100,
+            }),
+            None
+        );
+
+        // A second ToolStart appends into the same run (block 2).
+        assert_eq!(
+            m.apply_event(&AgentEvent::ToolStart {
+                tool: "grep".into(),
+                input: "{}".into(),
+            }),
+            Some(2)
+        );
     }
 
     #[test]

@@ -78,7 +78,7 @@ impl OpenAIClient {
     pub fn with_config(config: OpenAIConfig) -> Self {
         Self {
             config,
-            http_client: HttpClient::new(),
+            http_client: crate::http::client(),
         }
     }
 

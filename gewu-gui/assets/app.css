@@ -736,12 +736,11 @@ body {
 }
 
 .body.streaming {
-  white-space: pre-wrap;
   overflow-wrap: anywhere;
 }
 
-/* block cursor while streaming */
-.streaming::after {
+/* block cursor while streaming, inline at the end of the last element */
+.body.streaming > :last-child::after {
   content: "";
   display: inline-block;
   width: 0.55em;
