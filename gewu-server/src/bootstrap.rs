@@ -168,11 +168,18 @@ pub fn build_provider(
 
     let provider: Arc<dyn LlmProvider> = match provider_name.to_lowercase().as_str() {
         "anthropic" => {
-            if let Some(url) = base_url {
-                Arc::new(AnthropicProvider::new_with_endpoint(&api_key, &url, &model))
-            } else {
-                Arc::new(AnthropicProvider::new(&api_key, &model))
+            let mut builder = match base_url {
+                Some(url) => AnthropicProvider::new_with_endpoint(&api_key, &url, &model),
+                None => AnthropicProvider::new(&api_key, &model),
+            };
+            if let Some(max_tokens) = file_config.max_tokens {
+                builder = builder.with_max_tokens(max_tokens);
             }
+            info!(
+                "Anthropic max_tokens: {} (override with `max_tokens` in the config file)",
+                builder.max_tokens()
+            );
+            Arc::new(builder)
         }
         _ => {
             if let Some(url) = base_url {

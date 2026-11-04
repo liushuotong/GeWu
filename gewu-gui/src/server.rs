@@ -748,7 +748,7 @@ mod tests {
                     assert_eq!(value["first"], 3);
                     let html = value["html"].as_str().unwrap();
                     assert!(html.contains("data-card=\"3\""), "{html}");
-                    assert!(html.contains("seq 10 …"), "{html}");
+                    assert!(html.contains("tool-spinner"), "{html}");
                     // The assistant block before the run swaps to its final
                     // Markdown form.
                     if let Some(assistant) = value["assistant"].as_array() {

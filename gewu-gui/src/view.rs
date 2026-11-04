@@ -167,10 +167,14 @@ fn render_tool_run(out: &mut String, tab: &Tab, run: &[Block], first: usize) {
     } else {
         let expanded = tab.expanded_groups.contains(&first);
         let glyph = if expanded { "−" } else { "+" };
+        let running = run
+            .iter()
+            .any(|block| matches!(block, Block::Tool { output: None, .. }));
         let _ = writeln!(
             out,
-            "<div class=\"tool-group\" data-block=\"{first}\" data-action=\"toggle_group\" data-tab=\"{}\">\
+            "<div class=\"tool-group{}\" data-block=\"{first}\" data-action=\"toggle_group\" data-tab=\"{}\">\
              <button class=\"tool-summary\" data-action=\"toggle_group\" data-tab=\"{}\" data-block=\"{first}\">{glyph} {}</button>",
+            if running { " running" } else { "" },
             tab.id,
             tab.id,
             escape(&group_label(run))
@@ -196,19 +200,23 @@ fn render_tool(
     index: usize,
     depth: usize,
 ) {
-    let (name, mut title) = tool_row(tool, input);
-    if output.is_none() {
-        title.push_str(" …");
-    }
+    let (name, title) = tool_row(tool, input);
+    let running = output.is_none();
     let expanded = tab.expanded_outputs.contains(&index);
     let _ = writeln!(
         out,
-        "<div class=\"tool depth-{depth}\" data-action=\"toggle_tool\" data-tab=\"{}\" data-block=\"{index}\">\
+        "<div class=\"tool{} depth-{depth}\" data-action=\"toggle_tool\" data-tab=\"{}\" data-block=\"{index}\">\
          <button class=\"tool-row\" data-action=\"toggle_tool\" data-tab=\"{}\" data-block=\"{index}\">\
-         <span class=\"tool-name\">{}</span> <span class=\"tool-title\">{}</span></button>",
+         <span class=\"tool-name\">{}</span>{} <span class=\"tool-title\">{}</span></button>",
+        if running { " running" } else { "" },
         tab.id,
         tab.id,
         escape(name),
+        if running {
+            "<span class=\"tool-spinner\" aria-hidden=\"true\"></span>"
+        } else {
+            ""
+        },
         escape(&title)
     );
 
@@ -713,6 +721,34 @@ mod tests {
     }
 
     #[test]
+    fn running_tool_shows_spinner() {
+        let (ws, id) = tab_with_blocks(vec![Block::Tool {
+            tool: "bash".into(),
+            input: "sleep 30".into(),
+            output: None,
+        }]);
+        let html = transcript_html(ws.tab(id).unwrap());
+        assert!(html.contains("class=\"tool running depth-0\""), "{html}");
+        assert!(
+            html.contains("<span class=\"tool-spinner\" aria-hidden=\"true\"></span>"),
+            "{html}"
+        );
+    }
+
+    #[test]
+    fn finished_tool_has_no_running_indicator() {
+        let (ws, id) = tab_with_blocks(vec![Block::Tool {
+            tool: "bash".into(),
+            input: "ls".into(),
+            output: Some("a".into()),
+        }]);
+        let html = transcript_html(ws.tab(id).unwrap());
+        assert!(html.contains("class=\"tool depth-0\""), "{html}");
+        assert!(!html.contains("tool-spinner"), "{html}");
+        assert!(!html.contains("running"), "{html}");
+    }
+
+    #[test]
     fn running_group_says_exploring() {
         let (ws, id) = tab_with_blocks(vec![
             Block::Tool {
@@ -728,6 +764,54 @@ mod tests {
         ]);
         let html = transcript_html(ws.tab(id).unwrap());
         assert!(html.contains("+ Exploring: 1 bash, 1 grep"), "{html}");
+        assert!(html.contains("class=\"tool-group running\""), "{html}");
+    }
+
+    #[test]
+    fn finished_group_has_no_running_class() {
+        let (ws, id) = tab_with_blocks(vec![
+            Block::Tool {
+                tool: "bash".into(),
+                input: "ls".into(),
+                output: Some("a".into()),
+            },
+            Block::Tool {
+                tool: "grep".into(),
+                input: "TODO".into(),
+                output: Some("b".into()),
+            },
+        ]);
+        let html = transcript_html(ws.tab(id).unwrap());
+        assert!(html.contains("+ Explored: 1 bash, 1 grep"), "{html}");
+        assert!(
+            html.contains("class=\"tool-group\" data-block=\"0\""),
+            "{html}"
+        );
+        assert!(!html.contains("tool-spinner"), "{html}");
+    }
+
+    #[test]
+    fn partial_group_marks_remaining_tool_running() {
+        // A mixed run: first tool finished, second still running. The group
+        // label pulses and the expanded rows show only the pending spinner.
+        let (mut ws, id) = tab_with_blocks(vec![
+            Block::Tool {
+                tool: "bash".into(),
+                input: "ls".into(),
+                output: Some("a".into()),
+            },
+            Block::Tool {
+                tool: "grep".into(),
+                input: "TODO".into(),
+                output: None,
+            },
+        ]);
+        ws.tab_mut(id).unwrap().expanded_groups.insert(0);
+        let html = transcript_html(ws.tab(id).unwrap());
+        assert!(html.contains("class=\"tool-group running\""), "{html}");
+        assert!(html.contains("Exploring: 1 bash, 1 grep"), "{html}");
+        assert!(html.contains("class=\"tool depth-1\""), "{html}");
+        assert!(html.contains("tool-spinner"), "{html}");
     }
 
     #[test]

@@ -13,6 +13,10 @@ pub struct Config {
     pub provider: Option<String>,
     /// Optional path to a log file recording every wire LLM request as JSONL.
     pub log: Option<String>,
+    /// Output token budget sent as `max_tokens` on every Anthropic request.
+    /// Reasoning models spend thinking tokens from this budget; raise it when
+    /// turns come back empty or truncated (`stop_reason: "max_tokens"`).
+    pub max_tokens: Option<u32>,
     /// Optional directories to scan for skills (files named `SKILL.md`).
     #[serde(default)]
     pub skills: Option<Vec<String>>,
@@ -110,6 +114,18 @@ mod tests {
     fn log_is_optional() {
         let config: Config = serde_json::from_str("{}").unwrap();
         assert!(config.log.is_none());
+    }
+
+    #[test]
+    fn parses_max_tokens_option() {
+        let config: Config = serde_json::from_str(r#"{"max_tokens": 65536}"#).unwrap();
+        assert_eq!(config.max_tokens, Some(65536));
+    }
+
+    #[test]
+    fn max_tokens_is_optional() {
+        let config: Config = serde_json::from_str("{}").unwrap();
+        assert!(config.max_tokens.is_none());
     }
 
     #[test]

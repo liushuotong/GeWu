@@ -680,15 +680,37 @@ impl LlmProvider for OpenAIProvider {
 /// let provider = AnthropicProvider::new("api-key", "claude-3-7-sonnet")
 ///     .with_extended_thinking();
 /// ```
+/// Output budget for the Anthropic provider when the config does not pick
+/// one. Reasoning models (e.g. MiniMax M3) spend thinking tokens from this
+/// budget, so a small value can end a turn with no text at all — MiniMax's
+/// own API docs note that too small a `max_tokens` yields
+/// `stop_reason: "max_tokens"` with no text output. Newer reasoning models
+/// therefore get a much larger default than the legacy 8192.
+const ANTHROPIC_LEGACY_MAX_TOKENS: u32 = 8192;
+const ANTHROPIC_REASONING_MODEL_MAX_TOKENS: u32 = 32768;
+
 pub struct AnthropicProvider {
     client: AnthropicClient,
     model: String,
     #[allow(dead_code)]
     capabilities: Capabilities,
     retry_backoff: Duration,
+    /// Output token budget sent as `max_tokens` on every request.
+    max_tokens: u32,
 }
 
 impl AnthropicProvider {
+    /// Per-model output budget: reasoning models think from the same budget
+    /// and need far more than the legacy 8192.
+    fn default_max_tokens_for_model(model: &str) -> u32 {
+        let model_lower = model.to_lowercase();
+        if model_lower.contains("minimax") {
+            ANTHROPIC_REASONING_MODEL_MAX_TOKENS
+        } else {
+            ANTHROPIC_LEGACY_MAX_TOKENS
+        }
+    }
+
     /// Creates a new provider for the official Anthropic API.
     ///
     /// # Arguments
@@ -703,6 +725,7 @@ impl AnthropicProvider {
             model: model.to_string(),
             capabilities,
             retry_backoff: crate::http::RETRY_BACKOFF,
+            max_tokens: Self::default_max_tokens_for_model(model),
         }
     }
 
@@ -724,6 +747,7 @@ impl AnthropicProvider {
             model: model.to_string(),
             capabilities,
             retry_backoff: crate::http::RETRY_BACKOFF,
+            max_tokens: Self::default_max_tokens_for_model(model),
         }
     }
 
@@ -732,6 +756,20 @@ impl AnthropicProvider {
     pub fn with_retry_backoff(mut self, backoff: Duration) -> Self {
         self.retry_backoff = backoff;
         self
+    }
+
+    /// Overrides the output token budget sent as `max_tokens`.
+    ///
+    /// Reasoning models spend thinking tokens from this budget; raise it when
+    /// turns come back empty or truncated (`stop_reason: "max_tokens"`).
+    pub fn with_max_tokens(mut self, max_tokens: u32) -> Self {
+        self.max_tokens = max_tokens;
+        self
+    }
+
+    /// The output token budget sent as `max_tokens` on every request.
+    pub fn max_tokens(&self) -> u32 {
+        self.max_tokens
     }
 
     /// Enables extended thinking for supported models.
@@ -909,7 +947,7 @@ impl AnthropicProvider {
                 Some(anthropic_tools)
             },
             stream: true,
-            max_tokens: Some(8192),
+            max_tokens: Some(self.max_tokens),
         })
     }
 }
@@ -1129,6 +1167,35 @@ mod tests {
         let provider = OpenAIProvider::new_with_endpoint(api_key, base_url, model);
 
         assert!(provider.build(&[], &[]).is_ok());
+    }
+
+    /// Reasoning models think from the `max_tokens` budget, so the default
+    /// must be large enough for them to emit text after thinking; legacy
+    /// models keep the conservative 8192.
+    #[test]
+    fn anthropic_default_max_tokens_is_model_aware() {
+        let reasoning = AnthropicProvider::new("test-key", "MiniMax-M3.1-flash");
+        assert_eq!(reasoning.max_tokens, 32768);
+
+        let legacy = AnthropicProvider::new("test-key", "claude-3-5-sonnet");
+        assert_eq!(legacy.max_tokens, 8192);
+    }
+
+    #[test]
+    fn anthropic_max_tokens_is_configurable() {
+        let provider =
+            AnthropicProvider::new("test-key", "MiniMax-M3.1-flash").with_max_tokens(65_536);
+        let request = provider
+            .build_typed(
+                &[Message::User {
+                    content: vec![ContentPart::Text {
+                        text: "hi".to_string(),
+                    }],
+                }],
+                &[],
+            )
+            .expect("request builds");
+        assert_eq!(request.max_tokens, Some(65_536));
     }
 
     #[test]

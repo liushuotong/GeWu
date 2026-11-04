@@ -878,6 +878,35 @@ body {
   margin: 0 0 4px 6px;
 }
 
+/* running-tool indicator: a spinning arc next to the tool name */
+.tool-spinner {
+  flex: 0 0 auto;
+  align-self: center;
+  width: 10px;
+  height: 10px;
+  border: 1.5px solid var(--accent-dim);
+  border-top-color: var(--accent);
+  border-radius: 50%;
+  animation: spin 0.8s linear infinite;
+}
+
+@keyframes spin {
+  to {
+    transform: rotate(360deg);
+  }
+}
+
+/* while any tool in a group is still running, its label pulses */
+.tool-group.running .tool-summary {
+  animation: group-pulse 1.4s ease-in-out infinite;
+}
+
+@keyframes group-pulse {
+  50% {
+    opacity: 0.55;
+  }
+}
+
 /* -- footer ------------------------------------------------------------ */
 
 .footer {

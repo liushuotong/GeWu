@@ -49,14 +49,14 @@ pub use tools::execute_tool_with_panic_recovery;
 
 use crate::middleware::TruncationService;
 use crate::traits::{Experiences, LlmProvider, Memory, RequestLog, Tool, ToolRegistry};
-use crate::types::{AgentEvent, ContentPart, Message, ToolContext, ToolResult};
+use crate::types::{AgentEvent, ContentPart, Message, ProviderEvent, ToolContext, ToolResult};
 use anyhow::{Context, Result};
 use async_trait::async_trait;
 use futures::{Stream, StreamExt};
 use std::any::Any;
 use std::error::Error;
 use std::sync::Arc;
-use tracing::{info, trace};
+use tracing::{info, trace, warn};
 use uuid::Uuid;
 
 use self::execution::{DoomLoopDetector, LlmResponseAggregator, execute_tool_call};
@@ -238,14 +238,37 @@ impl Agent {
                     .await
                     .map_err(|e| anyhow::anyhow!(e))?;
 
+                // The provider's terminal stop reason (e.g. "max_tokens").
+                // The aggregator drops it, so it is captured here before the
+                // event is passed on.
+                let mut finish_reason: Option<String> = None;
                 while let Some(event_result) = stream.next().await {
                     let event = event_result.map_err(|e| anyhow::anyhow!(e))?;
+                    if let ProviderEvent::Finish { reason } = &event {
+                        finish_reason = reason.clone();
+                    }
                     if let Some(agent_event) = aggregator.process_event(event) {
                         yield agent_event;
                     }
                 }
 
                 let (content, tool_calls) = aggregator.take_parts();
+
+                // Reasoning models spend thinking tokens from the same
+                // `max_tokens` budget; when it runs out the turn can end with
+                // no text and no tool calls, which looks like a silent hang
+                // in the UI. Surface the truncation instead of hiding it.
+                if matches!(
+                    finish_reason.as_deref(),
+                    Some("max_tokens") | Some("length")
+                ) {
+                    warn!("LLM turn ended truncated (stop_reason: max_tokens)");
+                    yield AgentEvent::Error {
+                        error: "the model hit its output token limit (max_tokens); this reply \
+                                may be truncated or empty — raise `max_tokens` in the config file"
+                            .to_string(),
+                    };
+                }
 
                 self.memory.add_message(Message::Assistant {
                     content: if content.is_empty() { None } else { Some(content.clone()) },
@@ -640,6 +663,66 @@ mod tests {
         assert!(events
             .iter()
             .any(|e| matches!(e.as_ref().unwrap(), AgentEvent::Finish { .. })));
+        Ok(())
+    }
+
+    /// A reasoning model that exhausts the output budget on thinking ends the
+    /// turn with no content and `stop_reason: "max_tokens"`. The agent must
+    /// surface a truncation warning instead of finishing silently with an
+    /// empty response.
+    #[tokio::test]
+    async fn test_max_tokens_finish_surfaces_a_truncation_warning() -> Result<()> {
+        let provider = MockProvider::new(vec![vec![
+            ProviderEvent::ReasoningDelta {
+                delta: "thinking...".to_string(),
+            },
+            ProviderEvent::Finish {
+                reason: Some("max_tokens".to_string()),
+            },
+        ]]);
+        let mut agent = Agent::builder().llm(Arc::new(provider)).build()?;
+
+        let events = agent.ask("hello").collect::<Vec<_>>().await;
+        let events: Vec<AgentEvent> = events
+            .into_iter()
+            .collect::<std::result::Result<Vec<_>, _>>()
+            .expect("stream yields no errors");
+
+        let warning_position = events
+            .iter()
+            .position(|e| matches!(e, AgentEvent::Error { error } if error.contains("max_tokens")))
+            .expect("a truncation warning must be yielded");
+        let finish_position = events
+            .iter()
+            .position(|e| matches!(e, AgentEvent::Finish { response } if response.is_empty()))
+            .expect("the ask still finishes (with an empty response)");
+        assert!(
+            warning_position < finish_position,
+            "the warning must precede the terminal finish"
+        );
+        Ok(())
+    }
+
+    /// A normal completion (`stop_reason: "end_turn"`) must not trigger the
+    /// truncation warning.
+    #[tokio::test]
+    async fn test_normal_finish_does_not_warn() -> Result<()> {
+        let provider = MockProvider::new(vec![vec![
+            ProviderEvent::ContentDelta {
+                delta: "pong".to_string(),
+            },
+            ProviderEvent::Finish {
+                reason: Some("end_turn".to_string()),
+            },
+        ]]);
+        let mut agent = Agent::builder().llm(Arc::new(provider)).build()?;
+
+        let events = agent.ask("hello").collect::<Vec<_>>().await;
+        assert!(events.iter().all(|e| e.is_ok()));
+        assert!(!events.iter().any(|e| matches!(
+            e.as_ref().unwrap(),
+            AgentEvent::Error { error } if error.contains("max_tokens")
+        )));
         Ok(())
     }
 }
