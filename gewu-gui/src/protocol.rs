@@ -42,12 +42,13 @@ pub enum ClientMsg {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum ServerMsg {
-    /// Full initial state: tabs, active tab, transcript HTML, status HTML.
+    /// Full initial state: tabs, active tab, transcript, status and sidebar HTML.
     Snapshot {
         tabs: Vec<TabInfo>,
         active: u64,
         transcript: String,
         status: String,
+        sidebar: String,
     },
     /// Tab bar state changed (open/close/switch/busy marker).
     Tabs { tabs: Vec<TabInfo>, active: u64 },
@@ -113,5 +114,16 @@ mod tests {
         assert_eq!(json["type"], "tabs");
         assert_eq!(json["active"], 1);
         assert_eq!(json["tabs"][0]["label"], "new");
+
+        let msg = ServerMsg::Snapshot {
+            tabs: Vec::new(),
+            active: 1,
+            transcript: String::new(),
+            status: String::new(),
+            sidebar: "<section></section>".to_string(),
+        };
+        let json = serde_json::to_value(&msg).unwrap();
+        assert_eq!(json["type"], "snapshot");
+        assert_eq!(json["sidebar"], "<section></section>");
     }
 }

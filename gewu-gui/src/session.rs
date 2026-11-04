@@ -46,6 +46,8 @@ pub struct GuiSession {
     workspace: Workspace,
     conns: HashMap<u64, Conn>,
     model_label: Option<String>,
+    /// Tool names for the sidebar, fetched once; fixed for the default agent.
+    tools: Result<Vec<String>, String>,
 }
 
 enum Incoming {
@@ -67,12 +69,18 @@ impl GuiSession {
             })?;
 
         let model_label = match admin.info().await {
-            Ok(info) => Some(format!("{}/{}", info.provider, info.model)),
+            // The status bar shows the model name without the provider.
+            Ok(info) => Some(info.model),
             Err(e) => {
                 debug!("could not read server info: {e}");
                 None
             }
         };
+
+        let tools = admin.list_tools().await.map_err(|e| {
+            debug!("could not list tools: {e}");
+            e.to_string()
+        });
 
         let mut workspace = Workspace::new();
 
@@ -122,6 +130,7 @@ impl GuiSession {
             workspace,
             conns: HashMap::new(),
             model_label,
+            tools,
         })
     }
 
@@ -195,6 +204,7 @@ impl GuiSession {
             active,
             transcript: view::transcript_html(tab),
             status: view::status_html(tab),
+            sidebar: view::sidebar_html(&self.tools),
         }
     }
 

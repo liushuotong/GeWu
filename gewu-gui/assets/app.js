@@ -8,6 +8,7 @@
   "use strict";
 
   const TOKEN_KEY = "gewu-gui-token";
+  const SIDEBAR_KEY = "gewu-gui-sidebar";
   const MAX_RECONNECT_MS = 8000;
 
   const el = {
@@ -28,7 +29,8 @@
     loginForm: document.getElementById("login-form"),
     loginError: document.getElementById("login-error"),
     token: document.getElementById("token"),
-    upstream: document.getElementById("upstream"),
+    sidebar: document.getElementById("sidebar"),
+    sidebarToggle: document.getElementById("sidebar-toggle"),
   };
 
   const state = {
@@ -71,6 +73,35 @@
     }
   }
 
+  // -- sidebar ------------------------------------------------------------
+
+  // Open by default, except on narrow screens where it covers the transcript.
+  function loadSidebarOpen() {
+    try {
+      const saved = localStorage.getItem(SIDEBAR_KEY);
+      if (saved === "open") return true;
+      if (saved === "closed") return false;
+    } catch {
+      // Fall through to the default.
+    }
+    return !window.matchMedia("(max-width: 800px)").matches;
+  }
+
+  function setSidebarOpen(open, remember) {
+    el.app.classList.toggle("sidebar-collapsed", !open);
+    el.sidebarToggle.setAttribute("aria-expanded", String(open));
+    if (!remember) return;
+    try {
+      localStorage.setItem(SIDEBAR_KEY, open ? "open" : "closed");
+    } catch {
+      // The state still applies to this page.
+    }
+  }
+
+  function toggleSidebar() {
+    setSidebarOpen(el.app.classList.contains("sidebar-collapsed"), true);
+  }
+
   // -- connection ---------------------------------------------------------
 
   async function boot() {
@@ -78,8 +109,6 @@
       const response = await fetch("/api/config", { cache: "no-store" });
       const config = await response.json();
       state.authRequired = Boolean(config.auth_required);
-      el.upstream.textContent = config.server || "";
-      el.upstream.title = config.server ? `Upstream ${config.server}` : "";
     } catch (error) {
       toast(`Could not reach gewu-gui: ${error.message}`);
     }
@@ -188,6 +217,7 @@
         renderTabs(message.tabs, message.active);
         setTranscript(message.transcript, true);
         setStatus(message.status);
+        el.sidebar.innerHTML = message.sidebar || "";
         setBusy(message.tabs.some((tab) => tab.id === message.active && tab.busy));
         break;
       case "tabs":
@@ -372,8 +402,19 @@
   document.addEventListener("keydown", (event) => {
     if (event.key === "Escape" && state.busy && el.login.classList.contains("hidden")) {
       send({ op: "interrupt", tab: state.active });
+    } else if (
+      (event.ctrlKey || event.metaKey) &&
+      !event.altKey &&
+      !event.shiftKey &&
+      event.key.toLowerCase() === "b" &&
+      el.login.classList.contains("hidden")
+    ) {
+      event.preventDefault();
+      toggleSidebar();
     }
   });
+
+  el.sidebarToggle.addEventListener("click", toggleSidebar);
 
   el.newTab.addEventListener("click", () => send({ op: "open_tab" }));
 
@@ -456,5 +497,6 @@
     }, 5000);
   }
 
+  setSidebarOpen(loadSidebarOpen(), false);
   boot();
 })();

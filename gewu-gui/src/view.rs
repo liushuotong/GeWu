@@ -367,6 +367,39 @@ pub fn status_html(tab: &Tab) -> String {
     out
 }
 
+/// The right sidebar: the tools available to the agent, or why they are not.
+pub fn sidebar_html(tools: &Result<Vec<String>, String>) -> String {
+    let mut out = String::from("<section class=\"side-section\">");
+    match tools {
+        Ok(tools) => {
+            let _ = write!(
+                out,
+                "<h2 class=\"side-title\">tools<span class=\"side-count\">{}</span></h2>",
+                tools.len()
+            );
+            if tools.is_empty() {
+                out.push_str("<p class=\"side-note\">no tools</p>");
+            } else {
+                out.push_str("<ul class=\"side-list\">");
+                for name in tools {
+                    let _ = write!(out, "<li>{}</li>", escape(name));
+                }
+                out.push_str("</ul>");
+            }
+        }
+        Err(e) => {
+            out.push_str("<h2 class=\"side-title\">tools</h2>");
+            let _ = write!(
+                out,
+                "<p class=\"side-note error\">tools unavailable: {}</p>",
+                escape(e)
+            );
+        }
+    }
+    out.push_str("</section>");
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -386,6 +419,21 @@ mod tests {
             escape(r#"<script>&"x" '</script>"#),
             "&lt;script&gt;&amp;&quot;x&quot; &#39;&lt;/script&gt;"
         );
+    }
+
+    #[test]
+    fn sidebar_lists_escaped_tool_names() {
+        let html = sidebar_html(&Ok(vec!["read".into(), "<bad>".into()]));
+        assert!(html.contains("<span class=\"side-count\">2</span>"), "{html}");
+        assert!(html.contains("<li>read</li>"), "{html}");
+        assert!(html.contains("<li>&lt;bad&gt;</li>"), "{html}");
+    }
+
+    #[test]
+    fn sidebar_reports_unavailable_tools() {
+        let html = sidebar_html(&Err("boom <x>".into()));
+        assert!(html.contains("tools unavailable: boom &lt;x&gt;"), "{html}");
+        assert!(!html.contains("<ul"), "{html}");
     }
 
     #[test]
@@ -530,10 +578,11 @@ mod tests {
     fn status_shows_model_and_usage() {
         let (mut ws, id) = tab_with_blocks(vec![]);
         let tab = ws.tab_mut(id).unwrap();
-        tab.model_label = Some("openai/gpt-4o".into());
+        tab.model_label = Some("gpt-4o".into());
         tab.context = Some((34_000, 128_000));
         let html = status_html(ws.tab(id).unwrap());
-        assert!(html.contains("openai/gpt-4o"), "{html}");
+        assert!(html.contains("gpt-4o"), "{html}");
+        assert!(!html.contains("openai"), "{html}");
         assert!(!html.contains("session"), "{html}");
         assert!(html.contains("34k / 128k (26%)"), "{html}");
         assert!(html.contains("gauge-fill g25"), "{html}");

@@ -303,6 +303,9 @@ mod tests {
                 "list_sessions" => vec![json!({
                     "type": "sessions", "id": id, "sessions": [],
                 })],
+                "list_tools" => vec![json!({
+                    "type": "tools", "id": id, "tools": ["read", "grep"],
+                })],
                 "ping" => vec![json!({"type": "pong", "id": id})],
                 "usage" => vec![json!({
                     "type": "usage", "id": id, "used_tokens": 1000, "context_limit": 10000,
@@ -475,8 +478,11 @@ mod tests {
             snapshot["status"]
                 .as_str()
                 .unwrap()
-                .contains("fake/fake-model")
+                .contains("fake-model")
         );
+        let sidebar = snapshot["sidebar"].as_str().unwrap();
+        assert!(sidebar.contains("<li>read</li>"), "{sidebar}");
+        assert!(sidebar.contains("<li>grep</li>"), "{sidebar}");
 
         ws.send(WsMessage::text(r#"{"op":"ask","tab":1,"prompt":"hello"}"#))
             .await
