@@ -11,7 +11,7 @@ use anyhow::{Context, Result};
 use axum::extract::ws::{Message, WebSocket};
 use futures::stream::SplitSink;
 use futures::{SinkExt, StreamExt};
-use gewu_client::session::Phase;
+use gewu_client::session::{Block, Phase};
 use gewu_client::{AskStream, Client, Error as ClientError};
 use gewu_protocol::{AgentEvent, ServerMessage};
 use tokio::sync::mpsc;
@@ -48,6 +48,8 @@ pub struct GuiSession {
     model_label: Option<String>,
     /// Tool names for the sidebar, fetched once; fixed for the default agent.
     tools: Result<Vec<String>, String>,
+    /// Working directory the upstream server's agent operates in.
+    working_directory: Option<String>,
 }
 
 enum Incoming {
@@ -68,12 +70,16 @@ impl GuiSession {
                 )
             })?;
 
-        let model_label = match admin.info().await {
+        let (model_label, working_directory) = match admin.info().await {
             // The status bar shows the model name without the provider.
-            Ok(info) => Some(info.model),
+            // An empty directory means the upstream predates `info.cwd`.
+            Ok(info) => (
+                Some(info.model.clone()),
+                Some(info.working_directory.clone()).filter(|dir| !dir.is_empty()),
+            ),
             Err(e) => {
                 debug!("could not read server info: {e}");
-                None
+                (None, None)
             }
         };
 
@@ -131,6 +137,7 @@ impl GuiSession {
             conns: HashMap::new(),
             model_label,
             tools,
+            working_directory,
         })
     }
 
@@ -204,7 +211,7 @@ impl GuiSession {
             active,
             transcript: view::transcript_html(tab),
             status: view::status_html(tab),
-            sidebar: view::sidebar_html(&self.tools),
+            sidebar: view::sidebar_html(&self.tools, self.working_directory.as_deref()),
         }
     }
 
@@ -233,6 +240,19 @@ impl GuiSession {
         )
         .await?;
         Ok(())
+    }
+
+    /// Send just the tool card containing `block`, so toggles do not re-render
+    /// the whole transcript. Falls back to a full transcript if the card
+    /// cannot be located.
+    async fn send_tool_card(&self, tab_id: u64, block: usize, sender: &mut Sender) -> Result<()> {
+        if let Some(tab) = self.workspace.tab(tab_id)
+            && let Some(first) = tool_run_start(&tab.model.blocks, block)
+            && let Some(html) = view::tool_card_html(tab, first)
+        {
+            return send_msg(sender, &ServerMsg::ToolCard { first, html }).await;
+        }
+        self.send_transcript(sender).await
     }
 
     async fn send_transcript(&self, sender: &mut Sender) -> Result<()> {
@@ -402,7 +422,7 @@ impl GuiSession {
                     toggle(&mut tab.expanded_outputs, block);
                 }
                 if self.workspace.active_id() == tab {
-                    self.send_transcript(sender).await?;
+                    self.send_tool_card(tab, block, sender).await?;
                 }
             }
             ClientMsg::ToggleGroup { tab, block } => {
@@ -410,7 +430,7 @@ impl GuiSession {
                     toggle(&mut tab.expanded_groups, block);
                 }
                 if self.workspace.active_id() == tab {
-                    self.send_transcript(sender).await?;
+                    self.send_tool_card(tab, block, sender).await?;
                 }
             }
             ClientMsg::Refresh => {
@@ -641,6 +661,19 @@ impl GuiSession {
         }
         self.admin.close().await;
     }
+}
+
+/// Start of the run of consecutive tool blocks containing `block`, or `None`
+/// when `block` is not a tool block.
+fn tool_run_start(blocks: &[Block], block: usize) -> Option<usize> {
+    if !matches!(blocks.get(block), Some(Block::Tool { .. })) {
+        return None;
+    }
+    let mut start = block;
+    while start > 0 && matches!(blocks[start - 1], Block::Tool { .. }) {
+        start -= 1;
+    }
+    Some(start)
 }
 
 /// Insert `value` into `set` if absent, remove it otherwise.

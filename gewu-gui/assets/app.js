@@ -9,7 +9,7 @@
 
   const TOKEN_KEY = "gewu-gui-token";
   const SIDEBAR_KEY = "gewu-gui-sidebar";
-  const MAX_RECONNECT_MS = 8000;
+  const MAX_RECONNECT_MS = 60000;
 
   const el = {
     app: document.getElementById("app"),
@@ -44,6 +44,8 @@
     busy: false,
     attempt: 0,
     reconnectTimer: null,
+    countdownTimer: null,
+    reconnectAt: 0,
     refreshTimer: null,
     lastToast: { text: "", at: 0 },
   };
@@ -128,8 +130,7 @@
     ) {
       return;
     }
-    clearTimeout(state.reconnectTimer);
-    state.reconnectTimer = null;
+    clearReconnect();
 
     const scheme = location.protocol === "https:" ? "wss:" : "ws:";
     const url = `${scheme}//${location.host}/ws`;
@@ -179,13 +180,31 @@
     });
   }
 
+  // Cancel a pending reconnect and stop the countdown.
+  function clearReconnect() {
+    clearTimeout(state.reconnectTimer);
+    state.reconnectTimer = null;
+    clearInterval(state.countdownTimer);
+    state.countdownTimer = null;
+  }
+
+  // Render the remaining whole seconds from the fixed deadline, so the label
+  // stays correct even when background tabs throttle timers.
+  function renderCountdown() {
+    const seconds = Math.max(0, Math.ceil((state.reconnectAt - Date.now()) / 1000));
+    el.offlineText.textContent = `Disconnected — reconnecting in ${seconds}s…`;
+  }
+
   function scheduleReconnect() {
     if (state.reconnectTimer) return;
     const delay = Math.min(MAX_RECONNECT_MS, 500 * 2 ** state.attempt);
     state.attempt += 1;
-    el.offlineText.textContent = `Disconnected — reconnecting in ${Math.ceil(delay / 1000)}s…`;
+    state.reconnectAt = Date.now() + delay;
+    renderCountdown();
+    // Tick faster than once a second so whole-second values never skip.
+    state.countdownTimer = setInterval(renderCountdown, 250);
     state.reconnectTimer = setTimeout(() => {
-      state.reconnectTimer = null;
+      clearReconnect();
       connect();
     }, delay);
   }
@@ -193,6 +212,7 @@
   function setOffline(offline) {
     el.offline.classList.toggle("hidden", !offline);
     if (!offline) {
+      clearReconnect();
       el.offlineText.textContent = "Disconnected";
     }
   }
@@ -227,6 +247,9 @@
         break;
       case "transcript":
         setTranscript(message.html, false);
+        break;
+      case "tool_card":
+        replaceToolCard(message.first, message.html);
         break;
       case "text_delta":
         appendDelta(message.block, message.delta);
@@ -340,6 +363,26 @@
     el.status.innerHTML = html;
   }
 
+  // Swap one card's contents in place: keeping the `.tool-card` node avoids
+  // re-triggering its entry animation or moving the scroll position.
+  function replaceToolCard(first, html) {
+    const card = el.transcript.querySelector(
+      `.tool-card[data-card="${Number(first)}"]`,
+    );
+    if (!card) {
+      requestRefresh();
+      return;
+    }
+    const template = document.createElement("template");
+    template.innerHTML = html;
+    const fresh = template.content.firstElementChild;
+    if (!fresh) {
+      requestRefresh();
+      return;
+    }
+    card.replaceChildren(...fresh.childNodes);
+  }
+
   // The streaming block can be missing if a delta raced a tab switch.
   function requestRefresh() {
     if (state.refreshTimer) return;
@@ -423,8 +466,7 @@
   });
 
   el.retry.addEventListener("click", () => {
-    clearTimeout(state.reconnectTimer);
-    state.reconnectTimer = null;
+    clearReconnect();
     connect();
   });
 

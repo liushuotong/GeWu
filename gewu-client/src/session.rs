@@ -127,7 +127,7 @@ impl SessionModel {
                     self.blocks.push(Block::Tool {
                         tool: tool.clone(),
                         input: String::new(),
-                        output: Some(truncate(output, 400)),
+                        output: Some(tool_output(output)),
                     });
                 }
             }
@@ -184,7 +184,7 @@ impl SessionModel {
                     self.blocks.push(Block::Tool {
                         tool: tool_name.clone().unwrap_or_else(|| "tool".to_string()),
                         input: String::new(),
-                        output: Some(truncate(&output, 400)),
+                        output: Some(tool_output(&output)),
                     });
                 }
             }
@@ -223,7 +223,7 @@ impl SessionModel {
                     fallback = Some(i);
                 }
                 if tool_name.is_none_or(|name| name == tool) {
-                    *out = Some(truncate(output, 400));
+                    *out = Some(tool_output(output));
                     return true;
                 }
             }
@@ -231,7 +231,7 @@ impl SessionModel {
         if let Some(i) = fallback
             && let Block::Tool { output: out, .. } = &mut self.blocks[i]
         {
-            *out = Some(truncate(output, 400));
+            *out = Some(tool_output(output));
             return true;
         }
         false
@@ -316,6 +316,12 @@ pub fn summarize_tool_input(tool: &str, input: &str) -> String {
     summary.unwrap_or_else(|| truncate(&value.to_string(), 80))
 }
 
+/// Tool output as received, keeping line breaks so front-ends can collapse and
+/// expand it. The server already bounds results (2000 lines / 50 KB).
+fn tool_output(text: &str) -> String {
+    text.to_string()
+}
+
 fn truncate(text: &str, max_chars: usize) -> String {
     let mut out: String = text.chars().take(max_chars).collect();
     if text.chars().count() > max_chars {
@@ -372,6 +378,35 @@ mod tests {
                 output: Some("file.rs".into()),
             }]
         );
+    }
+
+    #[test]
+    fn tool_output_keeps_line_breaks_and_full_length() {
+        let mut m = model();
+        let output = (1..=60)
+            .map(|n| format!("line {n} with some padding text"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(output.len() > 400);
+        m.apply_event(&AgentEvent::ToolStart {
+            tool: "bash".into(),
+            input: r#"{"command":"seq 60"}"#.into(),
+        });
+        m.apply_event(&AgentEvent::ToolFinish {
+            tool: "bash".into(),
+            title: String::new(),
+            output: output.clone(),
+            metadata: Default::default(),
+        });
+        let Some(Block::Tool {
+            output: Some(stored),
+            ..
+        }) = m.blocks.last()
+        else {
+            panic!("expected a tool block with output");
+        };
+        assert_eq!(stored, &output, "front-ends need the real lines to expand");
+        assert!(stored.lines().count() > 6);
     }
 
     #[test]

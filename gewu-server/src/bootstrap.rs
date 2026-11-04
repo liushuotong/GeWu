@@ -64,6 +64,9 @@ pub struct Bootstrap {
     pub log_writer: Option<RequestLog>,
     pub model: String,
     pub provider_name: String,
+    /// Working directory all tools resolve paths against; captured once at
+    /// startup so the UI can show it.
+    pub working_directory: String,
 }
 
 /// Initialize tracing from the `--log-level` flag.
@@ -242,6 +245,10 @@ pub async fn bootstrap(args: &CommonArgs) -> Result<Bootstrap> {
         log_writer,
         model,
         provider_name,
+        working_directory: env::current_dir()
+            .unwrap_or_else(|_| std::path::PathBuf::from("/"))
+            .to_string_lossy()
+            .to_string(),
     })
 }
 

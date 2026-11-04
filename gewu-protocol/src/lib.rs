@@ -447,6 +447,9 @@ pub enum ServerMessage {
         model: String,
         /// Provider name (e.g. `openai`).
         provider: String,
+        /// The working directory the server's agent operates in (absolute).
+        #[serde(default)]
+        working_directory: String,
     },
     /// Reply to a `usage` request: the session's context usage.
     Usage {
@@ -680,6 +683,7 @@ mod tests {
             id: Value::Number(1.into()),
             model: "gpt-4o".into(),
             provider: "openai".into(),
+            working_directory: "/tmp/proj".into(),
         };
         assert_eq!(info.kind(), "info");
         assert!(info.correlation_id().is_some());

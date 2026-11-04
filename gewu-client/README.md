@@ -70,7 +70,7 @@ let response = client.ask("What is 2+2?").send().await?.final_response().await?;
 | `client.list_sessions()` | Persisted conversations, newest first (`SessionSummary`). |
 | `client.get_session(id)` | Load one stored session's messages, oldest first. |
 | `client.delete_session(id)` | Delete a stored session's messages from the store. |
-| `client.info()` | Model + provider the server was started with (`ServerInfo`). |
+| `client.info()` | Model, provider and working directory the server was started with (`ServerInfo`). |
 | `client.usage(session_id)` | Session context usage vs window (`Usage`). Zeros while an ask streams. |
 | `client.ping()` | Liveness check. |
 | `client.session_id()` | Session id for this connection's conversation (after an ask); persist it and pass it back via `.session_id(...)` to resume later. |

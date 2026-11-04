@@ -20,7 +20,7 @@ pub struct Tab {
     /// Stable id, unaffected by closing other tabs.
     pub id: u64,
     pub model: SessionModel,
-    /// Server model as `provider/model`, shown in the status line.
+    /// Server model name, shown in the status line.
     pub model_label: Option<String>,
     /// Context usage `(used tokens, context limit)`.
     pub context: Option<(u64, u64)>,

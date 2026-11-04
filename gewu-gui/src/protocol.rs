@@ -54,6 +54,9 @@ pub enum ServerMsg {
     Tabs { tabs: Vec<TabInfo>, active: u64 },
     /// Replace the active transcript with freshly rendered HTML.
     Transcript { html: String },
+    /// Replace one tool card in the active transcript (`first` is its run's
+    /// starting block index).
+    ToolCard { first: usize, html: String },
     /// Append streamed assistant text to one block.
     TextDelta { block: usize, delta: String },
     /// Replace the status line.
@@ -125,5 +128,14 @@ mod tests {
         let json = serde_json::to_value(&msg).unwrap();
         assert_eq!(json["type"], "snapshot");
         assert_eq!(json["sidebar"], "<section></section>");
+
+        let msg = ServerMsg::ToolCard {
+            first: 4,
+            html: "<div></div>".to_string(),
+        };
+        let json = serde_json::to_value(&msg).unwrap();
+        assert_eq!(json["type"], "tool_card");
+        assert_eq!(json["first"], 4);
+        assert_eq!(json["html"], "<div></div>");
     }
 }

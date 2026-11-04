@@ -299,6 +299,7 @@ mod tests {
             let replies: Vec<Value> = match op {
                 "info" => vec![json!({
                     "type": "info", "id": id, "model": "fake-model", "provider": "fake",
+                    "working_directory": "/tmp/fake-project",
                 })],
                 "list_sessions" => vec![json!({
                     "type": "sessions", "id": id, "sessions": [],
@@ -312,24 +313,42 @@ mod tests {
                 })],
                 "ask" => {
                     let request_id = "req-1".to_string();
-                    vec![
-                        json!({
-                            "type": "ready", "id": id, "request_id": request_id,
-                            "session_id": "sess-1", "agent": "build",
-                        }),
-                        json!({
+                    let prompt = request.get("prompt").and_then(Value::as_str).unwrap_or("");
+                    let mut replies = vec![json!({
+                        "type": "ready", "id": id, "request_id": request_id,
+                        "session_id": "sess-1", "agent": "build",
+                    })];
+                    // Prompts mentioning "tool" exercise the tool-card path.
+                    if prompt.contains("tool") {
+                        let output = (1..=10)
+                            .map(|n| format!("line {n}"))
+                            .collect::<Vec<_>>()
+                            .join("\n");
+                        replies.push(json!({
                             "type": "event", "id": null, "request_id": request_id,
-                            "event": {"type": "content_delta", "delta": "hello "},
-                        }),
-                        json!({
+                            "event": {"type": "tool_start", "tool": "bash", "input": "seq 10"},
+                        }));
+                        replies.push(json!({
                             "type": "event", "id": null, "request_id": request_id,
-                            "event": {"type": "content_delta", "delta": "world"},
-                        }),
-                        json!({
-                            "type": "result", "id": null, "request_id": request_id,
-                            "session_id": "sess-1", "response": "hello world",
-                        }),
-                    ]
+                            "event": {
+                                "type": "tool_finish", "tool": "bash",
+                                "title": "seq 10", "output": output,
+                            },
+                        }));
+                    }
+                    replies.push(json!({
+                        "type": "event", "id": null, "request_id": request_id,
+                        "event": {"type": "content_delta", "delta": "hello "},
+                    }));
+                    replies.push(json!({
+                        "type": "event", "id": null, "request_id": request_id,
+                        "event": {"type": "content_delta", "delta": "world"},
+                    }));
+                    replies.push(json!({
+                        "type": "result", "id": null, "request_id": request_id,
+                        "session_id": "sess-1", "response": "hello world",
+                    }));
+                    replies
                 }
                 _ => Vec::new(),
             };
@@ -483,6 +502,11 @@ mod tests {
         let sidebar = snapshot["sidebar"].as_str().unwrap();
         assert!(sidebar.contains("<li>read</li>"), "{sidebar}");
         assert!(sidebar.contains("<li>grep</li>"), "{sidebar}");
+        // The server's working directory is pinned at the bottom of the sidebar.
+        assert!(
+            sidebar.contains("side-path\">/tmp/fake-project</p>"),
+            "{sidebar}"
+        );
 
         ws.send(WsMessage::text(r#"{"op":"ask","tab":1,"prompt":"hello"}"#))
             .await
@@ -542,5 +566,89 @@ mod tests {
             final_tabs,
             "the final tabs message should be idle with a session"
         );
+    }
+
+    #[tokio::test]
+    async fn toggling_a_tool_sends_only_that_card() {
+        let upstream = spawn_fake_upstream().await;
+        let addr = spawn_gui(AppState {
+            endpoint: Endpoint::Tcp {
+                host: "127.0.0.1".to_string(),
+                port: upstream.port(),
+            },
+            token: None,
+            server_token: None,
+        })
+        .await;
+
+        let (mut ws, _) = tokio_tungstenite::connect_async(format!("ws://{addr}/ws"))
+            .await
+            .unwrap();
+        let snapshot = next_json(&mut ws).await;
+        assert_eq!(snapshot["type"], "snapshot");
+
+        ws.send(WsMessage::text(
+            json!({"op": "ask", "tab": 1, "prompt": "run a tool"}).to_string(),
+        ))
+        .await
+        .unwrap();
+
+        let mut transcript = String::new();
+        for _ in 0..80 {
+            let value = next_json(&mut ws).await;
+            match value["type"].as_str().unwrap_or("") {
+                "transcript" => {
+                    transcript = value["html"].as_str().unwrap_or("").to_string();
+                }
+                "tabs" => {
+                    let tab = &value["tabs"][0];
+                    if tab["session_id"] == "sess-1" && tab["busy"] == false {
+                        break;
+                    }
+                }
+                _ => {}
+            }
+        }
+        assert!(transcript.contains("+4 lines"), "{transcript}");
+        assert!(!transcript.contains("line 10"), "{transcript}");
+
+        // Let the ask's remaining terminal messages (status/tabs) drain so the
+        // only thing after the toggle is its own reply.
+        while tokio::time::timeout(
+            std::time::Duration::from_millis(150),
+            next_json(&mut ws),
+        )
+        .await
+        .is_ok()
+        {}
+
+        // Take the block index straight from the rendered card.
+        let marker = "data-action=\"toggle_tool\"";
+        let tail = &transcript[transcript.find(marker).expect("tool card")..];
+        let start = tail.find("data-block=\"").expect("block") + "data-block=\"".len();
+        let end = start + tail[start..].find('"').expect("closing quote");
+        let block: usize = tail[start..end].parse().expect("numeric block");
+
+        ws.send(WsMessage::text(
+            json!({"op": "toggle_tool", "tab": 1, "block": block}).to_string(),
+        ))
+        .await
+        .unwrap();
+
+        for _ in 0..20 {
+            let value = next_json(&mut ws).await;
+            match value["type"].as_str().unwrap_or("") {
+                "tool_card" => {
+                    assert_eq!(value["first"], block);
+                    let html = value["html"].as_str().unwrap();
+                    assert!(html.contains("line 10"), "{html}");
+                    assert!(!html.contains("+4 lines"), "{html}");
+                    return;
+                }
+                "transcript" => panic!("a toggle must not resend the whole transcript"),
+                _ => {}
+            }
+        }
+        panic!("expected a tool_card message");
     }
 }

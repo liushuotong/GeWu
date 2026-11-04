@@ -419,6 +419,7 @@ async fn handle_request(
             id: request.id,
             model: state.bootstrap.model.clone(),
             provider: state.bootstrap.provider_name.clone(),
+            working_directory: state.bootstrap.working_directory.clone(),
         })),
 
         Op::Usage => {
@@ -1468,6 +1469,7 @@ mod tests {
                 log_writer: None,
                 model: "test-model".to_string(),
                 provider_name: "test".to_string(),
+                working_directory: "/tmp/gewu-test".to_string(),
             },
             token: token.map(str::to_string),
             busy_sessions: Mutex::new(HashSet::new()),
@@ -1600,6 +1602,7 @@ mod tests {
                 log_writer: None,
                 model: "test-model".to_string(),
                 provider_name: "test".to_string(),
+                working_directory: "/tmp/gewu-test".to_string(),
             },
             token: None,
             busy_sessions: Mutex::new(HashSet::new()),

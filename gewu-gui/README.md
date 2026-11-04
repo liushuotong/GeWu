@@ -76,7 +76,7 @@ confirmation.
 | `Enter` | Send the prompt |
 | `Shift+Enter` | Insert a newline |
 | `Esc` | Interrupt the running ask |
-| `Ctrl+B` | Show or hide the sidebar (available tools) |
+| `Ctrl+B` | Show or hide the sidebar (available tools, working directory) |
 | Send / Stop | Send the composer / interrupt (buttons) |
 | Tab click | Switch sessions |
 | `×` on a tab | Close the tab and delete the session |

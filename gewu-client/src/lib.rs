@@ -59,6 +59,8 @@ pub struct ServerInfo {
     pub model: String,
     /// Provider name, e.g. `openai`.
     pub provider: String,
+    /// The working directory the server's agent operates in (absolute).
+    pub working_directory: String,
 }
 
 /// The session's context usage against the agent's context window.
@@ -241,13 +243,20 @@ impl Client {
         self.request(request).await.map(|_| ())
     }
 
-    /// The model and provider the server was started with.
+    /// The model, provider, and working directory the server runs with.
     pub async fn info(&self) -> Result<ServerInfo> {
         let request = ClientRequest::info(self.next_correlation_id());
         match self.request(request).await? {
             ServerMessage::Info {
-                model, provider, ..
-            } => Ok(ServerInfo { model, provider }),
+                model,
+                provider,
+                working_directory,
+                ..
+            } => Ok(ServerInfo {
+                model,
+                provider,
+                working_directory,
+            }),
             other => Err(unexpected(other, "info")),
         }
     }

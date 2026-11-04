@@ -99,6 +99,26 @@ fn render_block(out: &mut String, block: &Block, index: usize, streaming: bool) 
     out.push_str("</div>\n");
 }
 
+/// Render just the tool card that starts at block `first`, for targeted
+/// updates after a toggle. `None` when `first` is not a tool block.
+pub fn tool_card_html(tab: &Tab, first: usize) -> Option<String> {
+    if !matches!(tab.model.blocks.get(first), Some(Block::Tool { .. })) {
+        return None;
+    }
+    let run_len = tab.model.blocks[first..]
+        .iter()
+        .take_while(|block| matches!(block, Block::Tool { .. }))
+        .count();
+    let mut out = String::new();
+    render_tool_run(
+        &mut out,
+        tab,
+        &tab.model.blocks[first..first + run_len],
+        first,
+    );
+    Some(out)
+}
+
 /// Render a run of consecutive tool blocks inside one card.
 fn render_tool_run(out: &mut String, tab: &Tab, run: &[Block], first: usize) {
     let tools: Vec<(&str, &str, Option<&str>)> = run
@@ -113,7 +133,7 @@ fn render_tool_run(out: &mut String, tab: &Tab, run: &[Block], first: usize) {
         })
         .collect();
 
-    out.push_str("<div class=\"tool-card\">\n");
+    let _ = writeln!(out, "<div class=\"tool-card\" data-card=\"{first}\">");
     if tools.len() == 1 {
         let (tool, input, output) = tools[0];
         render_tool(out, tab, tool, input, output, first, 0);
@@ -122,8 +142,9 @@ fn render_tool_run(out: &mut String, tab: &Tab, run: &[Block], first: usize) {
         let glyph = if expanded { "−" } else { "+" };
         let _ = writeln!(
             out,
-            "<div class=\"tool-group\" data-block=\"{first}\">\
+            "<div class=\"tool-group\" data-block=\"{first}\" data-action=\"toggle_group\" data-tab=\"{}\">\
              <button class=\"tool-summary\" data-action=\"toggle_group\" data-tab=\"{}\" data-block=\"{first}\">{glyph} {}</button>",
+            tab.id,
             tab.id,
             escape(&group_label(run))
         );
@@ -155,9 +176,10 @@ fn render_tool(
     let expanded = tab.expanded_outputs.contains(&index);
     let _ = writeln!(
         out,
-        "<div class=\"tool depth-{depth}\" data-block=\"{index}\">\
+        "<div class=\"tool depth-{depth}\" data-action=\"toggle_tool\" data-tab=\"{}\" data-block=\"{index}\">\
          <button class=\"tool-row\" data-action=\"toggle_tool\" data-tab=\"{}\" data-block=\"{index}\">\
          <span class=\"tool-name\">{}</span> <span class=\"tool-title\">{}</span></button>",
+        tab.id,
         tab.id,
         escape(name),
         escape(&title)
@@ -367,8 +389,9 @@ pub fn status_html(tab: &Tab) -> String {
     out
 }
 
-/// The right sidebar: the tools available to the agent, or why they are not.
-pub fn sidebar_html(tools: &Result<Vec<String>, String>) -> String {
+/// The right sidebar: the tools available to the agent, or why they are not,
+/// and the working directory pinned to the bottom.
+pub fn sidebar_html(tools: &Result<Vec<String>, String>, working_directory: Option<&str>) -> String {
     let mut out = String::from("<section class=\"side-section\">");
     match tools {
         Ok(tools) => {
@@ -397,6 +420,17 @@ pub fn sidebar_html(tools: &Result<Vec<String>, String>) -> String {
         }
     }
     out.push_str("</section>");
+    if let Some(dir) = working_directory {
+        let _ = write!(
+            out,
+            "<section class=\"side-section side-cwd\" title=\"{}\">
+             <h2 class=\"side-title\">cwd</h2>
+             <p class=\"side-note side-path\">{}</p>
+             </section>",
+            escape(dir),
+            escape(dir)
+        );
+    }
     out
 }
 
@@ -423,17 +457,37 @@ mod tests {
 
     #[test]
     fn sidebar_lists_escaped_tool_names() {
-        let html = sidebar_html(&Ok(vec!["read".into(), "<bad>".into()]));
+        let html = sidebar_html(&Ok(vec!["read".into(), "<bad>".into()]), None);
         assert!(html.contains("<span class=\"side-count\">2</span>"), "{html}");
         assert!(html.contains("<li>read</li>"), "{html}");
         assert!(html.contains("<li>&lt;bad&gt;</li>"), "{html}");
+        assert!(!html.contains("side-cwd"), "{html}");
     }
 
     #[test]
     fn sidebar_reports_unavailable_tools() {
-        let html = sidebar_html(&Err("boom <x>".into()));
+        let html = sidebar_html(&Err("boom <x>".into()), None);
         assert!(html.contains("tools unavailable: boom &lt;x&gt;"), "{html}");
         assert!(!html.contains("<ul"), "{html}");
+    }
+
+    #[test]
+    fn sidebar_shows_working_directory_last() {
+        let html = sidebar_html(&Ok(vec!["read".into()]), Some("/home/kzhang/dev/GeWu"));
+        assert!(html.contains("side-cwd"), "{html}");
+        assert!(html.contains("side-path\">/home/kzhang/dev/GeWu</p>"), "{html}");
+        assert!(html.contains("title=\"/home/kzhang/dev/GeWu\""), "{html}");
+        // The cwd section renders after the tools section.
+        let tools_pos = html.find("tools").unwrap();
+        let cwd_pos = html.find("side-cwd").unwrap();
+        assert!(tools_pos < cwd_pos, "{html}");
+    }
+
+    #[test]
+    fn sidebar_escapes_working_directory() {
+        let html = sidebar_html(&Ok(vec![]), Some("/tmp/<bad>&dir"));
+        assert!(html.contains("/tmp/&lt;bad&gt;&amp;dir"), "{html}");
+        assert!(!html.contains("<bad>"), "{html}");
     }
 
     #[test]
@@ -501,11 +555,45 @@ mod tests {
             output: Some("a.rs\nb.rs".into()),
         }]);
         let html = transcript_html(ws.tab(id).unwrap());
-        assert!(html.contains("class=\"tool-card\""), "{html}");
+        assert!(html.contains("class=\"tool-card\" data-card=\"0\""), "{html}");
         assert!(html.contains("tool-name\">bash"), "{html}");
         assert!(html.contains("tool-title\">ls"), "{html}");
         assert!(html.contains("a.rs\nb.rs"), "{html}");
+        assert!(
+            html.contains("class=\"tool depth-0\" data-action=\"toggle_tool\""),
+            "the whole card body should be clickable: {html}"
+        );
         assert!(html.contains("data-action=\"toggle_tool\""), "{html}");
+    }
+
+    #[test]
+    fn tool_card_html_renders_one_run() {
+        let (mut ws, id) = tab_with_blocks(vec![
+            Block::Tool {
+                tool: "bash".into(),
+                input: "first".into(),
+                output: Some("one".into()),
+            },
+            Block::Assistant("between".into()),
+            Block::Tool {
+                tool: "bash".into(),
+                input: "second".into(),
+                output: Some((1..=10).map(|n| format!("line {n}")).collect::<Vec<_>>().join("\n")),
+            },
+        ]);
+        ws.tab_mut(id).unwrap().expanded_outputs.insert(2);
+        let html = tool_card_html(ws.tab(id).unwrap(), 2).expect("tool card");
+        assert!(html.contains("class=\"tool-card\" data-card=\"2\""), "{html}");
+        assert!(html.contains("line 10"), "expanded lines: {html}");
+        assert!(!html.contains("first"), "only the requested run: {html}");
+        assert!(!html.contains("between"), "{html}");
+    }
+
+    #[test]
+    fn tool_card_html_needs_a_tool_block() {
+        let (ws, id) = tab_with_blocks(vec![Block::Assistant("hi".into())]);
+        assert!(tool_card_html(ws.tab(id).unwrap(), 0).is_none());
+        assert!(tool_card_html(ws.tab(id).unwrap(), 9).is_none());
     }
 
     #[test]
@@ -549,6 +637,10 @@ mod tests {
         assert!(html.contains("+ Explored: 1 bash, 1 read"), "{html}");
         assert!(!html.contains("src/main.rs"), "{html}");
         assert!(html.contains("data-action=\"toggle_group\""), "{html}");
+        assert!(
+            html.contains("class=\"tool-group\" data-block=\"0\" data-action=\"toggle_group\""),
+            "the whole group card should be clickable: {html}"
+        );
 
         ws.tab_mut(id).unwrap().expanded_groups.insert(0);
         let html = transcript_html(ws.tab(id).unwrap());
