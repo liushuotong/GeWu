@@ -9,7 +9,7 @@ use std::fmt::Write as _;
 use gewu_client::session::{Block, Phase};
 use pulldown_cmark::{CowStr, Event, Options, Parser, Tag, html};
 
-use crate::workspace::{Tab, short_id};
+use crate::workspace::Tab;
 
 /// Lines of tool output shown before collapsing.
 const TOOL_PREVIEW_LINES: usize = 6;
@@ -323,22 +323,21 @@ fn format_k(tokens: u64) -> String {
     }
 }
 
-/// The status line: phase/model/session on the left, context usage on the
-/// right.
+/// The status line: a telemetry strip with phase, model, key hints,
+/// and a context gauge on the right.
 pub fn status_html(tab: &Tab) -> String {
     let mut out = String::from("<div class=\"status-inner\">");
     match tab.model.phase {
-        Phase::Idle => out.push_str("<span class=\"phase\">idle</span>"),
-        Phase::Busy => out.push_str("<span class=\"phase busy\">thinking…</span>"),
+        Phase::Idle => out.push_str("<span class=\"phase\"><i class=\"dot\"></i>idle</span>"),
+        Phase::Busy => {
+            out.push_str("<span class=\"phase busy\"><i class=\"dot\"></i>thinking…</span>");
+        }
     }
     if let Some(label) = &tab.model_label {
-        let _ = write!(out, "<span class=\"model\">{}</span>", escape(label));
-    }
-    if let Some(id) = &tab.model.session_id {
         let _ = write!(
             out,
-            "<span class=\"session\">session {}</span>",
-            escape(&short_id(id))
+            "<span class=\"kv\"><span class=\"k\">model</span><span class=\"v model\">{}</span></span>",
+            escape(label)
         );
     }
     let keys = if tab.model.phase == Phase::Busy {
@@ -349,12 +348,18 @@ pub fn status_html(tab: &Tab) -> String {
     let _ = write!(out, "<span class=\"hint\">{keys}</span>");
 
     if let Some((used, limit)) = tab.context.filter(|(used, limit)| *used > 0 && *limit > 0) {
-        let pct = used * 100 / limit;
+        let pct = (used * 100 / limit).min(100);
         let class = if pct >= 80 { "usage warn" } else { "usage" };
+        // The CSP forbids inline styles, so the gauge width snaps to 5% steps.
+        let step = pct / 5 * 5;
         let _ = write!(
             out,
-            "<span class=\"{class}\">{} ({}%)</span>",
+            "<span class=\"{class}\" title=\"{used} / {limit} tokens\">\
+             <span class=\"k\">ctx</span>\
+             <span class=\"gauge\" aria-hidden=\"true\"><span class=\"gauge-fill g{step}\"></span></span>\
+             <span class=\"v\">{} / {} ({}%)</span></span>",
             format_k(used),
+            format_k(limit),
             pct
         );
     }
@@ -526,12 +531,12 @@ mod tests {
         let (mut ws, id) = tab_with_blocks(vec![]);
         let tab = ws.tab_mut(id).unwrap();
         tab.model_label = Some("openai/gpt-4o".into());
-        tab.model.set_session(Some("abcdef123456".into()));
         tab.context = Some((34_000, 128_000));
         let html = status_html(ws.tab(id).unwrap());
         assert!(html.contains("openai/gpt-4o"), "{html}");
-        assert!(html.contains("session abcdef12…"), "{html}");
-        assert!(html.contains("34k (26%)"), "{html}");
+        assert!(!html.contains("session"), "{html}");
+        assert!(html.contains("34k / 128k (26%)"), "{html}");
+        assert!(html.contains("gauge-fill g25"), "{html}");
         assert!(html.contains("class=\"usage\""), "{html}");
     }
 
@@ -542,6 +547,7 @@ mod tests {
         let html = status_html(ws.tab(id).unwrap());
         assert!(html.contains("class=\"usage warn\""), "{html}");
         assert!(html.contains("(85%)"), "{html}");
+        assert!(html.contains("gauge-fill g85"), "{html}");
     }
 
     #[test]

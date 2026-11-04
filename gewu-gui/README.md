@@ -109,6 +109,7 @@ gewu-gui
   src/server.rs     axum router, static assets, token auth, /ws
   src/lib.rs        startup, security checks, listener
   assets/           index.html, app.js, app.css (embedded at build time)
+  assets/fonts/     Inter and JetBrains Mono (woff2, SIL OFL 1.1; see OFL-*.txt)
 ```
 
 Conversation state lives in `gewu-client::session` and is shared with

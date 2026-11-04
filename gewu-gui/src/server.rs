@@ -9,9 +9,9 @@ use std::time::Duration;
 
 use axum::Json;
 use axum::Router;
-use axum::extract::State;
 use axum::extract::ws::{Message, WebSocket, WebSocketUpgrade};
-use axum::http::header;
+use axum::extract::{Path, State};
+use axum::http::{StatusCode, header};
 use axum::response::{Html, IntoResponse, Response};
 use axum::routing::get;
 use serde::Serialize;
@@ -27,9 +27,25 @@ const INDEX_HTML: &str = include_str!("../assets/index.html");
 const APP_JS: &str = include_str!("../assets/app.js");
 const APP_CSS: &str = include_str!("../assets/app.css");
 
+/// Bundled fonts (SIL OFL 1.1; licenses in `assets/fonts/`).
+const FONTS: &[(&str, &[u8])] = &[
+    (
+        "inter-var.woff2",
+        include_bytes!("../assets/fonts/inter-var.woff2"),
+    ),
+    (
+        "jetbrains-mono-400.woff2",
+        include_bytes!("../assets/fonts/jetbrains-mono-400.woff2"),
+    ),
+    (
+        "jetbrains-mono-500.woff2",
+        include_bytes!("../assets/fonts/jetbrains-mono-500.woff2"),
+    ),
+];
+
 /// Everything is same-origin; model-authored Markdown cannot run script.
 const CSP: &str = "default-src 'self'; script-src 'self'; style-src 'self'; \
-                   img-src 'self' https:; connect-src 'self' ws: wss:; \
+                   font-src 'self'; img-src 'self' https:; connect-src 'self' ws: wss:; \
                    base-uri 'none'; form-action 'self'; frame-ancestors 'none'";
 
 /// How long a client has to send its auth frame.
@@ -61,6 +77,7 @@ pub fn router(state: AppState) -> Router {
         .route("/", get(index))
         .route("/app.js", get(app_js))
         .route("/app.css", get(app_css))
+        .route("/fonts/{name}", get(font))
         .route("/api/config", get(config))
         .route("/ws", get(ws_handler))
         .with_state(state)
@@ -104,6 +121,21 @@ async fn app_css() -> impl IntoResponse {
         ],
         APP_CSS,
     )
+}
+
+async fn font(Path(name): Path<String>) -> Response {
+    let Some((_, bytes)) = FONTS.iter().find(|(file, _)| *file == name) else {
+        return StatusCode::NOT_FOUND.into_response();
+    };
+    (
+        [
+            (header::CONTENT_TYPE, "font/woff2"),
+            (header::CACHE_CONTROL, "public, max-age=31536000, immutable"),
+            (header::X_CONTENT_TYPE_OPTIONS, "nosniff"),
+        ],
+        *bytes,
+    )
+        .into_response()
 }
 
 async fn config(State(state): State<AppState>) -> Json<ConfigResponse> {
@@ -354,6 +386,29 @@ mod tests {
         );
     }
 
+    async fn http_get(addr: std::net::SocketAddr, path: &str) -> Vec<u8> {
+        let mut stream = tokio::net::TcpStream::connect(addr).await.unwrap();
+        let request = format!("GET {path} HTTP/1.1\r\nHost: test\r\nConnection: close\r\n\r\n");
+        stream.write_all(request.as_bytes()).await.unwrap();
+        let mut response = Vec::new();
+        stream.read_to_end(&mut response).await.unwrap();
+        response
+    }
+
+    #[tokio::test]
+    async fn fonts_are_served_and_unknown_names_404() {
+        let addr = spawn_gui(test_state(None)).await;
+        for (name, bytes) in FONTS {
+            let response = http_get(addr, &format!("/fonts/{name}")).await;
+            let head = String::from_utf8_lossy(&response[..response.len().min(512)]);
+            assert!(head.contains("200 OK"), "{name}: {head}");
+            assert!(head.contains("content-type: font/woff2"), "{name}: {head}");
+            assert!(response.ends_with(bytes), "{name}: body mismatch");
+        }
+        let response = http_get(addr, "/fonts/..%2Fapp.css").await;
+        assert!(String::from_utf8_lossy(&response).contains("404"));
+    }
+
     #[tokio::test]
     async fn websocket_rejects_a_wrong_token() {
         let addr = spawn_gui(test_state(Some("secret"))).await;
@@ -446,7 +501,7 @@ mod tests {
                 }
                 "status" => {
                     let html = value["html"].as_str().unwrap();
-                    if html.contains("1k (10%)") {
+                    if html.contains("1k / 10k (10%)") {
                         usage = true;
                     }
                 }

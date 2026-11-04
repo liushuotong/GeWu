@@ -78,7 +78,7 @@
       const response = await fetch("/api/config", { cache: "no-store" });
       const config = await response.json();
       state.authRequired = Boolean(config.auth_required);
-      el.upstream.textContent = config.server ? `→ ${config.server}` : "";
+      el.upstream.textContent = config.server || "";
       el.upstream.title = config.server ? `Upstream ${config.server}` : "";
     } catch (error) {
       toast(`Could not reach gewu-gui: ${error.message}`);
