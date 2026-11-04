@@ -556,6 +556,7 @@ impl GuiSession {
         let mut structural = false;
         let mut delta: Option<(usize, String)> = None;
         let mut terminal = false;
+        let mut usage_updated = false;
 
         {
             let Some(tab) = self.workspace.tab_mut(event.tab_id) else {
@@ -578,6 +579,15 @@ impl GuiSession {
                                 structural = true;
                             } else {
                                 delta = Some((tab.model.blocks.len() - 1, text));
+                            }
+                        }
+                        Ok(AgentEvent::Usage {
+                            used_tokens,
+                            context_limit,
+                        }) => {
+                            if used_tokens > 0 && context_limit > 0 {
+                                tab.context = Some((used_tokens, context_limit));
+                                usage_updated = true;
                             }
                         }
                         // Reasoning is not shown; Finish is followed by Result.
@@ -635,7 +645,7 @@ impl GuiSession {
         if structural {
             self.send_tabs(sender).await?;
         }
-        if active && structural {
+        if active && (structural || usage_updated) {
             self.send_status(sender).await?;
         }
         if terminal {

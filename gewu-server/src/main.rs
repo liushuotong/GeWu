@@ -98,6 +98,7 @@ async fn run_agent(agent: &mut gewu_core::Agent, prompt: &str) -> Result<()> {
                             stop_spinner(&mut spinner_active, is_tty)?;
                             println!();
                         }
+                        AgentEvent::Usage { .. } => {}
                         AgentEvent::Error { error } => {
                             stop_spinner(&mut spinner_active, is_tty)?;
                             error!("Error from agent: {}", error);

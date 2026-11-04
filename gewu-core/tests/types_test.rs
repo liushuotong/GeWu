@@ -394,6 +394,22 @@ fn test_agent_event_finish() {
 }
 
 #[test]
+fn test_agent_event_usage_round_trip() {
+    let event = AgentEvent::Usage {
+        used_tokens: 34_000,
+        context_limit: 128_000,
+    };
+
+    let json = serde_json::to_value(&event).unwrap();
+    assert_eq!(json["type"], "usage");
+    assert_eq!(json["used_tokens"], 34_000);
+    assert_eq!(json["context_limit"], 128_000);
+
+    let decoded: AgentEvent = serde_json::from_value(json).unwrap();
+    assert_eq!(decoded, event);
+}
+
+#[test]
 fn test_agent_event_error() {
     let event = AgentEvent::Error {
         error: "Failed".to_string(),

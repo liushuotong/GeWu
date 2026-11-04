@@ -61,7 +61,7 @@ use uuid::Uuid;
 
 use self::execution::{DoomLoopDetector, LlmResponseAggregator, execute_tool_call};
 use crate::agent::media::extract_media_parts;
-use crate::compaction::prune;
+use crate::compaction::{estimate_message_tokens, prune};
 
 /// The main runtime that orchestrates conversation flow, tool execution, and context management.
 ///
@@ -251,6 +251,19 @@ impl Agent {
                     content: if content.is_empty() { None } else { Some(content.clone()) },
                     tool_calls: if tool_calls.is_empty() { None } else { Some(tool_calls.clone()) },
                 }).await;
+
+                // Report the running context estimate at every turn boundary
+                // (frontends update the usage gauge from these events).
+                let used_tokens: usize = self
+                    .memory
+                    .messages()
+                    .iter()
+                    .map(estimate_message_tokens)
+                    .sum();
+                yield AgentEvent::Usage {
+                    used_tokens: used_tokens as u64,
+                    context_limit: self.context_limit as u64,
+                };
 
                 if tool_calls.is_empty() {
                     yield AgentEvent::Finish { response: content };

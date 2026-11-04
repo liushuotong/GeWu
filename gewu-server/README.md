@@ -109,8 +109,11 @@ echoed on every reply.
 ```
 
 `event` payloads are the agent's own events (`content_delta`,
-`reasoning_delta`, `tool_start`, `tool_finish`, `finish`, `error`) as
-serialized JSON. Streamed `event`/`result` frames always carry `id: null`
+`reasoning_delta`, `tool_start`, `tool_finish`, `usage`, `finish`, `error`) as
+serialized JSON. The `usage` event carries the running context estimate
+(`used_tokens`/`context_limit`) and is emitted at each turn boundary so
+clients can update the usage gauge mid-ask. Streamed `event`/`result` frames
+always carry `id: null`
 (they come from the background ask task); replies (`ready`, `interrupted`,
 `error`, `pong`, `tools`, `agents`, `auth`, `usage`) echo the request's
 `id`, and `error` echoes it whenever it can be extracted.

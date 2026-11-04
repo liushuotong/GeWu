@@ -504,7 +504,18 @@ async fn run(
                 match event.frame {
                     Some(Ok(ServerMessage::Event { event, .. })) => {
                         match serde_json::from_value::<AgentEvent>(event) {
-                            Ok(event) => tab.app.apply_event(&event),
+                            Ok(event) => match &event {
+                                AgentEvent::Usage {
+                                    used_tokens,
+                                    context_limit,
+                                } => {
+                                    if *used_tokens > 0 && *context_limit > 0 {
+                                        tab.app.context =
+                                            Some((*used_tokens as usize, *context_limit as usize));
+                                    }
+                                }
+                                _ => tab.app.apply_event(&event),
+                            },
                             Err(e) => tab.app.note(format!("unrecognized event: {e}")),
                         }
                     }

@@ -132,6 +132,7 @@ impl SessionModel {
                 }
             }
             AgentEvent::Finish { response: _ } => {}
+            AgentEvent::Usage { .. } => {}
             AgentEvent::Error { error } => {
                 self.blocks.push(Block::Error(error.clone()));
             }

@@ -1367,7 +1367,7 @@ body {
 }
 
 /* The working directory section pinned to the bottom of the sidebar. */
-.side-cwd {
+.side-section.side-cwd {
   margin-top: auto;
   padding-top: 16px;
 }

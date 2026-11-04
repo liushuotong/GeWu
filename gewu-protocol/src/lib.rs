@@ -46,7 +46,7 @@
 //!
 //! `event` payloads are serialized [`AgentEvent`]s (tagged with `"type"`:
 //! `content_delta`, `reasoning_delta`, `tool_start`, `tool_finish`,
-//! `finish`, `error`).
+//! `usage`, `finish`, `error`).
 
 use serde::{Deserialize, Serialize};
 use serde_json::Value;

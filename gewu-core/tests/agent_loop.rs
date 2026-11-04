@@ -159,6 +159,48 @@ async fn test_agent_loop() {
 }
 
 #[tokio::test]
+async fn test_agent_emits_usage_at_turn_boundaries() {
+    let responses = vec![Message::Assistant {
+        content: Some("Done".to_string()),
+        tool_calls: None,
+    }];
+
+    let llm = Arc::new(MockLlm {
+        responses: Arc::new(Mutex::new(responses)),
+    });
+
+    let mut agent = AgentBuilder::default()
+        .llm(llm)
+        .with_tools(vec![])
+        .system_prompt("System")
+        .build()
+        .unwrap();
+
+    let mut stream = Box::pin(agent.ask("Do something"));
+    let mut kinds = Vec::new();
+    let mut usage = None;
+    while let Some(event) = stream.next().await {
+        match event.unwrap() {
+            AgentEvent::Usage {
+                used_tokens,
+                context_limit,
+            } => {
+                kinds.push("usage");
+                usage = Some((used_tokens, context_limit));
+            }
+            AgentEvent::Finish { .. } => kinds.push("finish"),
+            _ => {}
+        }
+    }
+
+    // One usage snapshot per turn, emitted before the terminal event.
+    assert_eq!(kinds, vec!["usage", "finish"]);
+    let (used_tokens, context_limit) = usage.unwrap();
+    assert!(used_tokens > 0, "history should count: {used_tokens}");
+    assert_eq!(context_limit, 128_000);
+}
+
+#[tokio::test]
 async fn test_apply_patch_metadata_through_agent_loop() {
     let directory = tempdir().unwrap();
     let tool_call = ToolCall {

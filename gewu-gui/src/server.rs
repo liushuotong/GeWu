@@ -344,6 +344,12 @@ mod tests {
                         "type": "event", "id": null, "request_id": request_id,
                         "event": {"type": "content_delta", "delta": "world"},
                     }));
+                    // The agent reports usage at each turn boundary; the GUI
+                    // must push it to the browser as a status update.
+                    replies.push(json!({
+                        "type": "event", "id": null, "request_id": request_id,
+                        "event": {"type": "usage", "used_tokens": 2000, "context_limit": 10000},
+                    }));
                     replies.push(json!({
                         "type": "result", "id": null, "request_id": request_id,
                         "session_id": "sess-1", "response": "hello world",
@@ -516,6 +522,7 @@ mod tests {
         let mut saw_delta = false;
         let mut final_transcript = false;
         let mut usage = false;
+        let mut streamed_usage = false;
         let mut final_tabs = false;
         for _ in 0..60 {
             let value = next_json(&mut ws).await;
@@ -539,6 +546,10 @@ mod tests {
                     if html.contains("1k / 10k (10%)") {
                         usage = true;
                     }
+                    // Mid-ask usage from the agent's own `usage` event.
+                    if html.contains("2k / 10k (20%)") {
+                        streamed_usage = true;
+                    }
                 }
                 "tabs" => {
                     let tab = &value["tabs"][0];
@@ -551,7 +562,7 @@ mod tests {
                 }
                 _ => {}
             }
-            if saw_streaming_text && saw_delta && final_transcript && usage && final_tabs {
+            if saw_streaming_text && saw_delta && final_transcript && usage && streamed_usage && final_tabs {
                 break;
             }
         }
@@ -562,6 +573,10 @@ mod tests {
             "the final Markdown transcript should arrive"
         );
         assert!(usage, "context usage should be refreshed");
+        assert!(
+            streamed_usage,
+            "mid-ask usage events should update the gauge in real time"
+        );
         assert!(
             final_tabs,
             "the final tabs message should be idle with a session"

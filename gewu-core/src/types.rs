@@ -172,6 +172,15 @@ pub enum AgentEvent {
     },
     /// The agent has finished with a final response.
     Finish { response: String },
+    /// A context-usage snapshot, emitted at each turn boundary so frontends
+    /// can update the usage gauge mid-ask.
+    Usage {
+        /// Estimated tokens in the conversation history (the same estimate
+        /// compaction acts on).
+        used_tokens: u64,
+        /// The agent's context window in tokens.
+        context_limit: u64,
+    },
     /// An error occurred during agent execution.
     Error { error: String },
 }

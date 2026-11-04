@@ -1283,6 +1283,19 @@ mod tests {
         lines
     }
 
+    /// Read frames until the ask's terminal `result`, skipping streamed
+    /// events (the agent emits a `usage` snapshot at every turn boundary).
+    async fn recv_result(rx: &mut mpsc::Receiver<String>) -> serde_json::Value {
+        loop {
+            let msg = recv_json(rx).await;
+            match msg["type"].as_str() {
+                Some("result") => return msg,
+                Some("event") => {}
+                other => panic!("unexpected frame while waiting for the result: {other:?} {msg}"),
+            }
+        }
+    }
+
     // -- execute_ask --------------------------------------------------------
 
     #[tokio::test]
@@ -1325,6 +1338,34 @@ mod tests {
         );
         let last = lines.last().unwrap();
         assert!(last.contains(r#""type":"result""#), "last line: {}", last);
+    }
+
+    #[tokio::test]
+    async fn ask_streams_usage_event_before_result() {
+        let session = plain_session();
+        let lines = collect_ask(&session, "hi").await;
+
+        let is_usage = |line: &str| {
+            serde_json::from_str::<serde_json::Value>(line)
+                .ok()
+                .and_then(|v| v.get("event").cloned())
+                .map(|e| e["type"] == "usage")
+                .unwrap_or(false)
+        };
+        let usage_index = lines
+            .iter()
+            .position(|l| is_usage(l))
+            .unwrap_or_else(|| panic!("expected a usage event, got {:?}", lines));
+        assert!(
+            lines[usage_index].contains("used_tokens") && lines[usage_index].contains("context_limit"),
+            "usage event line: {}",
+            lines[usage_index]
+        );
+        let result_index = lines
+            .iter()
+            .position(|l| l.contains(r#""type":"result""#))
+            .expect("ask should end with a result");
+        assert!(usage_index < result_index, "usage must precede the result");
     }
 
     // -- patch_dangling_tool_calls ------------------------------------------
@@ -1523,7 +1564,7 @@ mod tests {
             .unwrap();
         let _ready = recv_json(&mut out_rx).await;
         let _event = recv_json(&mut out_rx).await;
-        let _result = recv_json(&mut out_rx).await;
+        let _result = recv_result(&mut out_rx).await;
 
         in_tx
             .send(r#"{"id": 3, "op": "usage"}"#.to_string())
@@ -1683,8 +1724,7 @@ mod tests {
         let event = recv_json(&mut out_rx).await;
         assert_eq!(event["type"], "event");
         assert_eq!(event["event"]["type"], "content_delta");
-        let result = recv_json(&mut out_rx).await;
-        assert_eq!(result["type"], "result");
+        let result = recv_result(&mut out_rx).await;
         assert_eq!(result["response"], "Hello from test");
         assert_eq!(result["request_id"], request_id.as_str());
 
@@ -1704,7 +1744,7 @@ mod tests {
             .unwrap();
         let _ready = recv_json(&mut out_rx).await;
         let _event = recv_json(&mut out_rx).await;
-        let result = recv_json(&mut out_rx).await;
+        let result = recv_result(&mut out_rx).await;
         assert_eq!(result["type"], "result");
         let session_id = result["session_id"].as_str().unwrap().to_string();
 
