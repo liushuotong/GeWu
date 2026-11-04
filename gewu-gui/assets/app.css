@@ -51,6 +51,11 @@
   --accent-glow: rgba(79, 209, 197, 0.28);
   --warn: #f5b841;
   --warn-soft: rgba(245, 184, 65, 0.1);
+  --violet: #b392f0;
+  --violet-soft: rgba(179, 146, 240, 0.09);
+  --green: #7ee787;
+  --green-soft: rgba(126, 231, 135, 0.08);
+  --pink: #ff7eb6;
   --error: #ff5d6c;
   --error-soft: rgba(255, 93, 108, 0.08);
 
@@ -537,16 +542,22 @@ body {
 
 .markdown h1 {
   font-size: 1.4em;
+  color: var(--accent);
+  text-shadow: 0 0 16px var(--accent-soft);
+  padding-bottom: 0.3em;
+  background: linear-gradient(90deg, var(--accent), var(--violet), transparent) bottom / 100% 1px no-repeat;
 }
 
 .markdown h2 {
   font-size: 1.2em;
   padding-bottom: 0.25em;
-  border-bottom: 1px solid var(--line);
+  border-bottom: 1px solid rgba(179, 146, 240, 0.25);
+  color: var(--violet);
 }
 
 .markdown h3 {
   font-size: 1.05em;
+  color: var(--warn);
 }
 
 .markdown h4 {
@@ -554,12 +565,29 @@ body {
   font-size: 0.8em;
   text-transform: uppercase;
   letter-spacing: 0.12em;
-  color: var(--text-dim);
+  color: var(--green);
 }
 
 .markdown strong {
   font-weight: 600;
   color: #fff;
+  text-shadow: 0 0 12px var(--accent-soft);
+}
+
+.markdown em {
+  color: var(--violet);
+}
+
+.markdown del {
+  color: var(--pink);
+  opacity: 0.8;
+}
+
+.markdown mark {
+  color: var(--warn);
+  background: var(--warn-soft);
+  border-radius: 3px;
+  padding: 0.05em 0.25em;
 }
 
 .markdown ul,
@@ -572,8 +600,25 @@ body {
 }
 
 .markdown li::marker {
-  color: var(--accent-dim);
+  color: var(--accent);
   font-family: var(--mono);
+}
+
+.markdown li :is(ul, ol) > li::marker {
+  color: var(--violet);
+}
+
+.markdown ol > li::marker {
+  color: var(--warn);
+  font-variant-numeric: tabular-nums;
+}
+
+.markdown input[type="checkbox"] {
+  accent-color: var(--green);
+}
+
+.markdown li:has(> input[type="checkbox"]:checked, > p > input[type="checkbox"]:checked) {
+  color: var(--green);
 }
 
 .markdown a {
@@ -591,15 +636,15 @@ body {
   border: 0;
   height: 1px;
   margin: 1.5em 0;
-  background: linear-gradient(90deg, transparent, var(--line-strong), transparent);
+  background: linear-gradient(90deg, var(--accent-dim), var(--violet), transparent);
 }
 
 .markdown code {
   font-family: var(--mono);
   font-size: 0.86em;
-  color: #9fe7df;
-  background: var(--accent-soft);
-  border: 1px solid rgba(79, 209, 197, 0.12);
+  color: var(--green);
+  background: var(--green-soft);
+  border: 1px solid rgba(126, 231, 135, 0.16);
   border-radius: 3px;
   padding: 0.05em 0.35em;
 }
@@ -627,7 +672,7 @@ body {
   font-size: 10px;
   letter-spacing: 0.14em;
   text-transform: uppercase;
-  color: var(--text-faint);
+  color: var(--warn);
   background: var(--bg-raised);
   border-bottom: 1px solid var(--line);
 }
@@ -635,6 +680,15 @@ body {
 .markdown pre:has(code[class*="language-"])::before {
   content: "source";
 }
+
+.markdown pre:has(code.language-rust)::before { content: "rust"; }
+.markdown pre:has(code:is(.language-python, .language-py))::before { content: "python"; }
+.markdown pre:has(code:is(.language-javascript, .language-js, .language-jsx))::before { content: "javascript"; }
+.markdown pre:has(code:is(.language-typescript, .language-ts, .language-tsx))::before { content: "typescript"; }
+.markdown pre:has(code:is(.language-bash, .language-sh, .language-shell))::before { content: "shell"; }
+.markdown pre:has(code.language-json)::before { content: "json"; }
+.markdown pre:has(code.language-toml)::before { content: "toml"; }
+.markdown pre:has(code.language-sql)::before { content: "sql"; }
 
 .markdown pre code {
   color: var(--text);
@@ -646,10 +700,10 @@ body {
 }
 
 .markdown blockquote {
-  border-left: 2px solid var(--accent-dim);
+  border-left: 2px solid var(--violet);
   padding: 2px 0 2px 14px;
   color: var(--text-dim);
-  background: linear-gradient(90deg, var(--accent-soft), transparent 60%);
+  background: linear-gradient(90deg, var(--violet-soft), transparent 60%);
 }
 
 .markdown table {
@@ -673,11 +727,15 @@ body {
   font-weight: 500;
   text-transform: uppercase;
   letter-spacing: 0.08em;
-  color: var(--text-dim);
+  color: var(--warn);
   background: var(--bg-raised);
 }
 
-.markdown tr:hover td {
+.markdown tbody tr:nth-child(even) td {
+  background: rgba(79, 209, 197, 0.025);
+}
+
+.markdown tbody tr:hover td {
   background: var(--bg-hover);
 }
 
