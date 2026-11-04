@@ -3,6 +3,10 @@
 Browser-based GUI for a GeWu server (`gewu-server serve`), built on the
 [`gewu-client`](../gewu-client/README.md) library.
 
+> Tip: `cargo run -p gewu` starts the server and this GUI together in one
+> process and opens the browser — no need to run the two commands below by
+> hand. Use them when you want the pieces split across machines or terminals.
+
 Start a server first:
 
 ```bash

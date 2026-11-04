@@ -1,4 +1,5 @@
 pub mod bootstrap;
+pub mod cli;
 pub mod config;
 pub mod mcp_loader;
 mod memory_view;
@@ -129,7 +130,7 @@ enum Command {
     /// Run an agent with a prompt or in interactive mode
     Run(RunArgs),
     /// Run an agent as a server other programs can connect to
-    Serve(ServeArgs),
+    Serve(cli::ServeArgs),
     /// View persisted agent memory
     View(ViewArgs),
 }
@@ -161,34 +162,6 @@ struct RunArgs {
 }
 
 #[derive(Args)]
-struct ServeArgs {
-    /// Host to bind both listeners to
-    #[arg(long, default_value = server::DEFAULT_HOST)]
-    host: String,
-
-    /// Port for the WebSocket listener
-    #[arg(long, default_value_t = server::DEFAULT_WS_PORT)]
-    ws_port: u16,
-
-    /// Port for the newline-delimited JSON TCP listener
-    #[arg(long, default_value_t = server::DEFAULT_TCP_PORT)]
-    tcp_port: u16,
-
-    /// Shared token clients must authenticate with (also GEWU_SERVE_TOKEN).
-    /// Required when binding a non-loopback host unless --allow-anonymous.
-    #[arg(long, env = "GEWU_SERVE_TOKEN")]
-    token: Option<String>,
-
-    /// Allow binding a non-loopback host without a token. Dangerous: the
-    /// agent can run shell commands on this machine.
-    #[arg(long)]
-    allow_anonymous: bool,
-
-    #[command(flatten)]
-    common: bootstrap::CommonArgs,
-}
-
-#[derive(Args)]
 struct ViewArgs {
     /// Session ID to display; omit to list available sessions
     session_id: Option<String>,
@@ -204,43 +177,11 @@ async fn main() -> Result<()> {
 
     match Cli::parse().command {
         Command::Run(args) => run(args).await,
-        Command::Serve(args) => serve(args).await,
+        Command::Serve(args) => cli::serve_command(args).await,
         Command::View(args) => {
             memory_view::execute(args.session_id.as_deref(), args.db_path.as_deref()).await
         }
     }
-}
-
-async fn serve(cli: ServeArgs) -> Result<()> {
-    // Guard remote exposure: an unauthenticated, non-loopback server would
-    // hand shell access to anyone who can reach the ports.
-    if !is_loopback(&cli.host) && cli.token.is_none() && !cli.allow_anonymous {
-        anyhow::bail!(
-            "refusing to bind non-loopback host '{}' without --token; \
-             pass --token <secret> (clients then authenticate with the 'auth' op), \
-             or --allow-anonymous to accept the risk",
-            cli.host
-        );
-    }
-
-    let boot = bootstrap::bootstrap(&cli.common).await?;
-    info!(
-        "Starting gewu server (agent: {}, model: {}, provider: {})",
-        cli.common.agent, boot.model, boot.provider_name
-    );
-    server::serve(
-        boot,
-        &cli.host,
-        cli.ws_port,
-        cli.tcp_port,
-        cli.token.filter(|t| !t.is_empty()),
-    )
-    .await
-}
-
-/// Whether a bind host is reachable only from this machine.
-fn is_loopback(host: &str) -> bool {
-    matches!(host, "127.0.0.1" | "localhost" | "::1" | "[::1]")
 }
 
 async fn run(cli: RunArgs) -> Result<()> {
@@ -417,35 +358,7 @@ mod tests {
         match cli.command {
             Command::Serve(args) => {
                 assert_eq!(args.host, server::DEFAULT_HOST);
-                assert_eq!(args.ws_port, server::DEFAULT_WS_PORT);
-                assert_eq!(args.tcp_port, server::DEFAULT_TCP_PORT);
                 assert_eq!(args.common.agent, "build");
-            }
-            _ => panic!("expected serve command"),
-        }
-    }
-
-    #[test]
-    fn parses_serve_command_with_overrides() {
-        let cli = Cli::try_parse_from([
-            "gewu-server",
-            "serve",
-            "--host",
-            "0.0.0.0",
-            "--ws-port",
-            "9000",
-            "--tcp-port",
-            "9001",
-            "--agent",
-            "explore",
-        ])
-        .unwrap();
-        match cli.command {
-            Command::Serve(args) => {
-                assert_eq!(args.host, "0.0.0.0");
-                assert_eq!(args.ws_port, 9000);
-                assert_eq!(args.tcp_port, 9001);
-                assert_eq!(args.common.agent, "explore");
             }
             _ => panic!("expected serve command"),
         }

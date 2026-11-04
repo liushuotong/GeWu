@@ -8,6 +8,7 @@ GeWu (格物) is a comprehensive framework for building and deploying AI agents.
 
 | Crate | Description |
 |-------|-------------|
+| **`gewu`** | The one-command app: runs the agent server and the web GUI in a single process (`gewu` → open the printed URL). Also exposes `gewu serve` and `gewu gui` for split deployments. |
 | **`gewu-core`** | Core library providing the foundational abstractions for agents, tools, memory, and LLM providers. Contains the main Agent runtime with loop-based execution, tool calling, doom loop detection, and history compaction. |
 | **`gewu-providers`** | LLM provider implementations supporting OpenAI-compatible APIs and Anthropic Claude. Features streaming responses, tool/function calling, and multi-modal content handling. |
 | **`gewu-storage`** | Persistent memory implementation using SQLite via `sqlx`. Enables multi-session support where conversations persist across process restarts. |
@@ -25,6 +26,11 @@ GeWu (格物) is a comprehensive framework for building and deploying AI agents.
 ## Architecture
 
 ```
+┌─────────────────────────────────────────────────────────────┐
+│                    gewu (server + GUI app)                    │
+└─────────────────────────────────────────────────────────────┘
+                              │
+                              ▼
 ┌─────────────────────────────────────────────────────────────┐
 │                         gewu-server                           │
 └─────────────────────────────────────────────────────────────┘
@@ -105,11 +111,22 @@ cargo run -p gewu-server -- view
 cargo run -p gewu-server -- view <SESSION_ID>
 ```
 
-Run an agent as a server other programs can connect to (WebSocket on port
-8420, newline-delimited JSON TCP on port 8421 — see `gewu-server/README.md`
-for the wire protocol). Pass `--token` (or `GEWU_SERVE_TOKEN`) to require
-clients to authenticate; binding a non-loopback host without a token is
-refused:
+The quickest way to use the agent interactively is the `gewu` app — one
+command starts the agent server and the web GUI in a single process, prints
+both URLs, and opens the browser (`--no-open` to skip, `--no-gui` for
+headless server-only mode):
+
+```bash
+cargo run -p gewu                                     # server + GUI → open the printed URL
+cargo run -p gewu -- --no-gui                         # agent server only
+cargo run -p gewu -- --host 0.0.0.0 --token "$(openssl rand -hex 16)"  # remote, token-protected
+```
+
+For split deployments, run the pieces separately. Start an agent as a server
+other programs can connect to (WebSocket on port 8420, newline-delimited
+JSON TCP on port 8421 — see `gewu-server/README.md` for the wire protocol).
+Pass `--token` (or `GEWU_SERVE_TOKEN`) to require clients to authenticate;
+binding a non-loopback host without a token is refused:
 
 ```bash
 cargo run -p gewu-server -- serve
@@ -129,8 +146,9 @@ Or from a browser with the `gewu-gui` web UI (open
 one):
 
 ```bash
-cargo run -p gewu-gui                              # local GUI
-cargo run -p gewu-gui -- --open                    # open a browser too
+cargo run -p gewu gui                               # same as cargo run -p gewu-gui
+cargo run -p gewu-gui                               # local GUI
+cargo run -p gewu-gui -- --open                     # open a browser too
 cargo run -p gewu-gui -- --host 0.0.0.0 --token "$(openssl rand -hex 16)"  # remote, token-protected
 ```
 
