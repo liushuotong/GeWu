@@ -118,6 +118,12 @@ neutralized into text, and `javascript:`, `vbscript:`, and `data:` link/image
 destinations are replaced with `#`. Streamed deltas are appended with
 `textContent`, so partial assistant output cannot inject markup either.
 
+Assistant Markdown supports LaTeX math: `$…$` and `\(…\)` render inline,
+`$$…$$` and `\[…\]` render as display blocks, converted server-side to MathML
+Core (`math-core`) so no JavaScript or external fonts are needed. Math inside
+code spans and fenced blocks stays literal; TeX that fails to convert shows
+its escaped source instead. Prices like `$5 and $10` are left as plain text.
+
 ## Layout
 
 ```

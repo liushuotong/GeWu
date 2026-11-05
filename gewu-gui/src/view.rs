@@ -9,6 +9,7 @@ use std::fmt::Write as _;
 
 use gewu_client::session::{Block, Phase};
 use gewu_protocol::FileEntry;
+use math_core::{LatexToMathML, MathCoreConfig, MathDisplay};
 use pulldown_cmark::{CowStr, Event, Options, Parser, Tag, html};
 
 use crate::workspace::Tab;
@@ -330,18 +331,42 @@ fn plural(name: &str, count: usize) -> String {
     }
 }
 
+/// Marker around each extracted math segment's index; alphanumeric only, so
+/// it flows through Markdown parsing untouched and is swapped for rendered
+/// MathML afterwards.
+const MATH_MARKER: &str = "GWMATHZ";
+
 /// Markdown to safe HTML.
 ///
 /// Raw HTML is converted to escaped text, and dangerous link/image schemes
 /// are replaced with `#`, so model-authored content cannot inject script.
+/// LaTeX math (`$…$`, `$$…$$`, `\(…\)`, `\[…\]`) is rendered to MathML
+/// server-side. Math inside code spans and fenced code blocks stays literal,
+/// and TeX that fails to convert falls back to its escaped source.
 pub fn markdown_to_html(text: &str) -> String {
+    // Extract math before parsing: TeX `_`, `*`, and `\` must not be
+    // interpreted as Markdown emphasis or escapes.
+    let segments = extract_math(text);
+    let mut source = String::new();
+    if segments.is_empty() {
+        source.push_str(text);
+    } else {
+        let mut last = 0;
+        for (index, segment) in segments.iter().enumerate() {
+            source.push_str(&text[last..segment.start]);
+            let _ = write!(source, "{MATH_MARKER}{index}{MATH_MARKER}");
+            last = segment.end;
+        }
+        source.push_str(&text[last..]);
+    }
+
     let mut options = Options::empty();
     options.insert(Options::ENABLE_TABLES);
     options.insert(Options::ENABLE_STRIKETHROUGH);
     options.insert(Options::ENABLE_TASKLISTS);
     options.insert(Options::ENABLE_FOOTNOTES);
 
-    let parser = Parser::new_ext(text, options).map(|event| match event {
+    let parser = Parser::new_ext(&source, options).map(|event| match event {
         Event::Html(html) | Event::InlineHtml(html) => Event::Text(html),
         Event::Start(Tag::Link {
             link_type,
@@ -370,6 +395,253 @@ pub fn markdown_to_html(text: &str) -> String {
 
     let mut out = String::new();
     html::push_html(&mut out, parser);
+
+    if !segments.is_empty() {
+        out = substitute_math(&out, &segments);
+    }
+    out
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct MathSegment {
+    /// Byte range of the math *including* delimiters in the source text.
+    start: usize,
+    end: usize,
+    /// The TeX body between the delimiters.
+    tex: String,
+    /// True for display math (`$$…$$`, `\[…\]`).
+    display: bool,
+}
+
+/// Find LaTeX math in Markdown source, skipping fenced code blocks and
+/// inline code spans. A `$` opener must be followed by a non-space,
+/// non-digit character, and a `$` closer must hug the content and not be
+/// followed by a digit, so prices like `$5 and $10` stay plain text.
+fn extract_math(text: &str) -> Vec<MathSegment> {
+    let bytes = text.as_bytes();
+    let protected = protected_ranges(text);
+    let in_protected = |pos: usize| protected.iter().any(|&(s, e)| pos >= s && pos < e);
+
+    let mut segments = Vec::new();
+    let mut pos = 0;
+    while pos < bytes.len() {
+        if in_protected(pos) {
+            pos += 1;
+            continue;
+        }
+        if bytes[pos] == b'\\' {
+            let (open_len, close, display) = match bytes.get(pos + 1) {
+                Some(b'(') => (2usize, "\\)", false),
+                Some(b'[') => (2usize, "\\]", true),
+                _ => {
+                    pos += 1;
+                    continue;
+                }
+            };
+            let body_start = pos + open_len;
+            if let Some(close_pos) = find_unprotected(text, close, body_start, &protected) {
+                let tex = text[body_start..close_pos].trim();
+                if !tex.is_empty() {
+                    let end = close_pos + close.len();
+                    segments.push(MathSegment {
+                        start: pos,
+                        end,
+                        tex: tex.to_string(),
+                        display,
+                    });
+                    pos = end;
+                    continue;
+                }
+            }
+            pos += 2;
+            continue;
+        }
+        if bytes[pos] == b'$' {
+            let double = bytes.get(pos + 1) == Some(&b'$');
+            let delim_len = if double { 2 } else { 1 };
+            let body_start = pos + delim_len;
+            if !double {
+                // Opening `$` must hug the content and not start a price.
+                match bytes.get(body_start) {
+                    Some(c) if !c.is_ascii_whitespace() && !c.is_ascii_digit() => {}
+                    _ => {
+                        pos += 1;
+                        continue;
+                    }
+                }
+            }
+            if let Some(close_pos) = find_unprotected(
+                text,
+                if double { "$$" } else { "$" },
+                body_start,
+                &protected,
+            ) {
+                let end = close_pos + delim_len;
+                // Closing `$` must hug the content and not precede a digit
+                // (`… $5 and $10 …` must not pair the two prices).
+                let closes_inline = !double
+                    && close_pos > body_start
+                    && !bytes[close_pos - 1].is_ascii_whitespace();
+                let followed_by_digit = bytes.get(end).is_some_and(|c| c.is_ascii_digit());
+                if (double || closes_inline) && !followed_by_digit {
+                    let tex = text[body_start..close_pos].trim();
+                    if !tex.is_empty() {
+                        segments.push(MathSegment {
+                            start: pos,
+                            end,
+                            tex: tex.to_string(),
+                            display: double,
+                        });
+                        pos = end;
+                        continue;
+                    }
+                }
+                // Unusable closer: resume scanning just after it.
+                pos = close_pos + 1;
+                continue;
+            }
+            pos += delim_len;
+            continue;
+        }
+        pos += 1;
+    }
+    segments
+}
+
+/// Find the next occurrence of `needle` that is not inside a protected
+/// range, starting at `from`.
+fn find_unprotected(
+    text: &str,
+    needle: &str,
+    from: usize,
+    protected: &[(usize, usize)],
+) -> Option<usize> {
+    let mut search = from;
+    while search <= text.len() {
+        let found = text[search..].find(needle)? + search;
+        let inside = protected
+            .iter()
+            .any(|&(s, e)| found >= s && found < e);
+        if !inside {
+            return Some(found);
+        }
+        search = found + 1;
+    }
+    None
+}
+
+/// Byte ranges the math scanner must not touch: fenced code blocks and
+/// inline code spans.
+fn protected_ranges(text: &str) -> Vec<(usize, usize)> {
+    let bytes = text.as_bytes();
+    let mut ranges = Vec::new();
+
+    // Fenced code blocks (``` or ~~~).
+    let mut fence: Option<(u8, usize)> = None; // (fence char, block start)
+    let mut offset = 0;
+    for line in text.split_inclusive('\n') {
+        let trimmed = line.trim_start();
+        let marker = trimmed.as_bytes().first().copied();
+        let run = trimmed
+            .as_bytes()
+            .iter()
+            .take_while(|&&c| c == marker.unwrap_or(b'\0'))
+            .count();
+        match (fence, marker) {
+            (None, Some(c @ (b'`' | b'~'))) if run >= 3 => {
+                fence = Some((c, offset));
+            }
+            (Some((c, start)), Some(m)) if m == c && trimmed.trim().len() == run && run >= 3 => {
+                ranges.push((start, offset + line.len()));
+                fence = None;
+            }
+            _ => {}
+        }
+        offset += line.len();
+    }
+    if let Some((_, start)) = fence {
+        ranges.push((start, bytes.len()));
+    }
+
+    // Inline code spans (backtick runs with a matching closing run).
+    let mut pos = 0;
+    while pos < bytes.len() {
+        if ranges.iter().any(|&(s, e)| pos >= s && pos < e) {
+            pos += 1;
+            continue;
+        }
+        if bytes[pos] == b'`' {
+            let run_len = bytes[pos..].iter().take_while(|&&c| c == b'`').count();
+            let run_end = pos + run_len;
+            let mut search = run_end;
+            let mut close_end = None;
+            while search < bytes.len() {
+                if ranges.iter().any(|&(s, e)| search >= s && search < e) {
+                    search += 1;
+                    continue;
+                }
+                if bytes[search] == b'`' {
+                    let close_len = bytes[search..]
+                        .iter()
+                        .take_while(|&&c| c == b'`')
+                        .count();
+                    if close_len == run_len {
+                        close_end = Some(search + close_len);
+                        break;
+                    }
+                    search += close_len;
+                    continue;
+                }
+                search += 1;
+            }
+            if let Some(close_end) = close_end {
+                ranges.push((pos, close_end));
+                pos = close_end;
+                continue;
+            }
+            pos = run_end;
+            continue;
+        }
+        pos += 1;
+    }
+
+    ranges.sort_unstable();
+    ranges
+}
+
+/// Render one extracted math segment: MathML Core on success, the escaped
+/// TeX source on failure.
+fn math_html(segment: &MathSegment) -> String {
+    let display = if segment.display {
+        MathDisplay::Block
+    } else {
+        MathDisplay::Inline
+    };
+    let class = if segment.display {
+        "math-block"
+    } else {
+        "math-inline"
+    };
+    let converter = LatexToMathML::new(MathCoreConfig::default(), Vec::new());
+    let converted = converter
+        .ok()
+        .and_then(|c| c.convert_with_local_state(&segment.tex, display).ok());
+    match converted {
+        Some(result) => format!("<span class=\"{class}\">{}</span>", result.mathml),
+        None => format!(
+            "<code class=\"math-source\">{}</code>",
+            escape(&segment.tex)
+        ),
+    }
+}
+
+/// Swap each `GWMATHZ<i>GWMATHZ` placeholder for its rendered MathML.
+fn substitute_math(html: &str, segments: &[MathSegment]) -> String {
+    let mut out = html.to_string();
+    for (index, segment) in segments.iter().enumerate() {
+        let placeholder = format!("{MATH_MARKER}{index}{MATH_MARKER}");
+        out = out.replace(&placeholder, &math_html(segment));
+    }
     out
 }
 
@@ -592,6 +864,92 @@ mod tests {
             escape(r#"<script>&"x" '</script>"#),
             "&lt;script&gt;&amp;&quot;x&quot; &#39;&lt;/script&gt;"
         );
+    }
+
+    #[test]
+    fn inline_math_renders_as_mathml() {
+        let html = markdown_to_html("Energy is $E = mc^2$ indeed.");
+        assert!(html.contains("<math"), "{html}");
+        assert!(html.contains("math-inline"), "{html}");
+        assert!(!html.contains('$'), "{html}");
+    }
+
+    #[test]
+    fn display_math_renders_as_block() {
+        let html = markdown_to_html("Consider:\n\n$$\\int_0^\\infty e^{-x}\\,dx = 1$$\n\ndone");
+        assert!(html.contains("<math"), "{html}");
+        assert!(html.contains("math-block"), "{html}");
+    }
+
+    #[test]
+    fn backslash_math_delimiters_work() {
+        let html = markdown_to_html("Inline \\(a^2 + b^2\\) and display:\n\\[c^2\\]");
+        assert_eq!(html.matches("<math").count(), 2, "{html}");
+    }
+
+    #[test]
+    fn multiline_display_math_works() {
+        let html = markdown_to_html("$$\na + b\n$$");
+        assert!(html.contains("math-block"), "{html}");
+        assert!(html.contains("<math"), "{html}");
+    }
+
+    #[test]
+    fn math_in_code_spans_and_fences_stays_literal() {
+        let html = markdown_to_html("Fenced:\n\n```\n$x^2$\n```\n\nInline `$x^2$` code.");
+        assert!(!html.contains("<math"), "{html}");
+        assert!(html.contains("$x^2$"), "{html}");
+    }
+
+    #[test]
+    fn prices_stay_plain_text() {
+        let html = markdown_to_html("It costs $5 and $10 total.");
+        assert!(!html.contains("<math"), "{html}");
+        assert!(html.contains("$5 and $10"), "{html}");
+    }
+
+    #[test]
+    fn unmatched_dollar_stays_literal() {
+        for text in ["100$ profit", "a $ x", "trailing $"] {
+            let html = markdown_to_html(text);
+            assert!(!html.contains("<math"), "{text}: {html}");
+        }
+    }
+
+    #[test]
+    fn tex_specials_are_not_markdown_and_are_escaped() {
+        let html = markdown_to_html("$a_i * b$ and $x < 1$");
+        assert!(!html.contains("<em>"), "{html}");
+        assert_eq!(html.matches("<math").count(), 2, "{html}");
+        // A raw `<` before a space would mean unescaped TeX text.
+        assert!(!html.contains("< 1"), "{html}");
+    }
+
+    #[test]
+    fn malformed_tex_falls_back_to_escaped_source() {
+        let html = markdown_to_html("$\\notacommand{x}$");
+        assert!(html.contains("math-source"), "{html}");
+        assert!(html.contains("&lt;") || html.contains("notacommand"), "{html}");
+    }
+
+    #[test]
+    fn mathcal_and_dots_convert() {
+        // Regression: real assistant output the predecessor crate could not
+        // convert (unsupported `\mathcal` / `\dots`).
+        let html = markdown_to_html(
+            "a **guidance graph** $\\mathcal{G} = (\\mathcal{V}, \\mathcal{E})$: and $X_1, \\dots, X_K$.",
+        );
+        assert!(!html.contains("math-source"), "{html}");
+        assert_eq!(html.matches("<math").count(), 2, "{html}");
+    }
+
+    #[test]
+    fn tex_error_messages_cannot_inject_html() {
+        // TeX parse errors echo parts of the input; the fallback must
+        // escape them rather than trust the crate's inline error text.
+        let html = markdown_to_html("$\\notacommand{<b>}$");
+        assert!(!html.contains("<b>"), "{html}");
+        assert!(html.contains("math-source"), "{html}");
     }
 
     #[test]
