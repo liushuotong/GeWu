@@ -428,13 +428,19 @@ mod tests {
         // Absolute paths outside root should be rejected
         let root = Path::new("/home/user/project");
         let result = resolve_safe_path(root, "/etc/passwd");
-        assert!(result.is_err(), "Absolute path /etc/passwd should be rejected");
+        assert!(
+            result.is_err(),
+            "Absolute path /etc/passwd should be rejected"
+        );
 
         let result = resolve_safe_path(root, "/var/log");
         assert!(result.is_err(), "Absolute path /var/log should be rejected");
 
         let result = resolve_safe_path(root, "/home/user/../root");
-        assert!(result.is_err(), "Path with parent traversal should be rejected");
+        assert!(
+            result.is_err(),
+            "Path with parent traversal should be rejected"
+        );
     }
 
     #[test]
@@ -442,10 +448,16 @@ mod tests {
         // Absolute paths inside root should be accepted
         let root = Path::new("/home/user/project");
         let result = resolve_safe_path(root, "/home/user/project/src/main.rs");
-        assert!(result.is_ok(), "Absolute path inside root should be accepted");
+        assert!(
+            result.is_ok(),
+            "Absolute path inside root should be accepted"
+        );
 
         let result = resolve_safe_path(root, "/home/user/project/./src");
-        assert!(result.is_ok(), "Absolute path with current dir should be accepted");
+        assert!(
+            result.is_ok(),
+            "Absolute path with current dir should be accepted"
+        );
     }
 
     #[test]

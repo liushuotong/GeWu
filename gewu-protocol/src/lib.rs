@@ -62,6 +62,10 @@ pub enum Op {
     Interrupt,
     /// List the tool names available to the agent.
     ListTools,
+    /// List visible files and directories directly within a working-directory path.
+    ListFiles { path: String },
+    /// Read a bounded text file within the working directory.
+    ReadFile { path: String },
     /// List the available agent profiles (build/explore/general).
     ListAgents,
     /// List persisted conversation sessions, newest first.
@@ -109,7 +113,10 @@ impl Serialize for ClientRequest {
         use serde::ser::SerializeMap;
         let extra = self.session_id.is_some() as usize
             + self.agent.is_some() as usize
-            + matches!(self.op, Op::Ask { .. } | Op::Auth { .. }) as usize;
+            + matches!(
+                self.op,
+                Op::Ask { .. } | Op::Auth { .. } | Op::ListFiles { .. } | Op::ReadFile { .. }
+            ) as usize;
         let mut map = serializer.serialize_map(Some(2 + extra))?;
         map.serialize_entry("id", &self.id)?;
         match &self.op {
@@ -120,6 +127,14 @@ impl Serialize for ClientRequest {
             Op::Auth { token } => {
                 map.serialize_entry("op", "auth")?;
                 map.serialize_entry("token", token)?;
+            }
+            Op::ListFiles { path } => {
+                map.serialize_entry("op", "list_files")?;
+                map.serialize_entry("path", path)?;
+            }
+            Op::ReadFile { path } => {
+                map.serialize_entry("op", "read_file")?;
+                map.serialize_entry("path", path)?;
             }
             Op::Interrupt => map.serialize_entry("op", "interrupt")?,
             Op::ListTools => map.serialize_entry("op", "list_tools")?,
@@ -176,6 +191,24 @@ impl ClientRequest {
     /// Build a `list_tools` request.
     pub fn list_tools(id: impl Into<Value>) -> Self {
         Self::simple(id, Op::ListTools)
+    }
+
+    pub fn list_files(id: impl Into<Value>, path: impl Into<String>) -> Self {
+        Self {
+            id: id.into(),
+            op: Op::ListFiles { path: path.into() },
+            session_id: None,
+            agent: None,
+        }
+    }
+
+    pub fn read_file(id: impl Into<Value>, path: impl Into<String>) -> Self {
+        Self {
+            id: id.into(),
+            op: Op::ReadFile { path: path.into() },
+            session_id: None,
+            agent: None,
+        }
     }
 
     /// Build a `list_agents` request.
@@ -298,6 +331,20 @@ pub fn parse_request(line: &str) -> Result<ClientRequest, RequestError> {
         }
         "interrupt" => Op::Interrupt,
         "list_tools" => Op::ListTools,
+        "list_files" | "read_file" => {
+            let path = obj
+                .get("path")
+                .and_then(Value::as_str)
+                .ok_or_else(|| {
+                    RequestError::Invalid(format!("op '{}' requires a 'path' string", op_str))
+                })?
+                .to_string();
+            if op_str == "list_files" {
+                Op::ListFiles { path }
+            } else {
+                Op::ReadFile { path }
+            }
+        }
         "list_agents" => Op::ListAgents,
         "list_sessions" => Op::ListSessions,
         "get_session" => {
@@ -375,6 +422,12 @@ pub struct SessionSummary {
     pub message_count: i64,
     /// Human-readable time of the most recent message.
     pub updated_at: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct FileEntry {
+    pub name: String,
+    pub is_dir: bool,
 }
 
 /// Messages the server sends to the client.
@@ -482,6 +535,19 @@ pub enum ServerMessage {
         /// Names of the tools available to the agent.
         tools: Vec<String>,
     },
+    /// One level of visible working-directory entries.
+    Files {
+        id: Value,
+        path: String,
+        entries: Vec<FileEntry>,
+    },
+    /// Bounded text file contents for the GUI preview.
+    FileContent {
+        id: Value,
+        path: String,
+        content: String,
+        truncated: bool,
+    },
     /// Reply to a `list_agents` request.
     Agents {
         /// Echo of the client request id.
@@ -535,6 +601,8 @@ impl ServerMessage {
             ServerMessage::Usage { .. } => "usage",
             ServerMessage::Auth { .. } => "auth",
             ServerMessage::Tools { .. } => "tools",
+            ServerMessage::Files { .. } => "files",
+            ServerMessage::FileContent { .. } => "file_content",
             ServerMessage::Agents { .. } => "agents",
             ServerMessage::Sessions { .. } => "sessions",
             ServerMessage::Session { .. } => "session",
@@ -554,6 +622,8 @@ impl ServerMessage {
             | ServerMessage::Usage { id, .. }
             | ServerMessage::Auth { id, .. }
             | ServerMessage::Tools { id, .. }
+            | ServerMessage::Files { id, .. }
+            | ServerMessage::FileContent { id, .. }
             | ServerMessage::Agents { id, .. }
             | ServerMessage::Sessions { id, .. }
             | ServerMessage::Session { id, .. }
@@ -728,7 +798,12 @@ mod tests {
     #[test]
     fn auth_round_trips() {
         let req = parse_request(r#"{"id": 0, "op": "auth", "token": "secret"}"#).unwrap();
-        assert_eq!(req.op, Op::Auth { token: "secret".into() });
+        assert_eq!(
+            req.op,
+            Op::Auth {
+                token: "secret".into()
+            }
+        );
         assert_eq!(
             ClientRequest::auth(0, "secret").to_line(),
             r#"{"id":0,"op":"auth","token":"secret"}"#

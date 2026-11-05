@@ -4,9 +4,11 @@
 //! and the status line. Everything user- or model-authored is escaped, and
 //! raw HTML in Markdown is neutralized.
 
+use std::collections::{BTreeMap, BTreeSet};
 use std::fmt::Write as _;
 
 use gewu_client::session::{Block, Phase};
+use gewu_protocol::FileEntry;
 use pulldown_cmark::{CowStr, Event, Options, Parser, Tag, html};
 
 use crate::workspace::Tab;
@@ -426,7 +428,10 @@ pub fn status_html(tab: &Tab) -> String {
 
 /// The right sidebar: the tools available to the agent, or why they are not,
 /// and the working directory pinned to the bottom.
-pub fn sidebar_html(tools: &Result<Vec<String>, String>, working_directory: Option<&str>) -> String {
+pub fn sidebar_html(
+    tools: &Result<Vec<String>, String>,
+    working_directory: Option<&str>,
+) -> String {
     let mut out = String::from("<section class=\"side-section\">");
     match tools {
         Ok(tools) => {
@@ -469,6 +474,133 @@ pub fn sidebar_html(tools: &Result<Vec<String>, String>, working_directory: Opti
     out
 }
 
+fn sidebar_tools_content_html(tools: &Result<Vec<String>, String>) -> String {
+    let mut out = String::from("<section class=\"side-section\">");
+    match tools {
+        Ok(tools) if tools.is_empty() => out.push_str("<p class=\"side-note\">no tools</p>"),
+        Ok(tools) => {
+            let _ = write!(
+                out,
+                "<p class=\"side-note tool-count\">{} available</p><ul class=\"side-list\">",
+                tools.len()
+            );
+            for name in tools {
+                let _ = write!(out, "<li>{}</li>", escape(name));
+            }
+            out.push_str("</ul>");
+        }
+        Err(e) => {
+            let _ = write!(
+                out,
+                "<p class=\"side-note error\">tools unavailable: {}</p>",
+                escape(e)
+            );
+        }
+    }
+    out.push_str("</section>");
+    out
+}
+
+/// Render the sidebar's tabbed contents. FILES is intentionally first and
+/// active by default; the browser only changes the active panel locally.
+pub fn sidebar_tabs_html(
+    tools: &Result<Vec<String>, String>,
+    working_directory: Option<&str>,
+    root: Option<&str>,
+    expanded: &BTreeSet<String>,
+    cache: &BTreeMap<String, Vec<FileEntry>>,
+) -> String {
+    let tools_html = sidebar_tools_content_html(tools);
+    let files_html = file_tree_html(root.or(working_directory), expanded, cache);
+
+    format!(
+        "<div class=\"sidebar-tabs\" role=\"tablist\" aria-label=\"Sidebar views\"><button type=\"button\" class=\"sidebar-tab active\" role=\"tab\" aria-selected=\"true\" aria-controls=\"sidebar-files\" data-sidebar-tab=\"files\">FILES</button><button type=\"button\" class=\"sidebar-tab\" role=\"tab\" aria-selected=\"false\" aria-controls=\"sidebar-tools\" data-sidebar-tab=\"tools\">TOOLS</button></div><div id=\"sidebar-files\" class=\"sidebar-panel active\" role=\"tabpanel\">{files_html}</div><div id=\"sidebar-tools\" class=\"sidebar-panel\" role=\"tabpanel\" hidden>{tools_html}</div>"
+    )
+}
+
+pub fn file_tree_html(
+    root: Option<&str>,
+    expanded: &BTreeSet<String>,
+    cache: &BTreeMap<String, Vec<FileEntry>>,
+) -> String {
+    let root_label = root.unwrap_or("files");
+    let mut out =
+        String::from("<section class=\"side-section file-tree-section\" id=\"file-tree\">");
+    let _ = write!(
+        out,
+        "<div class=\"tree-toolbar\"><p class=\"tree-root\" title=\"{}\">{}</p><button class=\"tree-refresh\" type=\"button\" data-tree-refresh title=\"Refresh files\" aria-label=\"Refresh files\">↻</button></div><ul class=\"tree-list\">",
+        escape(root_label),
+        escape(root_label)
+    );
+    if let Some(entries) = cache.get("") {
+        for entry in entries {
+            render_tree_entry(&mut out, entry, &entry.name, 0, expanded, cache);
+        }
+    } else {
+        out.push_str("<li class=\"tree-empty\">loading files…</li>");
+    }
+    out.push_str("</ul></section>");
+    out
+}
+
+fn render_tree_entry(
+    out: &mut String,
+    entry: &FileEntry,
+    path: &str,
+    depth: usize,
+    expanded: &BTreeSet<String>,
+    cache: &BTreeMap<String, Vec<FileEntry>>,
+) {
+    if entry.is_dir {
+        let open = expanded.contains(path);
+        let _ = write!(
+            out,
+            "<li class=\"tree-entry\"><button type=\"button\" class=\"tree-dir\" data-path=\"{}\" style=\"--depth:{}\" aria-expanded=\"{}\"><span class=\"tree-caret\">{}</span><span class=\"tree-name\">{}</span></button>",
+            escape(path),
+            depth,
+            open,
+            if open { "▾" } else { "▸" },
+            escape(&entry.name)
+        );
+        if open {
+            out.push_str("<ul class=\"tree-children\">");
+            if let Some(children) = cache.get(path) {
+                for child in children {
+                    let child_path = format!("{path}/{}", child.name);
+                    render_tree_entry(out, child, &child_path, depth + 1, expanded, cache);
+                }
+            } else {
+                out.push_str("<li class=\"tree-empty\">loading…</li>");
+            }
+            out.push_str("</ul>");
+        }
+        out.push_str("</li>");
+    } else {
+        let _ = write!(
+            out,
+            "<li class=\"tree-entry\"><button type=\"button\" class=\"tree-file\" data-path=\"{}\" style=\"--depth:{}\"><span class=\"tree-caret\"></span><span class=\"tree-name\">{}</span></button></li>",
+            escape(path),
+            depth,
+            escape(&entry.name)
+        );
+    }
+}
+
+pub fn file_preview_html(path: &str, content: &str, truncated: bool) -> String {
+    let mut out = String::new();
+    let _ = write!(
+        out,
+        "<header class=\"preview-header\"><div class=\"preview-title\" title=\"{}\">{}</div><button type=\"button\" class=\"icon-button\" data-preview-close title=\"Close preview\" aria-label=\"Close preview\">×</button></header><pre class=\"preview-content\"><code>{}</code></pre>",
+        escape(path),
+        escape(path),
+        escape(content)
+    );
+    if truncated {
+        out.push_str("<p class=\"preview-truncated\">Preview limited to the first 512 KB.</p>");
+    }
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -493,7 +625,10 @@ mod tests {
     #[test]
     fn sidebar_lists_escaped_tool_names() {
         let html = sidebar_html(&Ok(vec!["read".into(), "<bad>".into()]), None);
-        assert!(html.contains("<span class=\"side-count\">2</span>"), "{html}");
+        assert!(
+            html.contains("<span class=\"side-count\">2</span>"),
+            "{html}"
+        );
         assert!(html.contains("<li>read</li>"), "{html}");
         assert!(html.contains("<li>&lt;bad&gt;</li>"), "{html}");
         assert!(!html.contains("side-cwd"), "{html}");
@@ -510,7 +645,10 @@ mod tests {
     fn sidebar_shows_working_directory_last() {
         let html = sidebar_html(&Ok(vec!["read".into()]), Some("/home/kzhang/dev/GeWu"));
         assert!(html.contains("side-cwd"), "{html}");
-        assert!(html.contains("side-path\">/home/kzhang/dev/GeWu</p>"), "{html}");
+        assert!(
+            html.contains("side-path\">/home/kzhang/dev/GeWu</p>"),
+            "{html}"
+        );
         assert!(html.contains("title=\"/home/kzhang/dev/GeWu\""), "{html}");
         // The cwd section renders after the tools section.
         let tools_pos = html.find("tools").unwrap();
@@ -523,6 +661,44 @@ mod tests {
         let html = sidebar_html(&Ok(vec![]), Some("/tmp/<bad>&dir"));
         assert!(html.contains("/tmp/&lt;bad&gt;&amp;dir"), "{html}");
         assert!(!html.contains("<bad>"), "{html}");
+    }
+
+    #[test]
+    fn sidebar_files_tab_is_active_by_default() {
+        let mut cache = BTreeMap::new();
+        cache.insert(
+            String::new(),
+            vec![FileEntry {
+                name: "main.rs".into(),
+                is_dir: false,
+            }],
+        );
+        let html = sidebar_tabs_html(
+            &Ok(vec!["read".into()]),
+            Some("/tmp/project"),
+            Some("/tmp/project"),
+            &BTreeSet::new(),
+            &cache,
+        );
+        assert!(
+            html.contains("data-sidebar-tab=\"files\">FILES</button>"),
+            "{html}"
+        );
+        assert!(
+            html.contains("data-sidebar-tab=\"tools\">TOOLS</button>"),
+            "{html}"
+        );
+        assert!(
+            html.contains("id=\"sidebar-files\" class=\"sidebar-panel active\""),
+            "{html}"
+        );
+        assert!(
+            html.contains("id=\"sidebar-tools\" class=\"sidebar-panel\" role=\"tabpanel\" hidden"),
+            "{html}"
+        );
+        assert!(!html.contains("<h2 class=\"side-title\">files"), "{html}");
+        assert!(!html.contains("<h2 class=\"side-title\">tools"), "{html}");
+        assert!(html.contains("data-tree-refresh"), "{html}");
     }
 
     #[test]
@@ -590,7 +766,10 @@ mod tests {
             output: Some("a.rs\nb.rs".into()),
         }]);
         let html = transcript_html(ws.tab(id).unwrap());
-        assert!(html.contains("class=\"tool-card\" data-card=\"0\""), "{html}");
+        assert!(
+            html.contains("class=\"tool-card\" data-card=\"0\""),
+            "{html}"
+        );
         assert!(html.contains("tool-name\">bash"), "{html}");
         assert!(html.contains("tool-title\">ls"), "{html}");
         assert!(html.contains("a.rs\nb.rs"), "{html}");
@@ -613,12 +792,20 @@ mod tests {
             Block::Tool {
                 tool: "bash".into(),
                 input: "second".into(),
-                output: Some((1..=10).map(|n| format!("line {n}")).collect::<Vec<_>>().join("\n")),
+                output: Some(
+                    (1..=10)
+                        .map(|n| format!("line {n}"))
+                        .collect::<Vec<_>>()
+                        .join("\n"),
+                ),
             },
         ]);
         ws.tab_mut(id).unwrap().expanded_outputs.insert(2);
         let html = tool_card_html(ws.tab(id).unwrap(), 2).expect("tool card");
-        assert!(html.contains("class=\"tool-card\" data-card=\"2\""), "{html}");
+        assert!(
+            html.contains("class=\"tool-card\" data-card=\"2\""),
+            "{html}"
+        );
         assert!(html.contains("line 10"), "expanded lines: {html}");
         assert!(!html.contains("first"), "only the requested run: {html}");
         assert!(!html.contains("between"), "{html}");
@@ -643,11 +830,17 @@ mod tests {
             tab
         };
         let html = block_html(tab, 0).expect("user block");
-        assert!(html.contains("class=\"block user\" data-block=\"0\""), "{html}");
+        assert!(
+            html.contains("class=\"block user\" data-block=\"0\""),
+            "{html}"
+        );
         assert!(!html.contains("streaming"), "{html}");
 
         let html = block_html(tab, 1).expect("assistant block");
-        assert!(html.contains("class=\"block assistant\" data-block=\"1\""), "{html}");
+        assert!(
+            html.contains("class=\"block assistant\" data-block=\"1\""),
+            "{html}"
+        );
         assert!(html.contains("body markdown streaming"), "{html}");
 
         assert!(block_html(tab, 9).is_none());

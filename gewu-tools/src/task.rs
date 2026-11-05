@@ -17,8 +17,8 @@
 //! ```
 
 use async_trait::async_trait;
-use gewu_core::types::{AgentEvent, ToolContext, ToolResult};
 use gewu_core::Agent;
+use gewu_core::types::{AgentEvent, ToolContext, ToolResult};
 use schemars::schema::RootSchema;
 use serde::Deserialize;
 use std::error::Error;
@@ -153,9 +153,9 @@ impl Tool for TaskTool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use futures_util::stream::BoxStream;
     use gewu_core::traits::LlmProvider;
     use gewu_core::types::{Message, ProviderEvent};
-    use futures_util::stream::BoxStream;
     use std::sync::Mutex;
 
     /// Streams canned provider events.
@@ -275,7 +275,10 @@ mod tests {
         let tool = make_tool(factory.clone());
 
         let result = tool
-            .execute(args("Check files", "build", None), &ToolContext::new("s", "m"))
+            .execute(
+                args("Check files", "build", None),
+                &ToolContext::new("s", "m"),
+            )
             .await
             .expect("task should succeed");
 
@@ -296,7 +299,10 @@ mod tests {
         let tool = make_tool(factory.clone());
 
         let result = tool
-            .execute(args("Resume", "explore", Some("prior-1")), &ToolContext::new("s", "m"))
+            .execute(
+                args("Resume", "explore", Some("prior-1")),
+                &ToolContext::new("s", "m"),
+            )
             .await
             .expect("task should succeed");
 

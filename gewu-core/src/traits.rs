@@ -41,7 +41,9 @@
 //! }
 //! ```
 
-use crate::types::{ExperienceQuery, Message, ProviderEvent, RecalledExperience, ToolContext, ToolResult};
+use crate::types::{
+    ExperienceQuery, Message, ProviderEvent, RecalledExperience, ToolContext, ToolResult,
+};
 use async_trait::async_trait;
 use chrono::Utc;
 use futures::stream::BoxStream;

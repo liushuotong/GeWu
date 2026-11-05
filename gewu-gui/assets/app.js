@@ -31,6 +31,7 @@
     token: document.getElementById("token"),
     sidebar: document.getElementById("sidebar"),
     sidebarToggle: document.getElementById("sidebar-toggle"),
+    filePreview: document.getElementById("file-preview"),
   };
 
   const state = {
@@ -269,6 +270,18 @@
         } else {
           toast(message.message);
         }
+        break;
+      case "file_tree":
+        const tree = document.getElementById("file-tree");
+        if (tree) tree.outerHTML = message.html;
+        break;
+      case "file_preview":
+        el.filePreview.innerHTML = message.html;
+        el.filePreview.classList.remove("hidden");
+        break;
+      case "close_preview":
+        el.filePreview.classList.add("hidden");
+        el.filePreview.textContent = "";
         break;
       default:
         break;
@@ -511,7 +524,9 @@
   });
 
   document.addEventListener("keydown", (event) => {
-    if (event.key === "Escape" && state.busy && el.login.classList.contains("hidden")) {
+    if (event.key === "Escape" && !el.filePreview.classList.contains("hidden")) {
+      send({ op: "close_preview" });
+    } else if (event.key === "Escape" && state.busy && el.login.classList.contains("hidden")) {
       send({ op: "interrupt", tab: state.active });
     } else if (
       (event.ctrlKey || event.metaKey) &&
@@ -563,6 +578,38 @@
     } else if (button.dataset.action === "toggle_group") {
       send({ op: "toggle_group", tab, block });
     }
+  });
+
+  el.sidebar.addEventListener("click", (event) => {
+    const sidebarTab = event.target.closest("[data-sidebar-tab]");
+    if (sidebarTab) {
+      setSidebarTab(sidebarTab.dataset.sidebarTab);
+      return;
+    }
+    const dir = event.target.closest("[data-path].tree-dir");
+    if (dir) { send({ op: "toggle_dir", path: dir.dataset.path }); return; }
+    const file = event.target.closest("[data-path].tree-file");
+    if (file) { send({ op: "read_file", path: file.dataset.path }); return; }
+    if (event.target.closest("[data-tree-refresh]")) { send({ op: "refresh_tree" }); }
+  });
+
+  function setSidebarTab(name) {
+    const tabs = el.sidebar.querySelectorAll("[data-sidebar-tab]");
+    const panels = el.sidebar.querySelectorAll(".sidebar-panel");
+    for (const tab of tabs) {
+      const active = tab.dataset.sidebarTab === name;
+      tab.classList.toggle("active", active);
+      tab.setAttribute("aria-selected", String(active));
+    }
+    for (const panel of panels) {
+      const active = panel.id === `sidebar-${name}`;
+      panel.classList.toggle("active", active);
+      panel.hidden = !active;
+    }
+  }
+
+  el.filePreview.addEventListener("click", (event) => {
+    if (event.target.closest("[data-preview-close]")) send({ op: "close_preview" });
   });
 
   // -- login --------------------------------------------------------------

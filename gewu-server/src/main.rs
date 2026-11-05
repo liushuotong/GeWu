@@ -210,7 +210,8 @@ async fn run(cli: RunArgs) -> Result<()> {
         // Dispatch on the configured provider exactly like `build_provider`
         // does, instead of always building an OpenAIProvider (which 404s
         // against, e.g., an Anthropic-compatible endpoint).
-        let (provider, _provider_name, _model) = bootstrap::build_provider(&cli.common, file_config)?;
+        let (provider, _provider_name, _model) =
+            bootstrap::build_provider(&cli.common, file_config)?;
         match provider.list_models().await {
             Ok(models) => {
                 println!("Available Models:");

@@ -144,7 +144,14 @@ async fn main() -> Result<()> {
     }
 
     // Context usage for the initially focused session (connects its tab).
-    activate_tab(&mut ws, &mut conns, &cli.host, cli.tcp_port, cli.token.as_deref()).await;
+    activate_tab(
+        &mut ws,
+        &mut conns,
+        &cli.host,
+        cli.tcp_port,
+        cli.token.as_deref(),
+    )
+    .await;
 
     let result = run(
         admin,

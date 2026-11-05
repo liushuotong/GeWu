@@ -33,7 +33,10 @@ impl LlmProvider for MockLlmProvider {
     async fn send<'a>(
         &'a self,
         request: Value,
-    ) -> Result<BoxStream<'a, Result<ProviderEvent, Box<dyn Error + Send + Sync>>>, Box<dyn Error + Send + Sync>> {
+    ) -> Result<
+        BoxStream<'a, Result<ProviderEvent, Box<dyn Error + Send + Sync>>>,
+        Box<dyn Error + Send + Sync>,
+    > {
         let tool_response_count = request["tool_response_count"].as_u64().unwrap_or(0) as usize;
         let behavior = request["behavior"].as_str().unwrap_or("").to_string();
 
@@ -83,7 +86,11 @@ impl Tool for TestTool {
     fn schema(&self) -> schemars::schema::RootSchema {
         schemars::schema_for!(serde_json::Value)
     }
-    async fn execute(&self, _args: Value, _ctx: &ToolContext) -> Result<ToolResult, Box<dyn std::error::Error + Send + Sync>> {
+    async fn execute(
+        &self,
+        _args: Value,
+        _ctx: &ToolContext,
+    ) -> Result<ToolResult, Box<dyn std::error::Error + Send + Sync>> {
         Ok(ToolResult::new("test_tool", "output".to_string()))
     }
 }
@@ -114,7 +121,10 @@ async fn test_tool_not_found_error() {
         }
     }
 
-    assert!(tool_found_error, "Should have received tool not found error in ToolFinish");
+    assert!(
+        tool_found_error,
+        "Should have received tool not found error in ToolFinish"
+    );
 }
 
 #[tokio::test]
@@ -140,7 +150,10 @@ async fn test_agent_reset_clears_memory() {
         async fn send<'a>(
             &'a self,
             _request: Value,
-        ) -> Result<BoxStream<'a, Result<ProviderEvent, Box<dyn Error + Send + Sync>>>, Box<dyn Error + Send + Sync>> {
+        ) -> Result<
+            BoxStream<'a, Result<ProviderEvent, Box<dyn Error + Send + Sync>>>,
+            Box<dyn Error + Send + Sync>,
+        > {
             Err("Not implemented".into())
         }
 
@@ -155,7 +168,10 @@ async fn test_agent_reset_clears_memory() {
         .build()
         .unwrap();
 
-    agent.memory.add_message(Message::User { content: vec![] }).await;
+    agent
+        .memory
+        .add_message(Message::User { content: vec![] })
+        .await;
     assert_eq!(agent.memory.messages().len(), 1);
 
     agent.reset().await;
@@ -240,7 +256,10 @@ async fn test_agent_reset_restores_system_prompt() {
         async fn send<'a>(
             &'a self,
             _request: Value,
-        ) -> Result<BoxStream<'a, Result<ProviderEvent, Box<dyn Error + Send + Sync>>>, Box<dyn Error + Send + Sync>> {
+        ) -> Result<
+            BoxStream<'a, Result<ProviderEvent, Box<dyn Error + Send + Sync>>>,
+            Box<dyn Error + Send + Sync>,
+        > {
             Err("Not implemented".into())
         }
 

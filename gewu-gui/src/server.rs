@@ -307,6 +307,11 @@ mod tests {
                 "list_tools" => vec![json!({
                     "type": "tools", "id": id, "tools": ["read", "grep"],
                 })],
+                "list_files" => vec![json!({
+                    "type": "files", "id": id,
+                    "path": request.get("path").and_then(Value::as_str).unwrap_or(""),
+                    "entries": [],
+                })],
                 "ping" => vec![json!({"type": "pong", "id": id})],
                 "usage" => vec![json!({
                     "type": "usage", "id": id, "used_tokens": 1000, "context_limit": 10000,
@@ -514,18 +519,13 @@ mod tests {
         let snapshot = next_json(&mut ws).await;
         assert_eq!(snapshot["type"], "snapshot");
         assert_eq!(snapshot["active"], 1);
-        assert!(
-            snapshot["status"]
-                .as_str()
-                .unwrap()
-                .contains("fake-model")
-        );
+        assert!(snapshot["status"].as_str().unwrap().contains("fake-model"));
         let sidebar = snapshot["sidebar"].as_str().unwrap();
         assert!(sidebar.contains("<li>read</li>"), "{sidebar}");
         assert!(sidebar.contains("<li>grep</li>"), "{sidebar}");
-        // The server's working directory is pinned at the bottom of the sidebar.
+        // The working directory appears once as the file tree root.
         assert!(
-            sidebar.contains("side-path\">/tmp/fake-project</p>"),
+            sidebar.contains("class=\"tree-root\" title=\"/tmp/fake-project\">/tmp/fake-project</p>"),
             "{sidebar}"
         );
 
@@ -557,7 +557,10 @@ mod tests {
                 "streaming_body" => {
                     assert_eq!(value["index"], 2);
                     assert!(
-                        value["html"].as_str().unwrap().contains("<p>hello world</p>"),
+                        value["html"]
+                            .as_str()
+                            .unwrap()
+                            .contains("<p>hello world</p>"),
                         "{}",
                         value["html"]
                     );
@@ -673,12 +676,9 @@ mod tests {
 
         // Let the ask's remaining terminal messages (status/tabs) drain so the
         // only thing after the toggle is its own reply.
-        while tokio::time::timeout(
-            std::time::Duration::from_millis(150),
-            next_json(&mut ws),
-        )
-        .await
-        .is_ok()
+        while tokio::time::timeout(std::time::Duration::from_millis(150), next_json(&mut ws))
+            .await
+            .is_ok()
         {}
 
         // Take the block index straight from the rendered card.
@@ -778,7 +778,10 @@ mod tests {
             saw_assistant_swap,
             "tool_card_start should carry the assistant body swap"
         );
-        assert!(saw_card_fill, "the tool output should fill the card in place");
+        assert!(
+            saw_card_fill,
+            "the tool output should fill the card in place"
+        );
         assert_eq!(
             transcripts, 1,
             "only the terminal frame may re-render the transcript"

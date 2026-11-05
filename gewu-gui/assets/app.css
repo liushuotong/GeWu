@@ -1344,13 +1344,54 @@ body {
   grid-column: 2;
   display: flex;
   flex-direction: column;
-  overflow-y: auto;
+  overflow: hidden;
   min-height: 0;
   padding: 16px 14px;
   background: var(--bg-panel);
   border-left: 1px solid var(--line);
   font-family: var(--mono);
   font-size: 12px;
+}
+
+.sidebar-tabs {
+  display: flex;
+  flex: 0 0 auto;
+  gap: 4px;
+  margin: -2px 0 16px;
+  border-bottom: 1px solid var(--line);
+}
+
+.sidebar-tab {
+  padding: 7px 9px;
+  border: 0;
+  border-bottom: 2px solid transparent;
+  background: transparent;
+  color: var(--text-faint);
+  font: 11px var(--mono);
+  letter-spacing: 0.08em;
+  cursor: pointer;
+}
+
+.sidebar-tab:hover,
+.sidebar-tab.active {
+  color: var(--accent);
+}
+
+.sidebar-tab.active {
+  border-bottom-color: var(--accent);
+}
+
+.sidebar-panel[hidden] {
+  display: none;
+}
+
+.sidebar-panel.active {
+  display: flex;
+  flex-direction: column;
+  min-height: 0;
+  flex: 1;
+  overflow-y: auto;
+  overscroll-behavior: contain;
 }
 
 .side-section + .side-section {
@@ -1404,6 +1445,25 @@ body {
   color: var(--text-dim);
   overflow-wrap: anywhere;
 }
+
+.tree-toolbar { display: flex; align-items: flex-start; justify-content: space-between; gap: 8px; margin-bottom: 6px; }
+.tree-root { min-width: 0; margin: 0; color: var(--text-dim); overflow-wrap: anywhere; }
+.tree-list, .tree-children { margin: 0; padding: 0; list-style: none; }
+.tree-children { margin-left: 10px; }
+.tree-entry { margin: 1px 0; }
+.tree-dir, .tree-file { display: flex; width: 100%; gap: 5px; padding: 3px 2px; border: 0; background: transparent; color: var(--text); text-align: left; font: inherit; cursor: pointer; }
+.tree-dir:hover, .tree-file:hover { color: var(--accent); background: var(--bg-hover); }
+.tree-caret { width: 10px; color: var(--text-faint); }
+.tree-name { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.tree-empty { padding: 3px 0; color: var(--text-faint); }
+.tree-refresh { border: 0; background: transparent; color: var(--text-dim); cursor: pointer; font: inherit; }
+.tree-refresh:hover { color: var(--accent); }
+.preview-overlay { position: fixed; inset: 0; z-index: 20; display: flex; flex-direction: column; margin-left: 8vw; padding: 0; background: var(--bg-panel); border-left: 1px solid var(--line); box-shadow: -12px 0 32px rgba(0,0,0,.45); }
+.preview-overlay.hidden { display: none; }
+.preview-header { display: flex; align-items: center; justify-content: space-between; gap: 12px; padding: 12px 18px; border-bottom: 1px solid var(--line); }
+.preview-title { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; color: var(--text); font: 12px var(--mono); }
+.preview-content { flex: 1; overflow: auto; margin: 0; padding: 18px; color: var(--text); font: 12px/1.6 var(--mono); white-space: pre; }
+.preview-truncated { margin: 0; padding: 8px 18px; color: var(--text-faint); border-top: 1px solid var(--line); font-size: 11px; }
 
 #sidebar-toggle[aria-expanded="true"] {
   color: var(--accent);

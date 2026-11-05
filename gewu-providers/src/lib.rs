@@ -23,7 +23,7 @@
 
 mod anthropic;
 mod http;
-mod providers;
 mod openai;
+mod providers;
 
 pub use providers::{AnthropicProvider, OpenAIProvider};

@@ -20,24 +20,22 @@
 //! - [`AnthropicProvider`] - Anthropic Claude provider implementation
 //! - [`ResponseParser`] - Trait for parsing streaming responses
 
-use crate::openai::{
-    ChatCompletionMessageToolCall, ChatCompletionMessageToolCallChunk,
-    ChatCompletionMessageToolCalls,
-    ChatCompletionRequestMessage, ChatCompletionRequestMessageContentPartImage,
-    ChatCompletionRequestSystemMessageArgs, ChatCompletionRequestToolMessageArgs,
-    ChatCompletionRequestUserMessageArgs, ChatCompletionRequestUserMessageContentPart,
-    ChatCompletionTools, ChatCompletionStream, ChatCompletionTool,
-    CreateChatCompletionRequest, FunctionCall as OpenAIFunctionCall,
-    FunctionObjectArgs, ImageUrl, OpenAIConfig, AssistantMessage as OpenAIAssistantMessage,
-    ChatCompletionRequestMessageContentPartText, FileData,
-    ChatCompletionRequestMessageContentPartFile, OpenAIClient, OpenAIError,
-};
 use crate::anthropic::{
     AnthropicChunk, AnthropicConfig, AnthropicError, AnthropicMessage, AnthropicStream,
-    AnthropicTool, ContentBlock, ContentBlockDeltaChunk, ContentBlockStart,
-    ContentBlockStartChunk, ContentDelta, CreateMessageRequest,
-    MessageStartChunk, UserMessage,
-    AssistantMessage as AnthropicAssistantMessage, Client as AnthropicClient,
+    AnthropicTool, AssistantMessage as AnthropicAssistantMessage, Client as AnthropicClient,
+    ContentBlock, ContentBlockDeltaChunk, ContentBlockStart, ContentBlockStartChunk, ContentDelta,
+    CreateMessageRequest, MessageStartChunk, UserMessage,
+};
+use crate::openai::{
+    AssistantMessage as OpenAIAssistantMessage, ChatCompletionMessageToolCall,
+    ChatCompletionMessageToolCallChunk, ChatCompletionMessageToolCalls,
+    ChatCompletionRequestMessage, ChatCompletionRequestMessageContentPartFile,
+    ChatCompletionRequestMessageContentPartImage, ChatCompletionRequestMessageContentPartText,
+    ChatCompletionRequestSystemMessageArgs, ChatCompletionRequestToolMessageArgs,
+    ChatCompletionRequestUserMessageArgs, ChatCompletionRequestUserMessageContentPart,
+    ChatCompletionStream, ChatCompletionTool, ChatCompletionTools, CreateChatCompletionRequest,
+    FileData, FunctionCall as OpenAIFunctionCall, FunctionObjectArgs, ImageUrl, OpenAIClient,
+    OpenAIConfig, OpenAIError,
 };
 use async_trait::async_trait;
 use futures::StreamExt;
@@ -309,14 +307,16 @@ impl OpenAIProvider {
                     calls
                         .iter()
                         .map(|tc| {
-                            ChatCompletionMessageToolCalls::Function(ChatCompletionMessageToolCall {
-                                id: tc.id.clone(),
-                                tool_type: "function".to_string(),
-                                function: OpenAIFunctionCall {
-                                    name: tc.function.name.clone(),
-                                    arguments: tc.function.arguments.clone(),
+                            ChatCompletionMessageToolCalls::Function(
+                                ChatCompletionMessageToolCall {
+                                    id: tc.id.clone(),
+                                    tool_type: "function".to_string(),
+                                    function: OpenAIFunctionCall {
+                                        name: tc.function.name.clone(),
+                                        arguments: tc.function.arguments.clone(),
+                                    },
                                 },
-                            })
+                            )
                         })
                         .collect()
                 });
@@ -427,7 +427,11 @@ impl OpenAIProvider {
         Ok(CreateChatCompletionRequest {
             model: self.model.clone(),
             messages: openai_messages,
-            tools: if openai_tools.is_empty() { None } else { Some(openai_tools) },
+            tools: if openai_tools.is_empty() {
+                None
+            } else {
+                Some(openai_tools)
+            },
             stream: None,
             max_tokens: None,
             temperature: None,
@@ -632,9 +636,8 @@ impl LlmProvider for OpenAIProvider {
             || {
                 let request = request.clone();
                 async move {
-                    let request: CreateChatCompletionRequest =
-                        serde_json::from_value(request)
-                            .map_err(|e| OpenAIError::Build(e.to_string()))?;
+                    let request: CreateChatCompletionRequest = serde_json::from_value(request)
+                        .map_err(|e| OpenAIError::Build(e.to_string()))?;
                     self.client.chat().create_stream(request).await
                 }
             },
@@ -807,9 +810,7 @@ impl AnthropicProvider {
 
     fn convert_content_part(&self, part: &ContentPart) -> Option<ContentBlock> {
         match part {
-            ContentPart::Text { text } => Some(ContentBlock::Text {
-                text: text.clone(),
-            }),
+            ContentPart::Text { text } => Some(ContentBlock::Text { text: text.clone() }),
             ContentPart::Image { data, mime_type } => Some(ContentBlock::Text {
                 text: format!("[Image: {}](data:{};base64,{})", mime_type, mime_type, data),
             }),
@@ -819,11 +820,9 @@ impl AnthropicProvider {
             ContentPart::Video { data, mime_type } => Some(ContentBlock::Text {
                 text: format!("[Video: {}](data:{};base64,{})", mime_type, mime_type, data),
             }),
-            ContentPart::File { data, mime_type } => {
-                Some(ContentBlock::Text {
-                    text: format!("[File: {}](data:{};base64,{})", mime_type, mime_type, data),
-                })
-            }
+            ContentPart::File { data, mime_type } => Some(ContentBlock::Text {
+                text: format!("[File: {}](data:{};base64,{})", mime_type, mime_type, data),
+            }),
         }
     }
 
@@ -838,7 +837,9 @@ impl AnthropicProvider {
                     .iter()
                     .filter_map(|p| self.convert_content_part(p))
                     .collect();
-                Ok(vec![AnthropicMessage::User(UserMessage { content: blocks })])
+                Ok(vec![AnthropicMessage::User(UserMessage {
+                    content: blocks,
+                })])
             }
             Message::Assistant {
                 content,
@@ -852,9 +853,13 @@ impl AnthropicProvider {
                 }
                 if let Some(calls) = tool_calls {
                     for call in calls {
-                        let input: Value = serde_json::from_str(&call.function.arguments).map_err(|e| {
-                            format!("Invalid arguments for Anthropic tool call '{}': {}", call.function.name, e)
-                        })?;
+                        let input: Value =
+                            serde_json::from_str(&call.function.arguments).map_err(|e| {
+                                format!(
+                                    "Invalid arguments for Anthropic tool call '{}': {}",
+                                    call.function.name, e
+                                )
+                            })?;
                         blocks.push(ContentBlock::ToolUse {
                             id: call.id.clone(),
                             name: call.function.name.clone(),
@@ -865,9 +870,11 @@ impl AnthropicProvider {
                 if blocks.is_empty() {
                     Ok(vec![])
                 } else {
-                    Ok(vec![AnthropicMessage::Assistant(AnthropicAssistantMessage {
-                        content: Some(blocks),
-                    })])
+                    Ok(vec![AnthropicMessage::Assistant(
+                        AnthropicAssistantMessage {
+                            content: Some(blocks),
+                        },
+                    )])
                 }
             }
             Message::Tool {
@@ -887,7 +894,9 @@ impl AnthropicProvider {
                         blocks.push(block);
                     }
                 }
-                Ok(vec![AnthropicMessage::User(UserMessage { content: blocks })])
+                Ok(vec![AnthropicMessage::User(UserMessage {
+                    content: blocks,
+                })])
             }
         }
     }
@@ -1012,10 +1021,7 @@ impl AnthropicToolCallAggregator {
                         let delta = state.argument_buffer[state.sent_len..new_len].to_string();
                         state.sent_len = new_len;
                         if !delta.is_empty() {
-                            events.push(ProviderEvent::ToolCallDelta {
-                                id,
-                                delta,
-                            });
+                            events.push(ProviderEvent::ToolCallDelta { id, delta });
                         }
                     }
                 }
@@ -1038,7 +1044,8 @@ impl AnthropicProvider {
     fn parse_stream(
         &self,
         stream: AnthropicStream,
-    ) -> futures::stream::BoxStream<'static, Result<ProviderEvent, Box<dyn Error + Send + Sync>>> {
+    ) -> futures::stream::BoxStream<'static, Result<ProviderEvent, Box<dyn Error + Send + Sync>>>
+    {
         let s = async_stream::try_stream! {
             let mut tool_aggregator = AnthropicToolCallAggregator::default();
             let mut stream = stream;
@@ -1146,7 +1153,7 @@ mod tests {
     use crate::openai::FunctionCallStream;
     use async_trait::async_trait;
     use gewu_core::types::{FunctionCall as CoreFunctionCall, ToolCall as CoreToolCall};
-    use gewu_core::{ToolContext, ToolResult, Tool};
+    use gewu_core::{Tool, ToolContext, ToolResult};
     use schemars::schema::RootSchema;
     use serde_json::Value;
 
@@ -1487,7 +1494,8 @@ mod tests {
 
         let converted = provider.convert_message(&msg).expect("convert success");
         match &converted[0] {
-            AnthropicMessage::Assistant(message) => match message.content.as_ref().unwrap().first() {
+            AnthropicMessage::Assistant(message) => match message.content.as_ref().unwrap().first()
+            {
                 Some(ContentBlock::ToolUse { id, name, input }) => {
                     assert_eq!(id, "toolu_1");
                     assert_eq!(name, "websearch");
@@ -1512,7 +1520,11 @@ mod tests {
         let converted = provider.convert_message(&msg).expect("convert success");
         match &converted[0] {
             AnthropicMessage::User(message) => match message.content.first() {
-                Some(ContentBlock::ToolResult { tool_use_id, content, is_error }) => {
+                Some(ContentBlock::ToolResult {
+                    tool_use_id,
+                    content,
+                    is_error,
+                }) => {
                     assert_eq!(tool_use_id, "toolu_1");
                     assert_eq!(content, "Search results");
                     assert_eq!(*is_error, None);
@@ -1530,7 +1542,10 @@ mod tests {
             content: "You are helpful".to_string(),
         };
         let converted = provider.convert_message(&msg).expect("convert success");
-        assert!(converted.is_empty(), "System messages should return empty for Anthropic");
+        assert!(
+            converted.is_empty(),
+            "System messages should return empty for Anthropic"
+        );
     }
 
     struct MockTool {
@@ -1587,9 +1602,10 @@ mod tests {
     #[test]
     fn anthropic_convert_tools() {
         let provider = AnthropicProvider::new("test-key", "claude-3-5-sonnet");
-        let tools: Vec<Arc<dyn Tool>> = vec![
-            Arc::new(MockTool::new("get_weather", "Get weather for a city")),
-        ];
+        let tools: Vec<Arc<dyn Tool>> = vec![Arc::new(MockTool::new(
+            "get_weather",
+            "Get weather for a city",
+        ))];
         let converted = provider.convert_tools(&tools).expect("convert success");
         assert_eq!(converted.len(), 1);
         assert_eq!(converted[0].name, "get_weather");
@@ -1692,11 +1708,11 @@ mod tests {
         assert_eq!(entries.len(), 1);
         assert!(entries[0]["timestamp"].is_string());
         assert_eq!(entries[0]["request"]["model"], "gpt-4o");
-        assert_eq!(entries[0]["request"]["messages"].as_array().unwrap().len(), 1);
         assert_eq!(
-            entries[0]["request"]["tools"].as_array().unwrap().len(),
+            entries[0]["request"]["messages"].as_array().unwrap().len(),
             1
         );
+        assert_eq!(entries[0]["request"]["tools"].as_array().unwrap().len(), 1);
     }
 
     #[tokio::test]

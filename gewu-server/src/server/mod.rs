@@ -32,6 +32,7 @@ use futures::{SinkExt, StreamExt};
 use gewu_core::ToolRegistry;
 use gewu_core::types::{AgentEvent, Message};
 pub use gewu_protocol as protocol;
+use gewu_protocol::FileEntry;
 use registry::create_agent;
 use serde_json::Value;
 use std::collections::HashSet;
@@ -298,7 +299,10 @@ impl ServerState {
     /// Claim a session for an ask. Returns `false` when another connection
     /// is already running an ask on that session.
     async fn claim_session(&self, session_id: &str) -> bool {
-        self.busy_sessions.lock().await.insert(session_id.to_string())
+        self.busy_sessions
+            .lock()
+            .await
+            .insert(session_id.to_string())
     }
 
     /// Release a session claim after its ask finished, failed, or was
@@ -485,6 +489,107 @@ async fn handle_request(
             Ok(Handled::Reply(ServerMessage::Tools {
                 id: request.id,
                 tools: session.tools,
+            }))
+        }
+
+        Op::ListFiles { path } => {
+            let root = &state.bootstrap.working_directory;
+            let dir = gewu_tools::fs_utils::resolve_safe_path(root, &path)
+                .map_err(|e| RequestError::Invalid(e.to_string()))?;
+            let canonical_root = std::fs::canonicalize(root).map_err(|e| {
+                RequestError::Failed(format!("cannot resolve working directory: {e}"))
+            })?;
+            let canonical_dir = std::fs::canonicalize(&dir)
+                .map_err(|e| RequestError::Failed(format!("cannot read directory: {e}")))?;
+            if !canonical_dir.starts_with(&canonical_root) {
+                return Err(RequestError::Invalid(
+                    "directory is outside the working directory".into(),
+                ));
+            }
+            if !canonical_dir.is_dir() {
+                return Err(RequestError::Invalid("path is not a directory".into()));
+            }
+            let mut entries = Vec::new();
+            for entry in ignore::WalkBuilder::new(&canonical_dir)
+                .max_depth(Some(1))
+                .hidden(true)
+                .git_ignore(true)
+                .require_git(false)
+                .build()
+                .skip(1)
+            {
+                let entry = entry.map_err(|e| RequestError::Failed(e.to_string()))?;
+                let Some(name) = entry.file_name().to_str() else {
+                    continue;
+                };
+                let is_dir = entry.file_type().is_some_and(|kind| kind.is_dir());
+                entries.push(FileEntry {
+                    name: name.to_string(),
+                    is_dir,
+                });
+            }
+            entries.sort_by(|a, b| {
+                b.is_dir
+                    .cmp(&a.is_dir)
+                    .then_with(|| a.name.to_lowercase().cmp(&b.name.to_lowercase()))
+            });
+            Ok(Handled::Reply(ServerMessage::Files {
+                id: request.id,
+                path,
+                entries,
+            }))
+        }
+
+        Op::ReadFile { path } => {
+            const MAX_PREVIEW_BYTES: usize = 512 * 1024;
+            let root = &state.bootstrap.working_directory;
+            let file = gewu_tools::fs_utils::resolve_safe_path(root, &path)
+                .map_err(|e| RequestError::Invalid(e.to_string()))?;
+            let canonical_root = std::fs::canonicalize(root).map_err(|e| {
+                RequestError::Failed(format!("cannot resolve working directory: {e}"))
+            })?;
+            let canonical_file = std::fs::canonicalize(&file)
+                .map_err(|e| RequestError::Failed(format!("cannot read file: {e}")))?;
+            if !canonical_file.starts_with(&canonical_root) {
+                return Err(RequestError::Invalid(
+                    "file is outside the working directory".into(),
+                ));
+            }
+            let metadata = std::fs::metadata(&canonical_file)
+                .map_err(|e| RequestError::Failed(format!("cannot read file: {e}")))?;
+            if !metadata.is_file() {
+                return Err(RequestError::Invalid("path is not a file".into()));
+            }
+            let file = std::fs::File::open(&canonical_file)
+                .map_err(|e| RequestError::Failed(format!("cannot read file: {e}")))?;
+            let mut bytes = Vec::new();
+            std::io::Read::read_to_end(
+                &mut std::io::Read::take(file, (MAX_PREVIEW_BYTES + 1) as u64),
+                &mut bytes,
+            )
+            .map_err(|e| RequestError::Failed(format!("cannot read file: {e}")))?;
+            let truncated = bytes.len() > MAX_PREVIEW_BYTES;
+            bytes.truncate(MAX_PREVIEW_BYTES);
+            if bytes.iter().take(8192).any(|byte| *byte == 0) {
+                return Err(RequestError::Failed(
+                    "binary files cannot be previewed".into(),
+                ));
+            }
+            if truncated {
+                while let Err(error) = std::str::from_utf8(&bytes) {
+                    if error.error_len().is_some() {
+                        break;
+                    }
+                    bytes.truncate(error.valid_up_to());
+                }
+            }
+            let content = String::from_utf8(bytes)
+                .map_err(|_| RequestError::Failed("file is not valid UTF-8 text".into()))?;
+            Ok(Handled::Reply(ServerMessage::FileContent {
+                id: request.id,
+                path,
+                content,
+                truncated,
             }))
         }
 
@@ -1357,7 +1462,8 @@ mod tests {
             .position(|l| is_usage(l))
             .unwrap_or_else(|| panic!("expected a usage event, got {:?}", lines));
         assert!(
-            lines[usage_index].contains("used_tokens") && lines[usage_index].contains("context_limit"),
+            lines[usage_index].contains("used_tokens")
+                && lines[usage_index].contains("context_limit"),
             "usage event line: {}",
             lines[usage_index]
         );
@@ -1839,7 +1945,9 @@ mod tests {
                     rejected = true;
                     break;
                 }
-                Some("result") => panic!("second ask should be rejected while the first is running"),
+                Some("result") => {
+                    panic!("second ask should be rejected while the first is running")
+                }
                 _ => continue,
             }
         }
@@ -2256,9 +2364,7 @@ mod tests {
 
         // A different session_id is now an error, not a silent ignore.
         in_tx
-            .send(
-                r#"{"id": 2, "op": "list_tools", "session_id": "other"}"#.to_string(),
-            )
+            .send(r#"{"id": 2, "op": "list_tools", "session_id": "other"}"#.to_string())
             .await
             .unwrap();
         let err = recv_json(&mut out_rx).await;
@@ -2293,26 +2399,21 @@ mod tests {
         let (in_b, mut out_b, handle_b) = spawn_connection(state.clone()).await;
 
         // Connection A starts an ask, creating session s1.
-        in_a
-            .send(r#"{"id": 1, "op": "ask", "prompt": "go", "session_id": "s1"}"#.to_string())
+        in_a.send(r#"{"id": 1, "op": "ask", "prompt": "go", "session_id": "s1"}"#.to_string())
             .await
             .unwrap();
         let ready = recv_json(&mut out_a).await;
         assert_eq!(ready["type"], "ready");
 
         // Connection B targets the same session and is rejected.
-        in_b
-            .send(r#"{"id": 1, "op": "ask", "prompt": "me too", "session_id": "s1"}"#.to_string())
+        in_b.send(r#"{"id": 1, "op": "ask", "prompt": "me too", "session_id": "s1"}"#.to_string())
             .await
             .unwrap();
         let mut rejected = false;
         for _ in 0..10 {
             let msg = recv_json(&mut out_b).await;
             if msg["type"] == "error" {
-                assert!(
-                    msg["error"].as_str().unwrap().contains("busy"),
-                    "{msg}"
-                );
+                assert!(msg["error"].as_str().unwrap().contains("busy"), "{msg}");
                 rejected = true;
                 break;
             }
@@ -2327,12 +2428,14 @@ mod tests {
         }
 
         // B can now run an ask on the same session.
-        in_b
-            .send(r#"{"id": 2, "op": "ask", "prompt": "me too", "session_id": "s1"}"#.to_string())
+        in_b.send(r#"{"id": 2, "op": "ask", "prompt": "me too", "session_id": "s1"}"#.to_string())
             .await
             .unwrap();
         let ready_b = recv_json(&mut out_b).await;
-        assert_eq!(ready_b["type"], "ready", "claim should be released: {ready_b}");
+        assert_eq!(
+            ready_b["type"], "ready",
+            "claim should be released: {ready_b}"
+        );
         loop {
             if recv_json(&mut out_b).await["type"] == "result" {
                 break;
@@ -2417,10 +2520,7 @@ mod tests {
         let messages = agent.memory.messages();
         assert_eq!(messages.len(), 3, "history with output is kept");
         assert!(matches!(messages[0], Message::User { .. }));
-        assert!(matches!(
-            messages.last().unwrap(),
-            Message::Tool { .. }
-        ));
+        assert!(matches!(messages.last().unwrap(), Message::Tool { .. }));
     }
 
     #[tokio::test]

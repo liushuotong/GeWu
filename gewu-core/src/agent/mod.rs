@@ -595,9 +595,11 @@ mod tests {
 
         let events = agent.ask("hello world").collect::<Vec<_>>().await;
         assert!(events.iter().all(|e| e.is_ok()));
-        assert!(events
-            .iter()
-            .any(|e| matches!(e.as_ref().unwrap(), AgentEvent::Finish { .. })));
+        assert!(
+            events
+                .iter()
+                .any(|e| matches!(e.as_ref().unwrap(), AgentEvent::Finish { .. }))
+        );
 
         let entries = parse_log_entries(&buffer.contents());
         assert_eq!(entries.len(), 1);
@@ -646,9 +648,11 @@ mod tests {
 
         let events = agent.ask("hello").collect::<Vec<_>>().await;
         assert!(events.iter().all(|e| e.is_ok()));
-        assert!(events
-            .iter()
-            .any(|e| matches!(e.as_ref().unwrap(), AgentEvent::Finish { .. })));
+        assert!(
+            events
+                .iter()
+                .any(|e| matches!(e.as_ref().unwrap(), AgentEvent::Finish { .. }))
+        );
         Ok(())
     }
 
@@ -660,9 +664,11 @@ mod tests {
 
         let events = agent.ask("hello").collect::<Vec<_>>().await;
         assert!(events.iter().all(|e| e.is_ok()));
-        assert!(events
-            .iter()
-            .any(|e| matches!(e.as_ref().unwrap(), AgentEvent::Finish { .. })));
+        assert!(
+            events
+                .iter()
+                .any(|e| matches!(e.as_ref().unwrap(), AgentEvent::Finish { .. }))
+        );
         Ok(())
     }
 

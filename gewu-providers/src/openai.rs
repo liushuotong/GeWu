@@ -83,9 +83,7 @@ impl OpenAIClient {
     }
 
     pub fn chat(&self) -> ChatCompletions<'_> {
-        ChatCompletions {
-            client: self,
-        }
+        ChatCompletions { client: self }
     }
 
     pub fn models(&self) -> Models<'_> {
@@ -104,10 +102,15 @@ impl<'a> ChatCompletions<'a> {
     ) -> Result<ChatCompletionStream, OpenAIError> {
         request.stream = Some(true);
         let url = format!("{}/chat/completions", self.client.config.base_url);
-        
-        let response = self.client.http_client
+
+        let response = self
+            .client
+            .http_client
             .post(&url)
-            .header("Authorization", format!("Bearer {}", self.client.config.api_key))
+            .header(
+                "Authorization",
+                format!("Bearer {}", self.client.config.api_key),
+            )
             .header("Content-Type", "application/json")
             .header("Accept", "text/event-stream")
             .json(&request)
@@ -193,7 +196,9 @@ where
                     }
                     match serde_json::from_str::<ChatCompletionChunk>(data) {
                         Ok(chunk) => return Poll::Ready(Some(Ok(chunk))),
-                        Err(e) => return Poll::Ready(Some(Err(OpenAIError::SseParse(e.to_string())))),
+                        Err(e) => {
+                            return Poll::Ready(Some(Err(OpenAIError::SseParse(e.to_string()))));
+                        }
                     }
                 }
             }
@@ -225,10 +230,15 @@ pub struct Models<'a> {
 impl<'a> Models<'a> {
     pub async fn list(&self) -> Result<ModelsResponse, OpenAIError> {
         let url = format!("{}/models", self.client.config.base_url);
-        
-        let response = self.client.http_client
+
+        let response = self
+            .client
+            .http_client
             .get(&url)
-            .header("Authorization", format!("Bearer {}", self.client.config.api_key))
+            .header(
+                "Authorization",
+                format!("Bearer {}", self.client.config.api_key),
+            )
             .send()
             .await?;
 
@@ -424,22 +434,22 @@ impl FunctionObjectArgs {
             parameters: Value::Object(serde_json::Map::new()),
         }
     }
-    
+
     pub fn name(mut self, name: &str) -> Self {
         self.name = name.to_string();
         self
     }
-    
+
     pub fn description(mut self, description: &str) -> Self {
         self.description = Some(description.to_string());
         self
     }
-    
+
     pub fn parameters(mut self, parameters: Value) -> Self {
         self.parameters = parameters;
         self
     }
-    
+
     pub fn build(self) -> Result<FunctionObject, OpenAIError> {
         if self.name.is_empty() {
             return Err(OpenAIError::Build("name is required".to_string()));
@@ -468,7 +478,7 @@ impl ChatCompletionRequestSystemMessageArgs {
         self.content = Some(content);
         self
     }
-    
+
     pub fn build(self) -> Result<SystemMessage, OpenAIError> {
         Ok(SystemMessage {
             content: self.content.unwrap_or_default(),
@@ -492,7 +502,7 @@ impl ChatCompletionRequestUserMessageArgs {
         self.content = Some(content);
         self
     }
-    
+
     pub fn build(self) -> Result<UserMessage, OpenAIError> {
         Ok(UserMessage {
             content: self.content.unwrap_or_default(),
@@ -520,15 +530,17 @@ impl ChatCompletionRequestToolMessageArgs {
         self.tool_call_id = Some(tool_call_id);
         self
     }
-    
+
     pub fn content(mut self, content: String) -> Self {
         self.content = Some(content);
         self
     }
-    
+
     pub fn build(self) -> Result<ToolMessage, OpenAIError> {
         Ok(ToolMessage {
-            tool_call_id: self.tool_call_id.ok_or_else(|| OpenAIError::Build("tool_call_id is required".to_string()))?,
+            tool_call_id: self
+                .tool_call_id
+                .ok_or_else(|| OpenAIError::Build("tool_call_id is required".to_string()))?,
             content: self.content.unwrap_or_default(),
         })
     }
@@ -645,10 +657,7 @@ mod tests {
             events.push(ev.expect("chunk should parse"));
         }
         assert_eq!(events.len(), 1);
-        assert_eq!(
-            events[0].choices[0].delta.content.as_deref(),
-            Some("你好")
-        );
+        assert_eq!(events[0].choices[0].delta.content.as_deref(), Some("你好"));
     }
 
     #[tokio::test]
@@ -660,9 +669,8 @@ mod tests {
             "data: {\"id\":\"1\",\"choices\":[{\"index\":0,\"delta\":{\"reasoning\":\" user\"}}]}\n\n",
             "data: [DONE]\n\n",
         );
-        let mut stream = ChatCompletionStream::new(body_stream(vec![Bytes::from_static(
-            sse.as_bytes(),
-        )]));
+        let mut stream =
+            ChatCompletionStream::new(body_stream(vec![Bytes::from_static(sse.as_bytes())]));
         let mut reasoning = String::new();
         while let Some(ev) = stream.next().await {
             let chunk = ev.expect("chunk should parse");

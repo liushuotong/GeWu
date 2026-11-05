@@ -46,7 +46,7 @@ pub use stream::AskStream;
 use std::sync::Arc;
 use tokio::sync::{mpsc, oneshot};
 
-use gewu_protocol::{ClientRequest, Message, ServerMessage, SessionSummary};
+use gewu_protocol::{ClientRequest, FileEntry, Message, ServerMessage, SessionSummary};
 use inner::Command;
 
 /// Alias for a [`Result`](std::result::Result) with this crate's error type.
@@ -198,6 +198,26 @@ impl Client {
         match self.request(request).await? {
             ServerMessage::Tools { tools, .. } => Ok(tools),
             other => Err(unexpected(other, "tools")),
+        }
+    }
+
+    pub async fn list_files(&self, path: impl Into<String>) -> Result<Vec<FileEntry>> {
+        let path = path.into();
+        let request = ClientRequest::list_files(self.next_correlation_id(), path.clone());
+        match self.request(request).await? {
+            ServerMessage::Files { entries, .. } => Ok(entries),
+            other => Err(unexpected(other, "files")),
+        }
+    }
+
+    pub async fn read_file(&self, path: impl Into<String>) -> Result<(String, bool)> {
+        let path = path.into();
+        let request = ClientRequest::read_file(self.next_correlation_id(), path);
+        match self.request(request).await? {
+            ServerMessage::FileContent {
+                content, truncated, ..
+            } => Ok((content, truncated)),
+            other => Err(unexpected(other, "file_content")),
         }
     }
 

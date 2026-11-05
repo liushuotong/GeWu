@@ -36,6 +36,14 @@ pub enum ClientMsg {
     ToggleGroup { tab: u64, block: usize },
     /// Ask for a fresh snapshot (e.g. after a transient UI error).
     Refresh,
+    /// Expand or collapse a directory in the file tree.
+    ToggleDir { path: String },
+    /// Open a file preview.
+    ReadFile { path: String },
+    /// Refresh the file tree.
+    RefreshTree,
+    /// Close the file preview.
+    ClosePreview,
 }
 
 /// GUI -> browser messages.
@@ -75,6 +83,12 @@ pub enum ServerMsg {
     Status { html: String },
     /// A protocol or upstream error to surface as a toast.
     Error { message: String },
+    /// Replace the rendered file tree.
+    FileTree { html: String },
+    /// Show the requested file preview.
+    FilePreview { html: String },
+    /// Close the file preview overlay.
+    ClosePreview,
 }
 
 #[cfg(test)]

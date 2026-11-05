@@ -145,7 +145,15 @@ impl SessionModel {
                     .rposition(|b| !matches!(b, Block::Tool { .. }))
                     .map_or(0, |i| i + 1);
                 (start..self.blocks.len())
-                    .find(|&i| matches!(&self.blocks[i], Block::Tool { output: Some(_), .. }))
+                    .find(|&i| {
+                        matches!(
+                            &self.blocks[i],
+                            Block::Tool {
+                                output: Some(_),
+                                ..
+                            }
+                        )
+                    })
                     .or(Some(self.blocks.len() - 1))
             }
             AgentEvent::Finish { response: _ } => None,

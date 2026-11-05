@@ -80,8 +80,8 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
 
     /// Backoff small enough that retry sleeps don't slow the test suite.
     const TEST_BACKOFF: Duration = Duration::from_millis(1);
@@ -108,12 +108,11 @@ mod tests {
     #[tokio::test]
     async fn retries_transient_failures_then_succeeds() {
         let calls = Arc::new(AtomicUsize::new(0));
-        let result: Result<u32, String> = with_retries(
-            TEST_BACKOFF,
-            counting_op(calls.clone(), 2),
-            |e| e.starts_with("transient"),
-        )
-        .await;
+        let result: Result<u32, String> =
+            with_retries(TEST_BACKOFF, counting_op(calls.clone(), 2), |e| {
+                e.starts_with("transient")
+            })
+            .await;
         assert_eq!(result.unwrap(), 3);
         assert_eq!(calls.load(Ordering::SeqCst), 3);
     }
@@ -129,7 +128,8 @@ mod tests {
                 Box::pin(async move {
                     c.fetch_add(1, Ordering::SeqCst);
                     Err::<u32, _>("fatal: bad request".to_string())
-                }) as std::pin::Pin<Box<dyn Future<Output = Result<u32, String>> + Send>>
+                })
+                    as std::pin::Pin<Box<dyn Future<Output = Result<u32, String>> + Send>>
             },
             |e| e.starts_with("transient"),
         )
@@ -141,12 +141,11 @@ mod tests {
     #[tokio::test]
     async fn gives_up_after_max_attempts() {
         let calls = Arc::new(AtomicUsize::new(0));
-        let result: Result<u32, String> = with_retries(
-            TEST_BACKOFF,
-            counting_op(calls.clone(), usize::MAX),
-            |e| e.starts_with("transient"),
-        )
-        .await;
+        let result: Result<u32, String> =
+            with_retries(TEST_BACKOFF, counting_op(calls.clone(), usize::MAX), |e| {
+                e.starts_with("transient")
+            })
+            .await;
         assert!(result.is_err());
         assert_eq!(calls.load(Ordering::SeqCst), MAX_ATTEMPTS as usize);
     }

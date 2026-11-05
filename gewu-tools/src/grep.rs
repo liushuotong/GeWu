@@ -317,10 +317,16 @@ mod tests {
             result.metadata.get("matches"),
             Some(&serde_json::json!(DISPLAY_LIMIT + 1))
         );
-        assert!(result.output.contains("Found 101 matches (more matches available)"));
-        assert!(result
-            .output
-            .contains("(Results truncated. Consider using a more specific path or pattern.)"));
+        assert!(
+            result
+                .output
+                .contains("Found 101 matches (more matches available)")
+        );
+        assert!(
+            result
+                .output
+                .contains("(Results truncated. Consider using a more specific path or pattern.)")
+        );
         Ok(())
     }
 
@@ -381,7 +387,11 @@ mod tests {
     async fn test_grep_tool_long_line_truncation() -> Result<()> {
         let dir = tempdir()?;
         let working_dir = dir.path().to_path_buf();
-        fs::write(dir.path().join("long.txt"), format!("{}\n", "a".repeat(2500))).await?;
+        fs::write(
+            dir.path().join("long.txt"),
+            format!("{}\n", "a".repeat(2500)),
+        )
+        .await?;
 
         let tool = GrepTool {
             working_directory: working_dir,

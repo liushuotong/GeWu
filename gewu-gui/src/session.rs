@@ -5,7 +5,7 @@
 //! The control flow mirrors `gewu-tui/src/main.rs`, but the output is JSON
 //! messages carrying rendered HTML instead of ratatui frames.
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
@@ -73,8 +73,7 @@ fn tool_update(blocks: &[Block], affected: Option<usize>, appended: bool) -> Tab
     let Some(run_start) = tool_run_start(blocks, index) else {
         return TabUpdate::Full;
     };
-    let new_run =
-        appended && (index == 0 || !matches!(blocks[index - 1], Block::Tool { .. }));
+    let new_run = appended && (index == 0 || !matches!(blocks[index - 1], Block::Tool { .. }));
     if new_run {
         TabUpdate::ToolCardStart(run_start)
     } else {
@@ -94,6 +93,8 @@ pub struct GuiSession {
     tools: Result<Vec<String>, String>,
     /// Working directory the upstream server's agent operates in.
     working_directory: Option<String>,
+    expanded_dirs: BTreeSet<String>,
+    file_cache: BTreeMap<String, Vec<gewu_protocol::FileEntry>>,
 }
 
 enum Incoming {
@@ -131,6 +132,11 @@ impl GuiSession {
             debug!("could not list tools: {e}");
             e.to_string()
         });
+
+        let mut file_cache = BTreeMap::new();
+        if let Ok(entries) = admin.list_files("").await {
+            file_cache.insert(String::new(), entries);
+        }
 
         let mut workspace = Workspace::new();
 
@@ -182,6 +188,8 @@ impl GuiSession {
             model_label,
             tools,
             working_directory,
+            expanded_dirs: BTreeSet::new(),
+            file_cache,
         })
     }
 
@@ -255,7 +263,13 @@ impl GuiSession {
             active,
             transcript: view::transcript_html(tab),
             status: view::status_html(tab),
-            sidebar: view::sidebar_html(&self.tools, self.working_directory.as_deref()),
+            sidebar: view::sidebar_tabs_html(
+                &self.tools,
+                self.working_directory.as_deref(),
+                self.working_directory.as_deref(),
+                &self.expanded_dirs,
+                &self.file_cache,
+            ),
         }
     }
 
@@ -351,7 +365,9 @@ impl GuiSession {
             return Ok(());
         }
         let endpoint = self.endpoint.clone();
-        let client = endpoint.connect_with_token(self.server_token.as_deref()).await?;
+        let client = endpoint
+            .connect_with_token(self.server_token.as_deref())
+            .await?;
         self.conns.entry(tab_id).or_default().client = Some(client);
         Ok(())
     }
@@ -480,6 +496,69 @@ impl GuiSession {
             ClientMsg::Refresh => {
                 self.send_active_full(sender).await?;
             }
+            ClientMsg::ToggleDir { path } => {
+                if self.expanded_dirs.contains(&path) {
+                    self.expanded_dirs.remove(&path);
+                } else {
+                    self.expanded_dirs.insert(path.clone());
+                    if !self.file_cache.contains_key(&path) {
+                        let entries = self
+                            .admin
+                            .list_files(path.clone())
+                            .await
+                            .map_err(|e| anyhow::anyhow!(e.to_string()))?;
+                        self.file_cache.insert(path, entries);
+                    }
+                }
+                send_msg(
+                    sender,
+                    &ServerMsg::FileTree {
+                        html: view::file_tree_html(
+                            self.working_directory.as_deref(),
+                            &self.expanded_dirs,
+                            &self.file_cache,
+                        ),
+                    },
+                )
+                .await?;
+            }
+            ClientMsg::RefreshTree => {
+                let paths: Vec<String> = std::iter::once(String::new())
+                    .chain(self.expanded_dirs.iter().cloned())
+                    .collect();
+                for path in paths {
+                    if let Ok(entries) = self.admin.list_files(path.clone()).await {
+                        self.file_cache.insert(path, entries);
+                    }
+                }
+                send_msg(
+                    sender,
+                    &ServerMsg::FileTree {
+                        html: view::file_tree_html(
+                            self.working_directory.as_deref(),
+                            &self.expanded_dirs,
+                            &self.file_cache,
+                        ),
+                    },
+                )
+                .await?;
+            }
+            ClientMsg::ReadFile { path } => match self.admin.read_file(path.clone()).await {
+                Ok((content, truncated)) => {
+                    send_msg(
+                        sender,
+                        &ServerMsg::FilePreview {
+                            html: view::file_preview_html(&path, &content, truncated),
+                        },
+                    )
+                    .await?
+                }
+                Err(e) => {
+                    self.send_error(sender, format!("could not preview file: {e}"))
+                        .await?
+                }
+            },
+            ClientMsg::ClosePreview => send_msg(sender, &ServerMsg::ClosePreview).await?,
         }
         Ok(())
     }
@@ -651,14 +730,15 @@ impl GuiSession {
                 Some(Ok(ServerMessage::Event { event, .. })) => {
                     match serde_json::from_value::<AgentEvent>(event) {
                         Ok(AgentEvent::ContentDelta { delta: text }) => {
-                            let affected = tab.model.apply_event(&AgentEvent::ContentDelta { delta: text });
+                            let affected = tab
+                                .model
+                                .apply_event(&AgentEvent::ContentDelta { delta: text });
                             if tab.model.blocks.len() != before {
                                 // A fresh block: render it immediately; the
                                 // throttle window starts on its first update.
                                 update = affected.map_or(TabUpdate::Full, TabUpdate::BlockAppend);
                             } else if stream_due {
-                                update = affected
-                                    .map_or(TabUpdate::Full, TabUpdate::StreamingBody);
+                                update = affected.map_or(TabUpdate::Full, TabUpdate::StreamingBody);
                             }
                             // Otherwise the delta is only in the model and
                             // rides along with the next due render.
@@ -921,7 +1001,11 @@ mod tests {
         ));
 
         // A new run that follows an earlier run starts its own card.
-        let blocks = vec![tool("bash", Some("out")), Block::Assistant("done".into()), tool("grep", None)];
+        let blocks = vec![
+            tool("bash", Some("out")),
+            Block::Assistant("done".into()),
+            tool("grep", None),
+        ];
         assert!(matches!(
             tool_update(&blocks, Some(2), true),
             TabUpdate::ToolCardStart(2)
