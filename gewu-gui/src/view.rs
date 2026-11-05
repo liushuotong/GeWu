@@ -500,7 +500,7 @@ pub fn file_tree_html(
         String::from("<section class=\"side-section file-tree-section\" id=\"file-tree\">");
     let _ = write!(
         out,
-        "<div class=\"tree-toolbar\"><p class=\"tree-root\" title=\"{}\">{}</p><button class=\"tree-refresh\" type=\"button\" data-tree-refresh title=\"Refresh files\" aria-label=\"Refresh files\">↻</button></div><ul class=\"tree-list\">",
+        "<div class=\"tree-toolbar\"><p class=\"tree-root\" title=\"{}\">{}</p><span class=\"tree-actions\"><button class=\"tree-upload\" type=\"button\" data-tree-upload title=\"Upload files\" aria-label=\"Upload files\">⬆</button><button class=\"tree-refresh\" type=\"button\" data-tree-refresh title=\"Refresh files\" aria-label=\"Refresh files\">↻</button></span></div><ul class=\"tree-list\">",
         escape(root_label),
         escape(root_label)
     );

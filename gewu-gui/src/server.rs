@@ -312,6 +312,13 @@ mod tests {
                     "path": request.get("path").and_then(Value::as_str).unwrap_or(""),
                     "entries": [],
                 })],
+                "write_file" => vec![json!({
+                    "type": "file_written", "id": id,
+                    "path": request.get("path").and_then(Value::as_str).unwrap_or(""),
+                    "bytes": request.get("content_base64").and_then(Value::as_str)
+                        .map(|payload| payload.len() * 3 / 4)
+                        .unwrap_or(0),
+                })],
                 "ping" => vec![json!({"type": "pong", "id": id})],
                 "usage" => vec![json!({
                     "type": "usage", "id": id, "used_tokens": 1000, "context_limit": 10000,
@@ -497,6 +504,90 @@ mod tests {
         // Passing auth must lead to a normal session snapshot.
         let value = next_json(&mut ws).await;
         assert_eq!(value["type"], "snapshot");
+    }
+
+    #[tokio::test]
+    async fn upload_files_refreshes_tree_and_notifies() {
+        let upstream = spawn_fake_upstream().await;
+        let addr = spawn_gui(AppState {
+            endpoint: Endpoint::Tcp {
+                host: "127.0.0.1".to_string(),
+                port: upstream.port(),
+            },
+            token: None,
+            server_token: None,
+        })
+        .await;
+        let (mut ws, _) = tokio_tungstenite::connect_async(format!("ws://{addr}/ws"))
+            .await
+            .unwrap();
+        let snapshot = next_json(&mut ws).await;
+        assert_eq!(snapshot["type"], "snapshot");
+
+        // A traversal name is sanitized client-side before it reaches the
+        // upstream, so the reply echoes the bare name.
+        ws.send(WsMessage::text(
+            r#"{"op":"upload_files","files":[{"name":"../notes.bin","content_base64":"aGVsbG8="}]}"#,
+        ))
+        .await
+        .unwrap();
+
+        let tree = loop {
+            let value = next_json(&mut ws).await;
+            if value["type"] != "status" {
+                break value;
+            }
+        };
+        assert_eq!(tree["type"], "file_tree");
+        assert!(tree["html"].as_str().unwrap().contains("data-tree-upload"));
+        let notice = loop {
+            let value = next_json(&mut ws).await;
+            if value["type"] != "status" {
+                break value;
+            }
+        };
+        assert_eq!(notice["type"], "notice");
+        assert!(
+            notice["message"].as_str().unwrap().contains("notes.bin"),
+            "{}",
+            notice
+        );
+    }
+
+    #[tokio::test]
+    async fn upload_files_reports_invalid_names_as_errors() {
+        let upstream = spawn_fake_upstream().await;
+        let addr = spawn_gui(AppState {
+            endpoint: Endpoint::Tcp {
+                host: "127.0.0.1".to_string(),
+                port: upstream.port(),
+            },
+            token: None,
+            server_token: None,
+        })
+        .await;
+        let (mut ws, _) = tokio_tungstenite::connect_async(format!("ws://{addr}/ws"))
+            .await
+            .unwrap();
+        let snapshot = next_json(&mut ws).await;
+        assert_eq!(snapshot["type"], "snapshot");
+
+        ws.send(WsMessage::text(r#"{"op":"upload_files","files":[{"name":"..","content_base64":"aGVsbG8="}]}"#))
+            .await
+            .unwrap();
+
+        let error = loop {
+            let value = next_json(&mut ws).await;
+            if value["type"] != "status" {
+                break value;
+            }
+        };
+        assert_eq!(error["type"], "error");
+        assert!(
+            error["message"].as_str().unwrap().contains("not a valid file name"),
+            "{}",
+            error
+        );
     }
 
     #[tokio::test]

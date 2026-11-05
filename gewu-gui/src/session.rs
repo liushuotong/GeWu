@@ -347,6 +347,42 @@ impl GuiSession {
         Ok(())
     }
 
+    async fn send_notice(&self, sender: &mut Sender, message: impl Into<String>) -> Result<()> {
+        send_msg(
+            sender,
+            &ServerMsg::Notice {
+                message: message.into(),
+            },
+        )
+        .await?;
+        Ok(())
+    }
+
+    /// Reload every visible tree level from the upstream and push the fresh
+    /// rendering to the browser.
+    async fn send_refreshed_tree(&mut self, sender: &mut Sender) -> Result<()> {
+        let paths: Vec<String> = std::iter::once(String::new())
+            .chain(self.expanded_dirs.iter().cloned())
+            .collect();
+        for path in paths {
+            if let Ok(entries) = self.admin.list_files(path.clone()).await {
+                self.file_cache.insert(path, entries);
+            }
+        }
+        send_msg(
+            sender,
+            &ServerMsg::FileTree {
+                html: view::file_tree_html(
+                    self.working_directory.as_deref(),
+                    &self.expanded_dirs,
+                    &self.file_cache,
+                ),
+            },
+        )
+        .await?;
+        Ok(())
+    }
+
     fn note_active(&mut self, message: impl Into<String>) {
         self.workspace.active_tab().model.note(message);
     }
@@ -575,25 +611,42 @@ impl GuiSession {
                 .await?;
             }
             ClientMsg::RefreshTree => {
-                let paths: Vec<String> = std::iter::once(String::new())
-                    .chain(self.expanded_dirs.iter().cloned())
-                    .collect();
-                for path in paths {
-                    if let Ok(entries) = self.admin.list_files(path.clone()).await {
-                        self.file_cache.insert(path, entries);
+                self.send_refreshed_tree(sender).await?;
+            }
+            ClientMsg::UploadFiles { files } => {
+                let mut uploaded = Vec::new();
+                let mut failures = Vec::new();
+                for file in files {
+                    let Some(name) = sanitize_upload_name(&file.name) else {
+                        failures.push(format!("'{}' is not a valid file name", file.name));
+                        continue;
+                    };
+                    use base64::Engine as _;
+                    let bytes = match base64::engine::general_purpose::STANDARD
+                        .decode(file.content_base64.as_bytes())
+                    {
+                        Ok(bytes) => bytes,
+                        Err(_) => {
+                            failures.push(format!("'{name}' is not valid base64"));
+                            continue;
+                        }
+                    };
+                    match self.admin.write_file(name.clone(), &bytes).await {
+                        Ok((_, bytes_written)) => uploaded.push(format!(
+                            "{name} ({} kB)",
+                            bytes_written / 1024
+                        )),
+                        Err(e) => failures.push(format!("could not upload '{name}': {e}")),
                     }
                 }
-                send_msg(
-                    sender,
-                    &ServerMsg::FileTree {
-                        html: view::file_tree_html(
-                            self.working_directory.as_deref(),
-                            &self.expanded_dirs,
-                            &self.file_cache,
-                        ),
-                    },
-                )
-                .await?;
+                if !uploaded.is_empty() {
+                    self.send_refreshed_tree(sender).await?;
+                    self.send_notice(sender, format!("Uploaded {}", uploaded.join(", ")))
+                        .await?;
+                }
+                if !failures.is_empty() {
+                    self.send_error(sender, failures.join("; ")).await?;
+                }
             }
             ClientMsg::ReadFile { path } => match self.admin.read_file(path.clone()).await {
                 Ok((content, truncated)) => {
@@ -1002,6 +1055,18 @@ async fn send_msg(sender: &mut Sender, msg: &ServerMsg) -> Result<()> {
     Ok(())
 }
 
+/// Reduce a browser-provided upload name to a bare, safe file name.
+/// Mirrors the server-side sanitization: only the final path component
+/// survives, and empty/dot names are rejected.
+fn sanitize_upload_name(name: &str) -> Option<String> {
+    let name = std::path::Path::new(name).file_name()?.to_str()?;
+    let name = name.trim();
+    if name.is_empty() || name == "." || name == ".." {
+        return None;
+    }
+    Some(name.to_string())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1013,6 +1078,25 @@ mod tests {
         assert!(set.contains(&3));
         toggle(&mut set, 3);
         assert!(!set.contains(&3));
+    }
+
+    #[test]
+    fn sanitize_upload_name_strips_components_and_rejects_dots() {
+        assert_eq!(sanitize_upload_name("notes.bin").as_deref(), Some("notes.bin"));
+        // Only the final component survives traversal attempts.
+        assert_eq!(sanitize_upload_name("../evil.txt").as_deref(), Some("evil.txt"));
+        assert_eq!(
+            sanitize_upload_name("some/dir/file.md").as_deref(),
+            Some("file.md")
+        );
+        assert_eq!(
+            sanitize_upload_name("/absolute/path/data.csv").as_deref(),
+            Some("data.csv")
+        );
+        assert_eq!(sanitize_upload_name(".."), None);
+        assert_eq!(sanitize_upload_name("."), None);
+        assert_eq!(sanitize_upload_name(""), None);
+        assert_eq!(sanitize_upload_name("   "), None);
     }
 
     fn tool(tool: &str, output: Option<&str>) -> Block {

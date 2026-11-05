@@ -6,10 +6,9 @@ use gewu_core::traits::{LlmProvider, Tool};
 use gewu_core::types::{AgentEvent, Message, ProviderEvent, ToolContext, ToolResult};
 use serde_json::Value;
 use std::error::Error;
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 
 struct MockLlmProvider {
-    responses: Arc<Mutex<Vec<Message>>>,
     tool_behavior: &'static str,
 }
 
@@ -98,7 +97,6 @@ impl Tool for TestTool {
 #[tokio::test]
 async fn test_tool_not_found_error() {
     let llm = MockLlmProvider {
-        responses: Arc::new(Mutex::new(vec![])),
         tool_behavior: "not_found",
     };
 
@@ -181,7 +179,6 @@ async fn test_agent_reset_clears_memory() {
 #[tokio::test]
 async fn test_empty_tool_name_skipped() {
     let llm = MockLlmProvider {
-        responses: Arc::new(Mutex::new(vec![])),
         tool_behavior: "empty_name",
     };
 
@@ -208,7 +205,6 @@ async fn test_empty_tool_name_skipped() {
 #[tokio::test]
 async fn test_max_turns_reached() {
     let llm = MockLlmProvider {
-        responses: Arc::new(Mutex::new(vec![])),
         tool_behavior: "default",
     };
 

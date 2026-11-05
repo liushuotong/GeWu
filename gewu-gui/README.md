@@ -63,6 +63,10 @@ optional.
 run shell commands on the GUI's machine. Bind to loopback unless you have a
 reverse proxy, TLS, and a strong token.
 
+File uploads (picker or drag-and-drop) are part of the same surface: they
+write into the upstream server's working-directory root, capped at 50 MB per
+file, with traversal names sanitized and existing files overwritten.
+
 ## Tabs
 
 On startup the GUI opens **every stored session as a tab** — oldest on the
@@ -86,6 +90,9 @@ confirmation.
 | `×` on a tab | Close the tab and delete the session |
 | Tool row / `… +N lines` | Expand or collapse tool output |
 | `+ Explored: …` | Expand or collapse a run of tool calls |
+| `⬆` in the file tree | Open a file picker; selected files upload into the working-directory root |
+| Drag files onto the page | Upload the dropped files the same way |
+| `↻` in the file tree | Refresh the file listing |
 
 The transcript streams assistant text and replaces it with rendered Markdown
 when the reply finishes. The status line shows the phase, `provider/model`, the

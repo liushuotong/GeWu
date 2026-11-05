@@ -237,6 +237,23 @@ impl Client {
         }
     }
 
+    /// Write (create or overwrite) a file in the server's working-directory
+    /// root. `path` must be a bare file name; returns the name used and the
+    /// number of bytes written.
+    pub async fn write_file(
+        &self,
+        path: impl Into<String>,
+        bytes: &[u8],
+    ) -> Result<(String, u64)> {
+        use base64::Engine as _;
+        let content_base64 = base64::engine::general_purpose::STANDARD.encode(bytes);
+        let request = ClientRequest::write_file(self.next_correlation_id(), path, content_base64);
+        match self.request(request).await? {
+            ServerMessage::FileWritten { path, bytes, .. } => Ok((path, bytes)),
+            other => Err(unexpected(other, "file_written")),
+        }
+    }
+
     /// List the available agent profiles (build/explore/general).
     pub async fn list_agents(&self) -> Result<Vec<String>> {
         let request = ClientRequest::list_agents(self.next_correlation_id());

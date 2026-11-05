@@ -271,6 +271,9 @@
           toast(message.message);
         }
         break;
+      case "notice":
+        toast(message.message);
+        break;
       case "file_tree":
         const tree = document.getElementById("file-tree");
         if (tree) tree.outerHTML = message.html;
@@ -644,7 +647,69 @@
     if (dir) { send({ op: "toggle_dir", path: dir.dataset.path }); return; }
     const file = event.target.closest("[data-path].tree-file");
     if (file) { send({ op: "read_file", path: file.dataset.path }); return; }
+    if (event.target.closest("[data-tree-upload]")) {
+      el.fileUpload.click();
+      return;
+    }
     if (event.target.closest("[data-tree-refresh]")) { send({ op: "refresh_tree" }); }
+  });
+
+  // -- file upload ---------------------------------------------------------
+
+  // Uploads always land in the working-directory root; the server sanitizes
+  // names and enforces the size cap.
+  const MAX_UPLOAD_BYTES = 50 * 1024 * 1024;
+
+  function bytesToBase64(buffer) {
+    const bytes = new Uint8Array(buffer);
+    let binary = "";
+    const chunk = 0x8000;
+    for (let offset = 0; offset < bytes.length; offset += chunk) {
+      binary += String.fromCharCode(...bytes.subarray(offset, offset + chunk));
+    }
+    return btoa(binary);
+  }
+
+  async function uploadFiles(fileList) {
+    const files = [...fileList].filter((file) => file.size <= MAX_UPLOAD_BYTES);
+    const skipped = fileList.length - files.length;
+    if (skipped > 0) {
+      toast(`Skipped ${skipped} file(s) over the 50 MB upload limit`);
+    }
+    if (!files.length) return;
+    const payloads = await Promise.all(
+      files.map(async (file) => ({
+        name: file.name,
+        content_base64: bytesToBase64(await file.arrayBuffer()),
+      })),
+    );
+    send({ op: "upload_files", files: payloads });
+  }
+
+  el.fileUpload = document.getElementById("file-upload");
+  el.fileUpload.addEventListener("change", () => {
+    if (el.fileUpload.files.length) uploadFiles(el.fileUpload.files);
+    el.fileUpload.value = "";
+  });
+
+  const fileTreeHost = document.getElementById("app");
+  fileTreeHost.addEventListener("dragover", (event) => {
+    if (!event.dataTransfer?.types?.includes("Files")) return;
+    event.preventDefault();
+    fileTreeHost.classList.add("drag-over");
+  });
+  fileTreeHost.addEventListener("dragleave", (event) => {
+    if (event.target === fileTreeHost) fileTreeHost.classList.remove("drag-over");
+  });
+  fileTreeHost.addEventListener("drop", (event) => {
+    fileTreeHost.classList.remove("drag-over");
+    if (!event.dataTransfer?.files?.length) return;
+    event.preventDefault();
+    if (!state.ready) {
+      toast("Still loading the session; try again in a moment");
+      return;
+    }
+    uploadFiles(event.dataTransfer.files);
   });
 
   function setSidebarTab(name) {

@@ -44,8 +44,18 @@ pub enum ClientMsg {
     ReadFile { path: String },
     /// Refresh the file tree.
     RefreshTree,
+    /// Upload files into the working-directory root. Names are sanitized
+    /// server-side; contents are base64-encoded.
+    UploadFiles { files: Vec<UploadedFile> },
     /// Close the file preview.
     ClosePreview,
+}
+
+/// One file to upload: browser-provided name plus base64-encoded body.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+pub struct UploadedFile {
+    pub name: String,
+    pub content_base64: String,
 }
 
 /// GUI -> browser messages.
@@ -87,6 +97,8 @@ pub enum ServerMsg {
     Status { html: String },
     /// A protocol or upstream error to surface as a toast.
     Error { message: String },
+    /// A non-error notification to surface as a toast.
+    Notice { message: String },
     /// Replace the rendered file tree.
     FileTree { html: String },
     /// Show the requested file preview.
@@ -185,5 +197,43 @@ mod tests {
         let json = serde_json::to_value(&msg).unwrap();
         assert_eq!(json["type"], "block_append");
         assert_eq!(json["index"], 2);
+
+        let msg = ServerMsg::Notice {
+            message: "Uploaded notes.bin (1 kB)".to_string(),
+        };
+        let json = serde_json::to_value(&msg).unwrap();
+        assert_eq!(json["type"], "notice");
+        assert_eq!(json["message"], "Uploaded notes.bin (1 kB)");
+    }
+
+    #[test]
+    fn parses_upload_files_commands() {
+        let msg = serde_json::from_str::<ClientMsg>(
+            r#"{"op":"upload_files","files":[
+                {"name":"notes.bin","content_base64":"aGVsbG8="},
+                {"name":"img.png","content_base64":""}
+            ]}"#,
+        )
+        .unwrap();
+        assert_eq!(
+            msg,
+            ClientMsg::UploadFiles {
+                files: vec![
+                    UploadedFile {
+                        name: "notes.bin".to_string(),
+                        content_base64: "aGVsbG8=".to_string(),
+                    },
+                    UploadedFile {
+                        name: "img.png".to_string(),
+                        content_base64: String::new(),
+                    },
+                ],
+            }
+        );
+        assert!(serde_json::from_str::<ClientMsg>(r#"{"op":"upload_files"}"#).is_err());
+        assert!(serde_json::from_str::<ClientMsg>(
+            r#"{"op":"upload_files","files":[{"name":"a.txt"}]}"#
+        )
+        .is_err());
     }
 }

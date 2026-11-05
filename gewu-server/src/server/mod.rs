@@ -661,6 +661,57 @@ async fn handle_request(
             }))
         }
 
+        Op::WriteFile { path, content_base64 } => {
+            const MAX_UPLOAD_BYTES: usize = 50 * 1024 * 1024;
+            // Only a bare file name is accepted: uploads land in the
+            // working-directory root, and the browser-provided name is
+            // untrusted. Directory components are stripped, so traversal
+            // like `../evil` collapses to `evil`.
+            let name = std::path::Path::new(&path)
+                .file_name()
+                .and_then(|name| name.to_str())
+                .filter(|name| !name.is_empty() && *name != "." && *name != "..")
+                .ok_or_else(|| {
+                    RequestError::Invalid("path must be a file name".into())
+                })?;
+            use base64::Engine as _;
+            let bytes = base64::engine::general_purpose::STANDARD
+                .decode(content_base64.as_bytes())
+                .map_err(|e| {
+                    RequestError::Invalid(format!("content_base64 is not valid base64: {e}"))
+                })?;
+            if bytes.len() > MAX_UPLOAD_BYTES {
+                return Err(RequestError::Invalid(format!(
+                    "file exceeds the {} MB upload limit",
+                    MAX_UPLOAD_BYTES / (1024 * 1024)
+                )));
+            }
+            let canonical_root = std::fs::canonicalize(&state.bootstrap.working_directory)
+                .map_err(|e| {
+                    RequestError::Failed(format!("cannot resolve working directory: {e}"))
+                })?;
+            let target = canonical_root.join(name);
+            if target.exists() {
+                // Follow symlinks so an existing name cannot redirect the
+                // write outside the working directory.
+                let canonical_target = std::fs::canonicalize(&target).map_err(|e| {
+                    RequestError::Failed(format!("cannot resolve target file: {e}"))
+                })?;
+                if !canonical_target.starts_with(&canonical_root) {
+                    return Err(RequestError::Invalid(
+                        "file is outside the working directory".into(),
+                    ));
+                }
+            }
+            std::fs::write(&target, &bytes)
+                .map_err(|e| RequestError::Failed(format!("cannot write file: {e}")))?;
+            Ok(Handled::Reply(ServerMessage::FileWritten {
+                id: request.id,
+                path: name.to_string(),
+                bytes: bytes.len() as u64,
+            }))
+        }
+
         Op::ListSessions => {
             let sessions = gewu_storage::list_sessions(&state.bootstrap.pool)
                 .await
@@ -1199,6 +1250,7 @@ async fn tcp_reader<R: AsyncRead + Unpin>(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use base64::Engine as _;
     use gewu_core::types::{ContentPart, ToolContext, ToolResult};
     use std::error::Error;
     use std::sync::atomic::{AtomicUsize, Ordering};
@@ -1263,7 +1315,7 @@ mod tests {
 
         async fn send<'a>(
             &'a self,
-            request: Value,
+            _request: Value,
         ) -> std::result::Result<
             futures::stream::BoxStream<
                 'a,
@@ -1756,6 +1808,146 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn write_file_writes_within_working_root() {
+        let root = tempfile::tempdir().unwrap();
+        let mut session = None;
+        let mut running = None;
+        let mut state = server_state_with(TestLlm::plain());
+        {
+            let bootstrap = &mut Arc::get_mut(&mut state).unwrap().bootstrap;
+            bootstrap.working_directory = root.path().to_string_lossy().to_string();
+        }
+
+        // Binary (non-UTF-8) payloads round-trip through base64.
+        let payload: Vec<u8> = (0u8..=255).cycle().take(4096).collect();
+        let encoded = base64::engine::general_purpose::STANDARD.encode(&payload);
+        let handled = handle_request(
+            &state,
+            &mut session,
+            &mut running,
+            ClientRequest::write_file(1, "data.bin", &encoded),
+        )
+        .await
+        .unwrap();
+        match handled {
+            Handled::Reply(ServerMessage::FileWritten { path, bytes, .. }) => {
+                assert_eq!(path, "data.bin");
+                assert_eq!(bytes, payload.len() as u64);
+            }
+            _ => panic!("unexpected reply"),
+        }
+        assert_eq!(std::fs::read(root.path().join("data.bin")).unwrap(), payload);
+
+        // Overwriting an existing file is allowed.
+        let replaced = b"replacement";
+        let encoded = base64::engine::general_purpose::STANDARD.encode(replaced);
+        handle_request(
+            &state,
+            &mut session,
+            &mut running,
+            ClientRequest::write_file(2, "data.bin", &encoded),
+        )
+        .await
+        .unwrap();
+        assert_eq!(std::fs::read(root.path().join("data.bin")).unwrap(), replaced);
+    }
+
+    #[tokio::test]
+    async fn write_file_collapses_traversal_to_a_root_name() {
+        let root = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        std::fs::write(outside.path().join("victim.txt"), "victim").unwrap();
+        let mut session = None;
+        let mut running = None;
+        let mut state = server_state_with(TestLlm::plain());
+        {
+            let bootstrap = &mut Arc::get_mut(&mut state).unwrap().bootstrap;
+            bootstrap.working_directory = root.path().to_string_lossy().to_string();
+        }
+
+        let encoded = base64::engine::general_purpose::STANDARD.encode(b"payload");
+        handle_request(
+            &state,
+            &mut session,
+            &mut running,
+            ClientRequest::write_file(1, "../victim.txt", &encoded),
+        )
+        .await
+        .unwrap();
+        // The `..` component is stripped, so the write lands in the root and
+        // the file outside it is untouched.
+        assert_eq!(
+            std::fs::read(root.path().join("victim.txt")).unwrap(),
+            b"payload"
+        );
+        assert_eq!(std::fs::read(outside.path().join("victim.txt")).unwrap(), b"victim");
+    }
+
+    #[tokio::test]
+    async fn write_file_rejects_bad_names_and_payloads() {
+        let root = tempfile::tempdir().unwrap();
+        let mut session = None;
+        let mut running = None;
+        let mut state = server_state_with(TestLlm::plain());
+        {
+            let bootstrap = &mut Arc::get_mut(&mut state).unwrap().bootstrap;
+            bootstrap.working_directory = root.path().to_string_lossy().to_string();
+        }
+
+        // `..` and empty names carry no file component to write.
+        for name in ["..", ".", ""] {
+            let result = handle_request(
+                &state,
+                &mut session,
+                &mut running,
+                ClientRequest::write_file(1, name, "aGk="),
+            )
+            .await;
+            assert!(result.is_err(), "expected '{name}' to be rejected");
+        }
+        assert_eq!(std::fs::read_dir(root.path()).unwrap().count(), 0);
+
+        // Non-base64 payloads are rejected before touching the disk.
+        let result = handle_request(
+            &state,
+            &mut session,
+            &mut running,
+            ClientRequest::write_file(2, "data.bin", "!!!not base64!!!"),
+        )
+        .await;
+        assert!(result.is_err(), "expected invalid base64 to be rejected");
+        assert_eq!(std::fs::read_dir(root.path()).unwrap().count(), 0);
+    }
+
+    #[tokio::test]
+    async fn write_file_rejects_oversize_payloads() {
+        let root = tempfile::tempdir().unwrap();
+        let mut session = None;
+        let mut running = None;
+        let mut state = server_state_with(TestLlm::plain());
+        {
+            let bootstrap = &mut Arc::get_mut(&mut state).unwrap().bootstrap;
+            bootstrap.working_directory = root.path().to_string_lossy().to_string();
+        }
+
+        let big = vec![0u8; 50 * 1024 * 1024 + 1];
+        let encoded = base64::engine::general_purpose::STANDARD.encode(&big);
+        let result = handle_request(
+            &state,
+            &mut session,
+            &mut running,
+            ClientRequest::write_file(1, "big.bin", &encoded),
+        )
+        .await;
+        let err = match result {
+            Err(err) => err,
+            Ok(_) => panic!("expected the upload cap to reject the payload"),
+        };
+        assert!(err.to_string().contains("upload limit"), "{err}");
+        assert_eq!(std::fs::read_dir(root.path()).unwrap().count(), 0);
+    }
+
+    #[tokio::test]
     async fn switching_profiles_keeps_live_memory() {
         let state = server_state_with(TestLlm::plain());
         let original = plain_session();
@@ -2105,7 +2297,6 @@ mod tests {
         // running ask streams events into the same channel from another
         // task, so drain messages until the error shows up. A `result`
         // first would mean the second ask was accepted, i.e. not rejected.
-        let mut rejected = false;
         loop {
             let msg = recv_json(&mut out_rx).await;
             match msg["type"].as_str() {
@@ -2118,7 +2309,6 @@ mod tests {
                         "unexpected error: {}",
                         msg["error"]
                     );
-                    rejected = true;
                     break;
                 }
                 Some("result") => {
@@ -2127,7 +2317,6 @@ mod tests {
                 _ => continue,
             }
         }
-        assert!(rejected);
 
         // Let the first ask finish.
         loop {

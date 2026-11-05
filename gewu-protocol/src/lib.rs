@@ -69,6 +69,9 @@ pub enum Op {
     ListFiles { path: String },
     /// Read a bounded text file within the working directory.
     ReadFile { path: String },
+    /// Write a base64-encoded file into the working-directory root. The
+    /// path must be a bare file name; existing files are overwritten.
+    WriteFile { path: String, content_base64: String },
     /// List the available agent profiles (build/explore/general).
     ListAgents,
     /// List persisted conversation sessions, newest first.
@@ -120,7 +123,11 @@ impl Serialize for ClientRequest {
             + self.agent.is_some() as usize
             + matches!(
                 self.op,
-                Op::Ask { .. } | Op::Auth { .. } | Op::ListFiles { .. } | Op::ReadFile { .. }
+                Op::Ask { .. }
+                    | Op::Auth { .. }
+                    | Op::ListFiles { .. }
+                    | Op::ReadFile { .. }
+                    | Op::WriteFile { .. }
             ) as usize;
         let mut map = serializer.serialize_map(Some(2 + extra))?;
         map.serialize_entry("id", &self.id)?;
@@ -149,6 +156,14 @@ impl Serialize for ClientRequest {
             Op::ReadFile { path } => {
                 map.serialize_entry("op", "read_file")?;
                 map.serialize_entry("path", path)?;
+            }
+            Op::WriteFile {
+                path,
+                content_base64,
+            } => {
+                map.serialize_entry("op", "write_file")?;
+                map.serialize_entry("path", path)?;
+                map.serialize_entry("content_base64", content_base64)?;
             }
             Op::Interrupt => map.serialize_entry("op", "interrupt")?,
             Op::ListTools => map.serialize_entry("op", "list_tools")?,
@@ -226,6 +241,25 @@ impl ClientRequest {
         Self {
             id: id.into(),
             op: Op::ReadFile { path: path.into() },
+            session_id: None,
+            agent: None,
+        }
+    }
+
+    /// Build a `write_file` request: `content_base64` is the base64-encoded
+    /// file body; `path` must be a bare file name inside the working
+    /// directory root.
+    pub fn write_file(
+        id: impl Into<Value>,
+        path: impl Into<String>,
+        content_base64: impl Into<String>,
+    ) -> Self {
+        Self {
+            id: id.into(),
+            op: Op::WriteFile {
+                path: path.into(),
+                content_base64: content_base64.into(),
+            },
             session_id: None,
             agent: None,
         }
@@ -377,6 +411,25 @@ pub fn parse_request(line: &str) -> Result<ClientRequest, RequestError> {
             }
         }
         "list_agents" => Op::ListAgents,
+        "write_file" => {
+            let path = obj
+                .get("path")
+                .and_then(Value::as_str)
+                .ok_or_else(|| {
+                    RequestError::Invalid("op 'write_file' requires a 'path' string".to_string())
+                })?
+                .to_string();
+            let content_base64 = obj
+                .get("content_base64")
+                .and_then(Value::as_str)
+                .ok_or_else(|| {
+                    RequestError::Invalid(
+                        "op 'write_file' requires a 'content_base64' string".to_string(),
+                    )
+                })?
+                .to_string();
+            Op::WriteFile { path, content_base64 }
+        }
         "list_sessions" => Op::ListSessions,
         "get_session" => {
             if obj.get("session_id").and_then(Value::as_str).is_none() {
@@ -584,6 +637,15 @@ pub enum ServerMessage {
         content: String,
         truncated: bool,
     },
+    /// Reply to a `write_file` request: the file was created or overwritten.
+    FileWritten {
+        /// Echo of the client request id.
+        id: Value,
+        /// The file name the content was written under.
+        path: String,
+        /// Number of bytes written.
+        bytes: u64,
+    },
     /// Reply to a `list_agents` request.
     Agents {
         /// Echo of the client request id.
@@ -640,6 +702,7 @@ impl ServerMessage {
             ServerMessage::Tools { .. } => "tools",
             ServerMessage::Files { .. } => "files",
             ServerMessage::FileContent { .. } => "file_content",
+            ServerMessage::FileWritten { .. } => "file_written",
             ServerMessage::Agents { .. } => "agents",
             ServerMessage::Sessions { .. } => "sessions",
             ServerMessage::Session { .. } => "session",
@@ -662,6 +725,7 @@ impl ServerMessage {
             | ServerMessage::Tools { id, .. }
             | ServerMessage::Files { id, .. }
             | ServerMessage::FileContent { id, .. }
+            | ServerMessage::FileWritten { id, .. }
             | ServerMessage::Agents { id, .. }
             | ServerMessage::Sessions { id, .. }
             | ServerMessage::Session { id, .. }
@@ -958,6 +1022,9 @@ mod tests {
 
         let line = ClientRequest::list_agents("4").to_line();
         assert_eq!(line, r#"{"id":"4","op":"list_agents"}"#);
+
+        let line = ClientRequest::write_file("9", "data.bin", "aGk=").to_line();
+        assert_eq!(line, r#"{"id":"9","op":"write_file","path":"data.bin","content_base64":"aGk="}"#);
     }
 
     #[test]
@@ -971,6 +1038,7 @@ mod tests {
             ClientRequest::interrupt(2),
             ClientRequest::list_tools("3"),
             ClientRequest::list_agents("4"),
+            ClientRequest::write_file("9", "data.bin", "aGk="),
         ] {
             let parsed = parse_request(&req.to_line()).unwrap();
             assert_eq!(parsed.id, req.id);
