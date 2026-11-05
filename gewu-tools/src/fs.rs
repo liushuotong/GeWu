@@ -6,9 +6,12 @@
 //!
 //! # Security
 //!
-//! All file paths are resolved through [`resolve_safe_path`](crate::fs_utils::resolve_safe_path)
-//! which prevents directory traversal attacks. Paths cannot escape the
-//! configured working directory.
+//! File paths are resolved according to the [`PathEnforcement`] level carried
+//! on the [`ToolContext`]. The level is server configuration (config key
+//! `sandbox`) and defaults to `None`: paths are used as provided with no
+//! containment checks. `Contain` rejects paths escaping the working directory
+//! via [`resolve_safe_path`](crate::fs_utils::resolve_safe_path), and
+//! `Strict` additionally canonicalizes and rejects symlinks.
 //!
 //! # Available Tools
 //!
@@ -19,7 +22,7 @@
 
 use crate::fs_utils::{
     glob_with_gitignore, into_tool_error, is_binary_file, mime_type, read_bytes, read_text,
-    resolve_safe_path, write,
+    resolve_read_path, resolve_write_path, write,
 };
 use crate::replacers::smart_replace;
 use anyhow::Result;
@@ -110,11 +113,12 @@ impl Tool for ReadFileTool {
     async fn execute(
         &self,
         args: serde_json::Value,
-        _ctx: &ToolContext,
+        ctx: &ToolContext,
     ) -> Result<ToolResult, Box<dyn Error + Send + Sync>> {
         let input: ReadArgs = serde_json::from_value(args).map_err(into_tool_error)?;
 
-        let file_path = resolve_safe_path(&self.working_directory, &input.file_path)
+        let file_path = resolve_read_path(&self.working_directory, &input.file_path, ctx.enforcement)
+            .await
             .map_err(into_tool_error)?;
 
         let metadata = tokio::fs::metadata(&file_path).await;
@@ -369,12 +373,14 @@ impl Tool for WriteFileTool {
     async fn execute(
         &self,
         args: serde_json::Value,
-        _ctx: &ToolContext,
+        ctx: &ToolContext,
     ) -> Result<ToolResult, Box<dyn Error + Send + Sync>> {
         let input: WriteArgs = serde_json::from_value(args).map_err(into_tool_error)?;
 
-        let file_path = resolve_safe_path(&self.working_directory, &input.file_path)
-            .map_err(into_tool_error)?;
+        let file_path =
+            resolve_write_path(&self.working_directory, &input.file_path, ctx.enforcement)
+                .await
+                .map_err(into_tool_error)?;
 
         write(&file_path, input.content.as_bytes())
             .await
@@ -403,12 +409,14 @@ impl Tool for EditFileTool {
     async fn execute(
         &self,
         args: serde_json::Value,
-        _ctx: &ToolContext,
+        ctx: &ToolContext,
     ) -> Result<ToolResult, Box<dyn Error + Send + Sync>> {
         let input: EditArgs = serde_json::from_value(args).map_err(into_tool_error)?;
 
-        let file_path = resolve_safe_path(&self.working_directory, &input.file_path)
-            .map_err(into_tool_error)?;
+        let file_path =
+            resolve_write_path(&self.working_directory, &input.file_path, ctx.enforcement)
+                .await
+                .map_err(into_tool_error)?;
 
         let content = read_text(&file_path).await.map_err(into_tool_error)?;
 
@@ -447,12 +455,14 @@ impl Tool for GlobTool {
     async fn execute(
         &self,
         args: serde_json::Value,
-        _ctx: &ToolContext,
+        ctx: &ToolContext,
     ) -> Result<ToolResult, Box<dyn Error + Send + Sync>> {
         let input: GlobArgs = serde_json::from_value(args).map_err(into_tool_error)?;
 
         let search_dir = if let Some(p) = &input.path {
-            resolve_safe_path(&self.working_directory, p).map_err(into_tool_error)?
+            resolve_read_path(&self.working_directory, p, ctx.enforcement)
+                .await
+                .map_err(into_tool_error)?
         } else {
             self.working_directory.clone()
         };
@@ -462,6 +472,9 @@ impl Tool for GlobTool {
         let paths_str: Vec<String> = paths
             .into_iter()
             .filter(|p| {
+                if ctx.enforcement == gewu_core::types::PathEnforcement::None {
+                    return true;
+                }
                 let normalized = crate::fs_utils::normalize_path(p);
                 normalized.starts_with(&self.working_directory)
             })
@@ -479,6 +492,7 @@ impl Tool for GlobTool {
 mod tests {
     use super::*;
     use anyhow::Result;
+    use gewu_core::types::PathEnforcement;
     use tempfile::tempdir;
     use tokio::fs;
 
@@ -597,6 +611,39 @@ mod tests {
         let content = fs::read_to_string(&file_path).await?;
         assert_eq!(content, "baz bar baz");
 
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn read_file_without_enforcement_reads_outside_root() -> Result<()> {
+        let root = tempdir()?;
+        let outside = tempdir()?;
+        let file_path = outside.path().join("outside.txt");
+        fs::write(&file_path, "outside content").await?;
+
+        let tool = ReadFileTool {
+            working_directory: root.path().to_path_buf(),
+        };
+        let ctx = ToolContext::new("test", "msg").with_enforcement(PathEnforcement::None);
+        let result = tool
+            .execute(
+                serde_json::json!({ "file_path": file_path.to_str().unwrap() }),
+                &ctx,
+            )
+            .await
+            .map_err(|e| anyhow::anyhow!(e.to_string()))?;
+        assert!(result.output.contains("outside content"), "{}", result.output);
+
+        // With containment on, the same request is rejected.
+        let ctx = ToolContext::new("test", "msg").with_enforcement(PathEnforcement::Contain);
+        let result = tool
+            .execute(
+                serde_json::json!({ "file_path": file_path.to_str().unwrap() }),
+                &ctx,
+            )
+            .await;
+        let error = result.unwrap_err().to_string();
+        assert!(error.contains("outside of working directory"), "{error}");
         Ok(())
     }
 }

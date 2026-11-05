@@ -49,7 +49,10 @@ pub use tools::execute_tool_with_panic_recovery;
 
 use crate::middleware::TruncationService;
 use crate::traits::{Experiences, LlmProvider, Memory, RequestLog, Tool, ToolRegistry};
-use crate::types::{AgentEvent, ContentPart, Message, ProviderEvent, ToolContext, ToolResult};
+use crate::types::{
+    AgentEvent, ContentPart, Message, PathEnforcement, ProviderEvent, ToolCall, ToolContext,
+    ToolResult,
+};
 use anyhow::{Context, Result};
 use async_trait::async_trait;
 use futures::{Stream, StreamExt};
@@ -62,6 +65,10 @@ use uuid::Uuid;
 use self::execution::{DoomLoopDetector, LlmResponseAggregator, execute_tool_call};
 use crate::agent::media::extract_media_parts;
 use crate::compaction::{estimate_message_tokens, prune};
+
+/// Maximum number of tool calls from a single LLM turn that execute at the
+/// same time. Extra calls queue behind the semaphore until a slot frees up.
+const MAX_PARALLEL_TOOL_CALLS: usize = 8;
 
 /// The main runtime that orchestrates conversation flow, tool execution, and context management.
 ///
@@ -86,6 +93,8 @@ pub struct Agent {
     truncation: TruncationService,
     /// Unique session identifier.
     session_id: String,
+    /// File-path confinement level passed to tools on every [`ToolContext`].
+    enforcement: PathEnforcement,
     /// Optional experiences store for recording and retrieving past experiences.
     #[allow(dead_code)]
     experiences: Option<Arc<dyn Experiences>>,
@@ -112,6 +121,8 @@ pub struct AgentBuilder {
     experiences: Option<Arc<dyn Experiences>>,
     /// Request log for recording LLM requests (optional).
     log: Option<RequestLog>,
+    /// File-path confinement level passed to tools (defaults to none).
+    enforcement: PathEnforcement,
 }
 
 /// Extracts a readable message from a panic payload.
@@ -149,11 +160,18 @@ impl Default for AgentBuilder {
             context_limit: 128_000,
             experiences: None,
             log: None,
+            enforcement: PathEnforcement::default(),
         }
     }
 }
 
 impl Agent {
+    /// Change behavior while retaining memory and all other runtime state.
+    /// The caller must ensure the agent is idle.
+    pub fn set_profile(&mut self, system_prompt: String, tools: Vec<Arc<dyn Tool>>) {
+        self.system_prompt = system_prompt;
+        self.tools = Arc::new(tools);
+    }
     /// Creates a new `AgentBuilder` for constructing `Agent` instances.
     pub fn builder() -> AgentBuilder {
         AgentBuilder::default()
@@ -182,7 +200,7 @@ impl Agent {
     /// 3. **Compaction check**: If history exceeds token limit, summarize older messages
     /// 4. **LLM request**: Send conversation to LLM with available tools
     /// 5. **Stream response**: Yield content/reasoning deltas as they arrive
-    /// 6. **Tool execution**: For each tool call, execute the tool and add result to history
+    /// 6. **Tool execution**: Execute all requested tool calls concurrently and add each result to history
     /// 7. **Repeat**: Continue from step 3 until LLM produces a final response
     ///
     /// # Arguments
@@ -210,7 +228,6 @@ impl Agent {
 
             let mut turn = 0;
             let mut doom_loop = DoomLoopDetector::new(3);
-            let mut message_id = Uuid::new_v4().to_string();
 
             loop {
                 if self.compact_if_needed().await? {
@@ -228,7 +245,17 @@ impl Agent {
                 prune(self.memory.messages_mut());
 
                 let mut aggregator = LlmResponseAggregator::new();
-                let messages = self.memory.messages().to_vec();
+                let mut messages = self.memory.messages().to_vec();
+                // Persisted history may belong to a different agent profile.
+                // Replace its base system prompt for this provider request,
+                // without rewriting conversation history or accumulating reminders.
+                if !self.system_prompt.is_empty() {
+                    if let Some(Message::System { content }) = messages.first_mut() {
+                        *content = self.system_prompt.clone();
+                    } else {
+                        messages.insert(0, Message::System { content: self.system_prompt.clone() });
+                    }
+                }
                 trace!("LLM request messages: {:?}", messages);
 
                 let tools_clone = self.tools.clone();
@@ -295,42 +322,110 @@ impl Agent {
 
                 info!("Agent requested {} tool calls", tool_calls.len());
 
-                for call in tool_calls {
+                // Results keyed by the original call index. Slots are filled
+                // by spawned tasks (and, for rejected calls, by synthesized
+                // error results) so that EVERY tool call of the turn ends up
+                // with a tool message in history — providers reject
+                // assistant turns whose tool_calls were never answered.
+                let mut results: Vec<Option<anyhow::Result<ToolResult>>> =
+                    (0..tool_calls.len()).map(|_| None).collect();
+
+                // Validate and announce every call first, then execute them
+                // all concurrently. Doom-loop bookkeeping stays sequential so
+                // the detector state matches the old per-call behavior.
+                let mut pending: Vec<(usize, ToolCall, String)> = Vec::new();
+                for (index, call) in tool_calls.iter().enumerate() {
                     let tool_name = call.function.name.clone();
                     let args = call.function.arguments.clone();
-                    let call_id = call.id.clone();
 
                     if let Some(error) = doom_loop.check(&tool_name, &args) {
                         yield AgentEvent::Error { error };
+                        // Close out every tool call of this turn so the
+                        // persisted history has no dangling tool_calls.
+                        for call in &tool_calls {
+                            self.memory.add_message(Message::Tool {
+                                tool_call_id: call.id.clone(),
+                                tool_name: Some(call.function.name.clone()),
+                                content: "Error: not executed because a doom loop was detected \
+                                          and the run was stopped."
+                                    .to_string(),
+                                media: Vec::new(),
+                            })
+                            .await;
+                        }
                         return;
                     }
                     doom_loop.record(tool_name.clone(), args.clone());
 
                     if tool_name.is_empty() {
                         yield AgentEvent::Error { error: "Tool name is empty, skipping execution".to_string() };
+                        results[index] = Some(Ok(ToolResult::new(
+                            tool_name.clone(),
+                            "Error: the tool call had an empty name and was not executed.",
+                        )));
                         continue;
                     }
 
                     yield AgentEvent::ToolStart { tool: tool_name.clone(), input: args.clone() };
+                    pending.push((index, call.clone(), Uuid::new_v4().to_string()));
+                }
 
-                    let ctx = ToolContext::new(&self.session_id, &message_id);
-                    message_id = Uuid::new_v4().to_string();
+                // Execute every pending call in parallel, bounded by a
+                // semaphore so a turn with many calls cannot exhaust system
+                // resources.
+                let semaphore = Arc::new(tokio::sync::Semaphore::new(MAX_PARALLEL_TOOL_CALLS));
+                let mut join_set = tokio::task::JoinSet::new();
+                for (index, call, message_id) in pending {
+                    let tool = self
+                        .tools
+                        .iter()
+                        .find(|t| t.name() == call.function.name)
+                        .cloned();
+                    let session_id = self.session_id.clone();
+                    let enforcement = self.enforcement;
+                    let truncation = self.truncation.clone();
+                    let semaphore = semaphore.clone();
+                    join_set.spawn(async move {
+                        let _permit = semaphore.acquire_owned().await.ok();
+                        let tool_name = call.function.name.clone();
+                        let ctx = ToolContext::new(&session_id, &message_id)
+                            .with_enforcement(enforcement);
+                        let result = if let Some(t) = tool {
+                            execute_tool_call(t, call, ctx, &truncation).await
+                        } else {
+                            Ok(ToolResult::new(
+                                tool_name.clone(),
+                                format!("Tool not found: {}", tool_name),
+                            ))
+                        };
+                        (index, result)
+                    });
+                }
 
-                    let tool = self.tools.iter().find(|t| t.name() == tool_name);
+                // Collect results keyed by the original call index.
+                while let Some(joined) = join_set.join_next().await {
+                    if let Ok((index, result)) = joined {
+                        results[index] = Some(result);
+                    }
+                }
 
-                    let result = if let Some(t) = tool {
-                        match execute_tool_call(t.clone(), call, ctx, &self.truncation).await {
-                            Ok(result) => result,
-                            Err(e) => {
-                                yield AgentEvent::Error { error: e.to_string() };
-                                continue;
-                            }
+                // Apply the results in the original call order so the
+                // conversation history stays deterministic regardless of
+                // completion order.
+                for (call, result) in tool_calls.iter().zip(results) {
+                    let tool_name = call.function.name.clone();
+                    let result = match result {
+                        Some(Ok(result)) => result,
+                        Some(Err(e)) => {
+                            yield AgentEvent::Error { error: e.to_string() };
+                            ToolResult::new(tool_name.clone(), format!("Error: {}", e))
                         }
-                    } else {
-                        ToolResult::new(
+                        // The call's task panicked or was lost; still answer
+                        // the tool_call so history stays consistent.
+                        None => ToolResult::new(
                             tool_name.clone(),
-                            format!("Tool not found: {}", tool_name),
-                        )
+                            "Error: the tool call did not produce a result (execution task failed).",
+                        ),
                     };
 
                     yield AgentEvent::ToolFinish {
@@ -342,8 +437,8 @@ impl Agent {
 
                     let media_parts = extract_media_parts(&result.output);
                     self.memory.add_message(Message::Tool {
-                        tool_call_id: call_id,
-                        tool_name: Some(tool_name.clone()),
+                        tool_call_id: call.id.clone(),
+                        tool_name: Some(tool_name),
                         content: result.output,
                         media: media_parts,
                     }).await;
@@ -446,6 +541,13 @@ impl AgentBuilder {
         self
     }
 
+    /// Sets the file-path confinement level handed to tools on every
+    /// [`ToolContext`]. Defaults to [`PathEnforcement::None`] (no checks).
+    pub fn with_enforcement(mut self, enforcement: PathEnforcement) -> Self {
+        self.enforcement = enforcement;
+        self
+    }
+
     /// Builds the `Agent` instance.
     ///
     /// # Errors
@@ -471,6 +573,7 @@ impl AgentBuilder {
             session_id: Uuid::new_v4().to_string(),
             experiences: self.experiences,
             log: self.log,
+            enforcement: self.enforcement,
         };
         Ok(agent)
     }

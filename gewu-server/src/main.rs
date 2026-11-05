@@ -243,6 +243,7 @@ async fn run(cli: RunArgs) -> Result<()> {
         boot.mcp_tools,
         boot.log_writer,
         boot.skills,
+        boot.enforcement,
     )
     .await?;
     info!("Initialized agent: {}", cli.common.agent);

@@ -147,7 +147,8 @@ impl GuiSession {
                 for summary in sessions.into_iter().rev() {
                     match admin.get_session(&summary.session_id).await {
                         Ok(messages) => {
-                            workspace.open_session(&summary.session_id, &messages);
+                            let id = workspace.open_session(&summary.session_id, &messages);
+                            workspace.tab_mut(id).expect("opened").agent = summary.agent.clone();
                         }
                         Err(e) => {
                             let id = workspace.open_blank();
@@ -448,6 +449,57 @@ impl GuiSession {
         tab_tx: &mpsc::UnboundedSender<TabEvent>,
     ) -> Result<()> {
         match msg {
+            ClientMsg::RevertChat { tab, block, undo } => {
+                let Some(tab_state) = self.workspace.tab(tab) else { return self.send_error(sender, "unknown tab").await; };
+                if tab_state.busy() { return self.send_error(sender, "wait for the current turn to finish").await; }
+                let turn = if let Some(index) = block {
+                    if !matches!(tab_state.model.blocks.get(index), Some(Block::User(_))) { return self.send_error(sender, "not a user message").await; }
+                    Some(tab_state.model.blocks[..index].iter().filter(|b| matches!(b, Block::User(_))).count())
+                } else { None };
+                let session_id = tab_state.model.session_id.clone();
+                if session_id.is_none() { return self.send_error(sender, "no conversation to revert").await; }
+                if let Err(e) = self.ensure_client(tab).await { return self.send_error(sender, e.to_string()).await; }
+                let client = self.client(tab).expect("ensured");
+                if let Err(e) = client.usage(session_id.as_deref()).await { return self.send_error(sender, e.to_string()).await; }
+                match client.revert_chat(turn, undo).await {
+                    Ok((id, messages)) => {
+                        let tab_state = self.workspace.tab_mut(tab).expect("known");
+                        tab_state.model.load_history(&messages);
+                        tab_state.model.set_session(Some(id));
+                        tab_state.model.note("Conversation updated. Workspace files were NOT undone.");
+                        tab_state.expanded_groups.clear();
+                        tab_state.expanded_outputs.clear();
+                        tab_state.context = None;
+                        if self.workspace.active_id() == tab { self.send_active_full(sender).await?; }
+                    }
+                    Err(e) => self.send_error(sender, e.to_string()).await?,
+                }
+            }
+            ClientMsg::SwitchAgent { tab, agent } => {
+                if !["build", "plan"].contains(&agent.as_str()) { return self.send_error(sender, "unknown mode").await; }
+                if self.workspace.tab(tab).is_none_or(|tab| tab.busy()) { return self.send_error(sender, "wait for the current turn to finish").await; }
+                if let Err(e) = self.ensure_client(tab).await { return self.send_error(sender, e.to_string()).await; }
+                let client = self.client(tab).expect("ensured");
+                // Bind resumed tabs before switching so their conversation is retained.
+                if let Some(id) = self.workspace.tab(tab).and_then(|tab| tab.model.session_id.clone()) {
+                    if let Err(e) = client.usage(Some(&id)).await { return self.send_error(sender, e.to_string()).await; }
+                }
+                match client.switch_agent(agent.clone()).await {
+                    Ok((id, tools)) => {
+                        let tab_state = self.workspace.tab_mut(tab).expect("known tab");
+                        tab_state.model.set_session(Some(id));
+                        tab_state.agent = agent;
+                        self.tools = Ok(tools);
+                        if self.workspace.active_id() == tab {
+                            self.send_status(sender).await?;
+                            send_msg(sender, &ServerMsg::Tools {
+                                html: view::sidebar_tools_content_html(&self.tools),
+                            }).await?;
+                        }
+                    }
+                    Err(e) => self.send_error(sender, e.to_string()).await?,
+                }
+            }
             // Auth is consumed by the transport before the session starts.
             ClientMsg::Auth { .. } => {}
             ClientMsg::Ask { tab, prompt } => {

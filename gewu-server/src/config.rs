@@ -3,6 +3,7 @@ use serde::Deserialize;
 use std::path::PathBuf;
 use tracing::warn;
 
+use gewu_core::types::PathEnforcement;
 use gewu_tools::mcp::types::McpServerConfig;
 
 #[derive(Debug, Deserialize, Default)]
@@ -20,6 +21,12 @@ pub struct Config {
     /// Optional directories to scan for skills (files named `SKILL.md`).
     #[serde(default)]
     pub skills: Option<Vec<String>>,
+    /// File-path confinement for tools and file-tree operations:
+    /// `"none"` (default) applies no checks, `"contain"` rejects paths that
+    /// escape the working directory, `"strict"` also canonicalizes and
+    /// rejects symlinks.
+    #[serde(default)]
+    pub sandbox: PathEnforcement,
     #[serde(rename = "mcpServers", default)]
     pub mcp_servers: std::collections::HashMap<String, McpServerConfig>,
 }
@@ -142,5 +149,24 @@ mod tests {
     fn skills_is_optional() {
         let config: Config = serde_json::from_str("{}").unwrap();
         assert!(config.skills.is_none());
+    }
+
+    #[test]
+    fn sandbox_defaults_to_no_enforcement() {
+        let config: Config = serde_json::from_str("{}").unwrap();
+        assert_eq!(config.sandbox, PathEnforcement::None);
+    }
+
+    #[test]
+    fn parses_sandbox_levels() {
+        for (text, expected) in [
+            (r#""none""#, PathEnforcement::None),
+            (r#""contain""#, PathEnforcement::Contain),
+            (r#""strict""#, PathEnforcement::Strict),
+        ] {
+            let config: Config = serde_json::from_str(&format!("{{\"sandbox\": {text}}}")).unwrap();
+            assert_eq!(config.sandbox, expected, "parsing {text}");
+        }
+        assert!(serde_json::from_str::<Config>("{\"sandbox\": \"yolo\"}").is_err());
     }
 }

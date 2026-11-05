@@ -44,6 +44,8 @@ pub trait AgentFactory: Send + Sync {
 pub struct TaskTool {
     factory: Arc<dyn AgentFactory>,
     description: String,
+    /// Subagent types this tool may launch; enforced in `execute`.
+    allowed: Vec<String>,
 }
 
 #[derive(Deserialize)]
@@ -75,7 +77,10 @@ fn schema() -> RootSchema {
 
 impl TaskTool {
     /// Creates a task tool. `agents` is the (name, description) list
-    /// rendered into the tool description.
+    /// rendered into the tool description. The same list is enforced as an
+    /// allow-list: calls with any other `subagent_type` are rejected with an
+    /// error result, so restricting the list (e.g. to read-only agents)
+    /// actually restricts delegation.
     pub fn new(factory: Arc<dyn AgentFactory>, agents: Vec<(String, String)>) -> Self {
         let agent_list = agents
             .iter()
@@ -84,9 +89,11 @@ impl TaskTool {
             .join("\n");
 
         let description = include_str!("prompts/task.txt").replace("{agents}", &agent_list);
+        let allowed = agents.into_iter().map(|(name, _)| name).collect();
         Self {
             factory,
             description,
+            allowed,
         }
     }
 }
@@ -111,6 +118,17 @@ impl Tool for TaskTool {
         _ctx: &ToolContext,
     ) -> Result<ToolResult, Box<dyn Error + Send + Sync>> {
         let input: TaskArgs = serde_json::from_value(args)?;
+
+        if !self.allowed.iter().any(|name| name == &input.subagent_type) {
+            return Ok(ToolResult::new(
+                "task",
+                format!(
+                    "Error: subagent type '{}' is not available. Available subagents: {}.",
+                    input.subagent_type,
+                    self.allowed.join(", ")
+                ),
+            ));
+        }
 
         let (mut agent, session_id) = self
             .factory
@@ -347,12 +365,30 @@ mod tests {
         factory.fail_create = true;
         let tool = make_tool(Arc::new(factory));
 
+        // "build" is advertised, so the call reaches the factory and its
+        // failure surfaces.
         let error = tool
-            .execute(args("Check", "nope", None), &ToolContext::new("s", "m"))
+            .execute(args("Check", "build", None), &ToolContext::new("s", "m"))
             .await
             .expect_err("factory error should surface");
 
         assert!(error.to_string().contains("Failed to create agent"));
+    }
+
+    #[tokio::test]
+    async fn task_rejects_unadvertised_subagent_type() {
+        let factory = Arc::new(MockFactory::new(content_finish_events()));
+        let tool = make_tool(factory.clone());
+
+        let result = tool
+            .execute(args("Check", "general", None), &ToolContext::new("s", "m"))
+            .await
+            .expect("unadvertised type should be an error result, not a stream failure");
+
+        assert!(result.output.contains("not available"));
+        assert!(result.output.contains("explore"));
+        // The factory must never be asked to create the denied agent.
+        assert!(factory.requests.lock().unwrap().is_empty());
     }
 
     #[tokio::test]

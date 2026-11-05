@@ -9,6 +9,7 @@
 //! - [`Capabilities`] - Model capabilities for input/output modalities
 //! - [`ToolResult`] - Structured result from tool execution
 //! - [`ToolContext`] - Execution context passed to tools
+//! - [`PathEnforcement`] - File-path confinement level for tools
 //! - [`FileAttachment`] - File attachment in tool results
 //! - [`TruncationResult`] - Result of output truncation
 
@@ -263,12 +264,34 @@ impl ToolResult {
     }
 }
 
+/// How strictly file-touching tools confine paths to the working directory.
+///
+/// The level is server configuration (config key `sandbox`), travels to tools
+/// on [`ToolContext`], and defaults to [`PathEnforcement::None`] — paths are
+/// used as provided with no containment checks.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum PathEnforcement {
+    /// No checks: relative paths are joined to the working directory and
+    /// absolute paths are used as-is.
+    #[default]
+    None,
+    /// Lexical containment: `.`/`..` are normalized and paths that resolve
+    /// outside the working directory are rejected. Symlinks are followed.
+    Contain,
+    /// Containment plus canonicalization and symlink-component rejection;
+    /// resolved paths must land inside the real (canonicalized) root.
+    Strict,
+}
+
 #[derive(Clone, Debug)]
 pub struct ToolContext {
     pub session_id: String,
     pub message_id: String,
     pub abort: Arc<std::sync::atomic::AtomicBool>,
     pub metadata: std::collections::HashMap<String, serde_json::Value>,
+    /// File-path confinement level for this execution.
+    pub enforcement: PathEnforcement,
 }
 
 impl ToolContext {
@@ -278,7 +301,14 @@ impl ToolContext {
             message_id: message_id.into(),
             abort: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             metadata: Default::default(),
+            enforcement: PathEnforcement::default(),
         }
+    }
+
+    /// Returns the context with a different path-enforcement level.
+    pub fn with_enforcement(mut self, enforcement: PathEnforcement) -> Self {
+        self.enforcement = enforcement;
+        self
     }
 
     pub fn is_aborted(&self) -> bool {

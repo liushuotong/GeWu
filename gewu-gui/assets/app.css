@@ -455,11 +455,41 @@ body {
   position: relative;
   width: fit-content;
   max-width: min(82%, 64ch);
-  padding: 8px 14px 8px 30px;
+  padding: 8px 36px 8px 30px;
   background: linear-gradient(180deg, rgba(79, 209, 197, 0.07), rgba(79, 209, 197, 0.035));
   border: 1px solid rgba(79, 209, 197, 0.2);
   border-radius: 8px 8px 2px 8px;
   color: var(--text);
+}
+
+.block.user .body.plain {
+  transition: background 0.12s, border-color 0.12s;
+}
+
+.block.user:hover .body.plain,
+.block.user:focus-within .body.plain,
+.block.user:has(.message-menu-trigger[aria-expanded="true"]) .body.plain {
+  background: var(--bg-hover);
+  border-color: var(--accent-dim);
+}
+
+.message-menu-trigger::after {
+  content: "⋯";
+  position: absolute;
+  top: 8px;
+  right: 12px;
+  z-index: 2;
+  color: var(--accent);
+  font: 16px/1 var(--mono);
+  opacity: 0;
+  pointer-events: none;
+  transition: opacity 0.12s;
+}
+
+.block.user:hover .message-menu-trigger::after,
+.block.user:focus-within .message-menu-trigger::after,
+.message-menu-trigger[aria-expanded="true"]::after {
+  opacity: 1;
 }
 
 .block.user .body.plain::before {
@@ -1354,6 +1384,18 @@ body {
 }
 
 /* -- sidebar ----------------------------------------------------------- */
+.block.user { position: relative; }
+.message-menu-trigger { position: absolute; inset: 0; width: 100%; background: transparent; border: 0; cursor: pointer; }
+.block.user .body { position: relative; z-index: 1; pointer-events: auto; }
+.message-menu-trigger:focus-visible { outline: 2px solid var(--accent); border-radius: 4px; }
+.message-menu { position: absolute; right: 0; top: 100%; z-index: 10; min-width: 150px; padding: 6px; background: var(--bg-panel); border: 1px solid var(--line); border-radius: 5px; box-shadow: 0 6px 18px rgba(0,0,0,.35); }
+.message-menu[hidden] { display: none; }
+.message-menu .chat-revert { width: 100%; text-align: left; }
+.chat-revert { background: transparent; color: var(--text-dim); border: 1px solid var(--line); border-radius: 3px; font: 11px var(--mono); padding: 3px 6px; cursor: pointer; }
+.chat-revert:hover { color: var(--accent); border-color: var(--accent); }
+.mode-button { background: transparent; border: 1px solid var(--line); color: var(--text-dim); font: inherit; cursor: pointer; border-radius: 3px; }
+.mode-button[aria-pressed="true"] { color: var(--accent); border-color: var(--accent); }
+.mode-button:disabled { opacity: .5; cursor: default; }
 
 .sidebar {
   grid-row: 1 / -1;
@@ -1426,10 +1468,6 @@ body {
   text-transform: uppercase;
 }
 
-.side-count {
-  color: var(--text-dim);
-}
-
 .side-list {
   margin: 0;
   padding: 0;
@@ -1449,17 +1487,6 @@ body {
 
 .side-note.error {
   color: var(--error);
-}
-
-/* The working directory section pinned to the bottom of the sidebar. */
-.side-section.side-cwd {
-  margin-top: auto;
-  padding-top: 16px;
-}
-
-.side-path {
-  color: var(--text-dim);
-  overflow-wrap: anywhere;
 }
 
 .tree-toolbar { display: flex; align-items: flex-start; justify-content: space-between; gap: 8px; margin-bottom: 6px; }

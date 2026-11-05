@@ -21,7 +21,6 @@
 //! | [`CodeSearchTool`](search::CodeSearchTool) | `codesearch` | Search code semantically |
 //! | [`TodoReadTool`](todo::TodoReadTool) | `todoread` | Read the task list |
 //! | [`TodoWriteTool`](todo::TodoWriteTool) | `todowrite` | Write the task list |
-//! | [`BatchTool`](batch::BatchTool) | `batch` | Execute multiple tools at once |
 //! | [`TaskTool`](task::TaskTool) | `task` | Launch sub-agents for complex tasks |
 //! | [`SkillTool`](skill::SkillTool) | `skill` | Load skill instructions into the conversation |
 //!
@@ -57,7 +56,6 @@
 
 pub mod apply_patch;
 pub mod bash;
-pub mod batch;
 pub mod fs;
 pub mod fs_utils;
 pub mod grep;
@@ -72,7 +70,6 @@ pub mod web_fetch;
 
 pub use apply_patch::ApplyPatchTool;
 pub use bash::BashTool;
-pub use batch::BatchTool;
 pub use fs::{EditFileTool, GlobTool, ReadFileTool, WriteFileTool};
 pub use grep::GrepTool;
 pub use list::ListTool;

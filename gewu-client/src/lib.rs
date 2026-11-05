@@ -122,6 +122,22 @@ pub struct AskBuilder<'a> {
 }
 
 impl Client {
+    pub async fn revert_chat(&self, turn: Option<usize>, undo: bool) -> Result<(String, Vec<Message>)> {
+        match self.request(ClientRequest::revert_chat(self.next_correlation_id(), turn, undo)).await? {
+            ServerMessage::Session { session_id, messages, .. } => Ok((session_id, messages)),
+            ServerMessage::Error { error, .. } => Err(Error::Server(error)),
+            other => Err(unexpected(other, "session")),
+        }
+    }
+    /// Switch profiles on an idle session, retaining its stored history.
+    pub async fn switch_agent(&self, agent: impl Into<String>) -> Result<(String, Vec<String>)> {
+        let request = ClientRequest::switch_agent(self.next_correlation_id(), agent);
+        match self.request(request).await? {
+            ServerMessage::AgentSwitched { session_id, tools, .. } => Ok((session_id, tools)),
+            ServerMessage::Error { error, .. } => Err(Error::Server(error)),
+            other => Err(unexpected(other, "agent_switched")),
+        }
+    }
     /// Connect over TCP (newline-delimited JSON; the server listens on
     /// port 8421 by default).
     pub async fn tcp(host: &str, port: u16) -> Result<Self> {

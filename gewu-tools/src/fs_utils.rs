@@ -7,6 +7,7 @@
 #![allow(dead_code)]
 #![allow(clippy::collapsible_if)]
 use anyhow::{Context, Result};
+use gewu_core::types::PathEnforcement;
 use mime_guess;
 use serde::{Serialize, de::DeserializeOwned};
 use std::io::ErrorKind;
@@ -185,6 +186,41 @@ pub async fn resolve_safe_write_path(
     }
 
     anyhow::bail!("Unable to resolve a safe parent for {:?}", path)
+}
+
+/// Joins a user path to the root with no containment checks. Relative paths
+/// are joined; absolute paths replace the root entirely. The result is
+/// normalized lexically (`.`/`..` resolved).
+pub fn resolve_unchecked(root: impl AsRef<Path>, user_path: impl AsRef<Path>) -> PathBuf {
+    normalize_path(&root.as_ref().join(user_path))
+}
+
+/// Resolves a path that is read or must already exist, honoring the
+/// configured [`PathEnforcement`] level.
+pub async fn resolve_read_path(
+    root: impl AsRef<Path>,
+    user_path: impl AsRef<Path>,
+    enforcement: PathEnforcement,
+) -> Result<PathBuf> {
+    match enforcement {
+        PathEnforcement::None => Ok(resolve_unchecked(root, user_path)),
+        PathEnforcement::Contain => resolve_safe_path(root, user_path),
+        PathEnforcement::Strict => resolve_safe_existing_path(root, user_path).await,
+    }
+}
+
+/// Resolves a path that may be created or overwritten, honoring the
+/// configured [`PathEnforcement`] level.
+pub async fn resolve_write_path(
+    root: impl AsRef<Path>,
+    user_path: impl AsRef<Path>,
+    enforcement: PathEnforcement,
+) -> Result<PathBuf> {
+    match enforcement {
+        PathEnforcement::None => Ok(resolve_unchecked(root, user_path)),
+        PathEnforcement::Contain => resolve_safe_path(root, user_path),
+        PathEnforcement::Strict => resolve_safe_write_path(root, user_path).await,
+    }
 }
 
 /// Checks if a path exists.
@@ -512,5 +548,62 @@ mod tests {
         // Relative path should work
         let result = resolve_safe_path(root, "home");
         assert!(result.is_ok());
+    }
+
+    #[tokio::test]
+    async fn enforcement_levels_control_containment() -> Result<()> {
+        let dir = tempdir()?;
+        let outside = tempdir()?;
+        let outside_file = outside.path().join("secret.txt");
+        fs::write(&outside_file, "secret").await?;
+
+        // None: paths resolve as given, even outside the root.
+        let resolved = resolve_read_path(dir.path(), &outside_file, PathEnforcement::None).await?;
+        assert_eq!(resolved, fs::canonicalize(&outside_file).await?);
+        assert_eq!(
+            resolve_unchecked(dir.path(), "../sibling.txt"),
+            dir.path().parent().unwrap().join("sibling.txt")
+        );
+        let written = resolve_write_path(dir.path(), "../new.txt", PathEnforcement::None).await?;
+        assert_eq!(
+            written,
+            dir.path().parent().unwrap().join("new.txt")
+        );
+
+        // Contain: outside absolutes and traversal rejected.
+        assert!(
+            resolve_read_path(dir.path(), &outside_file, PathEnforcement::Contain)
+                .await
+                .is_err()
+        );
+        assert!(
+            resolve_write_path(dir.path(), "../escape.txt", PathEnforcement::Contain)
+                .await
+                .is_err()
+        );
+        assert!(
+            resolve_read_path(dir.path(), &outside_file, PathEnforcement::Strict)
+                .await
+                .is_err()
+        );
+
+        #[cfg(unix)]
+        {
+            let link = dir.path().join("link");
+            std::os::unix::fs::symlink(outside.path(), &link)?;
+            // Contain is lexical only: it follows a symlink out of the root.
+            assert!(
+                resolve_read_path(dir.path(), "link/secret.txt", PathEnforcement::Contain)
+                    .await
+                    .is_ok()
+            );
+            // Strict rejects the symlinked component.
+            assert!(
+                resolve_read_path(dir.path(), "link/secret.txt", PathEnforcement::Strict)
+                    .await
+                    .is_err()
+            );
+        }
+        Ok(())
     }
 }

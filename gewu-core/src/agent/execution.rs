@@ -161,6 +161,10 @@ impl LlmResponseAggregator {
 /// 3. Truncates the output if necessary
 /// 4. Returns the tool result with its output truncated if necessary
 ///
+/// Failures are reported as error `ToolResult`s (never `Err`) so the caller
+/// always records a tool message for every tool call — an assistant turn with
+/// unanswered `tool_calls` is rejected by strict providers.
+///
 /// # Arguments
 ///
 /// * `tool` - The tool to execute
@@ -170,7 +174,7 @@ impl LlmResponseAggregator {
 ///
 /// # Returns
 ///
-/// The tool result, or an error if argument parsing failed
+/// The tool result; argument-parse failures come back as an error result
 pub(super) async fn execute_tool_call(
     tool: std::sync::Arc<dyn Tool>,
     call: ToolCall,
@@ -180,8 +184,20 @@ pub(super) async fn execute_tool_call(
     let tool_name = tool.name().to_string();
     let args = call.function.arguments;
 
-    let args_val: serde_json::Value = serde_json::from_str(&args)
-        .map_err(|e| anyhow::anyhow!("Failed to parse arguments: {}", e))?;
+    let args_val: serde_json::Value = match serde_json::from_str(&args) {
+        Ok(value) => value,
+        Err(e) => {
+            warn!("Tool '{}' received invalid arguments: {}", tool_name, e);
+            return Ok(ToolResult::new(
+                tool_name,
+                format!(
+                    "Error: invalid arguments ({}). The arguments must be a valid JSON object \
+                     matching the tool's input schema. Re-issue the call with corrected arguments.",
+                    e
+                ),
+            ));
+        }
+    };
 
     match execute_tool_with_panic_recovery(tool, args_val, ctx).await {
         Ok(mut res) => {

@@ -56,12 +56,15 @@ pub use gewu_core::types::{AgentEvent, ContentPart, FunctionCall, Message, ToolC
 /// Operations a client can request.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Op {
+    RevertChat { turn: Option<usize>, undo: bool },
     /// Run an agent turn with the given prompt; events stream back.
     Ask { prompt: String },
     /// Interrupt the currently running `ask` on this connection, if any.
     Interrupt,
     /// List the tool names available to the agent.
     ListTools,
+    /// Explicitly change the active profile without replacing the conversation.
+    SwitchAgent { agent: String },
     /// List visible files and directories directly within a working-directory path.
     ListFiles { path: String },
     /// Read a bounded text file within the working directory.
@@ -112,6 +115,8 @@ impl Serialize for ClientRequest {
     fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
         use serde::ser::SerializeMap;
         let extra = self.session_id.is_some() as usize
+            + if matches!(self.op, Op::RevertChat { .. }) { 2 } else { 0 }
+            + matches!(self.op, Op::SwitchAgent { .. }) as usize
             + self.agent.is_some() as usize
             + matches!(
                 self.op,
@@ -120,6 +125,15 @@ impl Serialize for ClientRequest {
         let mut map = serializer.serialize_map(Some(2 + extra))?;
         map.serialize_entry("id", &self.id)?;
         match &self.op {
+            Op::RevertChat { turn, undo } => {
+                map.serialize_entry("op", "revert_chat")?;
+                map.serialize_entry("turn", turn)?;
+                map.serialize_entry("undo", undo)?;
+            }
+            Op::SwitchAgent { agent } => {
+                map.serialize_entry("op", "switch_agent")?;
+                map.serialize_entry("target_agent", agent)?;
+            }
             Op::Ask { prompt } => {
                 map.serialize_entry("op", "ask")?;
                 map.serialize_entry("prompt", prompt)?;
@@ -157,6 +171,12 @@ impl Serialize for ClientRequest {
 }
 
 impl ClientRequest {
+    pub fn revert_chat(id: impl Into<Value>, turn: Option<usize>, undo: bool) -> Self {
+        Self::simple(id, Op::RevertChat { turn, undo })
+    }
+    pub fn switch_agent(id: impl Into<Value>, agent: impl Into<String>) -> Self {
+        Self::simple(id, Op::SwitchAgent { agent: agent.into() })
+    }
     /// Build an `ask` request.
     pub fn ask(id: impl Into<Value>, prompt: impl Into<String>) -> Self {
         Self {
@@ -319,6 +339,17 @@ pub fn parse_request(line: &str) -> Result<ClientRequest, RequestError> {
         .ok_or_else(|| RequestError::Invalid("missing required field 'op'".to_string()))?;
 
     let op = match op_str {
+        "revert_chat" => {
+            let turn = match obj.get("turn") {
+                None | Some(Value::Null) => None,
+                Some(value) => Some(value.as_u64().and_then(|n| usize::try_from(n).ok()).ok_or_else(|| RequestError::Invalid("turn must be a nonnegative integer".into()))?),
+            };
+            let undo = match obj.get("undo") { None => false, Some(value) => value.as_bool().ok_or_else(|| RequestError::Invalid("undo must be boolean".into()))? };
+            Op::RevertChat { turn, undo }
+        }
+        "switch_agent" => Op::SwitchAgent {
+            agent: obj.get("target_agent").and_then(Value::as_str).ok_or_else(|| RequestError::Invalid("switch_agent requires target_agent".into()))?.to_string(),
+        },
         "ask" => {
             let prompt = obj
                 .get("prompt")
@@ -416,6 +447,8 @@ pub fn agent_event_to_value(event: &AgentEvent) -> Value {
 /// Summary of one persisted conversation session.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct SessionSummary {
+    #[serde(default = "default_agent_name")]
+    pub agent: String,
     /// Server session id, usable to resume the conversation.
     pub session_id: String,
     /// Number of stored messages.
@@ -423,6 +456,8 @@ pub struct SessionSummary {
     /// Human-readable time of the most recent message.
     pub updated_at: String,
 }
+
+fn default_agent_name() -> String { "build".into() }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct FileEntry {
@@ -434,6 +469,7 @@ pub struct FileEntry {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum ServerMessage {
+    AgentSwitched { id: Value, session_id: String, agent: String, tools: Vec<String> },
     /// Sent when an `ask` begins; carries the server-assigned request id
     /// and the session handling the request.
     Ready {
@@ -591,6 +627,7 @@ impl ServerMessage {
     /// The message's `"type"` tag, e.g. `"event"`, `"result"`, `"error"`.
     pub fn kind(&self) -> &'static str {
         match self {
+            ServerMessage::AgentSwitched { .. } => "agent_switched",
             ServerMessage::Ready { .. } => "ready",
             ServerMessage::Event { .. } => "event",
             ServerMessage::Result { .. } => "result",
@@ -616,6 +653,7 @@ impl ServerMessage {
     /// are emitted by the background ask task; those return `None` here.
     pub fn correlation_id(&self) -> Option<&Value> {
         match self {
+            ServerMessage::AgentSwitched { id, .. } => Some(id),
             ServerMessage::Ready { id, .. }
             | ServerMessage::Pong { id }
             | ServerMessage::Info { id, .. }
@@ -652,6 +690,26 @@ impl ServerMessage {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn chat_revert_requests_round_trip() {
+        for (turn, undo) in [(None, false), (Some(2), false), (None, true)] {
+            let request = ClientRequest::revert_chat(1, turn, undo);
+            assert_eq!(parse_request(&request.to_line()).unwrap(), request);
+        }
+        assert!(parse_request(r#"{"id":1,"op":"revert_chat","turn":-1}"#).is_err());
+    }
+
+    #[test]
+    fn switch_agent_round_trip() {
+        let request = ClientRequest::switch_agent(7, "plan");
+        assert_eq!(parse_request(&request.to_line()).unwrap(), request);
+        assert!(parse_request(r#"{"id":1,"op":"switch_agent"}"#).is_err());
+        let reply = ServerMessage::AgentSwitched { id: 7.into(), session_id: "s".into(), agent: "plan".into(), tools: vec![] };
+        assert_eq!(reply.kind(), "agent_switched");
+        assert_eq!(reply.correlation_id(), Some(&Value::from(7)));
+        assert_eq!(serde_json::from_str::<ServerMessage>(&reply.to_line()).unwrap(), reply);
+    }
 
     #[test]
     fn parses_ask_request() {
@@ -827,6 +885,7 @@ mod tests {
     #[test]
     fn history_replies_round_trip() {
         let summary = SessionSummary {
+            agent: "build".into(),
             session_id: "s1".into(),
             message_count: 3,
             updated_at: "now".into(),

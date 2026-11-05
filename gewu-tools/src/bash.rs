@@ -62,7 +62,7 @@ impl Tool for BashTool {
     async fn execute(
         &self,
         args: serde_json::Value,
-        _ctx: &ToolContext,
+        ctx: &ToolContext,
     ) -> Result<ToolResult, Box<dyn Error + Send + Sync>> {
         let input: BashArgs = serde_json::from_value(args).map_err(|e| anyhow::anyhow!(e))?;
 
@@ -108,7 +108,8 @@ impl Tool for BashTool {
         }
 
         let work_dir = if let Some(wd) = &input.workdir {
-            crate::fs_utils::resolve_safe_path(&self.working_directory, wd)
+            crate::fs_utils::resolve_read_path(&self.working_directory, wd, ctx.enforcement)
+                .await
                 .map_err(|e| anyhow::anyhow!(e))?
         } else {
             self.working_directory.clone()

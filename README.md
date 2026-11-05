@@ -52,7 +52,6 @@ GeWu (格物) is a comprehensive framework for building and deploying AI agents.
 │ - fs ops   │  └──────────┘  └────────────┘  └────────────┘
 │ - grep     │
 │ - search   │
-│ - batch    │
 └────────────┘
 
 ┌────────────┐  ┌────────────┐  ┌─────────────────┐  ┌────────────────┐
@@ -74,6 +73,7 @@ The CLI provides pre-configured agent types optimized for different use cases:
 | **build** | Default agent for software engineering tasks | Off | All tools including bash, file edit, task management |
 | **explore** | Fast agent for exploring codebases | On | Read-only tools, restricted bash |
 | **general** | General-purpose agent for research and multi-step tasks | Off | All tools including task management |
+| **plan** | Read-only planning agent for discussing implementation plans | Off | Read-only tools, full bash (prompt-restricted to read-only), explore-only delegation |
 
 ## Built-in Tools
 
@@ -91,7 +91,6 @@ The CLI provides pre-configured agent types optimized for different use cases:
 | Code Search | `codesearch` | Search code using semantic search |
 | Todo Read | `todoread` | Read the task list |
 | Todo Write | `todowrite` | Write/update the task list |
-| Batch | `batch` | Execute multiple tools in parallel |
 | Task | `task` | Launch sub-agents (build/explore/general) for complex tasks; resumable via `task_id` |
 | Skill | `skill` | Load skill instructions from config-declared skill directories into the conversation |
 

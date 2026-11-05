@@ -17,6 +17,7 @@ const MAX_LABEL: usize = 16;
 /// One tab: a conversation plus its view state.
 #[derive(Debug)]
 pub struct Tab {
+    pub agent: String,
     /// Stable id, unaffected by closing other tabs.
     pub id: u64,
     pub model: SessionModel,
@@ -33,6 +34,7 @@ pub struct Tab {
 impl Tab {
     fn new(id: u64) -> Self {
         Self {
+            agent: "build".into(),
             id,
             model: SessionModel::new(),
             model_label: None,

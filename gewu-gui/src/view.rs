@@ -80,6 +80,9 @@ fn render_block(out: &mut String, block: &Block, index: usize, streaming: bool) 
     };
     let _ = writeln!(out, "<div class=\"block {class}\" data-block=\"{index}\">");
     write_block_body(out, block, streaming);
+    if matches!(block, Block::User(_)) {
+        let _ = write!(out, "<button type=\"button\" class=\"message-menu-trigger\" aria-label=\"Message actions\" aria-haspopup=\"menu\" aria-expanded=\"false\" aria-controls=\"message-menu-{index}\"></button><div id=\"message-menu-{index}\" class=\"message-menu\" role=\"menu\" hidden><button type=\"button\" role=\"menuitem\" class=\"chat-revert\" data-revert-block=\"{index}\" title=\"Revert conversation from here; files are not undone\">Revert chat</button></div>");
+    }
     out.push_str("</div>\n");
 }
 
@@ -398,7 +401,11 @@ fn format_k(tokens: u64) -> String {
 /// The status line: a telemetry strip with phase, model, key hints,
 /// and a context gauge on the right.
 pub fn status_html(tab: &Tab) -> String {
+    // Mode controls are rendered with status updates, including busy changes.
     let mut out = String::from("<div class=\"status-inner\">");
+    for mode in ["build", "plan"] {
+        let _ = write!(out, "<button type=\"button\" class=\"mode-button\" data-mode=\"{mode}\" aria-pressed=\"{}\" {}>{mode}</button>", tab.agent == mode, if tab.busy() { "disabled" } else { "" });
+    }
     match tab.model.phase {
         Phase::Idle => out.push_str("<span class=\"phase\"><i class=\"dot\"></i>idle</span>"),
         Phase::Busy => {
@@ -439,55 +446,7 @@ pub fn status_html(tab: &Tab) -> String {
     out
 }
 
-/// The right sidebar: the tools available to the agent, or why they are not,
-/// and the working directory pinned to the bottom.
-pub fn sidebar_html(
-    tools: &Result<Vec<String>, String>,
-    working_directory: Option<&str>,
-) -> String {
-    let mut out = String::from("<section class=\"side-section\">");
-    match tools {
-        Ok(tools) => {
-            let _ = write!(
-                out,
-                "<h2 class=\"side-title\">tools<span class=\"side-count\">{}</span></h2>",
-                tools.len()
-            );
-            if tools.is_empty() {
-                out.push_str("<p class=\"side-note\">no tools</p>");
-            } else {
-                out.push_str("<ul class=\"side-list\">");
-                for name in tools {
-                    let _ = write!(out, "<li>{}</li>", escape(name));
-                }
-                out.push_str("</ul>");
-            }
-        }
-        Err(e) => {
-            out.push_str("<h2 class=\"side-title\">tools</h2>");
-            let _ = write!(
-                out,
-                "<p class=\"side-note error\">tools unavailable: {}</p>",
-                escape(e)
-            );
-        }
-    }
-    out.push_str("</section>");
-    if let Some(dir) = working_directory {
-        let _ = write!(
-            out,
-            "<section class=\"side-section side-cwd\" title=\"{}\">
-             <h2 class=\"side-title\">cwd</h2>
-             <p class=\"side-note side-path\">{}</p>
-             </section>",
-            escape(dir),
-            escape(dir)
-        );
-    }
-    out
-}
-
-fn sidebar_tools_content_html(tools: &Result<Vec<String>, String>) -> String {
+pub fn sidebar_tools_content_html(tools: &Result<Vec<String>, String>) -> String {
     let mut out = String::from("<section class=\"side-section\">");
     match tools {
         Ok(tools) if tools.is_empty() => out.push_str("<p class=\"side-note\">no tools</p>"),
@@ -637,9 +596,9 @@ mod tests {
 
     #[test]
     fn sidebar_lists_escaped_tool_names() {
-        let html = sidebar_html(&Ok(vec!["read".into(), "<bad>".into()]), None);
+        let html = sidebar_tools_content_html(&Ok(vec!["read".into(), "<bad>".into()]));
         assert!(
-            html.contains("<span class=\"side-count\">2</span>"),
+            html.contains("2 available"),
             "{html}"
         );
         assert!(html.contains("<li>read</li>"), "{html}");
@@ -649,29 +608,14 @@ mod tests {
 
     #[test]
     fn sidebar_reports_unavailable_tools() {
-        let html = sidebar_html(&Err("boom <x>".into()), None);
+        let html = sidebar_tools_content_html(&Err("boom <x>".into()));
         assert!(html.contains("tools unavailable: boom &lt;x&gt;"), "{html}");
         assert!(!html.contains("<ul"), "{html}");
     }
 
     #[test]
-    fn sidebar_shows_working_directory_last() {
-        let html = sidebar_html(&Ok(vec!["read".into()]), Some("/home/kzhang/dev/GeWu"));
-        assert!(html.contains("side-cwd"), "{html}");
-        assert!(
-            html.contains("side-path\">/home/kzhang/dev/GeWu</p>"),
-            "{html}"
-        );
-        assert!(html.contains("title=\"/home/kzhang/dev/GeWu\""), "{html}");
-        // The cwd section renders after the tools section.
-        let tools_pos = html.find("tools").unwrap();
-        let cwd_pos = html.find("side-cwd").unwrap();
-        assert!(tools_pos < cwd_pos, "{html}");
-    }
-
-    #[test]
     fn sidebar_escapes_working_directory() {
-        let html = sidebar_html(&Ok(vec![]), Some("/tmp/<bad>&dir"));
+        let html = file_tree_html(Some("/tmp/<bad>&dir"), &BTreeSet::new(), &BTreeMap::new());
         assert!(html.contains("/tmp/&lt;bad&gt;&amp;dir"), "{html}");
         assert!(!html.contains("<bad>"), "{html}");
     }

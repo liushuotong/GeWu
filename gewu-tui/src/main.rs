@@ -253,7 +253,7 @@ async fn activate_tab(
         app.note(format!("context usage unavailable: {e}"));
         return;
     }
-    let client = conns
+                                             let client = conns
         .get(&tab_id)
         .and_then(|conn| conn.client.as_ref())
         .expect("just ensured");
@@ -416,8 +416,37 @@ async fn run(
                                             let client = conns
                                                 .get(&tab_id)
                                                 .and_then(|conn| conn.client.as_ref())
-                                                .expect("just ensured");
-                                            let mut builder = client.ask(prompt.clone());
+                                                 .expect("just ensured");
+                                             if prompt == "/undo" || prompt == "/redo" {
+                                                 if session.is_none() { app.fail("no conversation to revert"); continue; }
+                                                 if let Err(e) = client.usage(session.as_deref()).await { app.fail(e.to_string()); continue; }
+                                                 match client.revert_chat(None, prompt == "/redo").await {
+                                                     Ok((id, messages)) => {
+                                                         app.model.load_history(&messages);
+                                                         app.model.set_session(Some(id));
+                                                         app.model.note("Chat updated. File changes were NOT undone.");
+                                                     }
+                                                     Err(e) => app.fail(e.to_string()),
+                                                 }
+                                                 continue;
+                                             }
+                                             if prompt == "/plan" || prompt == "/build" {
+                                                 if let Some(id) = session.as_deref() {
+                                                     if let Err(e) = client.usage(Some(id)).await {
+                                                         app.fail(format!("could not select session: {e}"));
+                                                         continue;
+                                                     }
+                                                 }
+                                                 match client.switch_agent(prompt.trim_start_matches('/')).await {
+                                                     Ok((id, _)) => {
+                                                         app.model.set_session(Some(id));
+                                                         app.model.note(format!("{} mode active", prompt.trim_start_matches('/')));
+                                                     }
+                                                     Err(e) => app.fail(format!("could not switch agent: {e}")),
+                                                 }
+                                                 continue;
+                                             }
+                                             let mut builder = client.ask(prompt.clone());
                                             if let Some(session) = session {
                                                 builder = builder.session_id(session);
                                             }

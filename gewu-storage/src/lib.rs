@@ -50,6 +50,81 @@ use gewu_core::types::Message;
 use sqlx::{Row, sqlite::SqlitePool};
 use tracing::{error, info};
 
+async fn ensure_reverts(pool: &SqlitePool) -> Result<()> {
+    sqlx::query("CREATE TABLE IF NOT EXISTS chat_reverts (session_id TEXT PRIMARY KEY, messages TEXT NOT NULL)").execute(pool).await?;
+    Ok(())
+}
+
+#[cfg(test)]
+mod revert_tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn revert_restore_and_commit_are_persistent() {
+        let pool = sqlx::sqlite::SqlitePoolOptions::new().max_connections(1).connect("sqlite::memory:").await.unwrap();
+        let mut memory = SqliteMemory::new(pool.clone(), "chat".into()).await.unwrap();
+        for text in ["first", "second"] {
+            memory.add_message(Message::User { content: vec![gewu_core::types::ContentPart::Text { text: text.into() }] }).await;
+        }
+        let original = memory.messages().to_vec();
+        assert!(revert_chat(&pool, "chat", Some(9), false).await.is_err());
+        assert_eq!(revert_chat(&pool, "chat", None, false).await.unwrap(), original[..1]);
+        assert_eq!(SqliteMemory::new(pool.clone(), "chat".into()).await.unwrap().messages().len(), 1);
+        assert_eq!(revert_chat(&pool, "chat", None, true).await.unwrap(), original);
+        assert!(revert_chat(&pool, "chat", None, true).await.is_err());
+        revert_chat(&pool, "chat", Some(0), false).await.unwrap();
+        commit_chat_revert(&pool, "chat").await.unwrap();
+        assert!(revert_chat(&pool, "chat", None, true).await.is_err());
+    }
+}
+
+pub async fn commit_chat_revert(pool: &SqlitePool, session_id: &str) -> Result<()> {
+    ensure_reverts(pool).await?;
+    sqlx::query("DELETE FROM chat_reverts WHERE session_id = ?").bind(session_id).execute(pool).await?;
+    Ok(())
+}
+
+/// Revert to the zero-based user turn, or restore the last staged revert.
+/// Only conversation rows are touched, never workspace files.
+pub async fn revert_chat(pool: &SqlitePool, session_id: &str, turn: Option<usize>, undo: bool) -> Result<Vec<Message>> {
+    ensure_reverts(pool).await?;
+    let mut tx = pool.begin().await?;
+    let rows: Vec<(String,)> = sqlx::query_as("SELECT content FROM memory_messages WHERE session_id = ? ORDER BY id").bind(session_id).fetch_all(&mut *tx).await?;
+    let current: Vec<Message> = rows.iter().map(|(text,)| serde_json::from_str(text)).collect::<std::result::Result<_, _>>()?;
+    let next = if undo {
+        let saved: Option<String> = sqlx::query_scalar("SELECT messages FROM chat_reverts WHERE session_id = ?").bind(session_id).fetch_optional(&mut *tx).await?;
+        serde_json::from_str(&saved.ok_or_else(|| anyhow::anyhow!("no chat revert to undo"))?)?
+    } else {
+        let users: Vec<usize> = current.iter().enumerate().filter_map(|(i,m)| matches!(m, Message::User { .. }).then_some(i)).collect();
+        let target = turn.unwrap_or_else(|| users.len().saturating_sub(1));
+        let boundary = *users.get(target).ok_or_else(|| anyhow::anyhow!("user turn not found"))?;
+        sqlx::query("INSERT INTO chat_reverts(session_id, messages) VALUES (?, ?) ON CONFLICT(session_id) DO UPDATE SET messages = excluded.messages")
+            .bind(session_id).bind(serde_json::to_string(&current)?).execute(&mut *tx).await?;
+        current[..boundary].to_vec()
+    };
+    sqlx::query("DELETE FROM memory_messages WHERE session_id = ?").bind(session_id).execute(&mut *tx).await?;
+    for message in &next {
+        sqlx::query("INSERT INTO memory_messages(session_id, content) VALUES (?, ?)").bind(session_id).bind(serde_json::to_string(message)?).execute(&mut *tx).await?;
+    }
+    if undo { sqlx::query("DELETE FROM chat_reverts WHERE session_id = ?").bind(session_id).execute(&mut *tx).await?; }
+    tx.commit().await?;
+    Ok(next)
+}
+
+/// Session profile metadata is separate from message history (legacy sessions
+/// without a row continue to use Build).
+pub async fn session_agent(pool: &SqlitePool, session_id: &str) -> Result<String> {
+    sqlx::query("CREATE TABLE IF NOT EXISTS session_agents (session_id TEXT PRIMARY KEY, agent TEXT NOT NULL)").execute(pool).await?;
+    let value: Option<String> = sqlx::query_scalar("SELECT agent FROM session_agents WHERE session_id = ?").bind(session_id).fetch_optional(pool).await?;
+    Ok(value.unwrap_or_else(|| "build".into()))
+}
+
+pub async fn set_session_agent(pool: &SqlitePool, session_id: &str, agent: &str) -> Result<()> {
+    session_agent(pool, session_id).await?;
+    sqlx::query("INSERT INTO session_agents(session_id, agent) VALUES (?, ?) ON CONFLICT(session_id) DO UPDATE SET agent = excluded.agent").bind(session_id).bind(agent).execute(pool).await?;
+    Ok(())
+}
+
 /// One stored message together with its database identity.
 #[derive(Debug, Clone)]
 pub struct StoredMessage {
@@ -80,6 +155,7 @@ async fn memory_table_exists(pool: &SqlitePool) -> Result<bool> {
 /// Sessions are derived from the `memory_messages` table, so a session exists
 /// once it has at least one stored message.
 pub async fn list_sessions(pool: &SqlitePool) -> Result<Vec<gewu_protocol::SessionSummary>> {
+    session_agent(pool, "").await?;
     if !memory_table_exists(pool).await? {
         return Ok(Vec::new());
     }
@@ -87,6 +163,7 @@ pub async fn list_sessions(pool: &SqlitePool) -> Result<Vec<gewu_protocol::Sessi
         r#"
         SELECT
             session_id,
+            COALESCE((SELECT agent FROM session_agents WHERE session_agents.session_id = memory_messages.session_id), 'build') AS agent,
             COUNT(*) AS message_count,
             datetime(MAX(created_at), 'unixepoch', 'localtime') AS updated_at
         FROM memory_messages
@@ -101,6 +178,7 @@ pub async fn list_sessions(pool: &SqlitePool) -> Result<Vec<gewu_protocol::Sessi
     rows.into_iter()
         .map(|row| {
             Ok(gewu_protocol::SessionSummary {
+                agent: row.try_get("agent")?,
                 session_id: row.try_get("session_id")?,
                 message_count: row.try_get("message_count")?,
                 updated_at: row

@@ -2,11 +2,11 @@ use anyhow::{Result, anyhow};
 use async_trait::async_trait;
 use gewu_core::Agent;
 use gewu_core::traits::{LlmProvider, RequestLog, Tool, ToolRegistry};
-use gewu_core::types::{ToolContext, ToolResult};
+use gewu_core::types::{PathEnforcement, ToolContext, ToolResult};
 use gewu_storage::SqliteMemory;
 use gewu_tools::task::AgentFactory;
 use gewu_tools::{
-    ApplyPatchTool, BashTool, BatchTool, CodeSearchTool, EditFileTool, GlobTool, GrepTool,
+    ApplyPatchTool, BashTool, CodeSearchTool, EditFileTool, GlobTool, GrepTool,
     ListTool, ReadFileTool, SkillInfo, SkillTool, TaskTool, TodoItem, TodoReadTool, TodoWriteTool,
     WebFetchTool, WebSearchTool, WriteFileTool,
 };
@@ -23,7 +23,6 @@ const RESERVED_ADDITIONAL_TOOL_NAMES: &[&str] = &[
     "skill",
     "todowrite",
     "todoread",
-    "batch",
 ];
 
 pub struct AgentConfig {
@@ -40,6 +39,10 @@ pub fn list_available_agents() -> Vec<AgentConfig> {
         AgentConfig {
             name: "explore".to_string(),
             description: "Fast agent specialized for exploring codebases.".to_string(),
+        },
+        AgentConfig {
+            name: "plan".to_string(),
+            description: "Read-only planning agent. Switch to build to implement changes.".to_string(),
         },
         AgentConfig {
             name: "general".to_string(),
@@ -85,6 +88,7 @@ struct SqliteAgentFactory {
     provider: Arc<dyn LlmProvider>,
     pool: SqlitePool,
     skills: Vec<SkillInfo>,
+    enforcement: PathEnforcement,
 }
 
 #[async_trait]
@@ -103,6 +107,7 @@ impl AgentFactory for SqliteAgentFactory {
             Vec::new(),
             None,
             self.skills.clone(),
+            self.enforcement,
         )
         .await
         .map_err(|e| -> Box<dyn Error + Send + Sync> { e.to_string().into() })?;
@@ -110,15 +115,24 @@ impl AgentFactory for SqliteAgentFactory {
     }
 }
 
-/// Builds the task tool wired to the CLI registry.
-fn task_tool(provider: Arc<dyn LlmProvider>, pool: SqlitePool, skills: Vec<SkillInfo>) -> TaskTool {
+/// Builds the task tool wired to the CLI registry. `allowed` filters which
+/// subagent types are advertised and permitted; empty means all of them.
+fn task_tool(
+    provider: Arc<dyn LlmProvider>,
+    pool: SqlitePool,
+    skills: Vec<SkillInfo>,
+    enforcement: PathEnforcement,
+    allowed: &[&str],
+) -> TaskTool {
     let factory = Arc::new(SqliteAgentFactory {
         provider,
         pool,
         skills,
+        enforcement,
     });
     let agents = list_available_agents()
         .into_iter()
+        .filter(|a| allowed.is_empty() || allowed.contains(&a.name.as_str()))
         .map(|a| (a.name, a.description))
         .collect();
     TaskTool::new(factory, agents)
@@ -131,12 +145,13 @@ fn build_tool_registry_and_list(
     working_directory: std::path::PathBuf,
     additional_tools: Vec<Arc<dyn Tool>>,
     skills: Vec<SkillInfo>,
+    enforcement: PathEnforcement,
 ) -> Result<(Arc<dyn ToolRegistry>, Vec<Arc<dyn Tool>>)> {
     let mut tools: Vec<Box<dyn Tool>> = match name {
         "build" => {
             let todos = Arc::new(Mutex::new(Vec::<TodoItem>::new()));
             vec![
-                Box::new(task_tool(provider.clone(), pool.clone(), skills.clone())),
+                Box::new(task_tool(provider.clone(), pool.clone(), skills.clone(), enforcement, &[])),
                 Box::new(ReadFileTool {
                     working_directory: working_directory.clone(),
                 }),
@@ -169,6 +184,24 @@ fn build_tool_registry_and_list(
                 Box::new(TodoReadTool::new(todos.clone())),
             ]
         }
+        "plan" => {
+            let todos = Arc::new(Mutex::new(Vec::<TodoItem>::new()));
+            vec![
+                Box::new(task_tool(provider.clone(), pool.clone(), skills.clone(), enforcement, &["explore"])),
+                Box::new(ReadFileTool { working_directory: working_directory.clone() }),
+                Box::new(GlobTool { working_directory: working_directory.clone() }),
+                Box::new(GrepTool { working_directory: working_directory.clone() }),
+                Box::new(ListTool { working_directory: working_directory.clone() }),
+                Box::new(BashTool {
+                    working_directory: working_directory.clone(),
+                    safe_mode: false,
+                }),
+                Box::new(WebFetchTool),
+                Box::new(WebSearchTool),
+                Box::new(TodoWriteTool::new(todos.clone())),
+                Box::new(TodoReadTool::new(todos.clone())),
+            ]
+        }
         "explore" => {
             vec![
                 Box::new(ReadFileTool {
@@ -195,7 +228,7 @@ fn build_tool_registry_and_list(
         "general" => {
             let todos = Arc::new(Mutex::new(Vec::<TodoItem>::new()));
             vec![
-                Box::new(task_tool(provider.clone(), pool.clone(), skills.clone())),
+                Box::new(task_tool(provider.clone(), pool.clone(), skills.clone(), enforcement, &[])),
                 Box::new(ReadFileTool {
                     working_directory: working_directory.clone(),
                 }),
@@ -255,7 +288,9 @@ fn build_tool_registry_and_list(
             tool.name()
         );
     }
-    tools_arc.extend(additional_tools);
+    // Additional tools (including MCP) have no read-only capability contract.
+    // Never expose them in Plan, even indirectly through BatchTool.
+    if name != "plan" { tools_arc.extend(additional_tools); }
 
     let registry: Arc<dyn ToolRegistry> = Arc::new(ToolRegistryImpl {
         tools: Arc::new(tools_arc.clone()),
@@ -272,52 +307,111 @@ pub async fn create_agent(
     additional_tools: Vec<Arc<dyn Tool>>,
     log: Option<RequestLog>,
     skills: Vec<SkillInfo>,
+    enforcement: PathEnforcement,
 ) -> Result<(Agent, Arc<dyn ToolRegistry>)> {
     let working_directory = std::env::current_dir()?;
 
     let memory = SqliteMemory::new(pool.clone(), session_id).await?;
 
-    let (registry, tools_arc) = build_tool_registry_and_list(
+    let (all_tools, system_prompt, registry) = agent_profile(
         name,
         provider.clone(),
         pool,
         working_directory,
         additional_tools,
         skills.clone(),
+        enforcement,
     )?;
+    let mut builder = Agent::builder()
+        .llm(provider)
+        .with_tools(all_tools)
+        .memory(Box::new(memory))
+        .system_prompt(&system_prompt)
+        .with_enforcement(enforcement);
+    if let Some(log) = log { builder = builder.with_log(log); }
+    Ok((builder.build()?, registry))
+}
 
-    let batch_tool: Arc<dyn Tool> = Arc::new(BatchTool::new(registry.clone()));
-    let mut all_tools = vec![batch_tool];
-    all_tools.extend(tools_arc);
+/// Build profile configuration without opening or reloading conversation memory.
+pub fn agent_profile(
+    name: &str,
+    provider: Arc<dyn LlmProvider>,
+    pool: SqlitePool,
+    working_directory: std::path::PathBuf,
+    additional_tools: Vec<Arc<dyn Tool>>,
+    skills: Vec<SkillInfo>,
+    enforcement: PathEnforcement,
+) -> Result<(Vec<Arc<dyn Tool>>, String, Arc<dyn ToolRegistry>)> {
+    let (registry, tools_arc) = build_tool_registry_and_list(name, provider, pool, working_directory, additional_tools, skills.clone(), enforcement)?;
 
     let mut system_prompt = match name {
         "build" => include_str!("prompts/build.txt"),
+        "plan" => include_str!("prompts/plan.txt"),
         "explore" => include_str!("prompts/explore.txt"),
         "general" => include_str!("prompts/general.txt"),
         _ => return Err(anyhow!("Unknown agent type: {}", name)),
     }
     .to_string();
+    if name == "build" {
+        system_prompt.push_str("\n\nBuild mode is active. Earlier Plan-mode read-only restrictions no longer apply. You may implement changes using the available tools, within the user's requested scope.");
+    }
     if !skills.is_empty() {
         system_prompt.push_str("\n\n");
         system_prompt.push_str(&gewu_tools::skill::available_skills_section(&skills));
     }
 
-    let mut builder = Agent::builder()
-        .llm(provider)
-        .with_tools(all_tools)
-        .memory(Box::new(memory))
-        .system_prompt(&system_prompt);
-    if let Some(log) = log {
-        builder = builder.with_log(log);
-    }
-    let agent = builder.build()?;
-
-    Ok((agent, registry))
+    Ok((tools_arc, system_prompt, registry))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn plan_has_no_editing_tools() {
+        let pool = sqlx::sqlite::SqlitePoolOptions::new().connect("sqlite::memory:").await.unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let (_, tools) = build_tool_registry_and_list("plan", Arc::new(DummyLlm), pool, dir.path().to_path_buf(), vec![Arc::new(NamedTool("external_mutator"))], vec![], PathEnforcement::Contain).unwrap();
+        let names: Vec<_> = tools.iter().map(|tool| tool.name()).collect();
+        for expected in ["read_file", "glob", "grep", "list", "webfetch", "websearch", "bash", "task", "todowrite", "todoread"] {
+            assert!(names.contains(&expected), "Plan is missing {expected}");
+        }
+        for forbidden in ["write_file", "edit_file", "apply_patch", "external_mutator"] {
+            assert!(!names.contains(&forbidden), "Plan exposes {forbidden}");
+        }
+        // Delegation is restricted to the read-only explore subagent.
+        let task = tools
+            .iter()
+            .find(|tool| tool.name() == "task")
+            .expect("plan should expose the task tool");
+        let description = task.description();
+        assert!(description.contains("\"explore\""), "plan task tool should advertise explore");
+        assert!(!description.contains("\"build\""), "plan task tool must not advertise build");
+        assert!(!description.contains("\"general\""), "plan task tool must not advertise general");
+        // Bash is unrestricted (prompt-restricted to read-only, like
+        // opencode's plan mode): a command outside the old safe-mode
+        // allow-list executes instead of being refused.
+        let bash = tools
+            .iter()
+            .find(|tool| tool.name() == "bash")
+            .expect("plan should expose bash");
+        let result = bash
+            .execute(
+                serde_json::json!({ "command": "touch plan_probe" }),
+                &ToolContext::new("s", "m"),
+            )
+            .await
+            .unwrap();
+        assert!(
+            !result.output.contains("not allowed in safe mode"),
+            "plan bash should not run in safe mode, got: {}",
+            result.output
+        );
+        assert!(
+            dir.path().join("plan_probe").exists(),
+            "plan bash should execute commands outside the safe-mode allow-list"
+        );
+    }
     use futures::stream::BoxStream;
     use gewu_core::types::{Message, ProviderEvent};
     use std::error::Error;
@@ -389,6 +483,7 @@ mod tests {
                 directory.path().to_path_buf(),
                 Vec::new(),
                 Vec::new(),
+                PathEnforcement::Contain,
             )
             .unwrap();
             assert!(tools.iter().any(|tool| tool.name() == "apply_patch"));
@@ -401,6 +496,7 @@ mod tests {
             directory.path().to_path_buf(),
             Vec::new(),
             Vec::new(),
+            PathEnforcement::Contain,
         )
         .unwrap();
         assert!(!tools.iter().any(|tool| tool.name() == "apply_patch"));
@@ -420,6 +516,7 @@ mod tests {
             Vec::new(),
             Some(log),
             Vec::new(),
+            PathEnforcement::Contain,
         )
         .await
         .expect("create_agent should accept a request log");
@@ -449,6 +546,7 @@ mod tests {
             Vec::new(),
             None,
             skills,
+            PathEnforcement::Contain,
         )
         .await
         .expect("create_agent should register the skill tool");
@@ -469,18 +567,9 @@ mod tests {
             directory.path().to_path_buf(),
             vec![Arc::new(NamedTool("apply_patch"))],
             Vec::new(),
+            PathEnforcement::Contain,
         );
         assert!(reserved.err().unwrap().to_string().contains("reserved"));
-
-        let batch = build_tool_registry_and_list(
-            "explore",
-            provider.clone(),
-            pool.clone(),
-            directory.path().to_path_buf(),
-            vec![Arc::new(NamedTool("batch"))],
-            Vec::new(),
-        );
-        assert!(batch.err().unwrap().to_string().contains("reserved"));
 
         let duplicate = build_tool_registry_and_list(
             "build",
@@ -489,6 +578,7 @@ mod tests {
             directory.path().to_path_buf(),
             vec![Arc::new(NamedTool("websearch"))],
             Vec::new(),
+            PathEnforcement::Contain,
         );
         assert!(
             duplicate

@@ -5,6 +5,7 @@
 
 use anyhow::{Context, Result};
 use gewu_core::traits::{LlmProvider, RequestLog};
+use gewu_core::types::PathEnforcement;
 use gewu_providers::{AnthropicProvider, OpenAIProvider};
 use sqlx::SqlitePool;
 use sqlx::sqlite::SqlitePoolOptions;
@@ -67,6 +68,8 @@ pub struct Bootstrap {
     /// Working directory all tools resolve paths against; captured once at
     /// startup so the UI can show it.
     pub working_directory: String,
+    /// File-path confinement level for tools and file-tree operations.
+    pub enforcement: PathEnforcement,
 }
 
 /// Initialize tracing from the `--log-level` flag.
@@ -256,6 +259,7 @@ pub async fn bootstrap(args: &CommonArgs) -> Result<Bootstrap> {
             .unwrap_or_else(|_| std::path::PathBuf::from("/"))
             .to_string_lossy()
             .to_string(),
+        enforcement: loaded_config.config.sandbox,
     })
 }
 

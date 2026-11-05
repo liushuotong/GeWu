@@ -275,6 +275,11 @@
         const tree = document.getElementById("file-tree");
         if (tree) tree.outerHTML = message.html;
         break;
+      case "tools": {
+        const panel = document.getElementById("sidebar-tools");
+        if (panel) panel.innerHTML = message.html;
+        break;
+      }
       case "file_preview":
         el.filePreview.innerHTML = message.html;
         el.filePreview.classList.remove("hidden");
@@ -541,6 +546,10 @@
   });
 
   el.sidebarToggle.addEventListener("click", toggleSidebar);
+  el.status.addEventListener("click", (event) => {
+    const button = event.target.closest("[data-mode]");
+    if (button && !state.busy) send({ op: "switch_agent", tab: state.active, agent: button.dataset.mode });
+  });
 
   el.newTab.addEventListener("click", () => send({ op: "open_tab" }));
 
@@ -568,6 +577,31 @@
   });
 
   el.transcript.addEventListener("click", (event) => {
+    const revert = event.target.closest("[data-revert-block]");
+    if (revert) {
+      closeMessageMenus();
+      if (!state.busy && window.confirm("Revert chat from this message? File changes will NOT be undone.")) {
+        send({ op: "revert_chat", tab: state.active, block: Number(revert.dataset.revertBlock), undo: false });
+      }
+      return;
+    }
+    const message = event.target.closest(".block.user");
+    if (message && !event.target.closest("a, input, textarea, .message-menu") && !window.getSelection()?.toString()) {
+      const trigger = message.querySelector(".message-menu-trigger");
+      if (trigger && (!event.target.closest("button") || event.target === trigger)) {
+        const open = trigger.getAttribute("aria-expanded") !== "true";
+        closeMessageMenus();
+        if (open) {
+          trigger.setAttribute("aria-expanded", "true");
+          const menu = message.querySelector(".message-menu");
+          menu.hidden = false;
+          const item = menu.querySelector("button");
+          item.disabled = state.busy;
+          item.focus();
+        }
+        return;
+      }
+    }
     const button = event.target.closest("[data-action]");
     if (!button) return;
     const tab = Number(button.dataset.tab);
@@ -579,6 +613,26 @@
       send({ op: "toggle_group", tab, block });
     }
   });
+
+  function closeMessageMenus(restoreFocus = false) {
+    for (const trigger of el.transcript.querySelectorAll('.message-menu-trigger[aria-expanded="true"]')) {
+      trigger.setAttribute("aria-expanded", "false");
+      const menu = document.getElementById(trigger.getAttribute("aria-controls"));
+      if (menu) menu.hidden = true;
+      if (restoreFocus) trigger.focus();
+    }
+  }
+
+  document.addEventListener("click", (event) => {
+    if (!event.target.closest(".block.user")) closeMessageMenus();
+  });
+  document.addEventListener("keydown", (event) => {
+    if (event.key === "Escape" && el.transcript.querySelector('.message-menu-trigger[aria-expanded="true"]')) {
+      closeMessageMenus(true);
+      event.preventDefault();
+      event.stopImmediatePropagation();
+    }
+  }, true);
 
   el.sidebar.addEventListener("click", (event) => {
     const sidebarTab = event.target.closest("[data-sidebar-tab]");

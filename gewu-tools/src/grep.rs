@@ -10,7 +10,7 @@
 //! - matched lines truncated to 2000 characters,
 //! - results grouped by file.
 
-use crate::fs_utils::{into_tool_error, resolve_safe_path};
+use crate::fs_utils::{into_tool_error, resolve_read_path};
 use anyhow::Result;
 use async_trait::async_trait;
 use gewu_core::traits::Tool;
@@ -112,7 +112,7 @@ impl Tool for GrepTool {
     async fn execute(
         &self,
         args: serde_json::Value,
-        _ctx: &ToolContext,
+        ctx: &ToolContext,
     ) -> Result<ToolResult, Box<dyn Error + Send + Sync>> {
         let input: GrepArgs = serde_json::from_value(args).map_err(into_tool_error)?;
         if input.pattern.is_empty() {
@@ -121,7 +121,9 @@ impl Tool for GrepTool {
 
         let search_path_str = input.path.as_deref().unwrap_or(".");
         let search_path =
-            resolve_safe_path(&self.working_directory, search_path_str).map_err(into_tool_error)?;
+            resolve_read_path(&self.working_directory, search_path_str, ctx.enforcement)
+                .await
+                .map_err(into_tool_error)?;
 
         let pattern = input.pattern;
         let pattern_for_task = pattern.clone();

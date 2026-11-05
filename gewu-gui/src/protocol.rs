@@ -18,6 +18,8 @@ pub struct TabInfo {
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
 #[serde(tag = "op", rename_all = "snake_case")]
 pub enum ClientMsg {
+    RevertChat { tab: u64, block: Option<usize>, undo: bool },
+    SwitchAgent { tab: u64, agent: String },
     /// First message when the GUI requires a token.
     Auth { token: String },
     /// Send a prompt to a tab.
@@ -50,6 +52,8 @@ pub enum ClientMsg {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum ServerMsg {
+    /// Replace only the tool panel; leave transcript and sidebar tabs intact.
+    Tools { html: String },
     /// Full initial state: tabs, active tab, transcript, status and sidebar HTML.
     Snapshot {
         tabs: Vec<TabInfo>,

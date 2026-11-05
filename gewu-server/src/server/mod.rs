@@ -30,7 +30,7 @@
 use anyhow::{Context, Result};
 use futures::{SinkExt, StreamExt};
 use gewu_core::ToolRegistry;
-use gewu_core::types::{AgentEvent, Message};
+use gewu_core::types::{AgentEvent, Message, PathEnforcement};
 pub use gewu_protocol as protocol;
 use gewu_protocol::FileEntry;
 use registry::create_agent;
@@ -264,7 +264,13 @@ impl ServerState {
             return Ok(existing.clone());
         }
 
-        let agent_name = agent_name.unwrap_or_else(|| DEFAULT_AGENT.to_string());
+        let agent_name = match agent_name {
+            Some(name) => name,
+            None => match session_id.as_deref() {
+                Some(id) => gewu_storage::session_agent(&self.bootstrap.pool, id).await?,
+                None => DEFAULT_AGENT.to_string(),
+            },
+        };
         if !registry::list_agent_names().contains(&agent_name) {
             anyhow::bail!("Unknown agent profile: {}", agent_name);
         }
@@ -278,11 +284,13 @@ impl ServerState {
             self.bootstrap.mcp_tools.clone(),
             self.bootstrap.log_writer.clone(),
             self.bootstrap.skills.clone(),
+            self.bootstrap.enforcement,
         )
         .await?;
         info!("Created session {} (agent: {})", session_id, agent_name);
 
         let agent = Arc::new(Mutex::new(agent));
+        gewu_storage::set_session_agent(&self.bootstrap.pool, &session_id, &agent_name).await?;
         // Snapshot the tool list once; it never changes for this session.
         let tools = agent.lock().await.list_tools();
 
@@ -410,6 +418,48 @@ async fn handle_request(
     request: ClientRequest,
 ) -> Result<Handled, RequestError> {
     match request.op {
+        Op::RevertChat { turn, undo } => {
+            if running.is_some() { return Err(RequestError::Failed("cannot revert a running turn".into())); }
+            let current = state.get_or_create_session(session, request.session_id, None).await.map_err(|e| RequestError::Failed(e.to_string()))?;
+            if !state.claim_session(&current.session_id).await { return Err(RequestError::Failed("session is busy".into())); }
+            let result = async {
+                let messages = gewu_storage::revert_chat(&state.bootstrap.pool, &current.session_id, turn, undo).await?;
+                let memory = gewu_storage::SqliteMemory::new(state.bootstrap.pool.clone(), current.session_id.clone()).await?;
+                current.agent.lock().await.memory = Box::new(memory);
+                Ok::<_, anyhow::Error>(Handled::Reply(ServerMessage::Session { id: request.id, session_id: current.session_id.clone(), messages }))
+            }.await;
+            state.release_session(&current.session_id).await;
+            result.map_err(|e| RequestError::Failed(e.to_string()))
+        }
+        Op::SwitchAgent { agent: target } => {
+            if running.is_some() {
+                return Err(RequestError::Failed("cannot switch agent while a turn is running".into()));
+            }
+            if !["build", "plan"].contains(&target.as_str()) {
+                return Err(RequestError::Invalid("switch_agent supports build or plan".into()));
+            }
+            let current = state.get_or_create_session(session, request.session_id, None).await
+                .map_err(|e| RequestError::Failed(e.to_string()))?;
+            if !state.claim_session(&current.session_id).await {
+                return Err(RequestError::Failed("session is busy on another connection".into()));
+            }
+            let replacement = registry::agent_profile(&target, state.bootstrap.provider.clone(), state.bootstrap.pool.clone(), state.bootstrap.working_directory.clone().into(), state.bootstrap.mcp_tools.clone(), state.bootstrap.skills.clone(), state.bootstrap.enforcement);
+            let result = match replacement {
+                Ok((tools, prompt, _)) => match gewu_storage::set_session_agent(&state.bootstrap.pool, &current.session_id, &target).await {
+                    Ok(()) => {
+                        let mut agent = current.agent.lock().await;
+                        agent.set_profile(prompt, tools);
+                        let tools = agent.list_tools();
+                        *session = Some(ConnectionSession { agent: current.agent.clone(), session_id: current.session_id.clone(), agent_name: target.clone(), tools: tools.clone() });
+                        Ok(Handled::Reply(ServerMessage::AgentSwitched { id: request.id, session_id: current.session_id.clone(), agent: target, tools }))
+                    }
+                    Err(e) => Err(RequestError::Failed(e.to_string())),
+                },
+                Err(e) => Err(RequestError::Failed(e.to_string())),
+            };
+            state.busy_sessions.lock().await.remove(&current.session_id);
+            result
+        }
         Op::Ping => Ok(Handled::Reply(ServerMessage::Pong { id: request.id })),
 
         // Auth is normally consumed by the connection loop's auth gate; if a
@@ -494,23 +544,35 @@ async fn handle_request(
 
         Op::ListFiles { path } => {
             let root = &state.bootstrap.working_directory;
-            let dir = gewu_tools::fs_utils::resolve_safe_path(root, &path)
-                .map_err(|e| RequestError::Invalid(e.to_string()))?;
-            let canonical_root = std::fs::canonicalize(root).map_err(|e| {
-                RequestError::Failed(format!("cannot resolve working directory: {e}"))
-            })?;
-            let canonical_dir = std::fs::canonicalize(&dir)
-                .map_err(|e| RequestError::Failed(format!("cannot read directory: {e}")))?;
-            if !canonical_dir.starts_with(&canonical_root) {
-                return Err(RequestError::Invalid(
-                    "directory is outside the working directory".into(),
-                ));
-            }
-            if !canonical_dir.is_dir() {
-                return Err(RequestError::Invalid("path is not a directory".into()));
-            }
+            let dir = match state.bootstrap.enforcement {
+                PathEnforcement::None => {
+                    let dir = std::path::Path::new(root).join(&path);
+                    if !dir.is_dir() {
+                        return Err(RequestError::Invalid("path is not a directory".into()));
+                    }
+                    dir
+                }
+                _ => {
+                    let dir = gewu_tools::fs_utils::resolve_safe_path(root, &path)
+                        .map_err(|e| RequestError::Invalid(e.to_string()))?;
+                    let canonical_root = std::fs::canonicalize(root).map_err(|e| {
+                        RequestError::Failed(format!("cannot resolve working directory: {e}"))
+                    })?;
+                    let canonical_dir = std::fs::canonicalize(&dir)
+                        .map_err(|e| RequestError::Failed(format!("cannot read directory: {e}")))?;
+                    if !canonical_dir.starts_with(&canonical_root) {
+                        return Err(RequestError::Invalid(
+                            "directory is outside the working directory".into(),
+                        ));
+                    }
+                    if !canonical_dir.is_dir() {
+                        return Err(RequestError::Invalid("path is not a directory".into()));
+                    }
+                    canonical_dir
+                }
+            };
             let mut entries = Vec::new();
-            for entry in ignore::WalkBuilder::new(&canonical_dir)
+            for entry in ignore::WalkBuilder::new(&dir)
                 .max_depth(Some(1))
                 .hidden(true)
                 .git_ignore(true)
@@ -543,24 +605,30 @@ async fn handle_request(
         Op::ReadFile { path } => {
             const MAX_PREVIEW_BYTES: usize = 512 * 1024;
             let root = &state.bootstrap.working_directory;
-            let file = gewu_tools::fs_utils::resolve_safe_path(root, &path)
-                .map_err(|e| RequestError::Invalid(e.to_string()))?;
-            let canonical_root = std::fs::canonicalize(root).map_err(|e| {
-                RequestError::Failed(format!("cannot resolve working directory: {e}"))
-            })?;
-            let canonical_file = std::fs::canonicalize(&file)
-                .map_err(|e| RequestError::Failed(format!("cannot read file: {e}")))?;
-            if !canonical_file.starts_with(&canonical_root) {
-                return Err(RequestError::Invalid(
-                    "file is outside the working directory".into(),
-                ));
-            }
-            let metadata = std::fs::metadata(&canonical_file)
+            let file = match state.bootstrap.enforcement {
+                PathEnforcement::None => std::path::Path::new(root).join(&path),
+                _ => {
+                    let file = gewu_tools::fs_utils::resolve_safe_path(root, &path)
+                        .map_err(|e| RequestError::Invalid(e.to_string()))?;
+                    let canonical_root = std::fs::canonicalize(root).map_err(|e| {
+                        RequestError::Failed(format!("cannot resolve working directory: {e}"))
+                    })?;
+                    let canonical_file = std::fs::canonicalize(&file)
+                        .map_err(|e| RequestError::Failed(format!("cannot read file: {e}")))?;
+                    if !canonical_file.starts_with(&canonical_root) {
+                        return Err(RequestError::Invalid(
+                            "file is outside the working directory".into(),
+                        ));
+                    }
+                    canonical_file
+                }
+            };
+            let metadata = std::fs::metadata(&file)
                 .map_err(|e| RequestError::Failed(format!("cannot read file: {e}")))?;
             if !metadata.is_file() {
                 return Err(RequestError::Invalid("path is not a file".into()));
             }
-            let file = std::fs::File::open(&canonical_file)
+            let file = std::fs::File::open(&file)
                 .map_err(|e| RequestError::Failed(format!("cannot read file: {e}")))?;
             let mut bytes = Vec::new();
             std::io::Read::read_to_end(
@@ -675,7 +743,23 @@ async fn handle_request(
                     session.session_id
                 )));
             }
+            // Recheck under the claim: a switch on another connection could
+            // have completed between session validation and claim acquisition.
+            match gewu_storage::session_agent(&state.bootstrap.pool, &session.session_id).await {
+                Ok(agent) if agent == session.agent_name => {}
+                result => {
+                    state.release_session(&session.session_id).await;
+                    return Err(RequestError::Failed(match result {
+                        Err(e) => e.to_string(),
+                        _ => "session agent changed; reconnect before continuing".into(),
+                    }));
+                }
+            }
             let request_id = crate::bootstrap::new_session_id();
+            if let Err(e) = gewu_storage::commit_chat_revert(&state.bootstrap.pool, &session.session_id).await {
+                state.release_session(&session.session_id).await;
+                return Err(RequestError::Failed(e.to_string()));
+            }
             Ok(Handled::Ask {
                 ready: ServerMessage::Ready {
                     id: request.id,
@@ -1617,10 +1701,101 @@ mod tests {
                 model: "test-model".to_string(),
                 provider_name: "test".to_string(),
                 working_directory: "/tmp/gewu-test".to_string(),
+                enforcement: PathEnforcement::None,
             },
             token: token.map(str::to_string),
             busy_sessions: Mutex::new(HashSet::new()),
         })
+    }
+
+    #[tokio::test]
+    async fn chat_revert_updates_live_history_and_undo_restores_it() {
+        let state = server_state_with(TestLlm::plain());
+        let mut session = None;
+        let current = state.get_or_create_session(&mut session, Some("revert-test".into()), None).await.unwrap();
+        {
+            let mut agent = current.agent.lock().await;
+            for text in ["first", "second"] {
+                agent.memory.add_message(Message::User { content: vec![gewu_core::types::ContentPart::Text { text: text.into() }] }).await;
+            }
+        }
+        let mut running = None;
+        handle_request(&state, &mut session, &mut running, ClientRequest::revert_chat(1, None, false)).await.unwrap();
+        assert_eq!(current.agent.lock().await.memory.messages().len(), 1);
+        handle_request(&state, &mut session, &mut running, ClientRequest::revert_chat(2, None, true)).await.unwrap();
+        assert_eq!(current.agent.lock().await.memory.messages().len(), 2);
+    }
+
+    #[tokio::test]
+    async fn file_tree_ops_follow_enforcement_setting() {
+        let root = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        let outside_file = outside.path().join("outside.txt");
+        std::fs::write(&outside_file, "outside").unwrap();
+        let outside_path = outside_file.to_string_lossy().to_string();
+        let mut session = None;
+        let mut running = None;
+
+        // Default (None): paths outside the working root are served.
+        let mut state = server_state_with(TestLlm::plain());
+        {
+            let bootstrap = &mut Arc::get_mut(&mut state).unwrap().bootstrap;
+            bootstrap.working_directory = root.path().to_string_lossy().to_string();
+            bootstrap.enforcement = PathEnforcement::None;
+        }
+        let handled = handle_request(&state, &mut session, &mut running, ClientRequest::read_file(1, &outside_path)).await.unwrap();
+        match handled {
+            Handled::Reply(ServerMessage::FileContent { content, .. }) => assert_eq!(content, "outside"),
+            _ => panic!("unexpected reply"),
+        }
+
+        // Contain: the same request is rejected as outside the root.
+        Arc::get_mut(&mut state).unwrap().bootstrap.enforcement = PathEnforcement::Contain;
+        let result = handle_request(&state, &mut session, &mut running, ClientRequest::read_file(2, &outside_path)).await;
+        assert!(result.is_err(), "expected containment rejection");
+    }
+
+    #[tokio::test]
+    async fn switching_profiles_keeps_live_memory() {
+        let state = server_state_with(TestLlm::plain());
+        let original = plain_session();
+        original.agent.lock().await.memory.add_message(Message::User {
+            content: vec![gewu_core::types::ContentPart::Text { text: "live memory not stored in SQLite".into() }],
+        }).await;
+        let before = original.agent.lock().await.memory.messages().to_vec();
+        let mut session = Some(original.clone());
+        let mut running = None;
+        for mode in ["plan", "build"] {
+            handle_request(&state, &mut session, &mut running, ClientRequest::switch_agent(1, mode)).await.unwrap();
+            let current = session.as_ref().unwrap();
+            assert!(Arc::ptr_eq(&original.agent, &current.agent));
+            assert_eq!(current.agent.lock().await.memory.messages(), before.as_slice());
+            assert_eq!(current.agent_name, mode);
+        }
+    }
+
+    #[tokio::test]
+    async fn switching_profiles_preserves_session_and_persists_mode() {
+        let state = server_state_with(TestLlm::plain());
+        let (tx, mut rx, handle) = spawn_connection(state.clone()).await;
+        tx.send(ClientRequest::switch_agent(1, "plan").to_line()).await.unwrap();
+        let plan = recv_json(&mut rx).await;
+        assert_eq!(plan["type"], "agent_switched");
+        assert_eq!(plan["agent"], "plan");
+        let id = plan["session_id"].as_str().unwrap().to_string();
+        assert!(plan["tools"].as_array().unwrap().iter().any(|t| t == "bash"));
+        assert!(plan["tools"].as_array().unwrap().iter().any(|t| t == "task"));
+        assert!(!plan["tools"].as_array().unwrap().iter().any(|t| t == "write_file"));
+        assert_eq!(gewu_storage::session_agent(&state.bootstrap.pool, &id).await.unwrap(), "plan");
+        tx.send(ClientRequest::switch_agent(2, "build").to_line()).await.unwrap();
+        let build = recv_json(&mut rx).await;
+        assert_eq!(build["session_id"], id);
+        assert_eq!(build["agent"], "build");
+        assert!(build["tools"].as_array().unwrap().iter().any(|t| t == "bash"));
+        tx.send(ClientRequest::switch_agent(3, "unknown").to_line()).await.unwrap();
+        assert_eq!(recv_json(&mut rx).await["type"], "error");
+        drop(tx);
+        handle.await.unwrap().unwrap();
     }
 
     #[tokio::test]
@@ -1750,6 +1925,7 @@ mod tests {
                 model: "test-model".to_string(),
                 provider_name: "test".to_string(),
                 working_directory: "/tmp/gewu-test".to_string(),
+                enforcement: PathEnforcement::None,
             },
             token: None,
             busy_sessions: Mutex::new(HashSet::new()),
