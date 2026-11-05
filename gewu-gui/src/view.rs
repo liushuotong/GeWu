@@ -15,8 +15,12 @@ use crate::workspace::Tab;
 
 /// Lines of tool output shown before collapsing.
 const TOOL_PREVIEW_LINES: usize = 6;
-/// Defensive cap on expanded tool output.
-const TOOL_MAX_LINES: usize = 500;
+/// Defensive cap on expanded tool output. Tool output is already truncated
+/// server-side; this only guards against pathological renders.
+const TOOL_MAX_LINES: usize = 5000;
+/// Commands longer than this (or spanning multiple lines) get a full-width
+/// block when the tool is expanded, since the inline title ellipsizes.
+const COMMAND_INLINE_LIMIT: usize = 80;
 
 /// Escape text for use in HTML text or a double-quoted attribute.
 pub fn escape(text: &str) -> String {
@@ -226,6 +230,15 @@ fn render_tool(
         out.push_str("</div>\n");
         return;
     };
+    // The one-line title ellipsizes long commands, so when the tool is
+    // expanded show the full command in its own block first.
+    if expanded && (input.len() > COMMAND_INLINE_LIMIT || input.contains('\n')) {
+        let _ = writeln!(
+            out,
+            "<pre class=\"tool-input\">{}</pre>",
+            escape(input.trim_end())
+        );
+    }
     let lines: Vec<&str> = output.trim_end().lines().collect();
     if lines.is_empty() {
         out.push_str("</div>\n");
@@ -881,6 +894,41 @@ mod tests {
         let html = transcript_html(ws.tab(id).unwrap());
         assert!(html.contains("line 10"), "{html}");
         assert!(!html.contains("+4 lines"), "{html}");
+    }
+
+    #[test]
+    fn expanded_tool_shows_the_full_command() {
+        let long_command = format!("echo {} # padded well past one line", "x".repeat(120));
+        let (mut ws, id) = tab_with_blocks(vec![Block::Tool {
+            tool: "bash".into(),
+            input: long_command.clone(),
+            output: Some("done".into()),
+        }]);
+        // Collapsed: the command appears only in the ellipsized title row.
+        let html = transcript_html(ws.tab(id).unwrap());
+        assert!(!html.contains("class=\"tool-input\""), "{html}");
+
+        ws.tab_mut(id).unwrap().expanded_outputs.insert(0);
+        let html = transcript_html(ws.tab(id).unwrap());
+        assert!(html.contains("class=\"tool-input\""), "{html}");
+        assert!(html.contains(&long_command), "full command visible: {html}");
+    }
+
+    #[test]
+    fn expanded_output_is_not_capped_at_500_lines() {
+        let output = (1..=600)
+            .map(|n| format!("line {n}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let (mut ws, id) = tab_with_blocks(vec![Block::Tool {
+            tool: "bash".into(),
+            input: "seq 600".into(),
+            output: Some(output),
+        }]);
+        ws.tab_mut(id).unwrap().expanded_outputs.insert(0);
+        let html = transcript_html(ws.tab(id).unwrap());
+        assert!(html.contains("line 600"), "{html}");
+        assert!(!html.contains("tool-more"), "{html}");
     }
 
     #[test]

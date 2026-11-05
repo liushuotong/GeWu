@@ -525,7 +525,8 @@ mod tests {
         assert!(sidebar.contains("<li>grep</li>"), "{sidebar}");
         // The working directory appears once as the file tree root.
         assert!(
-            sidebar.contains("class=\"tree-root\" title=\"/tmp/fake-project\">/tmp/fake-project</p>"),
+            sidebar
+                .contains("class=\"tree-root\" title=\"/tmp/fake-project\">/tmp/fake-project</p>"),
             "{sidebar}"
         );
 
