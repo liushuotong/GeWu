@@ -1,6 +1,6 @@
 use gewu_core::types::{
     AgentEvent, Capabilities, ContentPart, FileAttachment, FunctionCall, InputCapabilities,
-    Message, OutputCapabilities, ProviderEvent, ToolCall, ToolContext, ToolResult,
+    Message, OutputCapabilities, ProviderEvent, TokenUsage, ToolCall, ToolContext, ToolResult,
     TruncationResult,
 };
 
@@ -398,15 +398,41 @@ fn test_agent_event_usage_round_trip() {
     let event = AgentEvent::Usage {
         used_tokens: 34_000,
         context_limit: 128_000,
+        provider: Some(TokenUsage {
+            input_tokens: 1_000,
+            cached_tokens: 30_000,
+            cache_write_tokens: 3_000,
+            output_tokens: 500,
+        }),
     };
 
     let json = serde_json::to_value(&event).unwrap();
     assert_eq!(json["type"], "usage");
     assert_eq!(json["used_tokens"], 34_000);
     assert_eq!(json["context_limit"], 128_000);
+    // Provider usage serializes inline (not skipped) when present.
+    assert_eq!(json["provider"]["cached_tokens"], 30_000);
 
     let decoded: AgentEvent = serde_json::from_value(json).unwrap();
     assert_eq!(decoded, event);
+
+    // Provider usage is optional: older event payloads (or providers that
+    // report nothing) decode with `provider: None` and round-trip without
+    // the field on the wire.
+    let legacy: AgentEvent = serde_json::from_str(
+        r#"{"type":"usage","used_tokens":10,"context_limit":100}"#,
+    )
+    .unwrap();
+    assert_eq!(
+        legacy,
+        AgentEvent::Usage {
+            used_tokens: 10,
+            context_limit: 100,
+            provider: None,
+        }
+    );
+    let encoded = serde_json::to_string(&legacy).unwrap();
+    assert!(!encoded.contains("provider"), "{encoded}");
 }
 
 #[test]

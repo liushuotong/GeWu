@@ -51,7 +51,9 @@
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
-pub use gewu_core::types::{AgentEvent, ContentPart, FunctionCall, Message, ToolCall};
+pub use gewu_core::types::{
+    AgentEvent, ContentPart, FunctionCall, Message, TokenUsage, ToolCall,
+};
 
 /// Operations a client can request.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -625,6 +627,12 @@ pub enum ServerMessage {
         /// with `busy: false` instead means no session exists yet.
         #[serde(default)]
         busy: bool,
+        /// Provider-reported token accounting accumulated across the
+        /// session (cache hits/writes, uncached input, output). `None` when
+        /// the provider has not reported any usage yet; defaults to `None`
+        /// when decoding frames from older servers.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        provider_usage: Option<TokenUsage>,
     },
     /// Reply to an `auth` request. When `ok` is `false` the server closes
     /// the connection right after this frame.
@@ -919,19 +927,30 @@ mod tests {
             used_tokens: 34_000,
             context_limit: 128_000,
             busy: false,
+            provider_usage: Some(TokenUsage {
+                input_tokens: 1_000,
+                cached_tokens: 30_000,
+                cache_write_tokens: 3_000,
+                output_tokens: 500,
+            }),
         };
         assert_eq!(usage.kind(), "usage");
         assert!(usage.correlation_id().is_some());
-        let decoded: ServerMessage =
-            serde_json::from_str(&serde_json::to_string(&usage).unwrap()).unwrap();
+        let encoded = serde_json::to_string(&usage).unwrap();
+        assert!(encoded.contains("provider_usage"), "{encoded}");
+        let decoded: ServerMessage = serde_json::from_str(&encoded).unwrap();
         assert_eq!(decoded, usage);
 
-        // `busy` defaults to false when decoding frames from older servers.
+        // `busy`/`provider_usage` default when decoding frames from older
+        // servers.
         let legacy: ServerMessage =
             serde_json::from_str(r#"{"type":"usage","id":1,"used_tokens":5,"context_limit":6}"#)
                 .unwrap();
         match legacy {
-            ServerMessage::Usage { busy, .. } => assert!(!busy),
+            ServerMessage::Usage { busy, provider_usage, .. } => {
+                assert!(!busy);
+                assert!(provider_usage.is_none());
+            }
             other => panic!("expected usage, got {}", other.kind()),
         }
     }

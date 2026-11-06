@@ -508,6 +508,7 @@ mod tests {
             m.apply_event(&AgentEvent::Usage {
                 used_tokens: 10,
                 context_limit: 100,
+                provider: None,
             }),
             None
         );

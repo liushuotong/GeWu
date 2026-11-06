@@ -46,7 +46,9 @@ pub use stream::AskStream;
 use std::sync::Arc;
 use tokio::sync::{mpsc, oneshot};
 
-use gewu_protocol::{ClientRequest, FileEntry, Message, ServerMessage, SessionSummary};
+use gewu_protocol::{
+    ClientRequest, FileEntry, Message, ServerMessage, SessionSummary, TokenUsage,
+};
 use inner::Command;
 
 /// Alias for a [`Result`](std::result::Result) with this crate's error type.
@@ -76,6 +78,11 @@ pub struct Usage {
     /// lock; query again once it finishes. `0/0` with `busy: false` means
     /// the connection has no session yet.
     pub busy: bool,
+    /// Provider-reported token accounting accumulated across the session
+    /// (uncached input, cache hits, cache writes, output). `None` until the
+    /// provider reports usage; from it, `TokenUsage::cache_hit_rate_percent`
+    /// gives the session cache-hit rate.
+    pub provider_usage: Option<TokenUsage>,
 }
 
 /// Errors produced by the client.
@@ -346,11 +353,13 @@ impl Client {
                 used_tokens,
                 context_limit,
                 busy,
+                provider_usage,
                 ..
             } => Ok(Usage {
                 used_tokens,
                 context_limit,
                 busy,
+                provider_usage,
             }),
             other => Err(unexpected(other, "usage")),
         }

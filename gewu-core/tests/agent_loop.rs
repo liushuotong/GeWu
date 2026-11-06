@@ -184,6 +184,7 @@ async fn test_agent_emits_usage_at_turn_boundaries() {
             AgentEvent::Usage {
                 used_tokens,
                 context_limit,
+                ..
             } => {
                 kinds.push("usage");
                 usage = Some((used_tokens, context_limit));

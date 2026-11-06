@@ -241,7 +241,7 @@ pub struct AnthropicStream {
 }
 
 impl AnthropicStream {
-    fn new<S>(stream: S) -> Self
+    pub(crate) fn new<S>(stream: S) -> Self
     where
         S: Stream<Item = Result<Bytes, reqwest::Error>> + Send + 'static,
     {
@@ -435,6 +435,11 @@ pub struct Message {
     pub _role: String,
     #[serde(rename = "content")]
     pub _content: Vec<Value>,
+    /// Input/output token accounting for the request. Present on the
+    /// `message_start` payload; some proxies zero the cache fields here and
+    /// only report real numbers on the final `message_delta`.
+    #[serde(default)]
+    pub usage: Option<MessageUsage>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -498,10 +503,24 @@ pub struct MessageDelta {
     pub stop_reason: Option<String>,
 }
 
+/// Token accounting from `message_start.message.usage` and
+/// `message_delta.usage`.
+///
+/// Cache fields are defaulted (not optional) so payloads from proxies that
+/// omit them still parse; a missing field reads as 0, matching providers
+/// that report no caching.
 #[derive(Debug, Clone, Deserialize)]
 pub struct MessageUsage {
-    #[serde(rename = "output_tokens")]
-    pub _output_tokens: u32,
+    #[serde(default)]
+    pub input_tokens: u64,
+    #[serde(default)]
+    pub output_tokens: u64,
+    /// Prompt tokens served from the prompt cache (cache hits).
+    #[serde(default)]
+    pub cache_read_input_tokens: u64,
+    /// Prompt tokens written to the prompt cache by this request.
+    #[serde(default)]
+    pub cache_creation_input_tokens: u64,
 }
 
 #[derive(Debug, Clone, Deserialize)]

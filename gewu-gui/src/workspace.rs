@@ -7,7 +7,7 @@
 use std::collections::HashSet;
 
 use gewu_client::session::{Block, Phase, SessionModel};
-use gewu_protocol::Message;
+use gewu_protocol::{Message, TokenUsage};
 
 use crate::protocol::TabInfo;
 
@@ -25,6 +25,9 @@ pub struct Tab {
     pub model_label: Option<String>,
     /// Context usage `(used tokens, context limit)`.
     pub context: Option<(u64, u64)>,
+    /// Provider-reported token accounting accumulated across the session,
+    /// from which the status line derives the cache hit rate.
+    pub cache: Option<TokenUsage>,
     /// Tool runs the user expanded (keyed by the run's first block index).
     pub expanded_groups: HashSet<usize>,
     /// Tool calls whose full output the user expanded (block index).
@@ -39,6 +42,7 @@ impl Tab {
             model: SessionModel::new(),
             model_label: None,
             context: None,
+            cache: None,
             expanded_groups: HashSet::new(),
             expanded_outputs: HashSet::new(),
         }

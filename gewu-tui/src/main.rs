@@ -546,6 +546,7 @@ async fn run(
                                 AgentEvent::Usage {
                                     used_tokens,
                                     context_limit,
+                                    ..
                                 } => {
                                     if *used_tokens > 0 && *context_limit > 0 {
                                         tab.app.context =

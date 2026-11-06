@@ -1062,6 +1062,10 @@ body {
   font-variant-numeric: tabular-nums;
 }
 
+.status .cache {
+  font-variant-numeric: tabular-nums;
+}
+
 .gauge {
   position: relative;
   width: 84px;

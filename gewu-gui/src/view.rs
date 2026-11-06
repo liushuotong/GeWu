@@ -714,6 +714,18 @@ pub fn status_html(tab: &Tab) -> String {
             pct
         );
     }
+    // Session cache hit rate: provider-reported prompt-cache usage, summed
+    // over every LLM request. Hidden until the provider reports some.
+    if let Some(usage) = tab.cache.filter(|u| u.prompt_tokens() > 0) {
+        let rate = usage.cache_hit_rate_percent().unwrap_or(0);
+        let _ = write!(
+            out,
+            "<span class=\"kv cache\" title=\"provider-reported prompt-cache hits, {} tokens cached of {} prompt\">\
+             <span class=\"k\">cache</span><span class=\"v\">{rate}%</span></span>",
+            usage.cached_tokens,
+            usage.prompt_tokens()
+        );
+    }
     out.push_str("</div>");
     out
 }
@@ -849,6 +861,7 @@ pub fn file_preview_html(path: &str, content: &str, truncated: bool) -> String {
 mod tests {
     use super::*;
     use crate::workspace::Workspace;
+    use gewu_protocol::TokenUsage;
 
     fn tab_with_blocks(blocks: Vec<Block>) -> (Workspace, u64) {
         let mut ws = Workspace::new();
@@ -1367,9 +1380,30 @@ mod tests {
         assert!(html.contains("gpt-4o"), "{html}");
         assert!(!html.contains("openai"), "{html}");
         assert!(!html.contains("session"), "{html}");
+        assert!(!html.contains("cache"), "{html}");
         assert!(html.contains("34k / 128k (26%)"), "{html}");
         assert!(html.contains("gauge-fill g25"), "{html}");
         assert!(html.contains("class=\"usage\""), "{html}");
+    }
+
+    #[test]
+    fn status_shows_provider_cache_hit_rate() {
+        let (mut ws, id) = tab_with_blocks(vec![]);
+        let tab = ws.tab_mut(id).unwrap();
+        tab.context = Some((34_000, 128_000));
+        tab.cache = Some(TokenUsage {
+            input_tokens: 1_000,
+            cached_tokens: 9_000,
+            ..TokenUsage::default()
+        });
+        let html = status_html(ws.tab(id).unwrap());
+        assert!(html.contains("cache"), "{html}");
+        assert!(html.contains(">90%</span>"), "{html}");
+        // No provider usage: hidden even when the context gauge shows.
+        let (mut ws, id) = tab_with_blocks(vec![]);
+        ws.tab_mut(id).unwrap().context = Some((34_000, 128_000));
+        let html = status_html(ws.tab(id).unwrap());
+        assert!(!html.contains("cache"), "{html}");
     }
 
     #[test]

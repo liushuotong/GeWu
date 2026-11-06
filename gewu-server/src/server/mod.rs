@@ -641,6 +641,7 @@ async fn handle_request(
                     used_tokens: 0,
                     context_limit: 0,
                     busy: false,
+                    provider_usage: None,
                 }));
             }
             let conn = state
@@ -656,6 +657,7 @@ async fn handle_request(
                     used_tokens: 0,
                     context_limit: 0,
                     busy: true,
+                    provider_usage: None,
                 }));
             };
             let used_tokens: usize = agent
@@ -664,11 +666,14 @@ async fn handle_request(
                 .iter()
                 .map(gewu_core::compaction::estimate_message_tokens)
                 .sum();
+            let provider_usage = agent.provider_usage();
             Ok(Handled::Reply(ServerMessage::Usage {
                 id: request.id,
                 used_tokens: used_tokens as u64,
                 context_limit: agent.context_limit as u64,
                 busy: false,
+                provider_usage: (provider_usage.prompt_tokens() > 0 || provider_usage.output_tokens > 0)
+                    .then_some(provider_usage),
             }))
         }
 

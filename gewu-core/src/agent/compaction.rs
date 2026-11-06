@@ -83,8 +83,12 @@ When constructing the summary, try to stick to this template:
         let mut summary_text = String::new();
         while let Some(event_result) = stream.next().await {
             let event = event_result.map_err(|e| anyhow!("Compaction stream error: {}", e))?;
-            if let ProviderEvent::ContentDelta { delta } = event {
-                summary_text.push_str(&delta);
+            match event {
+                ProviderEvent::ContentDelta { delta } => summary_text.push_str(&delta),
+                // The compaction request is a real LLM request; its usage
+                // counts toward the session's provider-reported totals.
+                ProviderEvent::Usage { usage } => self.provider_usage.add(&usage),
+                _ => {}
             }
         }
 

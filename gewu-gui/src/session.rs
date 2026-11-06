@@ -488,8 +488,9 @@ impl GuiSession {
         let client = self.client(tab_id).expect("just ensured");
         match client.usage(Some(&session_id)).await {
             Ok(usage) if usage.used_tokens > 0 && usage.context_limit > 0 => {
-                self.workspace.tab_mut(tab_id).expect("active tab").context =
-                    Some((usage.used_tokens, usage.context_limit));
+                let tab = self.workspace.tab_mut(tab_id).expect("active tab");
+                tab.context = Some((usage.used_tokens, usage.context_limit));
+                tab.cache = usage.provider_usage;
             }
             Ok(_) => {}
             Err(e) => {
@@ -518,6 +519,7 @@ impl GuiSession {
             Ok(usage) if usage.used_tokens > 0 && usage.context_limit > 0 => {
                 if let Some(tab) = self.workspace.tab_mut(tab_id) {
                     tab.context = Some((usage.used_tokens, usage.context_limit));
+                    tab.cache = usage.provider_usage;
                 }
             }
             Ok(_) => {}
@@ -930,11 +932,15 @@ impl GuiSession {
                         Ok(AgentEvent::Usage {
                             used_tokens,
                             context_limit,
+                            provider,
                         }) => {
                             if used_tokens > 0 && context_limit > 0 {
                                 tab.context = Some((used_tokens, context_limit));
-                                usage_updated = true;
                             }
+                            if let Some(usage) = provider {
+                                tab.cache = Some(usage);
+                            }
+                            usage_updated = true;
                         }
                         // Reasoning is not shown; Finish is followed by Result.
                         Ok(AgentEvent::ReasoningDelta { .. }) | Ok(AgentEvent::Finish { .. }) => {}

@@ -41,7 +41,9 @@ use async_trait::async_trait;
 use futures::StreamExt;
 use futures::stream::BoxStream;
 use gewu_core::traits::{LlmProvider, Tool};
-use gewu_core::types::{Capabilities, ContentPart, Message, ProviderEvent};
+use gewu_core::types::{
+    Capabilities, ContentPart, Message, ProviderEvent, TokenUsage,
+};
 use serde_json::Value;
 use std::error::Error;
 use std::sync::Arc;
@@ -487,6 +489,12 @@ impl OpenAIProvider {
             // wire); logging the request without `stream: true` would make
             // the request log misrepresent what is sent.
             stream: Some(true),
+            // Usage (and its cache figures) ride on the final chunk only
+            // when requested; `create_stream` sets the same value on the
+            // wire request.
+            stream_options: Some(crate::openai::StreamOptions {
+                include_usage: Some(true),
+            }),
             max_tokens: None,
             temperature: None,
         })
@@ -627,6 +635,30 @@ impl ResponseParser for OpenAIProvider {
             let mut stream = stream;
             while let Some(result) = stream.next().await {
                 let response = result.map_err(|e| Box::new(e) as Box<dyn Error + Send + Sync>)?;
+                // The final chunk (requested via `stream_options.include_usage`)
+                // carries the whole-request usage with an empty `choices`.
+                if let Some(usage) = &response.usage
+                    && (!response.choices.is_empty() || usage.prompt_tokens > 0 || usage.total_tokens > 0)
+                {
+                    // `cached_tokens` is a subset of `prompt_tokens`;
+                    // the rest was processed uncached. Gateways without
+                    // the details object report no cache hits.
+                    let cached = usage
+                        .prompt_tokens_details
+                        .as_ref()
+                        .and_then(|d| d.cached_tokens)
+                        .unwrap_or(0) as u64;
+                    yield ProviderEvent::Usage {
+                        usage: TokenUsage {
+                            input_tokens: (usage.prompt_tokens as u64).saturating_sub(cached),
+                            cached_tokens: cached,
+                            // OpenAI's automatic prefix cache reports no
+                            // separate write figure.
+                            cache_write_tokens: 0,
+                            output_tokens: usage.completion_tokens as u64,
+                        },
+                    };
+                }
                 if let Some(choice) = response.choices.first() {
                     let delta = &choice.delta;
 
@@ -1173,11 +1205,32 @@ impl AnthropicProvider {
             let mut tool_aggregator = AnthropicToolCallAggregator::default();
             let mut stream = stream;
 
+            // Cache figures may be zeroed on `message_start` by proxies
+            // (LiteLLM/OpenRouter report real numbers only in the final
+            // `message_delta`), so each field keeps the latest non-zero
+            // value across both events.
+            let mut usage = TokenUsage::default();
+
             while let Some(result) = stream.next().await {
                 let chunk = result.map_err(|e| Box::new(e) as Box<dyn Error + Send + Sync>)?;
 
                 match chunk {
-                    AnthropicChunk::MessageStart(MessageStartChunk { .. }) => {}
+                    AnthropicChunk::MessageStart(MessageStartChunk { _message }) => {
+                        if let Some(message_usage) = _message.usage {
+                            if message_usage.input_tokens > 0 {
+                                usage.input_tokens = message_usage.input_tokens;
+                            }
+                            if message_usage.cache_read_input_tokens > 0 {
+                                usage.cached_tokens = message_usage.cache_read_input_tokens;
+                            }
+                            if message_usage.cache_creation_input_tokens > 0 {
+                                usage.cache_write_tokens = message_usage.cache_creation_input_tokens;
+                            }
+                            if message_usage.output_tokens > 0 {
+                                usage.output_tokens = message_usage.output_tokens;
+                            }
+                        }
+                    }
                     AnthropicChunk::ContentBlockStart(chunk) => {
                         for event in tool_aggregator.process_chunk(&chunk, chunk.index) {
                             yield event;
@@ -1202,7 +1255,30 @@ impl AnthropicProvider {
                     }
                     AnthropicChunk::ContentBlockStop(_) => {}
                     AnthropicChunk::MessageDelta(chunk) => {
+                        // `message_delta.usage` is the cumulative figure;
+                        // merge it over the `message_start` values (latest
+                        // non-zero per field, see above).
+                        let message_usage = &chunk._usage;
+                        if message_usage.input_tokens > 0 {
+                            usage.input_tokens = message_usage.input_tokens;
+                        }
+                        if message_usage.cache_read_input_tokens > 0 {
+                            usage.cached_tokens = message_usage.cache_read_input_tokens;
+                        }
+                        if message_usage.cache_creation_input_tokens > 0 {
+                            usage.cache_write_tokens = message_usage.cache_creation_input_tokens;
+                        }
+                        if message_usage.output_tokens > 0 {
+                            usage.output_tokens = message_usage.output_tokens;
+                        }
                         if let Some(reason) = chunk.delta.stop_reason {
+                            // Emit once, with the terminal cumulative
+                            // figures: some flows (server tools) deliver
+                            // several cumulative `message_delta` events, and
+                            // emitting each would double-count downstream.
+                            if usage.prompt_tokens() > 0 || usage.output_tokens > 0 {
+                                yield ProviderEvent::Usage { usage };
+                            }
                             yield ProviderEvent::Finish { reason: Some(reason) };
                         }
                     }
@@ -2147,5 +2223,128 @@ mod tests {
                 .iter()
                 .any(|e| matches!(e, ProviderEvent::Error { .. }))
         );
+    }
+
+    // -- Provider-reported usage (cache accounting) ------------------------
+
+    /// Collects the parsed events from a raw OpenAI SSE body.
+    async fn openai_parse_sse(sse: &'static str) -> Vec<ProviderEvent> {
+        let body: std::collections::VecDeque<Result<bytes::Bytes, reqwest::Error>> =
+            std::collections::VecDeque::from(vec![Ok(bytes::Bytes::from_static(sse.as_bytes()))]);
+        let wire = futures::stream::iter(body);
+        OpenAIProvider::new("test-key", "gpt-4o")
+            .parse_stream(ChatCompletionStream::new(wire))
+            .map(|e| e.expect("event should parse"))
+            .collect()
+            .await
+    }
+
+    /// Collects the parsed events from a raw Anthropic SSE body.
+    async fn anthropic_parse_sse(sse: &'static str) -> Vec<ProviderEvent> {
+        let body: std::collections::VecDeque<Result<bytes::Bytes, reqwest::Error>> =
+            std::collections::VecDeque::from(vec![Ok(bytes::Bytes::from_static(sse.as_bytes()))]);
+        let wire = futures::stream::iter(body);
+        AnthropicProvider::new("test-key", "claude-3-5-sonnet")
+            .parse_stream(AnthropicStream::new(wire))
+            .map(|e| e.expect("event should parse"))
+            .collect()
+            .await
+    }
+
+    fn usage_events(events: &[ProviderEvent]) -> Vec<gewu_core::types::TokenUsage> {
+        events
+            .iter()
+            .filter_map(|e| match e {
+                ProviderEvent::Usage { usage } => Some(*usage),
+                _ => None,
+            })
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn anthropic_usage_merges_start_and_delta_cache_figures() {
+        // Proxies (LiteLLM/OpenRouter) zero the cache fields on
+        // `message_start` and report real numbers in the final
+        // `message_delta`; each field must keep its latest non-zero value.
+        let sse = concat!(
+            "event: message_start\n",
+            r#"data: {"type":"message_start","message":{"id":"m1","role":"assistant","content":[],"usage":{"input_tokens":100,"output_tokens":1,"cache_read_input_tokens":0,"cache_creation_input_tokens":0}}}"#,
+            "\n\n",
+            "event: message_delta\n",
+            r#"data: {"type":"message_delta","delta":{"stop_reason":"end_turn"},"usage":{"output_tokens":42,"cache_read_input_tokens":700,"cache_creation_input_tokens":50}}"#,
+            "\n\n",
+            "event: message_stop\n",
+            "data: {}\n\n",
+        );
+        let events = anthropic_parse_sse(sse).await;
+        let usages = usage_events(&events);
+        assert_eq!(usages.len(), 1, "usage emitted once: {events:?}");
+        let usage = usages[0];
+        assert_eq!(usage.input_tokens, 100);
+        assert_eq!(usage.cached_tokens, 700);
+        assert_eq!(usage.cache_write_tokens, 50);
+        assert_eq!(usage.output_tokens, 42);
+        // 700 of 850 prompt tokens were served from cache.
+        assert_eq!(usage.cache_hit_rate_percent(), Some(82));
+    }
+
+    #[tokio::test]
+    async fn anthropic_usage_without_stop_reason_is_not_emitted() {
+        // A cumulative `message_delta` without a stop reason is not the
+        // terminal one; emitting per delta would double-count.
+        let sse = concat!(
+            "event: message_start\n",
+            r#"data: {"type":"message_start","message":{"id":"m1","role":"assistant","content":[],"usage":{"input_tokens":10,"output_tokens":1}}}"#,
+            "\n\n",
+            "event: message_delta\n",
+            r#"data: {"type":"message_delta","delta":{},"usage":{"output_tokens":2}}"#,
+            "\n\n",
+        );
+        let events = anthropic_parse_sse(sse).await;
+        assert!(
+            usage_events(&events).is_empty(),
+            "no Usage before Finish: {events:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn openai_usage_chunk_maps_cached_tokens() {
+        // The final chunk (empty `choices`) carries the usage; cached tokens
+        // are a subset of prompt tokens and the rest was billed uncached.
+        let sse = concat!(
+            r#"data: {"id":"c1","choices":[{"index":0,"delta":{"content":"Answer"}}]}"#,
+            "\n\n",
+            r#"data: {"id":"c1","choices":[],"usage":{"prompt_tokens":1000,"completion_tokens":20,"total_tokens":1020,"prompt_tokens_details":{"cached_tokens":800}}}"#,
+            "\n\n",
+            "data: [DONE]\n\n",
+        );
+        let events = openai_parse_sse(sse).await;
+        let usages = usage_events(&events);
+        assert_eq!(usages.len(), 1, "usage emitted once: {events:?}");
+        let usage = usages[0];
+        assert_eq!(usage.input_tokens, 200);
+        assert_eq!(usage.cached_tokens, 800);
+        assert_eq!(usage.cache_write_tokens, 0);
+        assert_eq!(usage.output_tokens, 20);
+        assert_eq!(usage.cache_hit_rate_percent(), Some(80));
+    }
+
+    #[tokio::test]
+    async fn openai_usage_without_details_reports_no_cache_hits() {
+        // Gateways (DeepSeek/GLM) may omit `prompt_tokens_details`; the
+        // request must still parse, with every prompt token uncached.
+        let sse = concat!(
+            r#"data: {"id":"c1","choices":[{"index":0,"delta":{"content":"Answer"}}]}"#,
+            "\n\n",
+            r#"data: {"id":"c1","choices":[],"usage":{"prompt_tokens":1000,"completion_tokens":20,"total_tokens":1020}}"#,
+            "\n\n",
+            "data: [DONE]\n\n",
+        );
+        let events = openai_parse_sse(sse).await;
+        let usages = usage_events(&events);
+        assert_eq!(usages.len(), 1, "{events:?}");
+        assert_eq!(usages[0].input_tokens, 1000);
+        assert_eq!(usages[0].cached_tokens, 0);
+        assert_eq!(usages[0].cache_hit_rate_percent(), Some(0));
     }
 }

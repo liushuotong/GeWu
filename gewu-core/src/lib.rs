@@ -60,5 +60,6 @@ pub use middleware::TruncationService;
 pub use traits::{Experiences, LlmProvider, Memory, Tool, ToolRegistry};
 pub use types::{
     AgentEvent, ContentPart, Experience, ExperienceQuery, FileAttachment, FunctionCall, Message,
-    ProviderEvent, RecalledExperience, ToolCall, ToolContext, ToolResult, TruncationResult,
+    ProviderEvent, RecalledExperience, TokenUsage, ToolCall, ToolContext, ToolResult,
+    TruncationResult,
 };

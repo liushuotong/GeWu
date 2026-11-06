@@ -122,6 +122,11 @@ impl<'a> ChatCompletions<'a> {
         mut request: CreateChatCompletionRequest,
     ) -> Result<ChatCompletionStream, OpenAIError> {
         request.stream = Some(true);
+        // Ask for the final usage chunk; without this the stream carries no
+        // token accounting (and no cache-hit figures).
+        request.stream_options = Some(StreamOptions {
+            include_usage: Some(true),
+        });
         let url = format!("{}/chat/completions", self.client.config.base_url);
 
         let response = self
@@ -340,10 +345,21 @@ pub struct CreateChatCompletionRequest {
     pub tools: Option<Vec<ChatCompletionTools>>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub stream: Option<bool>,
+    /// Set with `stream: true` to have the final chunk carry `usage`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub stream_options: Option<StreamOptions>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub max_tokens: Option<u32>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub temperature: Option<f32>,
+}
+
+/// `stream_options` for chat completion requests.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct StreamOptions {
+    /// Stream one extra final chunk carrying `usage` for the whole request.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub include_usage: Option<bool>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -669,6 +685,19 @@ pub struct Usage {
     pub prompt_tokens: u32,
     pub completion_tokens: u32,
     pub total_tokens: u32,
+    /// Cache/cost breakdown of the prompt tokens. OpenAI reports
+    /// `cached_tokens` under this object; third-party gateways that omit
+    /// the whole object must still parse (`#[serde(default)]`).
+    #[serde(default)]
+    pub prompt_tokens_details: Option<PromptTokensDetails>,
+}
+
+/// Breakdown of prompt tokens.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PromptTokensDetails {
+    /// Prompt tokens served from the provider's prompt cache (cache hits).
+    #[serde(default)]
+    pub cached_tokens: Option<u32>,
 }
 
 #[cfg(test)]

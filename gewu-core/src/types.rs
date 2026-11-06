@@ -125,6 +125,47 @@ pub struct OutputCapabilities {
     pub pdf: bool,
 }
 
+/// Provider-reported token accounting for one LLM request.
+///
+/// Every field is provider-reported (`0` when the provider does not report
+/// that figure); hit rate is computed against the totals, not per turn.
+/// Input token fields follow the Anthropic breakdown; OpenAI's
+/// `prompt_tokens_details.cached_tokens` maps to `cached_tokens`.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TokenUsage {
+    /// Uncached prompt tokens processed at full price.
+    pub input_tokens: u64,
+    /// Prompt tokens served from the provider cache (cache hits).
+    pub cached_tokens: u64,
+    /// Prompt tokens written to the provider cache this request.
+    pub cache_write_tokens: u64,
+    /// Output (completion) tokens.
+    pub output_tokens: u64,
+}
+
+impl TokenUsage {
+    /// Adds the other tally into this one (session accumulation).
+    pub fn add(&mut self, other: &TokenUsage) {
+        self.input_tokens += other.input_tokens;
+        self.cached_tokens += other.cached_tokens;
+        self.cache_write_tokens += other.cache_write_tokens;
+        self.output_tokens += other.output_tokens;
+    }
+
+    /// Total prompt tokens this request (or session) processed:
+    /// uncached + cached + newly-written.
+    pub fn prompt_tokens(&self) -> u64 {
+        self.input_tokens + self.cached_tokens + self.cache_write_tokens
+    }
+
+    /// Fraction of prompt tokens served from cache, as a percentage.
+    /// `None` when no prompt tokens were processed at all.
+    pub fn cache_hit_rate_percent(&self) -> Option<u64> {
+        let total = self.prompt_tokens();
+        (total > 0).then(|| self.cached_tokens * 100 / total)
+    }
+}
+
 /// Events emitted by the LLM provider during streaming responses.
 ///
 /// ProviderEvent represents the raw events that come from the LLM provider
@@ -144,6 +185,9 @@ pub enum ProviderEvent {
     ToolCallDelta { id: String, delta: String },
     /// The provider has finished generating the response.
     Finish { reason: Option<String> },
+    /// Provider-reported token usage for the completed request. Emitted
+    /// once per LLM request (after the last usage figure is known).
+    Usage { usage: TokenUsage },
     /// An error occurred during streaming.
     Error { error: String },
 }
@@ -181,6 +225,11 @@ pub enum AgentEvent {
         used_tokens: u64,
         /// The agent's context window in tokens.
         context_limit: u64,
+        /// Provider-reported token accounting accumulated across the whole
+        /// session (every LLM request, including compaction requests).
+        /// `None` when the provider reported no usage yet.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        provider: Option<TokenUsage>,
     },
     /// An error occurred during agent execution.
     Error { error: String },

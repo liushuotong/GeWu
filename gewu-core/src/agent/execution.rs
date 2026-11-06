@@ -146,6 +146,10 @@ impl LlmResponseAggregator {
                 None
             }
             ProviderEvent::Finish { .. } => None,
+            // Provider usage is folded into the agent's session totals by
+            // the ask loop (and compaction); the per-request figure is not
+            // forwarded as an agent event.
+            ProviderEvent::Usage { .. } => None,
             ProviderEvent::Error { error } => Some(AgentEvent::Error { error }),
         }
     }

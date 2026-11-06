@@ -50,8 +50,8 @@ pub use tools::execute_tool_with_panic_recovery;
 use crate::middleware::TruncationService;
 use crate::traits::{Experiences, LlmProvider, Memory, RequestLog, Tool, ToolRegistry};
 use crate::types::{
-    AgentEvent, ContentPart, Message, PathEnforcement, ProviderEvent, ToolCall, ToolContext,
-    ToolResult,
+    AgentEvent, ContentPart, Message, PathEnforcement, ProviderEvent, TokenUsage, ToolCall,
+    ToolContext, ToolResult,
 };
 use anyhow::{Context, Result};
 use async_trait::async_trait;
@@ -101,6 +101,9 @@ pub struct Agent {
     /// Optional request log; when set, every LLM request is recorded by the
     /// provider's `stream_response` (see [`crate::traits::RequestLog`]).
     log: Option<RequestLog>,
+    /// Provider-reported token usage accumulated across the whole session
+    /// (every completed LLM request, including compaction requests).
+    provider_usage: TokenUsage,
 }
 
 /// Builder for constructing `Agent` instances.
@@ -271,8 +274,12 @@ impl Agent {
                 let mut finish_reason: Option<String> = None;
                 while let Some(event_result) = stream.next().await {
                     let event = event_result.map_err(|e| anyhow::anyhow!(e))?;
-                    if let ProviderEvent::Finish { reason } = &event {
-                        finish_reason = reason.clone();
+                    match &event {
+                        ProviderEvent::Finish { reason } => finish_reason = reason.clone(),
+                        ProviderEvent::Usage { usage } => {
+                            self.provider_usage.add(usage);
+                        }
+                        _ => {}
                     }
                     if let Some(agent_event) = aggregator.process_event(event) {
                         yield agent_event;
@@ -473,7 +480,8 @@ impl Agent {
         }
     }
 
-    /// Builds the context-usage event from the current conversation estimate.
+    /// Builds the context-usage event from the current conversation estimate
+    /// plus the provider-reported token accounting for the whole session.
     fn usage_event(&self) -> AgentEvent {
         let used_tokens: usize = self
             .memory
@@ -484,7 +492,15 @@ impl Agent {
         AgentEvent::Usage {
             used_tokens: used_tokens as u64,
             context_limit: self.context_limit as u64,
+            provider: Some(self.provider_usage),
         }
+    }
+
+    /// Provider-reported token usage accumulated across the whole session
+    /// (every completed LLM request, including compaction requests). All
+    /// zeros until the provider reports usage.
+    pub fn provider_usage(&self) -> TokenUsage {
+        self.provider_usage
     }
 }
 
@@ -614,6 +630,7 @@ impl AgentBuilder {
             experiences: self.experiences,
             log: self.log,
             enforcement: self.enforcement,
+            provider_usage: TokenUsage::default(),
         };
         Ok(agent)
     }
