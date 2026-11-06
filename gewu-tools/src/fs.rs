@@ -41,6 +41,8 @@ const MAX_LINE_LENGTH: usize = 2000;
 const MAX_LINE_SUFFIX: &str = "... (line truncated to 2000 chars)";
 const MAX_BYTES: usize = 50 * 1024;
 const MAX_BYTES_LABEL: &str = "50 KB";
+/// Cap for image/PDF reads (raw bytes, before base64 inflation).
+const MAX_MEDIA_BYTES: usize = 20 * 1024 * 1024;
 
 #[derive(Debug, Deserialize, Serialize, schemars::JsonSchema)]
 pub struct ReadArgs {
@@ -231,6 +233,18 @@ impl Tool for ReadFileTool {
         let is_pdf = mime == "application/pdf";
 
         if is_image || is_pdf {
+            // Cap media reads like the text path: a multi-gigabyte file with
+            // an image/PDF extension would otherwise be fully loaded and
+            // base64-inflated in memory.
+            if meta.len() > MAX_MEDIA_BYTES as u64 {
+                return Ok(ToolResult::new(
+                    "read_file",
+                    format!(
+                        "Cannot read file: {} is {} bytes, which exceeds the {} byte media read cap",
+                        input.file_path, meta.len(), MAX_MEDIA_BYTES
+                    ),
+                ));
+            }
             let data = read_bytes(&file_path).await.map_err(into_tool_error)?;
             let encoded = BASE64.encode(&data);
             let msg = if is_image { "Image" } else { "PDF" };
@@ -292,7 +306,13 @@ impl Tool for ReadFileTool {
             }
 
             let truncated_line = if text.len() > MAX_LINE_LENGTH {
-                format!("{}{}", &text[..MAX_LINE_LENGTH], MAX_LINE_SUFFIX)
+                // Cut at a char boundary: byte 2000 can land mid-character
+                // in multi-byte input.
+                let mut cut = MAX_LINE_LENGTH;
+                while cut > 0 && !text.is_char_boundary(cut) {
+                    cut -= 1;
+                }
+                format!("{}{}", &text[..cut], MAX_LINE_SUFFIX)
             } else {
                 text.clone()
             };
@@ -325,7 +345,9 @@ impl Tool for ReadFileTool {
             .collect();
 
         let total_lines_count = total_lines;
-        let last_read_line = input.offset + lines.len() - 1;
+        // `lines` is empty when the file is empty (or the offset starts past
+        // EOF); saturating arithmetic avoids the `0 + 0 - 1` underflow.
+        let last_read_line = input.offset.saturating_sub(1) + lines.len().max(1);
         let next_offset = last_read_line + 1;
         let has_more_lines = has_more_lines || truncated_by_bytes;
 

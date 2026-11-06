@@ -204,27 +204,17 @@ where
 
     fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
         loop {
-            if let Some(pos) = self.buffer.iter().position(|&b| b == b'\n') {
+            while let Some(pos) = self.buffer.iter().position(|&b| b == b'\n') {
                 // Decode only complete lines, so a multi-byte character split
                 // across chunk boundaries is decoded once the line is whole.
                 let line = String::from_utf8_lossy(&self.buffer[..pos]).into_owned();
                 self.buffer.drain(..=pos);
 
-                let line = line.trim();
-                if line.is_empty() || line.starts_with(':') {
-                    continue;
-                }
-
-                if let Some(data) = line.strip_prefix("data: ") {
-                    if data == "[DONE]" {
-                        return Poll::Ready(None);
-                    }
-                    match serde_json::from_str::<ChatCompletionChunk>(data) {
-                        Ok(chunk) => return Poll::Ready(Some(Ok(chunk))),
-                        Err(e) => {
-                            return Poll::Ready(Some(Err(OpenAIError::SseParse(e.to_string()))));
-                        }
-                    }
+                match Self::process_line(&line) {
+                    LineOutcome::Continue => {}
+                    LineOutcome::Chunk(chunk) => return Poll::Ready(Some(Ok(chunk))),
+                    LineOutcome::Error(e) => return Poll::Ready(Some(Err(e))),
+                    LineOutcome::Done => return Poll::Ready(None),
                 }
             }
 
@@ -236,15 +226,59 @@ where
                     return Poll::Ready(Some(Err(OpenAIError::Http(e))));
                 }
                 Poll::Ready(None) => {
-                    if self.buffer.is_empty() {
-                        return Poll::Ready(None);
+                    // A final line without a trailing newline is still a
+                    // complete SSE field; process it before ending.
+                    if !self.buffer.is_empty() {
+                        let line = String::from_utf8_lossy(&self.buffer).into_owned();
+                        self.buffer.clear();
+                        match Self::process_line(&line) {
+                            LineOutcome::Chunk(chunk) => return Poll::Ready(Some(Ok(chunk))),
+                            LineOutcome::Error(e) => return Poll::Ready(Some(Err(e))),
+                            _ => {}
+                        }
                     }
-                    self.buffer.clear();
                     return Poll::Ready(None);
                 }
                 Poll::Pending => return Poll::Pending,
             }
         }
+    }
+}
+
+/// Result of processing one SSE line.
+enum LineOutcome {
+    /// Keep scanning for more lines.
+    Continue,
+    /// A complete data event was parsed.
+    Chunk(ChatCompletionChunk),
+    /// The event failed to parse.
+    Error(OpenAIError),
+    /// The `[DONE]` terminator was reached.
+    Done,
+}
+
+impl<S> SseStream<S>
+where
+    S: Stream<Item = Result<Bytes, reqwest::Error>>,
+{
+    fn process_line(raw: &str) -> LineOutcome {
+        let line = raw.trim();
+        if line.is_empty() || line.starts_with(':') {
+            return LineOutcome::Continue;
+        }
+        // The single space after the colon is optional per the SSE spec;
+        // servers and proxies may emit `data:{...}`.
+        if let Some(data) = line.strip_prefix("data:") {
+            let data = data.strip_prefix(' ').unwrap_or(data);
+            if data == "[DONE]" {
+                return LineOutcome::Done;
+            }
+            return match serde_json::from_str::<ChatCompletionChunk>(data) {
+                Ok(chunk) => LineOutcome::Chunk(chunk),
+                Err(e) => LineOutcome::Error(OpenAIError::SseParse(e.to_string())),
+            };
+        }
+        LineOutcome::Continue
     }
 }
 
@@ -708,5 +742,43 @@ mod tests {
             }
         }
         assert_eq!(reasoning, "The user");
+    }
+
+    #[tokio::test]
+    async fn sse_stream_accepts_data_field_without_space() {
+        // The SSE spec makes the single space after the colon optional;
+        // `data:{...}` must parse, not be silently skipped.
+        let sse = concat!(
+            "data:{\"id\":\"1\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\"hi\"}}]}\n\n",
+            "data:[DONE]\n\n",
+        );
+        let mut stream =
+            ChatCompletionStream::new(body_stream(vec![Bytes::from_static(sse.as_bytes())]));
+        let mut count = 0;
+        while let Some(ev) = stream.next().await {
+            let chunk = ev.expect("chunk should parse");
+            assert_eq!(chunk.choices[0].delta.content.as_deref(), Some("hi"));
+            count += 1;
+        }
+        assert_eq!(count, 1);
+    }
+
+    #[tokio::test]
+    async fn sse_stream_processes_final_line_without_trailing_newline() {
+        // A complete-but-unterminated last event must still be delivered.
+        let sse = concat!(
+            "data: {\"id\":\"1\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\"a\"}}]}\n\n",
+            "data: {\"id\":\"1\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\"b\"}}]}\n",
+        );
+        let mut stream =
+            ChatCompletionStream::new(body_stream(vec![Bytes::from_static(sse.as_bytes())]));
+        let mut text = String::new();
+        while let Some(ev) = stream.next().await {
+            let chunk = ev.expect("chunk should parse");
+            if let Some(c) = &chunk.choices[0].delta.content {
+                text.push_str(c);
+            }
+        }
+        assert_eq!(text, "ab");
     }
 }

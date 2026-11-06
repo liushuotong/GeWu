@@ -283,7 +283,12 @@ async fn run(cli: RunArgs) -> Result<()> {
         let trimmed = stdin_prompt.trim();
         if !trimmed.is_empty() {
             if trimmed.len() > 100 {
-                println!("> {}...", &trimmed[..100]);
+                // Cut at a char boundary; byte 100 can land mid-character.
+                let mut cut = 100;
+                while !trimmed.is_char_boundary(cut) {
+                    cut -= 1;
+                }
+                println!("> {}...", &trimmed[..cut]);
             } else {
                 println!("> {}", trimmed);
             }

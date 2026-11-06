@@ -9,6 +9,7 @@ use std::collections::VecDeque;
 use tracing::warn;
 
 use super::execute_tool_with_panic_recovery;
+use super::media::extract_media_parts;
 use crate::middleware::TruncationService;
 use crate::traits::Tool;
 
@@ -47,8 +48,20 @@ impl DoomLoopDetector {
     /// * `args` - The tool arguments
     pub(super) fn check(&mut self, tool: &str, args: &str) -> Option<String> {
         let current_call_sig = (tool.to_string(), args.to_string());
-        if self.recent_calls.len() == self.threshold
-            && self.recent_calls.iter().all(|x| x == &current_call_sig)
+        // The current call counts toward the streak: execution is stopped ON
+        // the threshold-th consecutive identical call, not one call after it
+        // (`record` only runs for calls that pass this check, so without
+        // counting the current call the detector would need threshold + 1
+        // calls to fire — contradicting the documented "3 identical calls
+        // stops execution").
+        let needed = self.threshold.saturating_sub(1);
+        if self.recent_calls.len() >= needed
+            && self
+                .recent_calls
+                .iter()
+                .rev()
+                .take(needed)
+                .all(|x| x == &current_call_sig)
         {
             return Some(format!(
                 "Doom loop detected: Tool '{}' called {} times repeatedly with identical arguments. Stopping.",
@@ -201,17 +214,26 @@ pub(super) async fn execute_tool_call(
 
     match execute_tool_with_panic_recovery(tool, args_val, ctx).await {
         Ok(mut res) => {
-            let truncation_result = truncation.truncate(&res.output);
-            if truncation_result.truncated {
-                res.output = format!(
-                    "{}\n\n[Output truncated - {} bytes saved to {}]",
-                    truncation_result.content,
-                    truncation_result.content.len(),
-                    truncation_result
-                        .output_path
-                        .map(|p| p.display().to_string())
-                        .unwrap_or_default()
-                );
+            // Media payloads (e.g. `read_file` on an image/PDF) must reach the
+            // agent's media extractor intact. Truncating them mangles the
+            // base64 JSON and the image is silently lost, so those outputs
+            // bypass truncation entirely.
+            if extract_media_parts(&res.output).is_empty() {
+                let original_len = res.output.len();
+                let truncation_result = truncation.truncate(&res.output);
+                if truncation_result.truncated {
+                    let saved_note = match &truncation_result.output_path {
+                        Some(path) => format!("full output saved to {}", path.display()),
+                        None => "full output could not be saved to disk".to_string(),
+                    };
+                    res.output = format!(
+                        "{}\n\n[Output truncated - {} of {} bytes shown; {}]",
+                        truncation_result.content,
+                        truncation_result.content.len(),
+                        original_len,
+                        saved_note
+                    );
+                }
             }
             Ok(res)
         }

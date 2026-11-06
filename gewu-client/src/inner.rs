@@ -122,13 +122,15 @@ impl Inner {
     }
 }
 
-/// Key used to match replies to pending requests. Numbers and strings are
-/// matched on their string form so `1` and `"1"` both work; the server
-/// echoes the id verbatim.
+/// Key used to match replies to pending requests. The key is type-tagged so
+/// a numeric id `1` and a string id `"1"` never collide (the server echoes
+/// the id verbatim, so same-type matching is exact).
 fn key_for(id: &serde_json::Value) -> String {
     match id {
-        serde_json::Value::String(s) => s.clone(),
-        other => other.to_string(),
+        serde_json::Value::String(s) => format!("s:{s}"),
+        serde_json::Value::Number(n) => format!("n:{n}"),
+        serde_json::Value::Null => "null".to_string(),
+        other => format!("o:{other}"),
     }
 }
 

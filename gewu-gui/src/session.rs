@@ -219,8 +219,15 @@ impl GuiSession {
 
         let ids: Vec<_> = self.workspace.tabs.iter().filter_map(|tab| tab.model.session_id.clone().map(|s| (tab.id, s))).collect();
         for (id, session_id) in ids {
-            self.ensure_client(id).await?;
-            self.observe(id, session_id, true).await?;
+            // One bad stored session must not prevent the browser session
+            // from starting; log and continue with the remaining tabs.
+            if let Err(e) = self.ensure_client(id).await {
+                warn!("failed to restore connection for tab {id}: {e}");
+                continue;
+            }
+            if let Err(e) = self.observe(id, session_id, true).await {
+                warn!("failed to restore observer for tab {id}: {e}");
+            }
         }
 
         loop {
@@ -253,7 +260,12 @@ impl GuiSession {
                 // Ping/pong and binary frames need no handling.
                 Incoming::Socket(Some(Ok(_))) => {}
                 Incoming::Tab(Some(event)) => {
-                    self.handle_tab_event(event, &mut sender).await?;
+                    // A failed upstream call for one tab must not disconnect
+                    // the whole browser session.
+                    if let Err(e) = self.handle_tab_event(event, &mut sender).await {
+                        warn!("handling tab event failed: {e}");
+                        self.send_error(&mut sender, e.to_string()).await?;
+                    }
                 }
                 // The keepalive sender means this cannot normally happen.
                 Incoming::Tab(None) => break,
@@ -625,12 +637,21 @@ impl GuiSession {
                 } else {
                     self.expanded_dirs.insert(path.clone());
                     if !self.file_cache.contains_key(&path) {
-                        let entries = self
-                            .admin
-                            .list_files(path.clone())
-                            .await
-                            .map_err(|e| anyhow::anyhow!(e.to_string()))?;
-                        self.file_cache.insert(path, entries);
+                        // A failed listing must not tear down the whole
+                        // browser session; report it and keep the tree open.
+                        match self.admin.list_files(path.clone()).await {
+                            Ok(entries) => {
+                                self.file_cache.insert(path.clone(), entries);
+                            }
+                            Err(e) => {
+                                self.expanded_dirs.remove(&path);
+                                self.send_error(
+                                    sender,
+                                    format!("failed to list '{}': {e}", path),
+                                )
+                                .await?;
+                            }
+                        }
                     }
                 }
                 send_msg(

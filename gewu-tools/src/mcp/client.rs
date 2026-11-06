@@ -4,9 +4,17 @@ use futures_util::StreamExt;
 use serde_json::{Value, json};
 use std::process::Stdio;
 use std::sync::Arc;
+use std::time::Duration;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::process::{Child, ChildStdin, Command};
 use tokio::sync::Mutex;
+
+/// Upper bound on how long a single JSON-RPC request waits for its response.
+///
+/// Without this, a hung MCP server blocks the calling tool forever — and
+/// because `McpToolWrapper` holds the client mutex for the duration of the
+/// call, every other tool on the same client behind it as well.
+pub const REQUEST_TIMEOUT: Duration = Duration::from_secs(120);
 
 enum Transport {
     Stdio {
@@ -56,7 +64,10 @@ impl McpClient {
             .envs(env)
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
-            .stderr(Stdio::inherit());
+            .stderr(Stdio::inherit())
+            // Kill the server process if the client is dropped, so it neither
+            // leaks nor lingers as an unreaped zombie.
+            .kill_on_drop(true);
 
         let mut child = cmd.spawn().context("Failed to spawn MCP server")?;
 
@@ -191,9 +202,11 @@ impl McpClient {
             Self::abort_pending_requests(&pending_requests_clone, "SSE connection lost").await;
         });
 
-        // Wait for endpoint
-        let endpoint = endpoint_rx
+        // Wait for the endpoint event with a timeout; a server that never
+        // sends it must not hang startup forever.
+        let endpoint = tokio::time::timeout(REQUEST_TIMEOUT, endpoint_rx)
             .await
+            .map_err(|_| anyhow::anyhow!("Timed out waiting for SSE endpoint event"))?
             .context("Failed to receive endpoint event from SSE stream")?
             .context("Invalid endpoint event")?;
 
@@ -546,11 +559,24 @@ impl McpClient {
             }
         }
 
-        // Wait for response with timeout?
-        // Let's assume tool calls might take long, so maybe a generous timeout or none.
-        let response = rx
-            .await
-            .context("Channel closed before response received")??;
+        // Wait for the response with a hard timeout. Without it, a server
+        // that never replies hangs the calling tool forever (and, via the
+        // client mutex in McpToolWrapper, every other tool on this client);
+        // each such call also leaks its pending_requests entry.
+        let response = match tokio::time::timeout(REQUEST_TIMEOUT, rx).await {
+            Ok(joined) => joined.context("Channel closed before response received")??,
+            Err(_) => {
+                // Drop the pending entry so the map does not accumulate
+                // abandoned correlation ids.
+                let mut pending = self.pending_requests.lock().await;
+                pending.remove(&id);
+                return Err(anyhow::anyhow!(
+                    "MCP request '{}' timed out after {}s",
+                    method,
+                    REQUEST_TIMEOUT.as_secs()
+                ));
+            }
+        };
 
         Ok(response)
     }

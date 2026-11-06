@@ -62,24 +62,7 @@ pub(crate) fn client() -> Client {
         .expect("static HTTP client configuration should never fail")
 }
 
-/// Runs `op`, retrying retryable errors indefinitely (see [`MAX_RETRY_WAIT`]).
-///
-/// Retrying is safe here because the operation is only attempted before any
-/// response bytes have been consumed, so no partial output can be duplicated.
-pub(crate) async fn with_retries<T, E, Fut, F>(
-    backoff: Duration,
-    op: F,
-    is_retryable: fn(&E) -> RetryDecision,
-) -> Result<T, E>
-where
-    F: FnMut() -> Fut,
-    Fut: Future<Output = Result<T, E>>,
-    E: std::fmt::Display,
-{
-    with_retries_capped(backoff, MAX_RETRY_WAIT, op, is_retryable).await
-}
-
-/// [`with_retries`] with an injectable per-wait cap, so tests don't sleep
+/// [`with_retries_capped`] with the standard per-wait cap, so tests don't sleep
 /// minutes.
 pub(crate) async fn with_retries_capped<T, E, Fut, F>(
     backoff: Duration,
@@ -196,15 +179,19 @@ mod tests {
     #[tokio::test]
     async fn retries_transient_failures_then_succeeds() {
         let calls = Arc::new(AtomicUsize::new(0));
-        let result: Result<u32, String> =
-            with_retries(TEST_BACKOFF, counting_op(calls.clone(), 2), |e| {
+        let result: Result<u32, String> = with_retries_capped(
+            TEST_BACKOFF,
+            MAX_RETRY_WAIT,
+            counting_op(calls.clone(), 2),
+            |e| {
                 if e.starts_with("transient") {
                     RetryDecision::Yes { after: None }
                 } else {
                     RetryDecision::No
                 }
-            })
-            .await;
+            },
+        )
+        .await;
         assert_eq!(result.unwrap(), 3);
         assert_eq!(calls.load(Ordering::SeqCst), 3);
     }
@@ -213,8 +200,9 @@ mod tests {
     async fn does_not_retry_permanent_failures() {
         let calls = Arc::new(AtomicUsize::new(0));
         let c = calls.clone();
-        let result: Result<u32, String> = with_retries(
+        let result: Result<u32, String> = with_retries_capped(
             TEST_BACKOFF,
+            MAX_RETRY_WAIT,
             || {
                 let c = c.clone();
                 Box::pin(async move {
@@ -261,8 +249,9 @@ mod tests {
     async fn rate_limit_hint_shorter_than_the_cap_is_honored() {
         let calls = Arc::new(AtomicUsize::new(0));
         let c = calls.clone();
-        let result: Result<u32, String> = with_retries(
+        let result: Result<u32, String> = with_retries_capped(
             Duration::from_secs(999), // must not be used: the hint wins
+            MAX_RETRY_WAIT,
             move || {
                 let c = c.clone();
                 Box::pin(async move {

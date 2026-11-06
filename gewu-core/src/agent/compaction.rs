@@ -118,7 +118,8 @@ When constructing the summary, try to stick to this template:
 
         new_history.push(Message::Assistant {
             content: Some(format!(
-                "Summary of previous conversation:\n{}",
+                "{}\n{}",
+                crate::compaction::SUMMARY_PREFIX,
                 summary_text
             )),
             tool_calls: None,

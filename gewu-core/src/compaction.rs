@@ -61,12 +61,20 @@ pub fn estimate_tokens(text: &str) -> usize {
 ///
 /// // With an 8k context limit and 100k tokens, overflow is false
 /// assert!(!is_overflow(100_000, 128_000));
+///
+/// // Small limits never overflow on empty history: the reserved buffer is
+/// // clamped to half the window.
+/// assert!(!is_overflow(0, 8_000));
 /// ```
 pub fn is_overflow(total_tokens: usize, limit_context: usize) -> bool {
     if limit_context == 0 {
         return false;
     }
-    let reserved = COMPACTION_BUFFER;
+    // Reserve a buffer to leave working space after compaction, but never
+    // reserve more than half the window: with the full 20k buffer, an 8k
+    // local model would have `usable == 0` and every turn (even empty
+    // history) would fire a compaction.
+    let reserved = COMPACTION_BUFFER.min(limit_context / 2);
     let usable = limit_context.saturating_sub(reserved);
     total_tokens >= usable
 }
@@ -122,8 +130,9 @@ pub fn estimate_message_tokens(msg: &Message) -> usize {
 /// most recent 2 turns (to keep recent context), and marks old tool outputs
 /// for pruning once the total tool output size exceeds a threshold.
 ///
-/// A message starting with "Summary:" is treated as a compaction summary
-/// and stops the pruning process (preserving the summarized history intact).
+/// A message starting with the compaction summary prefix ([`SUMMARY_PREFIX`])
+/// is treated as a compaction summary and stops the pruning process
+/// (preserving the summarized history intact).
 ///
 /// # Arguments
 ///
@@ -142,6 +151,14 @@ pub fn estimate_message_tokens(msg: &Message) -> usize {
 /// 4. Once threshold exceeded, marks those messages for pruning
 /// 5. Only actually prunes if total savings exceed `PRUNE_MINIMUM_SAVINGS`
 /// 6. Replaces tool content with "[Output pruned]" and clears media
+///
+/// A message starting with the compaction summary prefix ([`SUMMARY_PREFIX`])
+/// stops the pruning process (preserving the summarized history intact).
+pub const SUMMARY_PREFIX: &str = "Summary of previous conversation:";
+
+/// The number of most recent turns that are protected from pruning.
+const PROTECTED_TURNS: usize = 2;
+
 pub fn prune(messages: &mut [Message]) -> usize {
     let mut total_tool_tokens = 0;
     let mut pruned_tokens = 0;
@@ -153,7 +170,7 @@ pub fn prune(messages: &mut [Message]) -> usize {
             turns += 1;
         }
 
-        if turns < 2 {
+        if turns < PROTECTED_TURNS {
             continue;
         }
 
@@ -161,7 +178,10 @@ pub fn prune(messages: &mut [Message]) -> usize {
             content: Some(c), ..
         } = msg
         {
-            if c.starts_with("Summary:") {
+            // Recognize the exact prefix the compactor writes (see
+            // [`SUMMARY_PREFIX`]); a bare "Summary:" check never matched real
+            // summaries, so pruning walked straight through them.
+            if c.starts_with(SUMMARY_PREFIX) || c.starts_with("Summary:") {
                 break;
             }
         }

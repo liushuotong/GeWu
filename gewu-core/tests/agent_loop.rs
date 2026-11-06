@@ -197,7 +197,7 @@ async fn test_agent_emits_usage_at_turn_boundaries() {
     assert_eq!(kinds, vec!["usage", "finish"]);
     let (used_tokens, context_limit) = usage.unwrap();
     assert!(used_tokens > 0, "history should count: {used_tokens}");
-    assert_eq!(context_limit, 128_000);
+    assert_eq!(context_limit, 256_000);
 }
 
 #[tokio::test]

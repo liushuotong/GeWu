@@ -24,7 +24,7 @@ use crate::anthropic::{
     AnthropicChunk, AnthropicConfig, AnthropicError, AnthropicMessage, AnthropicStream,
     AnthropicTool, AssistantMessage as AnthropicAssistantMessage, Client as AnthropicClient,
     ContentBlock, ContentBlockDeltaChunk, ContentBlockStart, ContentBlockStartChunk, ContentDelta,
-    CreateMessageRequest, MessageStartChunk, UserMessage,
+    CreateMessageRequest, MessageStartChunk, SourceBlock, UserMessage,
 };
 use crate::openai::{
     AssistantMessage as OpenAIAssistantMessage, ChatCompletionMessageToolCall,
@@ -266,7 +266,9 @@ impl OpenAIProvider {
                             content_type: "file".to_string(),
                             file: FileData {
                                 filename: Some("document.pdf".to_string()),
-                                file_data: Some(data.clone()),
+                                // The API expects a full data URI here, not raw
+                                // base64 (matches the image_url branch above).
+                                file_data: Some(format!("data:{};base64,{}", mime_type, data)),
                                 file_id: None,
                             },
                         },
@@ -325,7 +327,14 @@ impl OpenAIProvider {
                                     tool_type: "function".to_string(),
                                     function: OpenAIFunctionCall {
                                         name: tc.function.name.clone(),
-                                        arguments: tc.function.arguments.clone(),
+                                        // An empty arguments string is rejected
+                                        // by the API; normalize to an empty
+                                        // object.
+                                        arguments: if tc.function.arguments.trim().is_empty() {
+                                            "{}".to_string()
+                                        } else {
+                                            tc.function.arguments.clone()
+                                        },
                                     },
                                 },
                             )
@@ -342,54 +351,67 @@ impl OpenAIProvider {
             }
             Message::Tool {
                 tool_call_id,
-                tool_name,
+                tool_name: _,
                 content,
-                media,
+                media: _,
             } => {
+                // Media is NOT appended here: a user message between tool
+                // messages breaks the `assistant(tool_calls) → tool` contiguity
+                // that strict backends require. `build_typed` defers media to
+                // after the run of tool messages.
                 let m = ChatCompletionRequestToolMessageArgs::default()
                     .tool_call_id(tool_call_id.clone())
                     .content(content.clone())
                     .build()
                     .map_err(|e| Box::new(e) as Box<dyn Error + Send + Sync>)?;
-                let mut messages = vec![ChatCompletionRequestMessage::Tool(m)];
+                Ok(vec![ChatCompletionRequestMessage::Tool(m)])
+            }
+        }
+    }
 
-                if !media.is_empty() {
-                    let mut parts: Vec<ChatCompletionRequestUserMessageContentPart> = Vec::new();
-                    let label = match tool_name {
-                        Some(name) => format!("Tool '{}' returned additional media:", name),
-                        None => "Tool returned additional media:".to_string(),
-                    };
+    /// Emits deferred tool-result media as user message(s).
+    ///
+    /// Called once the run of tool messages ends so the produced user
+    /// messages never interleave between two `tool` messages.
+    fn flush_pending_media(
+        &self,
+        messages: &mut Vec<ChatCompletionRequestMessage>,
+        pending: &mut Vec<(Option<String>, Vec<ContentPart>)>,
+    ) {
+        for (tool_name, media) in pending.drain(..) {
+            let mut parts: Vec<ChatCompletionRequestUserMessageContentPart> = Vec::new();
+            let label = match tool_name {
+                Some(name) => format!("Tool '{}' returned additional media:", name),
+                None => "Tool returned additional media:".to_string(),
+            };
+            parts.push(ChatCompletionRequestUserMessageContentPart::Text(
+                ChatCompletionRequestMessageContentPartText {
+                    content_type: "text".to_string(),
+                    text: label,
+                },
+            ));
+            for part in media {
+                if let Some(converted) = self.convert_content_part(&part) {
+                    parts.push(converted);
+                } else {
+                    let unsupported_label = format!(
+                        "[Unsupported media type: {} - this model does not support {} input]",
+                        part.mime_type(),
+                        part.mime_type()
+                    );
                     parts.push(ChatCompletionRequestUserMessageContentPart::Text(
                         ChatCompletionRequestMessageContentPartText {
                             content_type: "text".to_string(),
-                            text: label,
+                            text: unsupported_label,
                         },
                     ));
-                    for part in media {
-                        if let Some(converted) = self.convert_content_part(part) {
-                            parts.push(converted);
-                        } else {
-                            let unsupported_label = format!(
-                                "[Unsupported media type: {} - this model does not support {} input]",
-                                part.mime_type(),
-                                part.mime_type()
-                            );
-                            parts.push(ChatCompletionRequestUserMessageContentPart::Text(
-                                ChatCompletionRequestMessageContentPartText {
-                                    content_type: "text".to_string(),
-                                    text: unsupported_label,
-                                },
-                            ));
-                        }
-                    }
-                    let extra = ChatCompletionRequestUserMessageArgs::default()
-                        .content(parts)
-                        .build()
-                        .map_err(|e| Box::new(e) as Box<dyn Error + Send + Sync>)?;
-                    messages.push(ChatCompletionRequestMessage::User(extra));
                 }
-
-                Ok(messages)
+            }
+            if let Ok(extra) = ChatCompletionRequestUserMessageArgs::default()
+                .content(parts)
+                .build()
+            {
+                messages.push(ChatCompletionRequestMessage::User(extra));
             }
         }
     }
@@ -429,10 +451,27 @@ impl OpenAIProvider {
         tools: &[Arc<dyn Tool>],
     ) -> Result<CreateChatCompletionRequest, Box<dyn Error + Send + Sync>> {
         let mut openai_messages: Vec<ChatCompletionRequestMessage> = Vec::new();
+        // Media attached to tool results is deferred until the run of tool
+        // messages ends; a user message between two `tool` messages breaks
+        // the `assistant(tool_calls) → tool` contiguity strict backends
+        // require.
+        let mut pending_media: Vec<(Option<String>, Vec<ContentPart>)> = Vec::new();
         for msg in messages {
-            let mut converted = self.convert_message(msg)?;
-            openai_messages.append(&mut converted);
+            if matches!(msg, Message::Tool { .. }) {
+                let mut converted = self.convert_message(msg)?;
+                openai_messages.append(&mut converted);
+                if let Message::Tool { tool_name, media, .. } = msg {
+                    if !media.is_empty() {
+                        pending_media.push((tool_name.clone(), media.clone()));
+                    }
+                }
+            } else {
+                self.flush_pending_media(&mut openai_messages, &mut pending_media);
+                let mut converted = self.convert_message(msg)?;
+                openai_messages.append(&mut converted);
+            }
         }
+        self.flush_pending_media(&mut openai_messages, &mut pending_media);
 
         let openai_tools = self.convert_tools(tools)?;
 
@@ -444,7 +483,10 @@ impl OpenAIProvider {
             } else {
                 Some(openai_tools)
             },
-            stream: None,
+            // This provider always streams (`create_stream` sets it on the
+            // wire); logging the request without `stream: true` would make
+            // the request log misrepresent what is sent.
+            stream: Some(true),
             max_tokens: None,
             temperature: None,
         })
@@ -610,7 +652,11 @@ impl ResponseParser for OpenAIProvider {
 
                     if let Some(reason) = &choice.finish_reason {
                         yield ProviderEvent::Finish {
-                            reason: Some(format!("{:?}", reason)),
+                            // `finish_reason` is a plain String; Debug-
+                            // formatting it would wrap the value in literal
+                            // quotes and break the consumer's match on
+                            // "max_tokens"/"length".
+                            reason: Some(reason.clone()),
                         };
                     }
                 }
@@ -844,18 +890,34 @@ impl AnthropicProvider {
     fn convert_content_part(&self, part: &ContentPart) -> Option<ContentBlock> {
         match part {
             ContentPart::Text { text } => Some(ContentBlock::Text { text: text.clone() }),
-            ContentPart::Image { data, mime_type } => Some(ContentBlock::Text {
-                text: format!("[Image: {}](data:{};base64,{})", mime_type, mime_type, data),
+            ContentPart::Image { data, mime_type } => Some(ContentBlock::Image {
+                source: SourceBlock {
+                    source_type: "base64".to_string(),
+                    media_type: mime_type.clone(),
+                    data: data.clone(),
+                },
             }),
-            ContentPart::Audio { data, mime_type } => Some(ContentBlock::Text {
-                text: format!("[Audio: {}](data:{};base64,{})", mime_type, mime_type, data),
+            ContentPart::Audio { mime_type, .. } => Some(ContentBlock::Text {
+                text: format!("[Audio file: {} - not supported by this model]", mime_type),
             }),
-            ContentPart::Video { data, mime_type } => Some(ContentBlock::Text {
-                text: format!("[Video: {}](data:{};base64,{})", mime_type, mime_type, data),
+            ContentPart::Video { mime_type, .. } => Some(ContentBlock::Text {
+                text: format!("[Video file: {} - not supported by this model]", mime_type),
             }),
-            ContentPart::File { data, mime_type } => Some(ContentBlock::Text {
-                text: format!("[File: {}](data:{};base64,{})", mime_type, mime_type, data),
-            }),
+            ContentPart::File { data, mime_type } if mime_type == "application/pdf" => {
+                Some(ContentBlock::Document {
+                    source: SourceBlock {
+                        source_type: "base64".to_string(),
+                        media_type: mime_type.clone(),
+                        data: data.clone(),
+                    },
+                })
+            }
+            ContentPart::File { mime_type, .. } if mime_type != "application/pdf" => {
+                Some(ContentBlock::Text {
+                    text: format!("[File: {} - not supported by this model]", mime_type),
+                })
+            }
+            ContentPart::File { .. } => None,
         }
     }
 
@@ -886,13 +948,20 @@ impl AnthropicProvider {
                 }
                 if let Some(calls) = tool_calls {
                     for call in calls {
-                        let input: Value =
-                            serde_json::from_str(&call.function.arguments).map_err(|e| {
+                        // An empty arguments string (e.g. a no-argument tool
+                        // call whose fragments never arrived) must become an
+                        // empty JSON object; `from_str("")` is a hard error.
+                        let args = call.function.arguments.trim();
+                        let input: Value = if args.is_empty() {
+                            Value::Object(Default::default())
+                        } else {
+                            serde_json::from_str(args).map_err(|e| {
                                 format!(
                                     "Invalid arguments for Anthropic tool call '{}': {}",
                                     call.function.name, e
                                 )
-                            })?;
+                            })?
+                        };
                         blocks.push(ContentBlock::ToolUse {
                             id: call.id.clone(),
                             name: call.function.name.clone(),
@@ -1009,7 +1078,7 @@ impl AnthropicToolCallAggregator {
         }
 
         match &chunk.content_block {
-            ContentBlockStart::ToolUse { id, name } => {
+            ContentBlockStart::ToolUse { id, name, input } => {
                 let state = &mut self.states[idx];
                 state.id = Some(id.clone());
                 state.name = Some(name.clone());
@@ -1018,6 +1087,24 @@ impl AnthropicToolCallAggregator {
                     id: id.clone(),
                     name: name.clone(),
                 });
+                // Anthropic delivers the complete `input` object on the start
+                // block for some calls (notably no-argument tools) and sends
+                // no `input_json_delta` fragments afterwards. Seed the buffer
+                // so the arguments reach the agent instead of ending up empty.
+                if let Some(input) = input {
+                    if input.as_object().map(|o| !o.is_empty()).unwrap_or(false) {
+                        state.argument_buffer = input.to_string();
+                        let new_len = state.argument_buffer.len();
+                        let delta = state.argument_buffer[state.sent_len..new_len].to_string();
+                        state.sent_len = new_len;
+                        if !delta.is_empty() {
+                            events.push(ProviderEvent::ToolCallDelta {
+                                id: id.clone(),
+                                delta,
+                            });
+                        }
+                    }
+                }
             }
             ContentBlockStart::Thinking { thinking, .. } => {
                 if !thinking.is_empty() {
@@ -1037,7 +1124,10 @@ impl AnthropicToolCallAggregator {
         let idx = index as usize;
 
         if idx >= self.states.len() {
-            return events;
+            // A delta without a preceding start block can still carry
+            // reasoning text; create the state so it is not dropped.
+            // (InputJsonDelta below is still guarded by `started`.)
+            self.states.resize_with(idx + 1, ToolCallState::default);
         }
 
         let state = &mut self.states[idx];
@@ -1103,11 +1193,10 @@ impl AnthropicProvider {
                                     yield ProviderEvent::ContentDelta { delta: text.clone() };
                                 }
                             }
-                            ContentDelta::ThinkingDelta { thinking } => {
-                                if !thinking.is_empty() {
-                                    yield ProviderEvent::ReasoningDelta { delta: thinking.clone() };
-                                }
-                            }
+                            // ThinkingDelta is already emitted by the
+                            // aggregator above; emitting it here too would
+                            // duplicate every reasoning token in the stream.
+                            ContentDelta::ThinkingDelta { .. } => {}
                             ContentDelta::InputJsonDelta { .. } => {}
                         }
                     }
@@ -1120,6 +1209,11 @@ impl AnthropicProvider {
                     AnthropicChunk::MessageStop => {}
                     AnthropicChunk::Error(e) => {
                         yield ProviderEvent::Error { error: e.error.message };
+                        // An `error` event is terminal per the Anthropic
+                        // streaming spec: the server sends nothing else and
+                        // keeps the connection open. Continuing to poll would
+                        // hang the turn forever.
+                        return;
                     }
                 }
             }
@@ -1248,7 +1342,11 @@ mod tests {
     }
 
     #[test]
-    fn convert_message_emits_media_followup() {
+    fn convert_message_defers_media_followup() {
+        // Regression: a user message between two tool messages breaks the
+        // `assistant(tool_calls) → tool` contiguity strict backends require,
+        // so convert_message must emit ONLY the tool message; build_typed
+        // flushes deferred media after the run of tool messages ends.
         let provider = OpenAIProvider::new("test-key", "gpt-4");
         let msg = Message::Tool {
             tool_call_id: "call_1".to_string(),
@@ -1266,17 +1364,43 @@ mod tests {
         };
 
         let converted = provider.convert_message(&msg).expect("convert success");
-        assert_eq!(converted.len(), 2);
+        assert_eq!(converted.len(), 1);
         match &converted[0] {
             ChatCompletionRequestMessage::Tool(tool_msg) => {
                 assert_eq!(tool_msg.tool_call_id.as_str(), "call_1");
             }
-            _ => panic!("first message should be tool"),
+            _ => panic!("only message should be tool"),
         }
-        match &converted[1] {
-            ChatCompletionRequestMessage::User(_) => {}
-            _ => panic!("second message should be user"),
-        }
+
+        // Through build_typed, two adjacent tool messages with media must
+        // keep their tool messages contiguous, with media flushed after.
+        let tool2 = Message::Tool {
+            tool_call_id: "call_2".to_string(),
+            tool_name: Some("read_file".to_string()),
+            content: "second".to_string(),
+            media: vec![ContentPart::Image {
+                data: "Wg==".to_string(),
+                mime_type: "image/png".to_string(),
+            }],
+        };
+        let assistant = Message::Assistant {
+            content: None,
+            tool_calls: None,
+        };
+        let request = provider
+            .build_typed(&[msg, tool2, assistant], &[])
+            .expect("build success");
+        let roles: Vec<String> = request
+            .messages
+            .iter()
+            .map(|m| match m {
+                ChatCompletionRequestMessage::Tool(_) => "tool".to_string(),
+                ChatCompletionRequestMessage::User(_) => "user".to_string(),
+                ChatCompletionRequestMessage::Assistant(_) => "assistant".to_string(),
+                ChatCompletionRequestMessage::System(_) => "system".to_string(),
+            })
+            .collect();
+        assert_eq!(roles, vec!["tool", "tool", "user", "user", "assistant"]);
     }
 
     fn make_chunk(
@@ -2010,9 +2134,18 @@ mod tests {
         let messages = vec![Message::User {
             content: vec![ContentPart::Text { text: "hello".to_string() }],
         }];
-        provider
+        let events: Vec<ProviderEvent> = provider
             .stream_response(&messages, &[], None)
             .await
-            .expect("clamped retry should succeed despite the hour-long hint");
+            .expect("clamped retry should succeed despite the hour-long hint")
+            .map(|event| event.expect("event should parse"))
+            .collect()
+            .await;
+        // The retry delivered a clean (empty but valid) stream, not an error.
+        assert!(
+            !events
+                .iter()
+                .any(|e| matches!(e, ProviderEvent::Error { .. }))
+        );
     }
 }

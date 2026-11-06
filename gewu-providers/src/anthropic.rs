@@ -40,6 +40,9 @@ pub enum AnthropicError {
     /// API returned an error response.
     #[error("API error: {0}")]
     Api(String),
+    /// A known SSE event could not be parsed.
+    #[error("SSE parse error: {0}")]
+    SseParse(String),
 }
 
 /// Builds the rate-limit error for a 429 response body.
@@ -151,7 +154,14 @@ pub enum ContentBlock {
     Text {
         text: String,
     },
-    Source {
+    /// Inline base64 image (`type: "image"` on the wire).
+    #[serde(rename = "image")]
+    Image {
+        source: SourceBlock,
+    },
+    /// Inline base64 document, e.g. PDF (`type: "document"` on the wire).
+    #[serde(rename = "document")]
+    Document {
         source: SourceBlock,
     },
     ToolUse {
@@ -252,7 +262,12 @@ impl Stream for AnthropicStream {
 
 struct AnthropicSseStream<S> {
     stream: Pin<Box<S>>,
+    /// Unparsed bytes from the wire.
     buffer: String,
+    /// The most recent `event:` field, pending until its payload arrives.
+    current_event: Option<String>,
+    /// Accumulated `data:` payload for the current event.
+    data_buffer: String,
 }
 
 impl<S> AnthropicSseStream<S>
@@ -263,6 +278,84 @@ where
         Self {
             stream: Box::pin(stream),
             buffer: String::new(),
+            current_event: None,
+            data_buffer: String::new(),
+        }
+    }
+
+    /// Processes one SSE line, returning a chunk when an event completes.
+    ///
+    /// Line-based (not pair-based): the `event:` field is remembered across
+    /// transport chunk boundaries so an event split between its `event:` and
+    /// `data:` lines is never dropped.
+    fn process_line(&mut self, line: &str) -> Option<Result<AnthropicChunk, AnthropicError>> {
+        let line = line.trim();
+        if line.is_empty() {
+            // Blank line terminates the event per the SSE spec.
+            return self.take_event();
+        }
+        if line.starts_with(':') {
+            // Comment / keep-alive.
+            return None;
+        }
+        if let Some(value) = line.strip_prefix("event:") {
+            // Flush a previous event that was not terminated by a blank line,
+            // then record the new event type.
+            let flushed = self.take_event();
+            self.current_event = Some(value.trim().to_string());
+            return flushed;
+        }
+        if let Some(value) = line.strip_prefix("data:") {
+            // The single space after the colon is optional per the SSE spec.
+            let value = value.strip_prefix(' ').unwrap_or(value);
+            if !self.data_buffer.is_empty() {
+                self.data_buffer.push('\n');
+            }
+            self.data_buffer.push_str(value);
+            return None;
+        }
+        // Other fields (`id:`, `retry:`) are ignored.
+        None
+    }
+
+    /// Dispatches the pending event, consuming any buffered state.
+    fn take_event(&mut self) -> Option<Result<AnthropicChunk, AnthropicError>> {
+        let event_type = self.current_event.take()?;
+        let data = std::mem::take(&mut self.data_buffer);
+
+        match event_type.as_str() {
+            // Terminal marker events carry no data payload.
+            "content_block_stop" => Some(Ok(AnthropicChunk::ContentBlockStop(()))),
+            "message_stop" => Some(Ok(AnthropicChunk::MessageStop)),
+            "message_start" | "content_block_start" | "content_block_delta" | "message_delta"
+            | "error" => {
+                if data.is_empty() {
+                    return None;
+                }
+                let parsed = match event_type.as_str() {
+                    "message_start" => serde_json::from_str::<MessageStartChunk>(&data)
+                        .map(AnthropicChunk::MessageStart),
+                    "content_block_start" => serde_json::from_str::<ContentBlockStartChunk>(&data)
+                        .map(AnthropicChunk::ContentBlockStart),
+                    "content_block_delta" => serde_json::from_str::<ContentBlockDeltaChunk>(&data)
+                        .map(AnthropicChunk::ContentBlockDelta),
+                    "message_delta" => serde_json::from_str::<MessageDeltaChunk>(&data)
+                        .map(AnthropicChunk::MessageDelta),
+                    "error" => {
+                        serde_json::from_str::<ErrorChunk>(&data).map(AnthropicChunk::Error)
+                    }
+                    _ => unreachable!("event type filtered above"),
+                };
+                match parsed {
+                    Ok(chunk) => Some(Ok(chunk)),
+                    Err(e) => Some(Err(AnthropicError::SseParse(format!(
+                        "failed to parse {} event: {}",
+                        event_type, e
+                    )))),
+                }
+            }
+            // Unknown event types (e.g. `ping`) are ignored.
+            _ => None,
         }
     }
 }
@@ -275,86 +368,13 @@ where
 
     fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
         loop {
-            if let Some(pos) = self.buffer.find('\n') {
-                let line = self.buffer[..pos].to_string();
-                self.buffer = self.buffer[pos + 1..].to_string();
-
-                let line = line.trim();
-                if line.is_empty() || line.starts_with(':') {
-                    continue;
-                }
-
-                if let Some(event_data) = line.strip_prefix("event: ") {
-                    let event_type = event_data.trim().to_string();
-
-                    if let Some(pos2) = self.buffer.find('\n') {
-                        let data_line = self.buffer[..pos2].to_string();
-                        self.buffer = self.buffer[pos2 + 1..].to_string();
-
-                        if let Some(data) = data_line.strip_prefix("data: ") {
-                            let data = data.trim();
-                            if data.is_empty() {
-                                continue;
-                            }
-
-                            match event_type.as_str() {
-                                "message_start" => {
-                                    if let Ok(chunk) =
-                                        serde_json::from_str::<MessageStartChunk>(data)
-                                    {
-                                        return Poll::Ready(Some(Ok(
-                                            AnthropicChunk::MessageStart(chunk),
-                                        )));
-                                    }
-                                }
-                                "content_block_start" => {
-                                    if let Ok(chunk) =
-                                        serde_json::from_str::<ContentBlockStartChunk>(data)
-                                    {
-                                        return Poll::Ready(Some(Ok(
-                                            AnthropicChunk::ContentBlockStart(chunk),
-                                        )));
-                                    }
-                                }
-                                "content_block_delta" => {
-                                    if let Ok(chunk) =
-                                        serde_json::from_str::<ContentBlockDeltaChunk>(data)
-                                    {
-                                        return Poll::Ready(Some(Ok(
-                                            AnthropicChunk::ContentBlockDelta(chunk),
-                                        )));
-                                    }
-                                }
-                                "content_block_stop" => {
-                                    return Poll::Ready(Some(Ok(
-                                        AnthropicChunk::ContentBlockStop(()),
-                                    )));
-                                }
-                                "message_delta" => {
-                                    if let Ok(chunk) =
-                                        serde_json::from_str::<MessageDeltaChunk>(data)
-                                    {
-                                        return Poll::Ready(Some(Ok(
-                                            AnthropicChunk::MessageDelta(chunk),
-                                        )));
-                                    }
-                                }
-                                "message_stop" => {
-                                    return Poll::Ready(Some(Ok(AnthropicChunk::MessageStop)));
-                                }
-                                "error" => {
-                                    if let Ok(error_chunk) =
-                                        serde_json::from_str::<ErrorChunk>(data)
-                                    {
-                                        return Poll::Ready(Some(Ok(AnthropicChunk::Error(
-                                            error_chunk,
-                                        ))));
-                                    }
-                                }
-                                _ => continue,
-                            }
-                        }
-                    }
+            // Process every complete line already buffered so events are
+            // never lost at transport chunk boundaries.
+            while let Some(pos) = self.buffer.find('\n') {
+                let line = self.buffer[..pos].trim_end_matches('\r').to_string();
+                self.buffer.drain(..=pos);
+                if let Some(event) = self.process_line(&line) {
+                    return Poll::Ready(Some(event));
                 }
             }
 
@@ -368,10 +388,18 @@ where
                     return Poll::Ready(Some(Err(AnthropicError::Http(e))));
                 }
                 Poll::Ready(None) => {
-                    if self.buffer.is_empty() {
-                        return Poll::Ready(None);
+                    // A final line without a trailing newline is still a
+                    // complete SSE field; process it before ending.
+                    if !self.buffer.is_empty() {
+                        let line = std::mem::take(&mut self.buffer);
+                        if let Some(event) = self.process_line(line.trim_end_matches('\r')) {
+                            return Poll::Ready(Some(event));
+                        }
                     }
-                    self.buffer.clear();
+                    // Flush a trailing event that lacked its blank-line terminator.
+                    if let Some(event) = self.take_event() {
+                        return Poll::Ready(Some(event));
+                    }
                     return Poll::Ready(None);
                 }
                 Poll::Pending => return Poll::Pending,
@@ -395,13 +423,17 @@ pub enum AnthropicChunk {
 
 #[derive(Debug, Clone, Deserialize)]
 pub struct MessageStartChunk {
+    #[serde(rename = "message")]
     pub _message: Message,
 }
 
 #[derive(Debug, Clone, Deserialize)]
 pub struct Message {
+    #[serde(rename = "id")]
     pub _id: String,
+    #[serde(rename = "role")]
     pub _role: String,
+    #[serde(rename = "content")]
     pub _content: Vec<Value>,
 }
 
@@ -415,14 +447,20 @@ pub struct ContentBlockStartChunk {
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum ContentBlockStart {
     Text {
+        #[serde(rename = "text")]
         _text: String,
     },
     ToolUse {
         id: String,
         name: String,
+        /// The complete `input` object when Anthropic sends it on the start
+        /// block instead of (or before) `input_json_delta` fragments.
+        #[serde(default)]
+        input: Option<Value>,
     },
     Thinking {
         thinking: String,
+        #[serde(rename = "signature")]
         _signature: String,
     },
 }
@@ -451,6 +489,7 @@ pub enum ContentDelta {
 #[derive(Debug, Clone, Deserialize)]
 pub struct MessageDeltaChunk {
     pub delta: MessageDelta,
+    #[serde(rename = "usage")]
     pub _usage: MessageUsage,
 }
 
@@ -461,6 +500,7 @@ pub struct MessageDelta {
 
 #[derive(Debug, Clone, Deserialize)]
 pub struct MessageUsage {
+    #[serde(rename = "output_tokens")]
     pub _output_tokens: u32,
 }
 
@@ -518,5 +558,108 @@ pub struct Model {
     pub id: String,
     #[serde(rename = "type")]
     pub _model_type: String,
+    #[serde(rename = "display_name")]
     pub _display_name: Option<String>,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use futures::StreamExt;
+
+    /// A stream of canned body chunks, typed as the SSE source expects.
+    fn body_stream(chunks: Vec<Bytes>) -> impl Stream<Item = Result<Bytes, reqwest::Error>> {
+        futures::stream::iter(chunks.into_iter().map(Ok).collect::<Vec<_>>())
+    }
+
+    async fn collect(chunks: Vec<Bytes>) -> Vec<AnthropicChunk> {
+        let stream = AnthropicSseStream::new(body_stream(chunks));
+        stream
+            .filter_map(|r| async { r.ok() })
+            .collect::<Vec<_>>()
+            .await
+    }
+
+    #[tokio::test]
+    async fn message_delta_parses_real_wire_payload() {
+        // Regression: the usage fields are named `usage`/`output_tokens` on
+        // the wire, not `_usage`/`_output_tokens`. A real payload must parse
+        // and surface its stop reason, or Finish never fires.
+        let sse = concat!(
+            "event: message_delta\n",
+            r#"data: {"type":"message_delta","delta":{"stop_reason":"max_tokens"},"usage":{"output_tokens":42}}"#,
+            "\n\n",
+        );
+        let events = collect(vec![Bytes::from_static(sse.as_bytes())]).await;
+        assert_eq!(events.len(), 1);
+        match &events[0] {
+            AnthropicChunk::MessageDelta(chunk) => {
+                assert_eq!(chunk.delta.stop_reason.as_deref(), Some("max_tokens"));
+            }
+            other => panic!("expected MessageDelta, got {:?}", other),
+        }
+    }
+
+    #[tokio::test]
+    async fn event_split_across_chunk_boundaries_is_not_dropped() {
+        // Regression: the transport chunk ends between the `event:` and
+        // `data:` lines. The parser must remember the pending event instead
+        // of dropping it.
+        let chunk1 = Bytes::from_static(b"event: content_block_delta\n");
+        let chunk2 = Bytes::from_static(
+            br#"data: {"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"hello"}}"#,
+        );
+        let chunk3 = Bytes::from_static(b"\n\n");
+        let events = collect(vec![chunk1, chunk2, chunk3]).await;
+        assert_eq!(events.len(), 1);
+        match &events[0] {
+            AnthropicChunk::ContentBlockDelta(chunk) => match &chunk.delta {
+                ContentDelta::TextDelta { text } => assert_eq!(text, "hello"),
+                other => panic!("expected TextDelta, got {:?}", other),
+            },
+            other => panic!("expected ContentBlockDelta, got {:?}", other),
+        }
+    }
+
+    #[tokio::test]
+    async fn keep_alive_lines_between_event_and_data_are_skipped() {
+        // A keep-alive comment (or id/retry field) between the event and its
+        // data must not consume the event.
+        let sse = concat!(
+            "event: message_delta\n",
+            ": keep-alive\n",
+            "id: 7\n",
+            r#"data: {"type":"message_delta","delta":{"stop_reason":"end_turn"},"usage":{"output_tokens":1}}"#,
+            "\n\n",
+        );
+        let events = collect(vec![Bytes::from_static(sse.as_bytes())]).await;
+        assert_eq!(events.len(), 1);
+        assert!(matches!(events[0], AnthropicChunk::MessageDelta(_)));
+    }
+
+    #[tokio::test]
+    async fn data_field_without_space_is_accepted() {
+        let sse = concat!(
+            "event:content_block_stop\n",
+            "event: message_stop\n",
+        );
+        let events = collect(vec![Bytes::from_static(sse.as_bytes())]).await;
+        assert_eq!(events.len(), 2);
+        assert!(matches!(events[0], AnthropicChunk::ContentBlockStop(())));
+        assert!(matches!(events[1], AnthropicChunk::MessageStop));
+    }
+
+    #[tokio::test]
+    async fn final_event_without_trailing_blank_line_is_delivered() {
+        let sse = concat!(
+            "event: message_start\n",
+            r#"data: {"type":"message_start","message":{"id":"m1","role":"assistant","content":[]}}"#,
+            "\n\n",
+            "event: message_stop\n",
+        );
+        let events = collect(vec![Bytes::from_static(sse.as_bytes())]).await;
+        assert_eq!(events.len(), 2);
+        assert!(matches!(events[0], AnthropicChunk::MessageStart(_)));
+        assert!(matches!(events[1], AnthropicChunk::MessageStop));
+    }
 }

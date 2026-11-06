@@ -141,6 +141,15 @@ impl Tool for TaskTool {
         let mut result = String::new();
 
         while let Some(event_result) = stream.next().await {
+            // Stop consuming the subagent stream once the parent turn has
+            // been aborted; otherwise a canceled turn waits for the entire
+            // subagent run to finish anyway.
+            if _ctx.is_aborted() {
+                return Ok(ToolResult::new(
+                    input.description,
+                    "Error: task aborted because the parent turn was canceled.",
+                ));
+            }
             match event_result {
                 Ok(event) => match event {
                     AgentEvent::ContentDelta { delta } => {

@@ -535,6 +535,8 @@ async fn run(
                 let terminal_frame = match &event.frame {
                     None => true,
                     Some(Ok(ServerMessage::Result { .. })) | Some(Err(_)) => true,
+                    // A server-sent terminal Error frame ends the turn too.
+                    Some(Ok(ServerMessage::Error { .. })) => true,
                     Some(_) => false,
                 };
                 match event.frame {
@@ -557,6 +559,12 @@ async fn run(
                     }
                     Some(Ok(ServerMessage::Result { session_id, .. })) => {
                         tab.app.set_session(Some(session_id));
+                    }
+                    // Surface server-sent errors instead of silently dropping
+                    // them — otherwise a failed turn looks like a prompt that
+                    // quietly produced nothing.
+                    Some(Ok(ServerMessage::Error { error, .. })) => {
+                        tab.app.fail(error);
                     }
                     Some(Ok(_)) => {}
                     Some(Err(e)) => {

@@ -297,12 +297,13 @@ pub async fn is_binary_file(path: impl AsRef<Path>, file_size: u64) -> Result<bo
         .and_then(|e| e.to_str())
         .map(|e| e.to_lowercase());
 
-    // Binary extensions list (same as legacy)
+    // Binary extensions list (same as legacy). `Path::extension()` yields the
+    // name WITHOUT the leading dot, so the patterns must not include one.
     match ext.as_deref() {
         Some(
-            ".zip" | ".tar" | ".gz" | ".exe" | ".dll" | ".so" | ".class" | ".jar" | ".war" | ".7z"
-            | ".doc" | ".docx" | ".xls" | ".xlsx" | ".ppt" | ".pptx" | ".odt" | ".ods" | ".odp"
-            | ".bin" | ".dat" | ".obj" | ".o" | ".a" | ".lib" | ".wasm" | ".pyc" | ".pyo",
+            "zip" | "tar" | "gz" | "exe" | "dll" | "so" | "class" | "jar" | "war" | "7z"
+            | "doc" | "docx" | "xls" | "xlsx" | "ppt" | "pptx" | "odt" | "ods" | "odp"
+            | "bin" | "dat" | "obj" | "o" | "a" | "lib" | "wasm" | "pyc" | "pyo",
         ) => return Ok(true),
         _ => {}
     }

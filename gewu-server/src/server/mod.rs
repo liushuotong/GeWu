@@ -103,6 +103,9 @@ struct LiveTurn {
     bytes: usize,
     seq: u64,
     busy: bool,
+    /// Notified (waiters) when `busy` flips back to false at turn
+    /// finalization, so interrupts await completion without spinning.
+    done: Arc<tokio::sync::Notify>,
     subscribers: Vec<Subscriber>,
     cancel: Option<tokio::sync::oneshot::Sender<()>>,
     terminal: Option<ServerMessage>,
@@ -151,6 +154,7 @@ async fn attach_subscriber(
     }.to_line()).await.map_err(|_| RequestError::Failed("subscriber disconnected".into()))?;
     state.turns.lock().await.insert(session_id.to_owned(), Arc::new(Mutex::new(LiveTurn {
         request_id: String::new(), messages, frames: vec![], bytes: 0, seq: 0, busy: false,
+        done: Arc::new(tokio::sync::Notify::new()),
         subscribers: vec![subscriber], cancel: None, terminal: None,
     })));
     Ok(())
@@ -421,9 +425,16 @@ impl ServerState {
             turn.request_id.clone()
         };
         // Finalization repairs history before releasing the session claim.
+        // Await the finalizer's notification instead of spinning: this runs
+        // while the global lifecycle lock is held, so a busy-wait would stall
+        // every other connection. The `Notify` is registered before `busy` is
+        // re-checked so a concurrent finalization cannot be missed.
+        let done = turn.lock().await.done.clone();
         loop {
+            let notified = done.notified();
+            tokio::pin!(notified);
             if !turn.lock().await.busy { break; }
-            tokio::task::yield_now().await;
+            notified.await;
         }
         Some(request_id)
     }
@@ -1049,7 +1060,9 @@ async fn start_session_turn(
     let (cancel, mut cancelled) = tokio::sync::oneshot::channel();
     let live = Arc::new(Mutex::new(LiveTurn {
         request_id: request_id.clone(), messages, frames: vec![], bytes: 0,
-        seq: 0, busy: true, subscribers: vec![], cancel: Some(cancel), terminal: None,
+        seq: 0, busy: true,
+        done: Arc::new(tokio::sync::Notify::new()),
+        subscribers: vec![], cancel: Some(cancel), terminal: None,
     }));
     // Register execution before acknowledging it: a failed socket write does
     // not strand a claimed session without its worker.
@@ -1101,6 +1114,8 @@ async fn start_session_turn(
             state.release_session(&session.session_id).await;
             live.busy = false;
             live.cancel = None;
+            // Wake any interrupt awaiting finalization (see `cancel_turn`).
+            live.done.notify_waiters();
             if let Some(terminal) = terminal { live.publish(terminal); }
             live.frames.clear();
             live.bytes = 0;
@@ -2393,7 +2408,7 @@ mod tests {
             usage["used_tokens"].as_u64().unwrap() > 0,
             "ask history should count: {usage}"
         );
-        assert_eq!(usage["context_limit"], 128_000);
+        assert_eq!(usage["context_limit"], 256_000);
 
         drop(in_tx);
         handle.await.unwrap().unwrap();

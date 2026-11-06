@@ -157,7 +157,7 @@ impl Default for AgentBuilder {
             system_prompt: String::new(),
             max_turns: None,
             memory: None,
-            context_limit: 128_000,
+            context_limit: 256_000,
             experiences: None,
             log: None,
             enforcement: PathEnforcement::default(),
@@ -302,20 +302,10 @@ impl Agent {
                     tool_calls: if tool_calls.is_empty() { None } else { Some(tool_calls.clone()) },
                 }).await;
 
-                // Report the running context estimate at every turn boundary
-                // (frontends update the usage gauge from these events).
-                let used_tokens: usize = self
-                    .memory
-                    .messages()
-                    .iter()
-                    .map(estimate_message_tokens)
-                    .sum();
-                yield AgentEvent::Usage {
-                    used_tokens: used_tokens as u64,
-                    context_limit: self.context_limit as u64,
-                };
-
                 if tool_calls.is_empty() {
+                    // Report the running context estimate at the turn boundary
+                    // (frontends update the usage gauge from these events).
+                    yield self.usage_event();
                     yield AgentEvent::Finish { response: content };
                     break;
                 }
@@ -334,21 +324,37 @@ impl Agent {
                 // all concurrently. Doom-loop bookkeeping stays sequential so
                 // the detector state matches the old per-call behavior.
                 let mut pending: Vec<(usize, ToolCall, String)> = Vec::new();
+                // Calls of this turn already announced with `ToolStart`. If
+                // the doom-loop check aborts the turn, each of them must
+                // still receive a `ToolFinish`, or the UI shows a tool card
+                // that never completes.
+                let mut announced: Vec<ToolCall> = Vec::new();
                 for (index, call) in tool_calls.iter().enumerate() {
                     let tool_name = call.function.name.clone();
                     let args = call.function.arguments.clone();
 
                     if let Some(error) = doom_loop.check(&tool_name, &args) {
                         yield AgentEvent::Error { error };
+                        // Close out every announced call of this turn so the
+                        // UI has no eternally "running" tool cards.
+                        let not_executed = "Error: not executed because a doom loop was detected \
+                                            and the run was stopped."
+                            .to_string();
+                        for announced_call in announced.drain(..) {
+                            yield AgentEvent::ToolFinish {
+                                tool: announced_call.function.name.clone(),
+                                title: announced_call.function.name.clone(),
+                                output: not_executed.clone(),
+                                metadata: Default::default(),
+                            };
+                        }
                         // Close out every tool call of this turn so the
                         // persisted history has no dangling tool_calls.
                         for call in &tool_calls {
                             self.memory.add_message(Message::Tool {
                                 tool_call_id: call.id.clone(),
                                 tool_name: Some(call.function.name.clone()),
-                                content: "Error: not executed because a doom loop was detected \
-                                          and the run was stopped."
-                                    .to_string(),
+                                content: not_executed.clone(),
                                 media: Vec::new(),
                             })
                             .await;
@@ -367,6 +373,7 @@ impl Agent {
                     }
 
                     yield AgentEvent::ToolStart { tool: tool_name.clone(), input: args.clone() };
+                    announced.push(call.clone());
                     pending.push((index, call.clone(), Uuid::new_v4().to_string()));
                 }
 
@@ -436,14 +443,47 @@ impl Agent {
                     };
 
                     let media_parts = extract_media_parts(&result.output);
+                    // The media payload is forwarded via `media` parts; keep
+                    // only a short text reference in the tool-message content
+                    // so the base64 blob is not sent to the provider twice
+                    // (and not counted twice by the token estimator).
+                    let content = if media_parts.is_empty() {
+                        result.output
+                    } else {
+                        match media_parts.iter().find(|p| {
+                            matches!(p, ContentPart::Text { .. })
+                        }) {
+                            Some(ContentPart::Text { text }) => text.clone(),
+                            _ => "[media attached]".to_string(),
+                        }
+                    };
                     self.memory.add_message(Message::Tool {
                         tool_call_id: call.id.clone(),
                         tool_name: Some(tool_name),
-                        content: result.output,
+                        content,
                         media: media_parts,
                     }).await;
                 }
+
+                // Report usage AFTER the tool results are in history: the
+                // next LLM request will carry them, and emitting before would
+                // under-report the context by the tool output size.
+                yield self.usage_event();
             }
+        }
+    }
+
+    /// Builds the context-usage event from the current conversation estimate.
+    fn usage_event(&self) -> AgentEvent {
+        let used_tokens: usize = self
+            .memory
+            .messages()
+            .iter()
+            .map(estimate_message_tokens)
+            .sum();
+        AgentEvent::Usage {
+            used_tokens: used_tokens as u64,
+            context_limit: self.context_limit as u64,
         }
     }
 }
@@ -722,12 +762,13 @@ mod tests {
             .with_log(buffer.handle())
             .build()?;
 
-        // usable = 20_100 - 20_000 buffer = 100 tokens; ~125 tokens overflows.
+        // The reserved buffer is clamped to half the window, so
+        // usable = 20_100 - 10_050 = 10_050 tokens; ~10_100 tokens overflows.
         agent
             .memory
             .add_message(Message::User {
                 content: vec![ContentPart::Text {
-                    text: "x".repeat(500),
+                    text: "x".repeat(40_400),
                 }],
             })
             .await;
@@ -832,6 +873,100 @@ mod tests {
             e.as_ref().unwrap(),
             AgentEvent::Error { error } if error.contains("max_tokens")
         )));
+        Ok(())
+    }
+
+    /// The detector must fire ON the threshold-th consecutive identical call,
+    /// not one call after it (docs: "3 identical calls stops execution").
+    #[test]
+    fn test_doom_loop_fires_on_threshold_call() {
+        let mut detector = super::execution::DoomLoopDetector::new(3);
+        assert!(
+            detector.check("read_file", r#"{"path":"a"}"#).is_none(),
+            "first call must not trigger"
+        );
+        detector.record("read_file".into(), r#"{"path":"a"}"#.into());
+        assert!(
+            detector.check("read_file", r#"{"path":"a"}"#).is_none(),
+            "second call must not trigger"
+        );
+        detector.record("read_file".into(), r#"{"path":"a"}"#.into());
+        assert!(
+            detector
+                .check("read_file", r#"{"path":"a"}"#)
+                .is_some(),
+            "third identical call must trigger"
+        );
+    }
+
+    /// An interrupted streak (different call in between) must not count
+    /// toward the threshold.
+    #[test]
+    fn test_doom_loop_requires_consecutive_calls() {
+        let mut detector = super::execution::DoomLoopDetector::new(3);
+        for _ in 0..3 {
+            detector.record("a_tool".into(), "{}".into());
+            detector.record("b_tool".into(), "{}".into());
+        }
+        assert!(detector.check("a_tool", "{}").is_none());
+    }
+
+    /// A doom loop must stop the run on the third identical call and close
+    /// out every announced tool call with a ToolFinish, so the UI never shows
+    /// a tool card that never completes.
+    #[tokio::test]
+    async fn test_doom_loop_stops_run_and_finishes_announced_calls() -> Result<()> {
+        let tool_call_response = || {
+            vec![
+                ProviderEvent::ToolCallStart {
+                    id: "call_1".to_string(),
+                    name: "missing_tool".to_string(),
+                },
+                ProviderEvent::ToolCallDelta {
+                    id: "call_1".to_string(),
+                    delta: "{}".to_string(),
+                },
+                ProviderEvent::Finish {
+                    reason: Some("tool_calls".to_string()),
+                },
+            ]
+        };
+        // More copies than the threshold: without the fix the run would keep
+        // looping; with it, it stops on the third identical call.
+        let provider = MockProvider::new(vec![
+            tool_call_response(),
+            tool_call_response(),
+            tool_call_response(),
+            tool_call_response(),
+            tool_call_response(),
+        ]);
+        let mut agent = Agent::builder().llm(Arc::new(provider)).build()?;
+
+        let events = agent.ask("loop please").collect::<Vec<_>>().await;
+        let events: Vec<&AgentEvent> = events.iter().map(|e| e.as_ref().unwrap()).collect();
+
+        assert!(
+            events.iter().any(
+                |e| matches!(e, AgentEvent::Error { error } if error.contains("Doom loop detected"))
+            ),
+            "doom loop error must be surfaced: {events:?}"
+        );
+
+        let starts = events
+            .iter()
+            .filter(|e| matches!(e, AgentEvent::ToolStart { .. }))
+            .count();
+        let finishes = events
+            .iter()
+            .filter(|e| matches!(e, AgentEvent::ToolFinish { .. }))
+            .count();
+        assert_eq!(
+            starts, finishes,
+            "every announced ToolStart must receive a ToolFinish"
+        );
+        // The third identical call triggers the detector before it is
+        // announced, so exactly threshold - 1 starts happen.
+        assert_eq!(starts, 2);
         Ok(())
     }
 }

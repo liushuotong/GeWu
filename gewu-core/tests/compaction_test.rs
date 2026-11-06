@@ -260,3 +260,73 @@ fn test_prune_stops_at_summary() {
         panic!("Expected Tool message at index 3");
     }
 }
+
+/// Regression: real compaction summaries start with
+/// `SUMMARY_PREFIX` ("Summary of previous conversation:"), not "Summary:".
+/// Pruning must stop at them instead of walking straight through and
+/// destroying the pre-summary history.
+#[test]
+fn test_prune_stops_at_real_compaction_summary() {
+    let mut messages = vec![
+        Message::System {
+            content: "You are helpful".to_string(),
+        },
+        Message::User {
+            content: vec![ContentPart::Text {
+                text: "Pre-summary request".to_string(),
+            }],
+        },
+        // Pre-summary tool output: large enough to exceed both prune
+        // thresholds, so the walk would prune it if it blew past the summary.
+        Message::Tool {
+            tool_call_id: "call_pre".to_string(),
+            tool_name: Some("tool".to_string()),
+            content: "x".repeat(200_000),
+            media: vec![],
+        },
+        // The boundary the compactor actually writes.
+        Message::Assistant {
+            content: Some(format!(
+                "{}\nHere is what happened before.",
+                gewu_core::compaction::SUMMARY_PREFIX
+            )),
+            tool_calls: None,
+        },
+        Message::User {
+            content: vec![ContentPart::Text {
+                text: "Post-summary request 1".to_string(),
+            }],
+        },
+        Message::Tool {
+            tool_call_id: "call_post1".to_string(),
+            tool_name: Some("tool".to_string()),
+            content: "Post-summary output 1".to_string(),
+            media: vec![],
+        },
+        Message::User {
+            content: vec![ContentPart::Text {
+                text: "Post-summary request 2".to_string(),
+            }],
+        },
+        Message::Tool {
+            tool_call_id: "call_post2".to_string(),
+            tool_name: Some("tool".to_string()),
+            content: "Post-summary output 2".to_string(),
+            media: vec![],
+        },
+    ];
+
+    prune(&mut messages);
+
+    // The tool output below the summary must be intact — pruning may only
+    // touch messages newer than the summary boundary.
+    if let Message::Tool { content, .. } = &messages[2] {
+        assert_eq!(
+            content.len(),
+            200_000,
+            "pre-summary content must not be pruned"
+        );
+    } else {
+        panic!("Expected Tool message at index 2");
+    }
+}
