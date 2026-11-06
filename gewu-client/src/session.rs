@@ -17,6 +17,13 @@ pub enum Block {
     /// Assistant content accumulated from `content_delta` events (or loaded
     /// from conversation history).
     Assistant(String),
+    /// A collapsed thinking indicator, e.g. "Thought 5.6s". While reasoning
+    /// streams (`started` set), the text is the live "Thinking… Ns" label.
+    Thought {
+        text: String,
+        /// When the reasoning segment started; `None` once it has ended.
+        started: Option<std::time::Instant>,
+    },
     /// A tool invocation (start; finished output appended when known).
     Tool {
         tool: String,
@@ -36,6 +43,7 @@ impl Block {
         match self {
             Block::User(_) => "you",
             Block::Assistant(_) => "gewu",
+            Block::Thought { .. } => "thought",
             Block::Tool { .. } => "tool",
             Block::Error(_) => "error",
             Block::Info(_) => "info",
@@ -45,9 +53,11 @@ impl Block {
     /// The block's body text.
     pub fn text(&self) -> &str {
         match self {
-            Block::User(text) | Block::Assistant(text) | Block::Error(text) | Block::Info(text) => {
-                text
-            }
+            Block::User(text)
+            | Block::Assistant(text)
+            | Block::Error(text)
+            | Block::Info(text)
+            | Block::Thought { text, .. } => text,
             Block::Tool { output, .. } => output.as_deref().unwrap_or("running…"),
         }
     }
@@ -71,6 +81,9 @@ pub struct SessionModel {
     pub phase: Phase,
     /// Server session handling this conversation, once known.
     pub session_id: Option<String>,
+    /// Transient status message (e.g. LLM retry backoff) shown in the busy
+    /// indicator; cleared by the next non-status event.
+    pub status: Option<String>,
 }
 
 impl Default for SessionModel {
@@ -86,6 +99,7 @@ impl SessionModel {
             blocks: Vec::new(),
             phase: Phase::Idle,
             session_id: None,
+            status: None,
         }
     }
 
@@ -110,16 +124,28 @@ impl SessionModel {
     /// Returns the index of the block the event affected, if any — callers
     /// can re-render just that block instead of the whole transcript.
     pub fn apply_event(&mut self, event: &AgentEvent) -> Option<usize> {
+        // A status message is transient UI state, not transcript content:
+        // any other event supersedes it. Status does not end an open
+        // thought — it can arrive mid-setup, before reasoning starts.
+        if !matches!(event, AgentEvent::Status { .. }) {
+            self.status = None;
+        }
         match event {
+            AgentEvent::Status { message } => {
+                self.status = Some(message.clone());
+                None
+            }
+            AgentEvent::ReasoningDelta { .. } => self.extend_thought(),
             AgentEvent::ContentDelta { delta } => {
+                self.end_thought();
                 let idx = self.open_assistant();
                 if let Block::Assistant(text) = &mut self.blocks[idx] {
                     text.push_str(delta);
                 }
                 Some(idx)
             }
-            AgentEvent::ReasoningDelta { .. } => None,
             AgentEvent::ToolStart { tool, input } => {
+                self.end_thought();
                 self.blocks.push(Block::Tool {
                     tool: tool.clone(),
                     input: summarize_tool_input(tool, input),
@@ -156,12 +182,48 @@ impl SessionModel {
                     })
                     .or(Some(self.blocks.len() - 1))
             }
-            AgentEvent::Finish { response: _ } => None,
-            AgentEvent::Usage { .. } => None,
+            AgentEvent::Finish { response: _ } => {
+                self.end_thought();
+                None
+            }
+            AgentEvent::Usage { .. } => {
+                // Terminal-chunk accounting: also a reasoning boundary (a
+                // turn that ends with thinking but no visible content).
+                self.end_thought();
+                None
+            }
             AgentEvent::Error { error } => {
+                self.end_thought();
                 self.blocks.push(Block::Error(error.clone()));
                 Some(self.blocks.len() - 1)
             }
+        }
+    }
+
+    /// Update the open reasoning indicator with the elapsed time, or start a
+    /// new one. Returns the affected block index.
+    fn extend_thought(&mut self) -> Option<usize> {
+        if let Some(Block::Thought { text, started }) = self.blocks.last_mut()
+            && let Some(started_at) = started.as_ref()
+        {
+            *text = format!("Thinking… {:.1}s", started_at.elapsed().as_secs_f32());
+            return Some(self.blocks.len() - 1);
+        }
+        self.blocks.push(Block::Thought {
+            text: "Thinking… 0.0s".to_string(),
+            started: Some(std::time::Instant::now()),
+        });
+        Some(self.blocks.len() - 1)
+    }
+
+    /// Collapse an open reasoning indicator to its final "Thought Ns" label.
+    fn end_thought(&mut self) {
+        if let Some(Block::Thought { text, started }) = self.blocks.last_mut()
+            && started.is_some()
+        {
+            let elapsed = started.unwrap().elapsed().as_secs_f32();
+            *text = format!("Thought {elapsed:.1}s");
+            *started = None;
         }
     }
 
@@ -469,6 +531,109 @@ mod tests {
         });
         m.finish_ask();
         assert_eq!(m.phase, Phase::Idle);
+    }
+
+    #[test]
+    fn status_event_sets_a_transient_cleared_by_the_next_event() {
+        let mut m = model();
+        m.submit("hi".into());
+
+        // The status is stored for the busy indicator, not the transcript.
+        assert_eq!(
+            m.apply_event(&AgentEvent::Status {
+                message: "LLM request failed: rate limited; retrying in 4s".into(),
+            }),
+            None
+        );
+        assert_eq!(
+            m.status.as_deref(),
+            Some("LLM request failed: rate limited; retrying in 4s")
+        );
+        assert_eq!(m.blocks.len(), 1); // only the user prompt
+
+        // Any other event supersedes it.
+        m.apply_event(&AgentEvent::ContentDelta { delta: "hi".into() });
+        assert_eq!(m.status, None);
+    }
+
+    #[test]
+    fn reasoning_starts_a_live_thought_block() {
+        let mut m = model();
+        m.submit("hi".into());
+
+        let first = m.apply_event(&AgentEvent::ReasoningDelta { delta: "hm".into() });
+        assert_eq!(first, Some(1));
+        match &m.blocks[1] {
+            Block::Thought { started, .. } => assert!(started.is_some()),
+            other => panic!("expected Thought block, got {other:?}"),
+        }
+
+        // Later deltas update the same block instead of stacking new ones.
+        assert_eq!(
+            m.apply_event(&AgentEvent::ReasoningDelta { delta: "mm".into() }),
+            first
+        );
+        assert_eq!(m.blocks.len(), 2);
+    }
+
+    #[test]
+    fn reasoning_ends_at_the_first_visible_output() {
+        let mut m = model();
+        m.submit("hi".into());
+        m.apply_event(&AgentEvent::ReasoningDelta { delta: "hm".into() });
+
+        // Content ends the thought and opens the assistant block.
+        let content_idx = m.apply_event(&AgentEvent::ContentDelta { delta: "answer".into() });
+        assert_eq!(content_idx, Some(2));
+        match &m.blocks[1] {
+            Block::Thought { text, started } => {
+                assert!(text.starts_with("Thought "), "{text}");
+                assert!(started.is_none());
+            }
+            other => panic!("expected Thought block, got {other:?}"),
+        }
+        assert_eq!(m.blocks[2], Block::Assistant("answer".into()));
+    }
+
+    #[test]
+    fn tool_call_also_ends_the_thought() {
+        let mut m = model();
+        m.submit("hi".into());
+        m.apply_event(&AgentEvent::ReasoningDelta { delta: "hm".into() });
+
+        m.apply_event(&AgentEvent::ToolStart {
+            tool: "bash".into(),
+            input: "{}".into(),
+        });
+        match &m.blocks[1] {
+            Block::Thought { text, started } => {
+                assert!(text.starts_with("Thought "), "{text}");
+                assert!(started.is_none());
+            }
+            other => panic!("expected Thought block, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_second_reasoning_segment_gets_its_own_block() {
+        let mut m = model();
+        m.submit("hi".into());
+        m.apply_event(&AgentEvent::ReasoningDelta { delta: "a".into() });
+        m.apply_event(&AgentEvent::ContentDelta { delta: "x".into() });
+
+        let second = m.apply_event(&AgentEvent::ReasoningDelta { delta: "b".into() });
+        assert_eq!(second, Some(3));
+        assert_eq!(m.blocks.len(), 4);
+        assert!(matches!(m.blocks[3], Block::Thought { .. }));
+    }
+
+    #[test]
+    fn no_reasoning_produces_no_thought_block() {
+        let mut m = model();
+        m.submit("hi".into());
+        m.apply_event(&AgentEvent::ContentDelta { delta: "plain".into() });
+        assert_eq!(m.blocks.len(), 2);
+        assert!(m.blocks.iter().all(|b| !matches!(b, Block::Thought { .. })));
     }
 
     #[test]

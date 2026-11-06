@@ -12,6 +12,7 @@ use reqwest::Client;
 use std::future::Future;
 use std::time::Duration;
 
+use gewu_core::traits::StatusSink;
 use serde_json::Value;
 
 /// Connect timeout for the initial TCP/TLS handshake.
@@ -69,6 +70,7 @@ pub(crate) async fn with_retries_capped<T, E, Fut, F>(
     max_wait: Duration,
     mut op: F,
     is_retryable: fn(&E) -> RetryDecision,
+    notify: Option<&StatusSink>,
 ) -> Result<T, E>
 where
     F: FnMut() -> Fut,
@@ -98,6 +100,14 @@ where
                         error = %e,
                         "retryable LLM request failure; retrying"
                     );
+                    // Surface the backoff to frontends: without this a
+                    // retry wait is indistinguishable from a silent hang.
+                    if let Some(notify) = notify {
+                        notify(format!(
+                            "LLM request failed: {e}; retrying in {}s (attempt {attempt})",
+                            delay.as_secs()
+                        ));
+                    }
                     tokio::time::sleep(delay).await;
                 }
             },
@@ -190,10 +200,41 @@ mod tests {
                     RetryDecision::No
                 }
             },
+            None,
         )
         .await;
         assert_eq!(result.unwrap(), 3);
         assert_eq!(calls.load(Ordering::SeqCst), 3);
+    }
+
+    #[tokio::test]
+    async fn retry_backoff_is_reported_to_the_status_sink() {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let statuses = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let sink_statuses = statuses.clone();
+        let sink: StatusSink = Arc::new(move |message: String| {
+            sink_statuses.lock().unwrap().push(message);
+        });
+        let result: Result<u32, String> = with_retries_capped(
+            TEST_BACKOFF,
+            MAX_RETRY_WAIT,
+            counting_op(calls.clone(), 2),
+            |e| {
+                if e.starts_with("transient") {
+                    RetryDecision::Yes { after: None }
+                } else {
+                    RetryDecision::No
+                }
+            },
+            Some(&sink),
+        )
+        .await;
+        assert_eq!(result.unwrap(), 3);
+        let reported = statuses.lock().unwrap();
+        assert_eq!(reported.len(), 2, "one status per failed attempt");
+        assert!(reported[0].contains("transient 1"), "{}", reported[0]);
+        assert!(reported[0].contains("attempt 1"), "{}", reported[0]);
+        assert!(reported[1].contains("attempt 2"), "{}", reported[1]);
     }
 
     #[tokio::test]
@@ -218,6 +259,7 @@ mod tests {
                     RetryDecision::No
                 }
             },
+            None,
         )
         .await;
         assert_eq!(result.unwrap_err(), "fatal: bad request");
@@ -239,6 +281,7 @@ mod tests {
                     RetryDecision::No
                 }
             },
+            None,
         )
         .await;
         assert_eq!(result.unwrap(), 8);
@@ -271,6 +314,7 @@ mod tests {
                     RetryDecision::No
                 }
             },
+            None,
         )
         .await;
         assert_eq!(result.unwrap(), 2);
@@ -303,6 +347,7 @@ mod tests {
                     RetryDecision::No
                 }
             },
+            None,
         )
         .await;
         assert_eq!(result.unwrap(), 2, "a hint beyond the cap must clamp, not fail");
@@ -325,6 +370,7 @@ mod tests {
                     RetryDecision::No
                 }
             },
+            None,
         )
         .await;
         assert_eq!(result.unwrap(), 6);

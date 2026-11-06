@@ -358,42 +358,84 @@ pub fn glob(pattern: &str) -> Result<Vec<PathBuf>> {
     Ok(paths)
 }
 
-/// Finds files matching a glob pattern, respecting .gitignore files.
-pub fn glob_with_gitignore(root: impl AsRef<Path>, pattern: &str) -> Result<Vec<PathBuf>> {
+/// Result of a workspace glob walk: matched files with their modification
+/// times, plus whether the walk was cut short by the entry limit.
+pub struct GlobMatches {
+    /// Matched files sorted by modification time, most recent first.
+    pub entries: Vec<(PathBuf, std::time::SystemTime)>,
+    /// True when the walk stopped early because `limit` entries had matched.
+    pub truncated: bool,
+}
+
+/// Finds files matching a glob pattern under `root`, respecting `.gitignore`
+/// files. `.git` directories are always excluded (matching ripgrep's
+/// `--glob=!**/.git/**`). When `hidden` is false, dot-files are skipped.
+///
+/// Matches are sorted by modification time (most recent first) so callers can
+/// surface recently-changed files; ties fall back to lexical path order for
+/// determinism. The walk stops after `limit` matches.
+pub fn glob_with_gitignore(
+    root: impl AsRef<Path>,
+    pattern: &str,
+    hidden: bool,
+    limit: usize,
+) -> Result<GlobMatches> {
     let root = root.as_ref();
     let walker = ignore::WalkBuilder::new(root)
-        .hidden(false) // Allow hidden files unless in .gitignore
+        .hidden(!hidden)
         .git_ignore(true)
+        .filter_entry(|entry| entry.file_name() != ".git")
         .build();
 
     let glob_pattern = glob::Pattern::new(pattern)
         .with_context(|| format!("Invalid glob pattern: {}", pattern))?;
 
-    let mut matches = Vec::new();
+    let mut entries: Vec<(PathBuf, std::time::SystemTime)> = Vec::new();
+    let mut truncated = false;
 
     for result in walker {
         match result {
             Ok(entry) => {
                 let path = entry.path();
-                if path.is_file() {
-                    // Compute path relative to root to match against the pattern
-                    if let Ok(relative_path) = path.strip_prefix(root) {
-                        // glob::Pattern matches against the string representation
-                        //We need to handle the case where the pattern assumes the root is the current directory
-                        if glob_pattern.matches_path(relative_path) {
-                            matches.push(path.to_path_buf());
-                        }
-                    }
+                if !path.is_file() {
+                    continue;
+                }
+                // Match against the root-relative path so patterns like
+                // `src/**/*.ts` behave as if root were the search directory.
+                let relative = match path.strip_prefix(root) {
+                    Ok(rel) => rel,
+                    Err(_) => continue,
+                };
+                if !glob_pattern.matches_path(relative) {
+                    continue;
+                }
+                let modified = entry
+                    .metadata()
+                    .ok()
+                    .and_then(|m| m.modified().ok())
+                    .unwrap_or(std::time::SystemTime::UNIX_EPOCH);
+                entries.push((path.to_path_buf(), modified));
+                if entries.len() > limit {
+                    truncated = true;
+                    break;
                 }
             }
             Err(_err) => {
-                // We might want to log this but for now just ignore/continue
-                // eprintln!("Error walking directory: {}", err);
+                // Ignore walk errors (permission denied, vanished files, ...)
+                // and keep going, matching ripgrep's default tolerance.
             }
         }
     }
 
-    Ok(matches)
+    // If the walk overflowed we may hold limit + 1 entries; trim first so the
+    // sort cannot waste effort on the surplus entry.
+    entries.truncate(limit);
+    entries.sort_by(|a, b| {
+        b.1.cmp(&a.1) // newest first
+            .then_with(|| a.0.cmp(&b.0))
+    });
+
+    Ok(GlobMatches { entries, truncated })
 }
 
 #[cfg(test)]

@@ -75,6 +75,7 @@ fn render_block(out: &mut String, block: &Block, index: usize, streaming: bool) 
     let class = match block {
         Block::User(_) => "user",
         Block::Assistant(_) => "assistant",
+        Block::Thought { .. } => "thought",
         Block::Error(_) => "error",
         Block::Info(_) => "info",
         Block::Tool { .. } => return,
@@ -101,6 +102,16 @@ fn write_block_body(out: &mut String, block: &Block, streaming: bool) {
                 markdown_to_html(text)
             );
         }
+        // Live "Thinking… Ns" while reasoning streams, settling into the
+        // final "Thought Ns" indicator once it ends.
+        Block::Thought { .. } => {
+            let _ = writeln!(
+                out,
+                "<div class=\"body plain thought{}\">{}</div>",
+                if streaming { " streaming" } else { "" },
+                escape(block.text())
+            );
+        }
         _ => {
             let _ = writeln!(
                 out,
@@ -123,14 +134,19 @@ pub fn block_html(tab: &Tab, index: usize) -> Option<String> {
     Some(out)
 }
 
-/// Render the Markdown body of an assistant block, either in its streaming
-/// form (with the cursor class) or final form, for in-place swaps.
+/// Render the body of a streaming block — assistant Markdown or the live
+/// "Thinking…" indicator — for in-place swaps.
 pub fn assistant_body_html(tab: &Tab, index: usize, streaming: bool) -> Option<String> {
     match tab.model.blocks.get(index) {
         Some(Block::Assistant(text)) => Some(format!(
             "<div class=\"body markdown{}\">{}</div>",
             if streaming { " streaming" } else { "" },
             markdown_to_html(text)
+        )),
+        Some(Block::Thought { .. }) => Some(format!(
+            "<div class=\"body plain thought{}\">{}</div>",
+            if streaming { " streaming" } else { "" },
+            escape(tab.model.blocks[index].text())
         )),
         _ => None,
     }
@@ -678,9 +694,18 @@ pub fn status_html(tab: &Tab) -> String {
     for mode in ["build", "plan"] {
         let _ = write!(out, "<button type=\"button\" class=\"mode-button\" data-mode=\"{mode}\" aria-pressed=\"{}\" {}>{mode}</button>", tab.agent == mode, if tab.busy() { "disabled" } else { "" });
     }
-    match tab.model.phase {
-        Phase::Idle => out.push_str("<span class=\"phase\"><i class=\"dot\"></i>idle</span>"),
-        Phase::Busy => {
+    match (&tab.model.phase, tab.model.status.as_deref()) {
+        (Phase::Idle, _) => out.push_str("<span class=\"phase\"><i class=\"dot\"></i>idle</span>"),
+        // A transient status (e.g. LLM retry backoff) replaces the plain
+        // "thinking…" so a rate-limit wait is visible in the browser.
+        (Phase::Busy, Some(status)) => {
+            let _ = write!(
+                out,
+                "<span class=\"phase busy\"><i class=\"dot\"></i>thinking… {}</span>",
+                escape(status)
+            );
+        }
+        (Phase::Busy, None) => {
             out.push_str("<span class=\"phase busy\"><i class=\"dot\"></i>thinking…</span>");
         }
     }
@@ -860,6 +885,7 @@ pub fn file_preview_html(path: &str, content: &str, truncated: bool) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use gewu_protocol::AgentEvent;
     use crate::workspace::Workspace;
     use gewu_protocol::TokenUsage;
 
@@ -1423,5 +1449,77 @@ mod tests {
         let html = status_html(ws.tab(id).unwrap());
         assert!(html.contains("thinking…"), "{html}");
         assert!(html.contains("Esc interrupt"), "{html}");
+    }
+
+    #[test]
+    fn finalized_thought_renders_dim_indicator_with_escaped_text() {
+        let (ws, id) = tab_with_blocks(vec![
+            Block::User("hi".into()),
+            Block::Thought {
+                text: "Thought 5.6s".into(),
+                started: None,
+            },
+            Block::Assistant("answer".into()),
+        ]);
+        let html = block_html(ws.tab(id).unwrap(), 1).expect("thought block renders");
+        assert!(html.contains("class=\"block thought\""), "{html}");
+        assert!(html.contains("class=\"body plain thought\""), "{html}");
+        assert!(html.contains("Thought 5.6s"), "{html}");
+
+        // Block text is escaped like other plain bodies.
+        let (ws, id) = tab_with_blocks(vec![Block::Thought {
+            text: "Thought <b>1.0s</b>".into(),
+            started: None,
+        }]);
+        let html = block_html(ws.tab(id).unwrap(), 0).unwrap();
+        assert!(html.contains("Thought &lt;b&gt;1.0s&lt;/b&gt;"), "{html}");
+        assert!(!html.contains("<b>"), "{html}");
+    }
+
+    #[test]
+    fn live_thought_renders_streaming_marker_when_last_and_busy() {
+        let (mut ws, id) = tab_with_blocks(vec![Block::User("hi".into())]);
+        {
+            let tab = ws.tab_mut(id).unwrap();
+            tab.model.submit("go".into()); // busy; adds a second user block
+            tab.model.apply_event(&AgentEvent::ReasoningDelta {
+                delta: "hm".into(),
+            });
+        }
+        // Blocks: user, user (from submit), thought.
+        let html = block_html(ws.tab(id).unwrap(), 2).expect("thought block renders");
+        assert!(html.contains("body plain thought streaming"), "{html}");
+        assert!(html.contains("Thinking…"), "{html}");
+
+        // Once a visible block follows, the thought is no longer the
+        // streaming tail and renders settled.
+        {
+            let tab = ws.tab_mut(id).unwrap();
+            tab.model.apply_event(&AgentEvent::ContentDelta {
+                delta: "answer".into(),
+            });
+        }
+        // Blocks: user, user (from submit), thought, assistant.
+        let html = block_html(ws.tab(id).unwrap(), 2).unwrap();
+        assert!(html.contains("body plain thought\""), "{html}");
+        assert!(!html.contains("streaming"), "{html}");
+    }
+
+    #[test]
+    fn assistant_body_html_serves_thought_bodies_for_in_place_updates() {
+        let (mut ws, id) = tab_with_blocks(vec![Block::User("hi".into())]);
+        let tab = ws.tab_mut(id).unwrap();
+        tab.model.submit("go".into());
+        tab.model.apply_event(&AgentEvent::ReasoningDelta {
+            delta: "hm".into(),
+        });
+
+        // Blocks: user, user (from submit), thought.
+        let html = assistant_body_html(ws.tab(id).unwrap(), 2, true).expect("thought body");
+        assert!(html.contains("body plain thought streaming"), "{html}");
+        assert!(html.contains("Thinking…"), "{html}");
+
+        // Non-thought, non-assistant blocks still return None.
+        assert_eq!(assistant_body_html(ws.tab(id).unwrap(), 0, true), None);
     }
 }

@@ -141,6 +141,12 @@ pub struct TokenUsage {
     pub cache_write_tokens: u64,
     /// Output (completion) tokens.
     pub output_tokens: u64,
+    /// Output tokens the model spent thinking (`reasoning_tokens` in
+    /// OpenAI-style breakdowns). Subtracted from nothing: it is reported
+    /// for latency diagnostics, not billing. `0` when the provider does
+    /// not report it.
+    #[serde(default)]
+    pub reasoning_tokens: u64,
 }
 
 impl TokenUsage {
@@ -150,6 +156,7 @@ impl TokenUsage {
         self.cached_tokens += other.cached_tokens;
         self.cache_write_tokens += other.cache_write_tokens;
         self.output_tokens += other.output_tokens;
+        self.reasoning_tokens += other.reasoning_tokens;
     }
 
     /// Total prompt tokens this request (or session) processed:
@@ -231,6 +238,11 @@ pub enum AgentEvent {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         provider: Option<TokenUsage>,
     },
+    /// A transient status message for frontends (e.g. LLM retry backoff).
+    ///
+    /// Not part of the transcript: frontends render it in their busy
+    /// indicator and replace or clear it with the next event.
+    Status { message: String },
     /// An error occurred during agent execution.
     Error { error: String },
 }

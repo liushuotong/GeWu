@@ -100,6 +100,15 @@ async fn run_agent(agent: &mut gewu_core::Agent, prompt: &str) -> Result<()> {
                             println!();
                         }
                         AgentEvent::Usage { .. } => {}
+                        // Transient provider status (e.g. retry backoff):
+                        // shown as a dim line so a wait is visible in the CLI.
+                        AgentEvent::Status { message } => {
+                            stop_spinner(&mut spinner_active, is_tty)?;
+                            if is_tty {
+                                println!("{DIM}{message}{RESET}");
+                                std::io::stdout().flush()?;
+                            }
+                        }
                         AgentEvent::Error { error } => {
                             stop_spinner(&mut spinner_active, is_tty)?;
                             error!("Error from agent: {}", error);

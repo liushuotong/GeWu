@@ -403,6 +403,7 @@ fn test_agent_event_usage_round_trip() {
             cached_tokens: 30_000,
             cache_write_tokens: 3_000,
             output_tokens: 500,
+            reasoning_tokens: 120,
         }),
     };
 

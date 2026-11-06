@@ -932,6 +932,7 @@ mod tests {
                 cached_tokens: 30_000,
                 cache_write_tokens: 3_000,
                 output_tokens: 500,
+                reasoning_tokens: 120,
             }),
         };
         assert_eq!(usage.kind(), "usage");
@@ -1128,6 +1129,19 @@ mod tests {
         assert_eq!(json["id"], Value::Null);
         assert_eq!(json["event"]["type"], "content_delta");
         assert_eq!(json["event"]["delta"], "hi");
+    }
+
+    #[test]
+    fn status_event_serializes_and_round_trips() {
+        let agent_event = AgentEvent::Status {
+            message: "LLM request failed: rate limited; retrying in 4s (attempt 1)".to_string(),
+        };
+        let value = agent_event_to_value(&agent_event);
+        assert_eq!(value["type"], "status");
+        assert_eq!(value["message"], "LLM request failed: rate limited; retrying in 4s (attempt 1)");
+
+        let decoded: AgentEvent = serde_json::from_value(value).unwrap();
+        assert_eq!(decoded, agent_event);
     }
 
     #[test]

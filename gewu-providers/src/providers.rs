@@ -40,13 +40,14 @@ use crate::openai::{
 use async_trait::async_trait;
 use futures::StreamExt;
 use futures::stream::BoxStream;
-use gewu_core::traits::{LlmProvider, Tool};
+use gewu_core::traits::{LlmProvider, StatusSink, Tool};
 use gewu_core::types::{
     Capabilities, ContentPart, Message, ProviderEvent, TokenUsage,
 };
 use serde_json::Value;
 use std::error::Error;
 use std::sync::Arc;
+use std::sync::Mutex;
 use std::time::Duration;
 
 static MULTIMODAL_CAP: Capabilities = Capabilities {
@@ -137,6 +138,9 @@ pub struct OpenAIProvider {
     /// Upper bound on a single retry wait; longer `Retry-After` hints are
     /// clamped down to this.
     retry_max_wait: Duration,
+    /// Sink for transient status messages (retry backoff), registered by
+    /// the agent layer so frontends can show progress during waits.
+    status_sink: Mutex<Option<StatusSink>>,
 }
 
 impl OpenAIProvider {
@@ -155,6 +159,7 @@ impl OpenAIProvider {
             capabilities,
             retry_backoff: crate::http::RETRY_BACKOFF,
             retry_max_wait: crate::http::MAX_RETRY_WAIT,
+            status_sink: Mutex::new(None),
         }
     }
 
@@ -177,6 +182,7 @@ impl OpenAIProvider {
             capabilities,
             retry_backoff: crate::http::RETRY_BACKOFF,
             retry_max_wait: crate::http::MAX_RETRY_WAIT,
+            status_sink: Mutex::new(None),
         }
     }
 
@@ -192,6 +198,15 @@ impl OpenAIProvider {
     pub fn with_retry_max_wait(mut self, max_wait: Duration) -> Self {
         self.retry_max_wait = max_wait;
         self
+    }
+
+    /// Snapshot of the registered status sink, if any. Taken before the
+    /// retry loop so no lock guard is held across an await point.
+    fn status_sink_snapshot(&self) -> Option<StatusSink> {
+        self.status_sink
+            .lock()
+            .expect("status sink lock poisoned")
+            .clone()
     }
 
     /// Determines capabilities based on model name.
@@ -648,6 +663,11 @@ impl ResponseParser for OpenAIProvider {
                         .as_ref()
                         .and_then(|d| d.cached_tokens)
                         .unwrap_or(0) as u64;
+                    let reasoning = usage
+                        .completion_tokens_details
+                        .as_ref()
+                        .and_then(|d| d.reasoning_tokens)
+                        .unwrap_or(0) as u64;
                     yield ProviderEvent::Usage {
                         usage: TokenUsage {
                             input_tokens: (usage.prompt_tokens as u64).saturating_sub(cached),
@@ -656,6 +676,7 @@ impl ResponseParser for OpenAIProvider {
                             // separate write figure.
                             cache_write_tokens: 0,
                             output_tokens: usage.completion_tokens as u64,
+                            reasoning_tokens: reasoning,
                         },
                     };
                 }
@@ -721,6 +742,7 @@ impl LlmProvider for OpenAIProvider {
         // errors, read timeouts on a stalled connection). The wire request is
         // re-parsed per attempt because `create_stream` consumes it; parse
         // failures are permanent and never retried.
+        let status_sink = self.status_sink_snapshot();
         let stream = crate::http::with_retries_capped(
             self.retry_backoff,
             self.retry_max_wait,
@@ -741,6 +763,7 @@ impl LlmProvider for OpenAIProvider {
                 }
                 _ => crate::http::RetryDecision::No,
             },
+            status_sink.as_ref(),
         )
         .await
         .map_err(|e| Box::new(e) as Box<dyn Error + Send + Sync>)?;
@@ -748,6 +771,10 @@ impl LlmProvider for OpenAIProvider {
         let parsed_stream = self.parse_stream(stream);
 
         Ok(parsed_stream)
+    }
+
+    fn set_status_sink(&self, sink: Option<StatusSink>) {
+        *self.status_sink.lock().expect("status sink lock poisoned") = sink;
     }
 
     async fn list_models(&self) -> Result<Vec<String>, Box<dyn Error + Send + Sync>> {
@@ -802,6 +829,9 @@ pub struct AnthropicProvider {
     retry_max_wait: Duration,
     /// Output token budget sent as `max_tokens` on every request.
     max_tokens: u32,
+    /// Sink for transient status messages (retry backoff), registered by
+    /// the agent layer so frontends can show progress during waits.
+    status_sink: Mutex<Option<StatusSink>>,
 }
 
 impl AnthropicProvider {
@@ -832,6 +862,7 @@ impl AnthropicProvider {
             retry_backoff: crate::http::RETRY_BACKOFF,
             retry_max_wait: crate::http::MAX_RETRY_WAIT,
             max_tokens: Self::default_max_tokens_for_model(model),
+            status_sink: Mutex::new(None),
         }
     }
 
@@ -855,6 +886,7 @@ impl AnthropicProvider {
             retry_backoff: crate::http::RETRY_BACKOFF,
             retry_max_wait: crate::http::MAX_RETRY_WAIT,
             max_tokens: Self::default_max_tokens_for_model(model),
+            status_sink: Mutex::new(None),
         }
     }
 
@@ -870,6 +902,15 @@ impl AnthropicProvider {
     pub fn with_retry_max_wait(mut self, max_wait: Duration) -> Self {
         self.retry_max_wait = max_wait;
         self
+    }
+
+    /// Snapshot of the registered status sink, if any. Taken before the
+    /// retry loop so no lock guard is held across an await point.
+    fn status_sink_snapshot(&self) -> Option<StatusSink> {
+        self.status_sink
+            .lock()
+            .expect("status sink lock poisoned")
+            .clone()
     }
 
     /// Overrides the output token budget sent as `max_tokens`.
@@ -1320,6 +1361,7 @@ impl LlmProvider for AnthropicProvider {
         // Retry the request-setup phase on transport-level failures; see the
         // OpenAI `send` for rationale. Parse failures are permanent and never
         // retried.
+        let status_sink = self.status_sink_snapshot();
         let stream = crate::http::with_retries_capped(
             self.retry_backoff,
             self.retry_max_wait,
@@ -1340,6 +1382,7 @@ impl LlmProvider for AnthropicProvider {
                 }
                 _ => crate::http::RetryDecision::No,
             },
+            status_sink.as_ref(),
         )
         .await
         .map_err(|e| Box::new(e) as Box<dyn Error + Send + Sync>)?;
@@ -1347,6 +1390,10 @@ impl LlmProvider for AnthropicProvider {
         let parsed_stream = self.parse_stream(stream);
 
         Ok(parsed_stream)
+    }
+
+    fn set_status_sink(&self, sink: Option<StatusSink>) {
+        *self.status_sink.lock().expect("status sink lock poisoned") = sink;
     }
 
     async fn list_models(&self) -> Result<Vec<String>, Box<dyn Error + Send + Sync>> {
@@ -2314,7 +2361,7 @@ mod tests {
         let sse = concat!(
             r#"data: {"id":"c1","choices":[{"index":0,"delta":{"content":"Answer"}}]}"#,
             "\n\n",
-            r#"data: {"id":"c1","choices":[],"usage":{"prompt_tokens":1000,"completion_tokens":20,"total_tokens":1020,"prompt_tokens_details":{"cached_tokens":800}}}"#,
+            r#"data: {"id":"c1","choices":[],"usage":{"prompt_tokens":1000,"completion_tokens":20,"total_tokens":1020,"prompt_tokens_details":{"cached_tokens":800},"completion_tokens_details":{"reasoning_tokens":7}}}"#,
             "\n\n",
             "data: [DONE]\n\n",
         );
@@ -2326,7 +2373,24 @@ mod tests {
         assert_eq!(usage.cached_tokens, 800);
         assert_eq!(usage.cache_write_tokens, 0);
         assert_eq!(usage.output_tokens, 20);
+        assert_eq!(usage.reasoning_tokens, 7);
         assert_eq!(usage.cache_hit_rate_percent(), Some(80));
+    }
+
+    #[tokio::test]
+    async fn openai_usage_without_reasoning_details_reports_zero() {
+        // Gateways may omit `completion_tokens_details`; thinking tokens
+        // are unknown, not zero-billed.
+        let sse = concat!(
+            r#"data: {"id":"c1","choices":[{"index":0,"delta":{"content":"Answer"}}]}"#,
+            "\n\n",
+            r#"data: {"id":"c1","choices":[],"usage":{"prompt_tokens":100,"completion_tokens":20,"total_tokens":120}}"#,
+            "\n\n",
+            "data: [DONE]\n\n",
+        );
+        let events = openai_parse_sse(sse).await;
+        let usages = usage_events(&events);
+        assert_eq!(usages[0].reasoning_tokens, 0);
     }
 
     #[tokio::test]

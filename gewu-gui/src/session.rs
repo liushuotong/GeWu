@@ -942,8 +942,18 @@ impl GuiSession {
                             }
                             usage_updated = true;
                         }
-                        // Reasoning is not shown; Finish is followed by Result.
-                        Ok(AgentEvent::ReasoningDelta { .. }) | Ok(AgentEvent::Finish { .. }) => {}
+                        // Reasoning drives the live "Thinking…" indicator;
+                        // Finish is followed by Result.
+                        Ok(agent_event @ AgentEvent::ReasoningDelta { .. }) => {
+                            let affected = tab.model.apply_event(&agent_event);
+                            let appended = tab.model.blocks.len() != before;
+                            if appended {
+                                update = affected.map_or(TabUpdate::Full, TabUpdate::BlockAppend);
+                            } else if stream_due {
+                                update = affected.map_or(TabUpdate::Full, TabUpdate::StreamingBody);
+                            }
+                        }
+                        Ok(AgentEvent::Finish { .. }) => {}
                         Ok(AgentEvent::Error { error }) => {
                             let affected = tab.model.apply_event(&AgentEvent::Error { error });
                             update = affected.map_or(TabUpdate::Full, TabUpdate::BlockAppend);

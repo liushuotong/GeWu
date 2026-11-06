@@ -690,6 +690,19 @@ pub struct Usage {
     /// the whole object must still parse (`#[serde(default)]`).
     #[serde(default)]
     pub prompt_tokens_details: Option<PromptTokensDetails>,
+    /// Breakdown of the completion tokens. OpenAI reports thinking tokens
+    /// as `reasoning_tokens` under this object; gateways that omit it must
+    /// still parse.
+    #[serde(default)]
+    pub completion_tokens_details: Option<CompletionTokensDetails>,
+}
+
+/// Breakdown of completion tokens.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CompletionTokensDetails {
+    /// Output tokens the model spent thinking (not visible content).
+    #[serde(default)]
+    pub reasoning_tokens: Option<u32>,
 }
 
 /// Breakdown of prompt tokens.

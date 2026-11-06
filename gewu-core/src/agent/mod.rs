@@ -59,6 +59,7 @@ use futures::{Stream, StreamExt};
 use std::any::Any;
 use std::error::Error;
 use std::sync::Arc;
+use tokio::sync::mpsc;
 use tracing::{info, trace, warn};
 use uuid::Uuid;
 
@@ -232,6 +233,14 @@ impl Agent {
             let mut turn = 0;
             let mut doom_loop = DoomLoopDetector::new(3);
 
+            // Provider retry backoff is reported through this channel and
+            // surfaced as `AgentEvent::Status`, so a rate-limit wait shows
+            // up in the UI instead of looking like a silent hang.
+            let (status_tx, mut status_rx) = mpsc::unbounded_channel::<String>();
+            self.llm.set_status_sink(Some(Arc::new(move |message| {
+                let _ = status_tx.send(message);
+            })));
+
             loop {
                 if self.compact_if_needed().await? {
                     info!("History compacted.");
@@ -262,10 +271,31 @@ impl Agent {
                 trace!("LLM request messages: {:?}", messages);
 
                 let tools_clone = self.tools.clone();
-                let mut stream = self
+
+                // Interleave provider status messages (retry backoff) with
+                // the awaited stream setup. The channel closes only when the
+                // sink is replaced or the ask ends; `status_open` prevents a
+                // closed channel from busy-looping the select.
+                let mut status_open = true;
+                let stream_fut = self
                     .llm
-                    .stream_response(&messages, tools_clone.as_slice(), self.log.as_ref())
-                    .await
+                    .stream_response(&messages, tools_clone.as_slice(), self.log.as_ref());
+                tokio::pin!(stream_fut);
+                let stream_result: Option<Result<_, _>> = loop {
+                    tokio::select! {
+                        result = &mut stream_fut => break Some(result),
+                        status = status_rx.recv(), if status_open => {
+                            match status {
+                                Some(message) => {
+                                    yield AgentEvent::Status { message };
+                                }
+                                None => status_open = false,
+                            }
+                        }
+                    }
+                };
+                let mut stream = stream_result
+                    .expect("select loop only exits by breaking with a result")
                     .map_err(|e| anyhow::anyhow!(e))?;
 
                 // The provider's terminal stop reason (e.g. "max_tokens").
@@ -687,6 +717,12 @@ mod tests {
     struct MockProvider {
         responses: Vec<Vec<ProviderEvent>>,
         call: AtomicUsize,
+        /// When set, emitted through the registered status sink on every
+        /// `send`, simulating provider-side retry reporting.
+        status_message: Option<String>,
+        status_sink: std::sync::Mutex<Option<crate::traits::StatusSink>>,
+        /// When set, the stream yields one event then a mid-stream error.
+        fail_stream: bool,
     }
 
     impl MockProvider {
@@ -694,6 +730,9 @@ mod tests {
             Self {
                 responses,
                 call: AtomicUsize::new(0),
+                status_message: None,
+                status_sink: std::sync::Mutex::new(None),
+                fail_stream: false,
             }
         }
 
@@ -704,6 +743,14 @@ mod tests {
                 },
                 ProviderEvent::Finish { reason: None },
             ]])
+        }
+
+        /// Content response preceded by a status message sent through the
+        /// registered sink (as a retrying provider would report).
+        fn content_with_status(delta: &str, status: &str) -> Self {
+            let mut provider = Self::single_content(delta);
+            provider.status_message = Some(status.to_string());
+            provider
         }
     }
 
@@ -721,6 +768,10 @@ mod tests {
             }))
         }
 
+        fn set_status_sink(&self, sink: Option<crate::traits::StatusSink>) {
+            *self.status_sink.lock().unwrap() = sink;
+        }
+
         async fn send<'a>(
             &'a self,
             _request: Value,
@@ -728,7 +779,30 @@ mod tests {
             BoxStream<'a, Result<ProviderEvent, Box<dyn Error + Send + Sync>>>,
             Box<dyn Error + Send + Sync>,
         > {
+            if let Some(message) = &self.status_message {
+                // Snapshot the sink (no guard across await) and report it
+                // while the send is still pending, as a real provider does
+                // during backoff waits: the status is sent, then the future
+                // stays pending, so the agent's select observes it.
+                let sink = self.status_sink.lock().unwrap().clone();
+                if let Some(sink) = sink {
+                    tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+                    sink(message.clone());
+                    tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+                }
+            }
             let index = self.call.fetch_add(1, Ordering::SeqCst);
+            if self.fail_stream {
+                // One event, then a mid-stream failure (e.g. a dropped
+                // connection): exercises the response log's error path.
+                let events: Vec<Result<ProviderEvent, Box<dyn Error + Send + Sync>>> = vec![
+                    Ok(ProviderEvent::ContentDelta {
+                        delta: "partial".to_string(),
+                    }),
+                    Err("stream dropped".into()),
+                ];
+                return Ok(Box::pin(futures::stream::iter(events)));
+            }
             let events = self.responses.get(index).cloned().unwrap_or_default();
             Ok(Box::pin(futures::stream::iter(events.into_iter().map(Ok))))
         }
@@ -762,11 +836,46 @@ mod tests {
         );
 
         let entries = parse_log_entries(&buffer.contents());
-        assert_eq!(entries.len(), 1);
+        assert_eq!(entries.len(), 2, "request line + response line");
         assert_eq!(entries[0]["request"]["model"], "mock");
         assert!(entries[0]["timestamp"].is_string());
         let messages = entries[0]["request"]["messages"].as_u64().unwrap();
         assert_eq!(messages, 1);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_provider_status_surfaces_as_status_event() -> Result<()> {
+        let mut agent = Agent::builder()
+            .llm(Arc::new(MockProvider::content_with_status(
+                "hi",
+                "LLM request failed: rate limited; retrying in 4s (attempt 1)",
+            )))
+            .build()?;
+
+        let events = agent.ask("hello").collect::<Vec<_>>().await;
+        assert!(events.iter().all(|e| e.is_ok()));
+
+        let status = events.iter().find_map(|e| match e.as_ref().unwrap() {
+            AgentEvent::Status { message } => Some(message.clone()),
+            _ => None,
+        });
+        assert_eq!(
+            status.as_deref(),
+            Some("LLM request failed: rate limited; retrying in 4s (attempt 1)"),
+            "provider status must surface as an AgentEvent::Status"
+        );
+        // The status precedes the streamed content (it is emitted during
+        // stream setup, before the response stream is consumed).
+        let status_pos = events
+            .iter()
+            .position(|e| matches!(e.as_ref().unwrap(), AgentEvent::Status { .. }))
+            .unwrap();
+        let content_pos = events
+            .iter()
+            .position(|e| matches!(e.as_ref().unwrap(), AgentEvent::ContentDelta { .. }))
+            .unwrap();
+        assert!(status_pos < content_pos);
         Ok(())
     }
 
@@ -794,8 +903,83 @@ mod tests {
         assert!(compacted);
 
         let entries = parse_log_entries(&buffer.contents());
-        assert_eq!(entries.len(), 1);
+        assert_eq!(
+            entries.len(),
+            2,
+            "compaction logs its request and response too"
+        );
         assert_eq!(entries[0]["request"]["model"], "mock");
+        assert_eq!(entries[1]["response"]["outcome"], "ok");
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_with_log_records_response_timing_and_usage() -> Result<()> {
+        let buffer = SharedBuffer::default();
+        let mut agent = Agent::builder()
+            .llm(Arc::new(MockProvider::new(vec![vec![
+                ProviderEvent::ContentDelta {
+                    delta: "hi".to_string(),
+                },
+                ProviderEvent::Usage {
+                    usage: TokenUsage {
+                        input_tokens: 100,
+                        cached_tokens: 700,
+                        cache_write_tokens: 0,
+                        output_tokens: 20,
+                        reasoning_tokens: 5,
+                    },
+                },
+                ProviderEvent::Finish { reason: None },
+            ]])))
+            .with_log(buffer.handle())
+            .build()?;
+
+        let events = agent.ask("hello").collect::<Vec<_>>().await;
+        assert!(events.iter().all(|e| e.is_ok()));
+
+        let entries = parse_log_entries(&buffer.contents());
+        assert_eq!(entries.len(), 2, "one request line + one response line");
+        let id = entries[0]["id"].as_str().unwrap();
+        assert_eq!(entries[1]["id"].as_str().unwrap(), id, "correlated by id");
+
+        let response = &entries[1]["response"];
+        assert_eq!(response["outcome"], "ok");
+        assert!(response["ttft_ms"].is_u64());
+        assert!(response["total_ms"].is_u64());
+        assert_eq!(response["events"], 3);
+        let usage = &response["usage"];
+        assert_eq!(usage["cached_tokens"], 700);
+        assert_eq!(usage["reasoning_tokens"], 5);
+        assert_eq!(usage["output_tokens"], 20);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_with_log_records_stream_error_outcome() -> Result<()> {
+        let buffer = SharedBuffer::default();
+        let mut provider = MockProvider::new(Vec::new());
+        provider.fail_stream = true;
+        let mut agent = Agent::builder()
+            .llm(Arc::new(provider))
+            .with_log(buffer.handle())
+            .build()?;
+
+        let events = agent.ask("hello").collect::<Vec<_>>().await;
+        assert!(events.iter().any(|e| e.is_err()), "stream error surfaces");
+
+        let entries = parse_log_entries(&buffer.contents());
+        assert_eq!(entries.len(), 2);
+        let response = &entries[1]["response"];
+        assert_eq!(response["outcome"], "error");
+        assert!(
+            response["error"]
+                .as_str()
+                .unwrap()
+                .contains("stream dropped")
+        );
+        assert_eq!(response["events"], 1, "the event before the error");
+        assert!(response["ttft_ms"].is_u64());
         Ok(())
     }
 

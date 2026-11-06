@@ -611,9 +611,14 @@ fn format_k(tokens: usize) -> String {
 /// The bottom status line: phase/model/session/scroll on the left, the
 /// context usage (`34k (27%)`) right-aligned, key hints between them.
 fn status_line(app: &App, width: u16) -> Line<'static> {
-    let phase = match app.model.phase {
-        Phase::Idle => Span::styled("idle", Style::new().dim()),
-        Phase::Busy => Span::styled("thinking…", Style::new().cyan()),
+    let phase = match (&app.model.phase, app.model.status.as_deref()) {
+        (Phase::Idle, _) => Span::styled("idle", Style::new().dim()),
+        // A transient status (e.g. LLM retry backoff) replaces the plain
+        // "thinking…" so a rate-limit wait is visible in the terminal.
+        (Phase::Busy, Some(status)) => {
+            Span::styled(format!("thinking… {status}"), Style::new().cyan())
+        }
+        (Phase::Busy, None) => Span::styled("thinking…", Style::new().cyan()),
     };
     let session = match &app.model.session_id {
         Some(id) => {
