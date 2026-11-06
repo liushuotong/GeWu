@@ -37,12 +37,33 @@ pub enum OpenAIError {
     /// Error parsing Server-Sent Events response.
     #[error("SSE parse error: {0}")]
     SseParse(String),
+    /// The provider rejected the request with a 429 rate limit. Carries the
+    /// parsed human message and the `Retry-After` hint when one was sent, so
+    /// the retry layer can decide whether waiting is worthwhile.
+    #[error("provider rate limit (429): {message}")]
+    RateLimit {
+        message: String,
+        retry_after: Option<std::time::Duration>,
+    },
     /// API returned an error response.
     #[error("API error: {0}")]
     Api(String),
     /// Error building request (missing required fields, etc.).
     #[error("Build error: {0}")]
     Build(String),
+}
+
+/// Builds the rate-limit error for a 429 response body.
+///
+/// `retry_after` is the `Retry-After` hint extracted from the headers before
+/// the body was consumed. The hint is advisory only: the retry layer clamps
+/// it to its per-wait cap, so every rate limit is retried indefinitely.
+pub(crate) fn rate_limit_error(
+    retry_after: Option<std::time::Duration>,
+    body: &str,
+) -> OpenAIError {
+    let message = crate::http::rate_limit_message(body);
+    OpenAIError::RateLimit { message, retry_after }
 }
 
 /// Configuration for the OpenAI API client.
@@ -119,7 +140,11 @@ impl<'a> ChatCompletions<'a> {
 
         let status = response.status();
         if !status.is_success() {
+            let retry_after = crate::http::retry_after(&response);
             let error_text = response.text().await.unwrap_or_default();
+            if status == reqwest::StatusCode::TOO_MANY_REQUESTS {
+                return Err(rate_limit_error(retry_after, &error_text));
+            }
             return Err(OpenAIError::Api(format!("{}: {}", status, error_text)));
         }
 
@@ -244,7 +269,11 @@ impl<'a> Models<'a> {
 
         let status = response.status();
         if !status.is_success() {
+            let retry_after = crate::http::retry_after(&response);
             let error_text = response.text().await.unwrap_or_default();
+            if status == reqwest::StatusCode::TOO_MANY_REQUESTS {
+                return Err(rate_limit_error(retry_after, &error_text));
+            }
             return Err(OpenAIError::Api(format!("{}: {}", status, error_text)));
         }
 

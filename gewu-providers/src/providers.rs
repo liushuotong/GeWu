@@ -132,6 +132,9 @@ pub struct OpenAIProvider {
     model: String,
     capabilities: Capabilities,
     retry_backoff: Duration,
+    /// Upper bound on a single retry wait; longer `Retry-After` hints are
+    /// clamped down to this.
+    retry_max_wait: Duration,
 }
 
 impl OpenAIProvider {
@@ -149,6 +152,7 @@ impl OpenAIProvider {
             model: model.to_string(),
             capabilities,
             retry_backoff: crate::http::RETRY_BACKOFF,
+            retry_max_wait: crate::http::MAX_RETRY_WAIT,
         }
     }
 
@@ -170,6 +174,7 @@ impl OpenAIProvider {
             model: model.to_string(),
             capabilities,
             retry_backoff: crate::http::RETRY_BACKOFF,
+            retry_max_wait: crate::http::MAX_RETRY_WAIT,
         }
     }
 
@@ -177,6 +182,13 @@ impl OpenAIProvider {
     /// (each retry waits four times longer than the previous one).
     pub fn with_retry_backoff(mut self, backoff: Duration) -> Self {
         self.retry_backoff = backoff;
+        self
+    }
+
+    /// Overrides the upper bound on a single retry wait; a provider's
+    /// `Retry-After` hint longer than this is clamped down to it.
+    pub fn with_retry_max_wait(mut self, max_wait: Duration) -> Self {
+        self.retry_max_wait = max_wait;
         self
     }
 
@@ -631,8 +643,9 @@ impl LlmProvider for OpenAIProvider {
         // errors, read timeouts on a stalled connection). The wire request is
         // re-parsed per attempt because `create_stream` consumes it; parse
         // failures are permanent and never retried.
-        let stream = crate::http::with_retries(
+        let stream = crate::http::with_retries_capped(
             self.retry_backoff,
+            self.retry_max_wait,
             || {
                 let request = request.clone();
                 async move {
@@ -641,7 +654,15 @@ impl LlmProvider for OpenAIProvider {
                     self.client.chat().create_stream(request).await
                 }
             },
-            |e| matches!(e, OpenAIError::Http(_)),
+            |e| match e {
+                // Transport-level failures retry with the backoff sequence.
+                OpenAIError::Http(_) => crate::http::RetryDecision::Yes { after: None },
+                // Rate limits honor the provider's suggested wait, capped.
+                OpenAIError::RateLimit { retry_after, .. } => {
+                    crate::http::RetryDecision::Yes { after: *retry_after }
+                }
+                _ => crate::http::RetryDecision::No,
+            },
         )
         .await
         .map_err(|e| Box::new(e) as Box<dyn Error + Send + Sync>)?;
@@ -698,6 +719,9 @@ pub struct AnthropicProvider {
     #[allow(dead_code)]
     capabilities: Capabilities,
     retry_backoff: Duration,
+    /// Upper bound on a single retry wait; longer `Retry-After` hints are
+    /// clamped down to this.
+    retry_max_wait: Duration,
     /// Output token budget sent as `max_tokens` on every request.
     max_tokens: u32,
 }
@@ -728,6 +752,7 @@ impl AnthropicProvider {
             model: model.to_string(),
             capabilities,
             retry_backoff: crate::http::RETRY_BACKOFF,
+            retry_max_wait: crate::http::MAX_RETRY_WAIT,
             max_tokens: Self::default_max_tokens_for_model(model),
         }
     }
@@ -750,6 +775,7 @@ impl AnthropicProvider {
             model: model.to_string(),
             capabilities,
             retry_backoff: crate::http::RETRY_BACKOFF,
+            retry_max_wait: crate::http::MAX_RETRY_WAIT,
             max_tokens: Self::default_max_tokens_for_model(model),
         }
     }
@@ -758,6 +784,13 @@ impl AnthropicProvider {
     /// (each retry waits four times longer than the previous one).
     pub fn with_retry_backoff(mut self, backoff: Duration) -> Self {
         self.retry_backoff = backoff;
+        self
+    }
+
+    /// Overrides the upper bound on a single retry wait; a provider's
+    /// `Retry-After` hint longer than this is clamped down to it.
+    pub fn with_retry_max_wait(mut self, max_wait: Duration) -> Self {
+        self.retry_max_wait = max_wait;
         self
     }
 
@@ -1117,8 +1150,9 @@ impl LlmProvider for AnthropicProvider {
         // Retry the request-setup phase on transport-level failures; see the
         // OpenAI `send` for rationale. Parse failures are permanent and never
         // retried.
-        let stream = crate::http::with_retries(
+        let stream = crate::http::with_retries_capped(
             self.retry_backoff,
+            self.retry_max_wait,
             || {
                 let request = request.clone();
                 async move {
@@ -1127,7 +1161,15 @@ impl LlmProvider for AnthropicProvider {
                     self.client.messages().create_stream(request).await
                 }
             },
-            |e| matches!(e, AnthropicError::Http(_)),
+            |e| match e {
+                // Transport-level failures retry with the backoff sequence.
+                AnthropicError::Http(_) => crate::http::RetryDecision::Yes { after: None },
+                // Rate limits honor the provider's suggested wait, capped.
+                AnthropicError::RateLimit { retry_after, .. } => {
+                    crate::http::RetryDecision::Yes { after: *retry_after }
+                }
+                _ => crate::http::RetryDecision::No,
+            },
         )
         .await
         .map_err(|e| Box::new(e) as Box<dyn Error + Send + Sync>)?;
@@ -1683,14 +1725,19 @@ mod tests {
             .collect()
     }
 
-    // The provider uses a millisecond backoff so the two retries against the
-    // unroutable endpoint don't slow the suite down.
     #[tokio::test]
     async fn stream_response_logs_wire_request_before_sending() {
-        // Unroutable endpoint: send fails, but the request is logged first.
+        // The request must be logged before it goes over the wire; a
+        // successful canned response proves it was sent and the log filled.
+        let sse = "data: {\"id\":\"chatcmpl-1\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\"hi\"}}]}\n\ndata: [DONE]\n\n";
+        let addr = serve_canned(vec![http_response(
+            "HTTP/1.1 200 OK",
+            &[("Content-Type", "text/event-stream")],
+            sse,
+        )])
+        .await;
         let provider =
-            OpenAIProvider::new_with_endpoint("test-key", "http://127.0.0.1:1", "gpt-4o")
-                .with_retry_backoff(std::time::Duration::from_millis(1));
+            OpenAIProvider::new_with_endpoint("test-key", &format!("http://{addr}"), "gpt-4o");
         let buffer = SharedBuffer::default();
         let messages = vec![Message::User {
             content: vec![ContentPart::Text {
@@ -1702,7 +1749,7 @@ mod tests {
         let result = provider
             .stream_response(&messages, &tools, Some(&buffer.handle()))
             .await;
-        assert!(result.is_err(), "send should fail against 127.0.0.1:1");
+        assert!(result.is_ok(), "send should succeed against the canned server");
 
         let entries = parse_log_entries(&buffer.contents());
         assert_eq!(entries.len(), 1);
@@ -1717,9 +1764,15 @@ mod tests {
 
     #[tokio::test]
     async fn stream_response_without_log_sends_normally() {
+        let sse = "data: {\"id\":\"chatcmpl-1\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\"hi\"}}]}\n\ndata: [DONE]\n\n";
+        let addr = serve_canned(vec![http_response(
+            "HTTP/1.1 200 OK",
+            &[("Content-Type", "text/event-stream")],
+            sse,
+        )])
+        .await;
         let provider =
-            OpenAIProvider::new_with_endpoint("test-key", "http://127.0.0.1:1", "gpt-4o")
-                .with_retry_backoff(std::time::Duration::from_millis(1));
+            OpenAIProvider::new_with_endpoint("test-key", &format!("http://{addr}"), "gpt-4o");
         let messages = vec![Message::User {
             content: vec![ContentPart::Text {
                 text: "hello".to_string(),
@@ -1727,7 +1780,7 @@ mod tests {
         }];
 
         let result = provider.stream_response(&messages, &[], None).await;
-        assert!(result.is_err(), "send should fail against 127.0.0.1:1");
+        assert!(result.is_ok(), "send should succeed against the canned server");
     }
 
     #[test]
@@ -1802,5 +1855,164 @@ mod tests {
             .collect();
         assert_eq!(reasoning, "Step one");
         assert_eq!(content, "Answer");
+    }
+
+    // -- 429 rate-limit handling -------------------------------------------
+
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    /// Builds a complete HTTP/1.1 response with `Connection: close` so the
+    /// client never reuses the connection across canned replies.
+    fn http_response(status_line: &str, headers: &[(&str, &str)], body: &str) -> String {
+        let mut response = format!("{status_line}\r\n");
+        for (name, value) in headers {
+            response.push_str(&format!("{name}: {value}\r\n"));
+        }
+        response.push_str(&format!("Content-Length: {}\r\n", body.len()));
+        response.push_str("Connection: close\r\n\r\n");
+        response.push_str(body);
+        response
+    }
+
+    /// Serves one canned response per connection, in order, then stops
+    /// accepting. Requests are drained before each reply.
+    async fn serve_canned(responses: Vec<String>) -> std::net::SocketAddr {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            for response in responses {
+                let Ok((mut socket, _)) = listener.accept().await else { break };
+                // Drain the request head and body so the reply is not reset.
+                let _ = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+                    let mut data = Vec::new();
+                    let mut chunk = [0u8; 4096];
+                    loop {
+                        let head_end = data.windows(4).position(|w| w == b"\r\n\r\n");
+                        if let Some(head_end) = head_end {
+                            let head = String::from_utf8_lossy(&data[..head_end]).to_string();
+                            let length = head
+                                .lines()
+                                .find_map(|line| {
+                                    let lowered = line.to_ascii_lowercase();
+                                    let value = lowered.strip_prefix("content-length:")?;
+                                    value.trim().parse::<usize>().ok()
+                                })
+                                .unwrap_or(0);
+                            if data.len() >= head_end + 4 + length { break; }
+                        }
+                        match socket.read(&mut chunk).await {
+                            Ok(0) | Err(_) => break,
+                            Ok(n) => data.extend_from_slice(&chunk[..n]),
+                        }
+                    }
+                })
+                .await;
+                if socket.write_all(response.as_bytes()).await.is_err() {
+                    break;
+                }
+                let _ = socket.shutdown().await;
+            }
+        });
+        addr
+    }
+
+    const NEW_API_429_BODY: &str = r#"{"error":{"code":"user_rate_limit_exceeded","message":"You have reached the request limit: at most 1 requests per 60 minutes","type":"new_api_error"}}"#;
+
+    #[tokio::test]
+    async fn openai_rate_limit_with_short_hint_is_retried() {
+        let sse = "data: {\"id\":\"chatcmpl-1\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\"hi\"}}]}\n\ndata: [DONE]\n\n";
+        let addr = serve_canned(vec![
+            http_response(
+                "HTTP/1.1 429 Too Many Requests",
+                &[("Retry-After", "0")],
+                r#"{"error":{"message":"slow down","type":"new_api_error"}}"#,
+            ),
+            http_response("HTTP/1.1 200 OK", &[("Content-Type", "text/event-stream")], sse),
+        ])
+        .await;
+        let provider = OpenAIProvider::new_with_endpoint("test-key", &format!("http://{addr}"), "gpt-4o")
+            .with_retry_backoff(std::time::Duration::from_millis(1));
+
+        let messages = vec![Message::User {
+            content: vec![ContentPart::Text { text: "hello".to_string() }],
+        }];
+        let events: Vec<_> = provider
+            .stream_response(&messages, &[], None)
+            .await
+            .expect("retry after the short hint should succeed")
+            .map(|event| event.expect("event should parse"))
+            .collect()
+            .await;
+        let content: String = events
+            .iter()
+            .filter_map(|event| match event {
+                ProviderEvent::ContentDelta { delta } => Some(delta.clone()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(content, "hi");
+    }
+
+    #[tokio::test]
+    async fn openai_rate_limit_with_long_hint_is_clamped_and_retried() {
+        let sse = "data: {\"id\":\"chatcmpl-1\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\"hi\"}}]}\n\ndata: [DONE]\n\n";
+        let addr = serve_canned(vec![
+            http_response(
+                "HTTP/1.1 429 Too Many Requests",
+                &[("Retry-After", "3600")],
+                NEW_API_429_BODY,
+            ),
+            http_response("HTTP/1.1 200 OK", &[("Content-Type", "text/event-stream")], sse),
+        ])
+        .await;
+        // Tiny injected cap: the hour-long hint clamps to it instead of
+        // stalling the test for minutes.
+        let provider = OpenAIProvider::new_with_endpoint("test-key", &format!("http://{addr}"), "gpt-4o")
+            .with_retry_backoff(std::time::Duration::from_millis(1))
+            .with_retry_max_wait(std::time::Duration::from_millis(1));
+
+        let messages = vec![Message::User {
+            content: vec![ContentPart::Text { text: "hello".to_string() }],
+        }];
+        let events: Vec<_> = provider
+            .stream_response(&messages, &[], None)
+            .await
+            .expect("clamped retry should succeed despite the hour-long hint")
+            .map(|event| event.expect("event should parse"))
+            .collect()
+            .await;
+        let content: String = events
+            .iter()
+            .filter_map(|event| match event {
+                ProviderEvent::ContentDelta { delta } => Some(delta.clone()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(content, "hi");
+    }
+
+    #[tokio::test]
+    async fn anthropic_rate_limit_with_long_hint_is_clamped_and_retried() {
+        let sse = "event: message_stop\ndata: {}\n\n";
+        let addr = serve_canned(vec![
+            http_response(
+                "HTTP/1.1 429 Too Many Requests",
+                &[("retry-after", "3600")],
+                r#"{"type":"error","error":{"type":"rate_limit_error","message":"Number of requests too high"}}"#,
+            ),
+            http_response("HTTP/1.1 200 OK", &[("Content-Type", "text/event-stream")], sse),
+        ])
+        .await;
+        let provider = AnthropicProvider::new_with_endpoint("test-key", &format!("http://{addr}"), "claude")
+            .with_retry_backoff(std::time::Duration::from_millis(1))
+            .with_retry_max_wait(std::time::Duration::from_millis(1));
+
+        let messages = vec![Message::User {
+            content: vec![ContentPart::Text { text: "hello".to_string() }],
+        }];
+        provider
+            .stream_response(&messages, &[], None)
+            .await
+            .expect("clamped retry should succeed despite the hour-long hint");
     }
 }

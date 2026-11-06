@@ -59,6 +59,8 @@ pub enum Op {
     RevertChat { turn: Option<usize>, undo: bool },
     /// Run an agent turn with the given prompt; events stream back.
     Ask { prompt: String },
+    /// Attach to a session, restoring its live turn if one is running.
+    SubscribeSession,
     /// Interrupt the currently running `ask` on this connection, if any.
     Interrupt,
     /// List the tool names available to the agent.
@@ -166,6 +168,7 @@ impl Serialize for ClientRequest {
                 map.serialize_entry("content_base64", content_base64)?;
             }
             Op::Interrupt => map.serialize_entry("op", "interrupt")?,
+            Op::SubscribeSession => map.serialize_entry("op", "subscribe_session")?,
             Op::ListTools => map.serialize_entry("op", "list_tools")?,
             Op::ListAgents => map.serialize_entry("op", "list_agents")?,
             Op::ListSessions => map.serialize_entry("op", "list_sessions")?,
@@ -221,6 +224,10 @@ impl ClientRequest {
     /// Build an `interrupt` request.
     pub fn interrupt(id: impl Into<Value>) -> Self {
         Self::simple(id, Op::Interrupt)
+    }
+
+    pub fn subscribe_session(id: impl Into<Value>, session_id: impl Into<String>) -> Self {
+        Self::simple(id, Op::SubscribeSession).with_session(session_id)
     }
 
     /// Build a `list_tools` request.
@@ -447,6 +454,7 @@ pub fn parse_request(line: &str) -> Result<ClientRequest, RequestError> {
             }
             Op::DeleteSession
         }
+        "subscribe_session" => Op::SubscribeSession,
         "ping" => Op::Ping,
         "info" => Op::Info,
         "usage" => Op::Usage,
@@ -522,6 +530,15 @@ pub struct FileEntry {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum ServerMessage {
+    /// Consistent reconnect boundary: history before the turn and every
+    /// streamed frame through `seq`. Subsequent frames are newer than it.
+    SessionSnapshot {
+        session_id: String,
+        messages: Vec<Message>,
+        frames: Vec<ServerMessage>,
+        busy: bool,
+        seq: u64,
+    },
     AgentSwitched { id: Value, session_id: String, agent: String, tools: Vec<String> },
     /// Sent when an `ask` begins; carries the server-assigned request id
     /// and the session handling the request.
@@ -689,6 +706,7 @@ impl ServerMessage {
     /// The message's `"type"` tag, e.g. `"event"`, `"result"`, `"error"`.
     pub fn kind(&self) -> &'static str {
         match self {
+            ServerMessage::SessionSnapshot { .. } => "session_snapshot",
             ServerMessage::AgentSwitched { .. } => "agent_switched",
             ServerMessage::Ready { .. } => "ready",
             ServerMessage::Event { .. } => "event",
@@ -731,7 +749,8 @@ impl ServerMessage {
             | ServerMessage::Session { id, .. }
             | ServerMessage::Deleted { id, .. } => Some(id),
             ServerMessage::Interrupted { id, .. } | ServerMessage::Error { id, .. } => id.as_ref(),
-            ServerMessage::Event { .. } | ServerMessage::Result { .. } => None,
+            ServerMessage::Event { .. } | ServerMessage::Result { .. }
+            | ServerMessage::SessionSnapshot { .. } => None,
         }
     }
 

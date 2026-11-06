@@ -89,7 +89,15 @@ struct SqliteAgentFactory {
     pool: SqlitePool,
     skills: Vec<SkillInfo>,
     enforcement: PathEnforcement,
+    /// Session owning this task tool. Subagent sessions are recorded with it
+    /// as parent, hiding them from the session list and enabling the depth
+    /// limit for nested spawns.
+    parent_session: String,
 }
+
+/// How deep `task` calls may nest: a top-level session may spawn subagents,
+/// but a subagent cannot spawn further ones.
+const MAX_SUBAGENT_DEPTH: usize = 1;
 
 #[async_trait]
 impl AgentFactory for SqliteAgentFactory {
@@ -98,7 +106,15 @@ impl AgentFactory for SqliteAgentFactory {
         subagent_type: &str,
         resume: Option<String>,
     ) -> Result<(Agent, String), Box<dyn Error + Send + Sync>> {
+        let depth = gewu_storage::subagent_depth(&self.pool, &self.parent_session).await?;
+        if depth >= MAX_SUBAGENT_DEPTH {
+            return Err(format!(
+                "subagent depth limit reached ({MAX_SUBAGENT_DEPTH}); subagents cannot launch further subagents"
+            )
+            .into());
+        }
         let session_id = resume.unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
+        gewu_storage::record_subagent_session(&self.pool, &session_id, &self.parent_session, subagent_type).await?;
         let (agent, _registry) = create_agent(
             subagent_type,
             self.provider.clone(),
@@ -123,12 +139,14 @@ fn task_tool(
     skills: Vec<SkillInfo>,
     enforcement: PathEnforcement,
     allowed: &[&str],
+    parent_session: &str,
 ) -> TaskTool {
     let factory = Arc::new(SqliteAgentFactory {
         provider,
         pool,
         skills,
         enforcement,
+        parent_session: parent_session.to_string(),
     });
     let agents = list_available_agents()
         .into_iter()
@@ -146,12 +164,13 @@ fn build_tool_registry_and_list(
     additional_tools: Vec<Arc<dyn Tool>>,
     skills: Vec<SkillInfo>,
     enforcement: PathEnforcement,
+    session_id: &str,
 ) -> Result<(Arc<dyn ToolRegistry>, Vec<Arc<dyn Tool>>)> {
     let mut tools: Vec<Box<dyn Tool>> = match name {
         "build" => {
             let todos = Arc::new(Mutex::new(Vec::<TodoItem>::new()));
             vec![
-                Box::new(task_tool(provider.clone(), pool.clone(), skills.clone(), enforcement, &[])),
+                Box::new(task_tool(provider.clone(), pool.clone(), skills.clone(), enforcement, &[], session_id)),
                 Box::new(ReadFileTool {
                     working_directory: working_directory.clone(),
                 }),
@@ -187,7 +206,7 @@ fn build_tool_registry_and_list(
         "plan" => {
             let todos = Arc::new(Mutex::new(Vec::<TodoItem>::new()));
             vec![
-                Box::new(task_tool(provider.clone(), pool.clone(), skills.clone(), enforcement, &["explore"])),
+                Box::new(task_tool(provider.clone(), pool.clone(), skills.clone(), enforcement, &["explore"], session_id)),
                 Box::new(ReadFileTool { working_directory: working_directory.clone() }),
                 Box::new(GlobTool { working_directory: working_directory.clone() }),
                 Box::new(GrepTool { working_directory: working_directory.clone() }),
@@ -228,7 +247,7 @@ fn build_tool_registry_and_list(
         "general" => {
             let todos = Arc::new(Mutex::new(Vec::<TodoItem>::new()));
             vec![
-                Box::new(task_tool(provider.clone(), pool.clone(), skills.clone(), enforcement, &[])),
+                Box::new(task_tool(provider.clone(), pool.clone(), skills.clone(), enforcement, &[], session_id)),
                 Box::new(ReadFileTool {
                     working_directory: working_directory.clone(),
                 }),
@@ -311,7 +330,7 @@ pub async fn create_agent(
 ) -> Result<(Agent, Arc<dyn ToolRegistry>)> {
     let working_directory = std::env::current_dir()?;
 
-    let memory = SqliteMemory::new(pool.clone(), session_id).await?;
+    let memory = SqliteMemory::new(pool.clone(), session_id.clone()).await?;
 
     let (all_tools, system_prompt, registry) = agent_profile(
         name,
@@ -321,6 +340,7 @@ pub async fn create_agent(
         additional_tools,
         skills.clone(),
         enforcement,
+        &session_id,
     )?;
     let mut builder = Agent::builder()
         .llm(provider)
@@ -333,6 +353,9 @@ pub async fn create_agent(
 }
 
 /// Build profile configuration without opening or reloading conversation memory.
+///
+/// `session_id` is the owning conversation: its task tool records spawned
+/// subagent sessions against it.
 pub fn agent_profile(
     name: &str,
     provider: Arc<dyn LlmProvider>,
@@ -341,8 +364,9 @@ pub fn agent_profile(
     additional_tools: Vec<Arc<dyn Tool>>,
     skills: Vec<SkillInfo>,
     enforcement: PathEnforcement,
+    session_id: &str,
 ) -> Result<(Vec<Arc<dyn Tool>>, String, Arc<dyn ToolRegistry>)> {
-    let (registry, tools_arc) = build_tool_registry_and_list(name, provider, pool, working_directory, additional_tools, skills.clone(), enforcement)?;
+    let (registry, tools_arc) = build_tool_registry_and_list(name, provider, pool, working_directory, additional_tools, skills.clone(), enforcement, session_id)?;
 
     let mut system_prompt = match name {
         "build" => include_str!("prompts/build.txt"),
@@ -371,7 +395,7 @@ mod tests {
     async fn plan_has_no_editing_tools() {
         let pool = sqlx::sqlite::SqlitePoolOptions::new().connect("sqlite::memory:").await.unwrap();
         let dir = tempfile::tempdir().unwrap();
-        let (_, tools) = build_tool_registry_and_list("plan", Arc::new(DummyLlm), pool, dir.path().to_path_buf(), vec![Arc::new(NamedTool("external_mutator"))], vec![], PathEnforcement::Contain).unwrap();
+        let (_, tools) = build_tool_registry_and_list("plan", Arc::new(DummyLlm), pool, dir.path().to_path_buf(), vec![Arc::new(NamedTool("external_mutator"))], vec![], PathEnforcement::Contain, "session").unwrap();
         let names: Vec<_> = tools.iter().map(|tool| tool.name()).collect();
         for expected in ["read_file", "glob", "grep", "list", "webfetch", "websearch", "bash", "task", "todowrite", "todoread"] {
             assert!(names.contains(&expected), "Plan is missing {expected}");
@@ -484,6 +508,7 @@ mod tests {
                 Vec::new(),
                 Vec::new(),
                 PathEnforcement::Contain,
+                "session",
             )
             .unwrap();
             assert!(tools.iter().any(|tool| tool.name() == "apply_patch"));
@@ -497,6 +522,7 @@ mod tests {
             Vec::new(),
             Vec::new(),
             PathEnforcement::Contain,
+            "session",
         )
         .unwrap();
         assert!(!tools.iter().any(|tool| tool.name() == "apply_patch"));
@@ -568,6 +594,7 @@ mod tests {
             vec![Arc::new(NamedTool("apply_patch"))],
             Vec::new(),
             PathEnforcement::Contain,
+            "session",
         );
         assert!(reserved.err().unwrap().to_string().contains("reserved"));
 
@@ -579,6 +606,7 @@ mod tests {
             vec![Arc::new(NamedTool("websearch"))],
             Vec::new(),
             PathEnforcement::Contain,
+            "session",
         );
         assert!(
             duplicate
@@ -587,5 +615,41 @@ mod tests {
                 .to_string()
                 .contains("Duplicate tool name")
         );
+    }
+
+    #[tokio::test]
+    async fn task_factory_records_subagents_and_enforces_depth() {
+        let pool = sqlx::sqlite::SqlitePoolOptions::new()
+            .connect("sqlite::memory:")
+            .await
+            .unwrap();
+        let provider: Arc<dyn LlmProvider> = Arc::new(DummyLlm);
+
+        let factory = SqliteAgentFactory {
+            provider: provider.clone(),
+            pool: pool.clone(),
+            skills: Vec::new(),
+            enforcement: PathEnforcement::None,
+            parent_session: "root".to_string(),
+        };
+        let (_, subagent_id) = factory.create("explore", None).await.unwrap();
+        // The subagent session is recorded with its parent, so the session
+        // list can hide it while task resume keeps working.
+        assert_eq!(gewu_storage::subagent_depth(&pool, "root").await.unwrap(), 0);
+        assert_eq!(gewu_storage::subagent_depth(&pool, &subagent_id).await.unwrap(), 1);
+
+        // A subagent cannot launch further subagents.
+        let nested = SqliteAgentFactory {
+            provider,
+            pool,
+            skills: Vec::new(),
+            enforcement: PathEnforcement::None,
+            parent_session: subagent_id,
+        };
+        let error = match nested.create("explore", None).await {
+            Err(e) => e.to_string(),
+            Ok(_) => panic!("nested subagent spawn should be rejected"),
+        };
+        assert!(error.contains("depth limit"), "unexpected error: {error}");
     }
 }

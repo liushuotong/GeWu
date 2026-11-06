@@ -122,6 +122,22 @@ pub struct AskBuilder<'a> {
 }
 
 impl Client {
+    /// Observe this session across turn boundaries until the connection closes.
+    pub async fn watch_session(&self, session_id: impl Into<String>) -> Result<AskStream> {
+        let request = ClientRequest::subscribe_session(self.next_correlation_id(), session_id);
+        let (tx, rx) = oneshot::channel();
+        self.commands.send(Command::Subscribe { request, stream: tx }).await
+            .map_err(|_| Error::Connection("connection closed".into()))?;
+        Ok(AskStream::new(rx.await.map_err(|_| Error::Connection("connection closed".into()))??))
+    }
+    /// Restore a session's current transcript and attach to its active turn.
+    pub async fn subscribe_session(&self, session_id: impl Into<String>) -> Result<AskStream> {
+        let request = ClientRequest::subscribe_session(self.next_correlation_id(), session_id);
+        let (tx, rx) = oneshot::channel();
+        self.commands.send(Command::Ask { request, stream: tx }).await
+            .map_err(|_| Error::Connection("connection closed".into()))?;
+        Ok(AskStream::new(rx.await.map_err(|_| Error::Connection("connection closed".into()))??))
+    }
     pub async fn revert_chat(&self, turn: Option<usize>, undo: bool) -> Result<(String, Vec<Message>)> {
         match self.request(ClientRequest::revert_chat(self.next_correlation_id(), turn, undo)).await? {
             ServerMessage::Session { session_id, messages, .. } => Ok((session_id, messages)),
@@ -352,7 +368,7 @@ impl Client {
         rx.await.ok().flatten()
     }
 
-    /// Close the connection, aborting any running ask. Other `Client`
+    /// Close the connection, detaching from any server-owned turn. Other `Client`
     /// clones become unusable too; in-flight calls fail with
     /// [`Error::Connection`].
     pub async fn close(&self) {

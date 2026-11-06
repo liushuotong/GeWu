@@ -35,7 +35,7 @@ pub use gewu_protocol as protocol;
 use gewu_protocol::FileEntry;
 use registry::create_agent;
 use serde_json::Value;
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::net::SocketAddr;
 use std::sync::Arc;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWriteExt};
@@ -62,7 +62,6 @@ pub const DEFAULT_TCP_PORT: u16 = 8421;
 pub const MAX_LINE_BYTES: usize = 1024 * 1024;
 
 /// Default agent profile used when the client does not specify one.
-const DEFAULT_AGENT: &str = "build";
 
 /// Shared server context handed to each connection handler.
 struct ServerState {
@@ -73,6 +72,88 @@ struct ServerState {
     /// Session ids with an ask currently running, across all connections.
     /// Guards one conversation from concurrent writes by two connections.
     busy_sessions: Mutex<HashSet<String>>,
+    sessions: Mutex<HashMap<String, ConnectionSession>>,
+    turns: Mutex<HashMap<String, Arc<Mutex<LiveTurn>>>>,
+    /// Serializes turn registration, snapshots, and lifecycle mutations.
+    lifecycle: Mutex<()>,
+}
+
+#[derive(Clone)]
+struct Subscriber {
+    out: mpsc::Sender<String>,
+    failed: tokio::sync::watch::Sender<bool>,
+    persistent: bool,
+}
+
+impl Subscriber {
+    fn send(&self, line: &str) -> bool {
+        if self.out.try_send(line.to_owned()).is_err() {
+            self.failed.send_replace(true);
+            false
+        } else { true }
+    }
+}
+
+/// Session-owned execution and reconnect state. Socket writers never own
+/// the worker and never backpressure it.
+struct LiveTurn {
+    request_id: String,
+    messages: Vec<Message>,
+    frames: Vec<ServerMessage>,
+    bytes: usize,
+    seq: u64,
+    busy: bool,
+    subscribers: Vec<Subscriber>,
+    cancel: Option<tokio::sync::oneshot::Sender<()>>,
+    terminal: Option<ServerMessage>,
+}
+
+impl LiveTurn {
+    fn publish(&mut self, message: ServerMessage) {
+        self.seq += 1;
+        let line = message.to_line();
+        self.bytes += line.len();
+        self.frames.push(message);
+        if self.bytes > 16 * 1024 * 1024 {
+            if let Some(cancel) = self.cancel.take() { let _ = cancel.send(()); }
+        }
+        // Disconnect slow readers rather than silently losing updates.
+        self.subscribers.retain(|subscriber| subscriber.send(&line));
+    }
+}
+
+async fn attach_subscriber(
+    state: &ServerState,
+    session_id: &str,
+    subscriber: Subscriber,
+) -> Result<(), RequestError> {
+    let turn = state.turns.lock().await.get(session_id).cloned();
+    if let Some(turn) = turn {
+        let mut live = turn.lock().await;
+        // Hold the turn lock through snapshot send and registration; a
+        // publisher cannot send an event into the snapshot/live gap.
+        let snapshot = ServerMessage::SessionSnapshot {
+            session_id: session_id.to_owned(), messages: live.messages.clone(),
+            frames: live.frames.clone(), busy: live.busy, seq: live.seq,
+        };
+        subscriber.out.send(snapshot.to_line()).await
+            .map_err(|_| RequestError::Failed("subscriber disconnected".into()))?;
+        live.subscribers.retain(|s| !s.out.same_channel(&subscriber.out));
+        live.subscribers.push(subscriber);
+        return Ok(());
+    }
+    let Some(session) = state.sessions.lock().await.get(session_id).cloned() else {
+        return Err(RequestError::Failed("unknown session".into()));
+    };
+    let messages = session.agent.lock().await.memory.messages().to_vec();
+    subscriber.out.send(ServerMessage::SessionSnapshot {
+        session_id: session_id.to_owned(), messages: messages.clone(), frames: vec![], busy: false, seq: 0,
+    }.to_line()).await.map_err(|_| RequestError::Failed("subscriber disconnected".into()))?;
+    state.turns.lock().await.insert(session_id.to_owned(), Arc::new(Mutex::new(LiveTurn {
+        request_id: String::new(), messages, frames: vec![], bytes: 0, seq: 0, busy: false,
+        subscribers: vec![subscriber], cancel: None, terminal: None,
+    })));
+    Ok(())
 }
 
 /// Per-connection session: one agent plus its identity.
@@ -89,10 +170,7 @@ struct ConnectionSession {
 
 /// A currently running ask on a connection.
 struct RunningAsk {
-    request_id: String,
-    /// Session claimed in `ServerState::busy_sessions` for this ask.
     session_id: String,
-    handle: JoinHandle<()>,
 }
 
 /// Run the server until shutdown is requested or Ctrl+C is received.
@@ -121,6 +199,9 @@ pub async fn serve(
         bootstrap,
         token,
         busy_sessions: Mutex::new(HashSet::new()),
+        sessions: Mutex::new(HashMap::new()),
+        turns: Mutex::new(HashMap::new()),
+        lifecycle: Mutex::new(()),
     });
 
     info!("gewu server listening:");
@@ -182,6 +263,7 @@ pub async fn serve(
     while tasks.join_next().await.is_some() {}
     connections.abort_all();
     while connections.join_next().await.is_some() {}
+    state.shutdown_turns().await;
     Ok(())
 }
 
@@ -264,18 +346,24 @@ impl ServerState {
             return Ok(existing.clone());
         }
 
+        let session_id = session_id.unwrap_or_else(crate::bootstrap::new_session_id);
+        // Serialize initialization so multiple observers share one agent.
+        let mut sessions = self.sessions.lock().await;
+        if let Some(existing) = sessions.get(&session_id) {
+            if agent_name.as_ref().is_some_and(|name| name != &existing.agent_name) {
+                anyhow::bail!("session agent mismatch");
+            }
+            *current = Some(existing.clone());
+            return Ok(existing.clone());
+        }
         let agent_name = match agent_name {
             Some(name) => name,
-            None => match session_id.as_deref() {
-                Some(id) => gewu_storage::session_agent(&self.bootstrap.pool, id).await?,
-                None => DEFAULT_AGENT.to_string(),
-            },
+            None => gewu_storage::session_agent(&self.bootstrap.pool, &session_id).await?,
         };
         if !registry::list_agent_names().contains(&agent_name) {
             anyhow::bail!("Unknown agent profile: {}", agent_name);
         }
 
-        let session_id = session_id.unwrap_or_else(crate::bootstrap::new_session_id);
         let (agent, _registry) = create_agent(
             &agent_name,
             self.bootstrap.provider.clone(),
@@ -290,6 +378,10 @@ impl ServerState {
         info!("Created session {} (agent: {})", session_id, agent_name);
 
         let agent = Arc::new(Mutex::new(agent));
+        {
+            let mut agent = agent.lock().await;
+            patch_dangling_tool_calls(&mut agent).await;
+        }
         gewu_storage::set_session_agent(&self.bootstrap.pool, &session_id, &agent_name).await?;
         // Snapshot the tool list once; it never changes for this session.
         let tools = agent.lock().await.list_tools();
@@ -301,6 +393,7 @@ impl ServerState {
             tools,
         };
         *current = Some(entry.clone());
+        sessions.insert(entry.session_id.clone(), entry.clone());
         Ok(entry)
     }
 
@@ -317,6 +410,27 @@ impl ServerState {
     /// interrupted. Idempotent.
     async fn release_session(&self, session_id: &str) {
         self.busy_sessions.lock().await.remove(session_id);
+    }
+
+    async fn cancel_turn(&self, session_id: &str) -> Option<String> {
+        let turn = self.turns.lock().await.get(session_id).cloned()?;
+        let request_id = {
+            let mut turn = turn.lock().await;
+            if !turn.busy { return None; }
+            if let Some(cancel) = turn.cancel.take() { let _ = cancel.send(()); }
+            turn.request_id.clone()
+        };
+        // Finalization repairs history before releasing the session claim.
+        loop {
+            if !turn.lock().await.busy { break; }
+            tokio::task::yield_now().await;
+        }
+        Some(request_id)
+    }
+
+    async fn shutdown_turns(&self) {
+        let ids: Vec<_> = self.turns.lock().await.keys().cloned().collect();
+        for id in ids { self.cancel_turn(&id).await; }
     }
 }
 
@@ -404,6 +518,7 @@ enum Handled {
         session_id: String,
         prompt: String,
     },
+    Subscribe { id: Value, session: ConnectionSession },
 }
 
 /// Handle one parsed client request, producing a reply or an ask to run.
@@ -417,7 +532,15 @@ async fn handle_request(
     running: &mut Option<RunningAsk>,
     request: ClientRequest,
 ) -> Result<Handled, RequestError> {
+    if let Some(active) = running.as_ref() {
+        if !state.busy_sessions.lock().await.contains(&active.session_id) { *running = None; }
+    }
     match request.op {
+        Op::SubscribeSession => {
+            let current = state.get_or_create_session(session, request.session_id, request.agent)
+                .await.map_err(|e| RequestError::Failed(e.to_string()))?;
+            Ok(Handled::Subscribe { id: request.id, session: current })
+        }
         Op::RevertChat { turn, undo } => {
             if running.is_some() { return Err(RequestError::Failed("cannot revert a running turn".into())); }
             let current = state.get_or_create_session(session, request.session_id, None).await.map_err(|e| RequestError::Failed(e.to_string()))?;
@@ -426,10 +549,30 @@ async fn handle_request(
                 let messages = gewu_storage::revert_chat(&state.bootstrap.pool, &current.session_id, turn, undo).await?;
                 let memory = gewu_storage::SqliteMemory::new(state.bootstrap.pool.clone(), current.session_id.clone()).await?;
                 current.agent.lock().await.memory = Box::new(memory);
-                Ok::<_, anyhow::Error>(Handled::Reply(ServerMessage::Session { id: request.id, session_id: current.session_id.clone(), messages }))
+                Ok::<_, anyhow::Error>(messages)
             }.await;
             state.release_session(&current.session_id).await;
-            result.map_err(|e| RequestError::Failed(e.to_string()))
+            if let Ok(messages) = &result {
+                // Keep the idle turn entry alive: observers registered on it
+                // must see the reverted history and stay attached, so the
+                // next turn's subscriber handoff finds them. Removing the
+                // entry silently detached every observer.
+                if let Some(turn) = state.turns.lock().await.get(&current.session_id).cloned() {
+                    let mut live = turn.lock().await;
+                    live.messages = messages.clone();
+                    let seq = live.seq + 1;
+                    live.publish(ServerMessage::SessionSnapshot {
+                        session_id: current.session_id.clone(),
+                        messages: messages.clone(),
+                        frames: vec![],
+                        busy: false,
+                        seq,
+                    });
+                }
+            }
+            result
+                .map(|messages| Handled::Reply(ServerMessage::Session { id: request.id, session_id: current.session_id.clone(), messages }))
+                .map_err(|e| RequestError::Failed(e.to_string()))
         }
         Op::SwitchAgent { agent: target } => {
             if running.is_some() {
@@ -443,14 +586,15 @@ async fn handle_request(
             if !state.claim_session(&current.session_id).await {
                 return Err(RequestError::Failed("session is busy on another connection".into()));
             }
-            let replacement = registry::agent_profile(&target, state.bootstrap.provider.clone(), state.bootstrap.pool.clone(), state.bootstrap.working_directory.clone().into(), state.bootstrap.mcp_tools.clone(), state.bootstrap.skills.clone(), state.bootstrap.enforcement);
+            let replacement = registry::agent_profile(&target, state.bootstrap.provider.clone(), state.bootstrap.pool.clone(), state.bootstrap.working_directory.clone().into(), state.bootstrap.mcp_tools.clone(), state.bootstrap.skills.clone(), state.bootstrap.enforcement, &current.session_id);
             let result = match replacement {
                 Ok((tools, prompt, _)) => match gewu_storage::set_session_agent(&state.bootstrap.pool, &current.session_id, &target).await {
                     Ok(()) => {
                         let mut agent = current.agent.lock().await;
                         agent.set_profile(prompt, tools);
                         let tools = agent.list_tools();
-                        *session = Some(ConnectionSession { agent: current.agent.clone(), session_id: current.session_id.clone(), agent_name: target.clone(), tools: tools.clone() });
+                         *session = Some(ConnectionSession { agent: current.agent.clone(), session_id: current.session_id.clone(), agent_name: target.clone(), tools: tools.clone() });
+                        state.sessions.lock().await.insert(current.session_id.clone(), session.as_ref().unwrap().clone());
                         Ok(Handled::Reply(ServerMessage::AgentSwitched { id: request.id, session_id: current.session_id.clone(), agent: target, tools }))
                     }
                     Err(e) => Err(RequestError::Failed(e.to_string())),
@@ -744,9 +888,19 @@ async fn handle_request(
                     "op 'delete_session' requires a 'session_id' string".to_string(),
                 ));
             };
-            gewu_storage::delete_session(&state.bootstrap.pool, &session_id)
+            state.cancel_turn(&session_id).await;
+            if !state.claim_session(&session_id).await {
+                return Err(RequestError::Failed("session is busy".into()));
+            }
+            let deleted = gewu_storage::delete_session(&state.bootstrap.pool, &session_id)
                 .await
-                .map_err(|e| RequestError::Failed(e.to_string()))?;
+                .map_err(|e| RequestError::Failed(e.to_string()));
+            if deleted.is_ok() {
+                state.sessions.lock().await.remove(&session_id);
+                state.turns.lock().await.remove(&session_id);
+            }
+            state.release_session(&session_id).await;
+            deleted?;
             info!("Deleted session {}", session_id);
             Ok(Handled::Reply(ServerMessage::Deleted {
                 id: request.id,
@@ -755,21 +909,12 @@ async fn handle_request(
         }
 
         Op::Interrupt => {
-            let request_id = running.as_ref().map(|r| r.request_id.clone());
-            if let Some(running) = running.take() {
-                abort_ask(running.handle).await;
-                // Release the cross-connection claim on this session.
-                state.release_session(&running.session_id).await;
-                // Repair the conversation history so the next LLM request is
-                // well-formed even though the ask was cut short, and drop a
-                // prompt that produced no output so it cannot steer the next
-                // ask.
-                if let Some(session) = session {
-                    let mut agent = session.agent.lock().await;
-                    patch_dangling_tool_calls(&mut agent).await;
-                    drop_dangling_prompt(&mut agent).await;
-                }
-            }
+            let target = request.session_id.or_else(|| session.as_ref().map(|s| s.session_id.clone()));
+            let request_id = match target {
+                Some(id) => state.cancel_turn(&id).await,
+                None => None,
+            };
+            *running = None;
             Ok(Handled::Reply(ServerMessage::Interrupted {
                 id: Some(request.id),
                 request_id,
@@ -895,34 +1040,75 @@ async fn execute_ask<E, Fut>(
 }
 
 /// Spawn an ask task that emits protocol lines through `out`.
-///
-/// All failures are reported to the client as `error` messages by
-/// `execute_ask`; the task itself always completes normally.
-fn spawn_ask(
-    session: ConnectionSession,
-    request_id: String,
-    prompt: String,
-    out: mpsc::Sender<String>,
-    done: mpsc::UnboundedSender<()>,
-) -> JoinHandle<()> {
+async fn start_session_turn(
+    state: Arc<ServerState>, session: ConnectionSession, request_id: String,
+    prompt: String, ready: ServerMessage, subscriber: Subscriber,
+) {
+    let mut messages = session.agent.lock().await.memory.messages().to_vec();
+    messages.push(Message::User { content: vec![protocol::ContentPart::Text { text: prompt.clone() }] });
+    let (cancel, mut cancelled) = tokio::sync::oneshot::channel();
+    let live = Arc::new(Mutex::new(LiveTurn {
+        request_id: request_id.clone(), messages, frames: vec![], bytes: 0,
+        seq: 0, busy: true, subscribers: vec![], cancel: Some(cancel), terminal: None,
+    }));
+    // Register execution before acknowledging it: a failed socket write does
+    // not strand a claimed session without its worker.
+    let previous = state.turns.lock().await.insert(session.session_id.clone(), live.clone());
+    if let Some(previous) = previous {
+        let mut previous = previous.lock().await;
+        let snapshot = ServerMessage::SessionSnapshot {
+            session_id: session.session_id.clone(), messages: live.lock().await.messages.clone(),
+            frames: vec![], busy: true, seq: 0,
+        }.to_line();
+        for observer in previous.subscribers.drain(..).filter(|s| s.persistent) {
+            if !observer.out.same_channel(&subscriber.out) && observer.send(&snapshot) {
+                live.lock().await.subscribers.push(observer);
+            }
+        }
+    }
+    if subscriber.send(&ready.to_line()) { live.lock().await.subscribers.push(subscriber); }
     tokio::spawn(async move {
-        execute_ask(&session, &request_id, &prompt, |msg| {
-            let out = out.clone();
-            async move { out.send(msg.to_line()).await.map_err(anyhow::Error::from) }
-        })
-        .await;
-        let _ = done.send(());
-    })
+        let worker_session = session.clone();
+        let worker_live = live.clone();
+        let mut worker = tokio::spawn(async move {
+            execute_ask(&worker_session, &request_id, &prompt, |message| {
+                let live = worker_live.clone();
+                async move {
+                    let mut live = live.lock().await;
+                    if message.is_ask_terminal().is_some() { live.terminal = Some(message); }
+                    else { live.publish(message); }
+                    Ok(())
+                }
+            }).await;
+        });
+        let failure = tokio::select! {
+            result = &mut worker => result.err().map(|e| format!("turn task failed: {e}")),
+            _ = &mut cancelled => { worker.abort(); let _ = worker.await; Some("interrupted".into()) },
+            _ = tokio::time::sleep(std::time::Duration::from_secs(3600)) => {
+                worker.abort(); let _ = worker.await; Some("turn exceeded the one-hour runtime limit".into())
+            }
+        };
+        {
+            let mut agent = session.agent.lock().await;
+            patch_dangling_tool_calls(&mut agent).await;
+            if failure.is_some() { drop_dangling_prompt(&mut agent).await; }
+            let mut live = live.lock().await;
+            let terminal = failure.map(|error| ServerMessage::Error { id: None, error })
+                .or_else(|| live.terminal.take());
+            live.messages = agent.memory.messages().to_vec();
+            live.frames.clear();
+            live.bytes = 0;
+            state.release_session(&session.session_id).await;
+            live.busy = false;
+            live.cancel = None;
+            if let Some(terminal) = terminal { live.publish(terminal); }
+            live.frames.clear();
+            live.bytes = 0;
+            live.subscribers.retain(|s| s.persistent && !s.out.is_closed());
+        }
+    });
 }
 
-/// Abort a running ask and await its task.
-///
-/// Awaiting the aborted handle guarantees the agent lock has been released
-/// before the caller proceeds to patch memory / start a new ask.
-async fn abort_ask(handle: JoinHandle<()>) {
-    handle.abort();
-    let _ = handle.await;
-}
 
 // ---------------------------------------------------------------------------
 // Connection loop
@@ -942,9 +1128,10 @@ async fn drive_connection(
     let mut running: Option<RunningAsk> = None;
     // Token-protected servers require an `auth` request first.
     let mut authenticated = state.token.is_none();
+    let (failed, mut failure) = tokio::sync::watch::channel(false);
     // Completion signals from ask tasks. The loop-side sender keeps this
     // channel open when no ask is running, so recv() simply stays pending.
-    let (done_tx, mut done_rx) = mpsc::unbounded_channel::<()>();
+    let (_done_tx, mut done_rx) = mpsc::unbounded_channel::<()>();
 
     let result = loop {
         tokio::select! {
@@ -1008,20 +1195,35 @@ async fn drive_connection(
                 // An interrupt request aborts + awaits the running ask inside
                 // handle_request, so the agent lock is released before any
                 // further request is handled.
+                let _lifecycle = state.lifecycle.lock().await;
+                // Refresh cached metadata after another observer switches profiles.
+                if let Some(current) = session.as_mut() {
+                    if let Some(latest) = state.sessions.lock().await.get(&current.session_id) {
+                        *current = latest.clone();
+                    } else {
+                        session = None;
+                    }
+                }
                 match handle_request(&state, &mut session, &mut running, request).await {
                     Ok(Handled::Reply(msg)) => {
                         out.send(msg.to_line()).await?;
                     }
                     Ok(Handled::Ask { ready, request_id, session_id, prompt }) => {
-                        out.send(ready.to_line()).await?;
                         let session = session
                             .clone()
                             .expect("session created by handle_request");
-                        running = Some(RunningAsk {
-                            request_id: request_id.clone(),
-                            session_id,
-                            handle: spawn_ask(session, request_id, prompt, out.clone(), done_tx.clone()),
-                        });
+                        start_session_turn(state.clone(), session, request_id, prompt, ready,
+                            Subscriber { out: out.clone(), failed: failed.clone(), persistent: false }).await;
+                        running = Some(RunningAsk { session_id });
+                    }
+                    Ok(Handled::Subscribe { id, session: current }) => {
+                        out.send(ServerMessage::Ready {
+                            id, request_id: String::new(), session_id: current.session_id.clone(),
+                            agent: current.agent_name,
+                        }.to_line()).await?;
+                        attach_subscriber(&state, &current.session_id, Subscriber {
+                            out: out.clone(), failed: failed.clone(), persistent: true,
+                        }).await.map_err(|e| anyhow::anyhow!(e.to_string()))?;
                     }
                     Err(RequestError::Invalid(msg)) | Err(RequestError::Failed(msg)) => {
                         out.send(
@@ -1038,12 +1240,16 @@ async fn drive_connection(
                     state.release_session(&running.session_id).await;
                 }
             }
+            _ = failure.changed() => {
+                break Err(anyhow::anyhow!("subscriber fell behind; reconnect to restore a snapshot"));
+            }
         }
     };
 
-    if let Some(running) = running.take() {
-        abort_ask(running.handle).await;
-        state.release_session(&running.session_id).await;
+    // A socket is only an observer. Session-owned workers survive detachment.
+    let turns: Vec<_> = state.turns.lock().await.values().cloned().collect();
+    for turn in turns {
+        turn.lock().await.subscribers.retain(|subscriber| !subscriber.out.same_channel(&out));
     }
     result
 }
@@ -1097,7 +1303,8 @@ async fn handle_ws_connection(
 
     let result = drive_connection(state, in_rx, out_tx).await;
 
-    drop(reader); // reader ends when the client disconnects
+    reader.abort();
+    let _ = reader.await;
     let _ = writer.await;
     if let Err(e) = &result {
         warn!("WebSocket client {} error: {}", peer, e);
@@ -1733,6 +1940,140 @@ mod tests {
         serde_json::from_str(&line).expect("valid JSON line")
     }
 
+    #[tokio::test]
+    async fn observer_receives_turns_started_after_idle_subscription() {
+        let state = server_state_with(TestLlm::plain());
+        let (observer, mut updates, observer_task) = spawn_connection(state.clone()).await;
+        observer.send(ClientRequest::subscribe_session(1, "observed").to_line()).await.unwrap();
+        assert_eq!(recv_json(&mut updates).await["type"], "ready");
+        assert_eq!(recv_json(&mut updates).await["busy"], false);
+        let (writer, mut replies, writer_task) = spawn_connection(state.clone()).await;
+        for id in 2..4 {
+            writer.send(ClientRequest::ask(id, "hello").with_session("observed").to_line()).await.unwrap();
+            assert_eq!(recv_json(&mut replies).await["type"], "ready");
+            let snapshot = recv_json(&mut updates).await;
+            assert_eq!(snapshot["type"], "session_snapshot");
+            assert_eq!(snapshot["busy"], true);
+            tokio::time::timeout(std::time::Duration::from_secs(5), async {
+                loop { if recv_json(&mut updates).await["type"] == "result" { break; } }
+                loop { if recv_json(&mut replies).await["type"] == "result" { break; } }
+            }).await.unwrap();
+        }
+        drop(observer); drop(writer); drop(updates); drop(replies);
+        observer_task.await.unwrap().unwrap();
+        writer_task.await.unwrap().unwrap();
+        assert!(state.turns.lock().await["observed"].lock().await.subscribers.is_empty());
+    }
+
+    #[tokio::test]
+    async fn observer_survives_a_revert_and_sees_the_next_turn() {
+        let state = server_state_with(TestLlm::plain());
+        let (observer, mut updates, observer_task) = spawn_connection(state.clone()).await;
+        observer.send(ClientRequest::subscribe_session(1, "observed").to_line()).await.unwrap();
+        assert_eq!(recv_json(&mut updates).await["type"], "ready");
+        assert_eq!(recv_json(&mut updates).await["busy"], false);
+        let (writer, mut replies, writer_task) = spawn_connection(state.clone()).await;
+
+        // One completed exchange gives the revert something to remove.
+        writer.send(ClientRequest::ask(2, "hello").with_session("observed").to_line()).await.unwrap();
+        assert_eq!(recv_json(&mut replies).await["type"], "ready");
+        let snapshot = recv_json(&mut updates).await;
+        assert_eq!(snapshot["busy"], true);
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            loop { if recv_json(&mut updates).await["type"] == "result" { break; } }
+            loop { if recv_json(&mut replies).await["type"] == "result" { break; } }
+        }).await.unwrap();
+
+        // Revert the exchange; the observer sees the truncated history
+        // (only the system prompt remains).
+        writer.send(ClientRequest::revert_chat(3, None, false).with_session("observed").to_line()).await.unwrap();
+        let reverted = recv_json(&mut updates).await;
+        assert_eq!(reverted["type"], "session_snapshot");
+        assert_eq!(reverted["busy"], false);
+        let history = reverted["messages"].as_array().unwrap();
+        assert_eq!(history.len(), 1);
+        assert_eq!(history[0]["role"], "system");
+        assert_eq!(recv_json(&mut replies).await["type"], "session");
+
+        // A turn started after the revert must reach the observer again —
+        // its snapshot carries the new user prompt, which is what the GUI
+        // renders as the message.
+        writer.send(ClientRequest::ask(4, "again").with_session("observed").to_line()).await.unwrap();
+        assert_eq!(recv_json(&mut replies).await["type"], "ready");
+        let snapshot = recv_json(&mut updates).await;
+        assert_eq!(snapshot["type"], "session_snapshot");
+        assert_eq!(snapshot["busy"], true);
+        let messages = snapshot["messages"].as_array().unwrap();
+        assert_eq!(messages.len(), 2, "system prompt plus the new user prompt");
+        assert_eq!(messages[1]["role"], "user");
+        assert!(serde_json::to_value(&messages[1]).unwrap().to_string().contains("again"));
+
+        drop(observer); drop(writer); drop(updates); drop(replies);
+        observer_task.await.unwrap().unwrap();
+        writer_task.await.unwrap().unwrap();
+    }
+
+    #[tokio::test]
+    async fn slow_subscriber_signals_connection_failure() {
+        let (out, _receiver) = mpsc::channel(1);
+        let (failed, failure) = tokio::sync::watch::channel(false);
+        let subscriber = Subscriber { out, failed, persistent: true };
+        assert!(subscriber.send("first"));
+        assert!(!subscriber.send("second"));
+        assert!(*failure.borrow());
+    }
+
+    #[tokio::test]
+    async fn disconnected_turn_can_be_observed_and_cancelled_from_new_connection() {
+        let state = server_state_with(TestLlm::slow_tool_call());
+        let (input, mut output, connection) = spawn_connection(state.clone()).await;
+        input.send(ClientRequest::ask(1, "work").to_line()).await.unwrap();
+        let ready = recv_json(&mut output).await;
+        let id = ready["session_id"].as_str().unwrap().to_owned();
+        drop(input);
+        drop(output);
+        connection.await.unwrap().unwrap();
+        assert!(state.busy_sessions.lock().await.contains(&id));
+
+        let (input, mut output, connection) = spawn_connection(state.clone()).await;
+        input.send(ClientRequest::subscribe_session(2, &id).to_line()).await.unwrap();
+        assert_eq!(recv_json(&mut output).await["type"], "ready");
+        let snapshot = recv_json(&mut output).await;
+        assert_eq!(snapshot["type"], "session_snapshot");
+        assert_eq!(snapshot["busy"], true);
+        assert_eq!(snapshot["messages"][0]["role"], "user");
+        input.send(ClientRequest::interrupt(3).with_session(&id).to_line()).await.unwrap();
+        loop {
+            let message = recv_json(&mut output).await;
+            if message["type"] == "interrupted" { break; }
+        }
+        assert!(!state.busy_sessions.lock().await.contains(&id));
+        drop(input);
+        drop(output);
+        connection.await.unwrap().unwrap();
+    }
+
+    #[tokio::test]
+    async fn detached_turn_finishes_without_a_subscriber() {
+        let state = server_state_with(TestLlm::plain());
+        let (input, mut output, connection) = spawn_connection(state.clone()).await;
+        input.send(ClientRequest::ask(1, "hello").to_line()).await.unwrap();
+        let ready = recv_json(&mut output).await;
+        let id = ready["session_id"].as_str().unwrap().to_owned();
+        drop(input);
+        drop(output);
+        connection.await.unwrap().unwrap();
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            loop {
+                if !state.busy_sessions.lock().await.contains(&id) { break; }
+                tokio::task::yield_now().await;
+            }
+        }).await.unwrap();
+        let mut current = None;
+        let session = state.get_or_create_session(&mut current, Some(id), None).await.unwrap();
+        assert!(session.agent.lock().await.memory.messages().iter().any(|m| matches!(m, Message::Assistant { .. })));
+    }
+
     fn server_state_with(provider: Arc<dyn gewu_core::traits::LlmProvider>) -> Arc<ServerState> {
         server_state_with_token(provider, None)
     }
@@ -1757,6 +2098,9 @@ mod tests {
             },
             token: token.map(str::to_string),
             busy_sessions: Mutex::new(HashSet::new()),
+            sessions: Mutex::new(HashMap::new()),
+            turns: Mutex::new(HashMap::new()),
+            lifecycle: Mutex::new(()),
         })
     }
 
@@ -2121,6 +2465,9 @@ mod tests {
             },
             token: None,
             busy_sessions: Mutex::new(HashSet::new()),
+            sessions: Mutex::new(HashMap::new()),
+            turns: Mutex::new(HashMap::new()),
+            lifecycle: Mutex::new(()),
         });
         let (in_tx, mut out_rx, handle) = spawn_connection(state).await;
 
@@ -2271,6 +2618,69 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn list_sessions_hides_subagents_and_delete_cascades() {
+        let state = server_state_with(TestLlm::plain());
+        let (in_tx, mut out_rx, handle) = spawn_connection(state.clone()).await;
+
+        // Produce a stored session.
+        in_tx
+            .send(r#"{"id": 1, "op": "ask", "prompt": "hello"}"#.to_string())
+            .await
+            .unwrap();
+        let _ready = recv_json(&mut out_rx).await;
+        let _event = recv_json(&mut out_rx).await;
+        let result = recv_result(&mut out_rx).await;
+        let session_id = result["session_id"].as_str().unwrap().to_string();
+
+        // Simulate the task tool spawning two subagent sessions.
+        let user = gewu_protocol::Message::User {
+            content: vec![gewu_protocol::ContentPart::Text {
+                text: "subagent work".to_string(),
+            }],
+        };
+        for name in ["sub-a", "sub-b"] {
+            gewu_storage::record_subagent_session(&state.bootstrap.pool, name, &session_id, "explore")
+                .await
+                .unwrap();
+            sqlx::query("INSERT INTO memory_messages (session_id, content) VALUES (?, ?)")
+                .bind(name)
+                .bind(serde_json::to_string(&user).unwrap())
+                .execute(&state.bootstrap.pool)
+                .await
+                .unwrap();
+        }
+
+        in_tx
+            .send(r#"{"id": 2, "op": "list_sessions"}"#.to_string())
+            .await
+            .unwrap();
+        let sessions = recv_json(&mut out_rx).await;
+        let listed: Vec<&str> = sessions["sessions"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|s| s["session_id"].as_str().unwrap())
+            .collect();
+        assert_eq!(listed, vec![session_id.as_str()], "subagent sessions must not be listed");
+
+        // Deleting the conversation removes its subagent transcripts too.
+        in_tx
+            .send(format!(r#"{{"id": 3, "op": "delete_session", "session_id": "{session_id}"}}"#))
+            .await
+            .unwrap();
+        assert_eq!(recv_json(&mut out_rx).await["type"], "deleted");
+        in_tx
+            .send(r#"{"id": 4, "op": "get_session", "session_id": "sub-a"}"#.to_string())
+            .await
+            .unwrap();
+        let empty = recv_json(&mut out_rx).await;
+        assert_eq!(empty["messages"].as_array().unwrap().len(), 0);
+
+        drop(in_tx);
+        handle.await.unwrap().unwrap();
+    }
+
+    #[tokio::test]
     async fn connection_rejects_second_ask_while_running() {
         // A slow tool-calling agent keeps the ask busy across two LLM turns,
         // long enough for the second ask to arrive while the first is still
@@ -2347,7 +2757,8 @@ mod tests {
             .send(r#"{"id": 2, "op": "interrupt"}"#.to_string())
             .await
             .unwrap();
-        let interrupted = recv_json(&mut out_rx).await;
+        let mut interrupted = recv_json(&mut out_rx).await;
+        if interrupted["type"] == "error" { interrupted = recv_json(&mut out_rx).await; }
         assert_eq!(interrupted["type"], "interrupted");
         assert_eq!(interrupted["request_id"], request_id.as_str());
         assert_eq!(interrupted["id"], 2);
@@ -2908,7 +3319,8 @@ mod tests {
             .send(r#"{"id": 2, "op": "interrupt"}"#.to_string())
             .await
             .unwrap();
-        let interrupted = recv_json(&mut out_rx).await;
+        let mut interrupted = recv_json(&mut out_rx).await;
+        if interrupted["type"] == "error" { interrupted = recv_json(&mut out_rx).await; }
         assert_eq!(interrupted["type"], "interrupted");
 
         // The next ask's LLM request must not contain the aborted prompt.

@@ -30,6 +30,8 @@ type Sender = SplitSink<WebSocket, Message>;
 #[derive(Default)]
 struct Conn {
     client: Option<Client>,
+    observer: Option<Client>,
+    observing: bool,
     task: Option<JoinHandle<()>>,
     /// When the streaming Markdown body was last pushed, throttling
     /// re-renders to [`STREAM_INTERVAL`]. `None` means the next delta is due.
@@ -95,6 +97,7 @@ pub struct GuiSession {
     working_directory: Option<String>,
     expanded_dirs: BTreeSet<String>,
     file_cache: BTreeMap<String, Vec<gewu_protocol::FileEntry>>,
+    tab_tx: Option<mpsc::UnboundedSender<TabEvent>>,
 }
 
 enum Incoming {
@@ -191,6 +194,7 @@ impl GuiSession {
             working_directory,
             expanded_dirs: BTreeSet::new(),
             file_cache,
+            tab_tx: None,
         })
     }
 
@@ -200,6 +204,7 @@ impl GuiSession {
         let (tab_tx, mut tab_rx) = mpsc::unbounded_channel::<TabEvent>();
         // Keep a sender alive so `tab_rx.recv()` only yields real events.
         let _tab_keepalive = tab_tx.clone();
+        self.tab_tx = Some(tab_tx.clone());
 
         match self.admin.ping().await {
             Ok(()) => self.note_active("connected"),
@@ -211,6 +216,12 @@ impl GuiSession {
         // Refresh context usage for the focused session. This may create the
         // tab's upstream connection.
         self.activate_active(&mut sender).await?;
+
+        let ids: Vec<_> = self.workspace.tabs.iter().filter_map(|tab| tab.model.session_id.clone().map(|s| (tab.id, s))).collect();
+        for (id, session_id) in ids {
+            self.ensure_client(id).await?;
+            self.observe(id, session_id, true).await?;
+        }
 
         loop {
             let incoming = tokio::select! {
@@ -414,6 +425,30 @@ impl GuiSession {
             .get(&tab_id)
             .and_then(|conn| conn.client.as_ref())
             .cloned()
+    }
+
+    async fn observe(&mut self, tab_id: u64, session_id: String, restore: bool) -> Result<()> {
+        let observer = self.endpoint.connect_with_token(self.server_token.as_deref()).await?;
+        let mut stream = observer.watch_session(session_id).await?;
+        let tx = self.tab_tx.clone().expect("running event loop");
+        let task = tokio::spawn(async move {
+            let mut first = true;
+            while let Some(frame) = stream.next_frame().await {
+                // After our own turn finishes, the local model already has
+                // every event. Do not replace it with an idle snapshot and
+                // shift block indices by discarding connection-local notes.
+                let skip = first && !restore && matches!(&frame,
+                    Ok(ServerMessage::SessionSnapshot { busy: false, .. }));
+                first = false;
+                if skip { continue; }
+                if tx.send(TabEvent { tab_id, frame: Some(frame) }).is_err() { return; }
+            }
+        });
+        let conn = self.conns.entry(tab_id).or_default();
+        if let Some(previous) = conn.task.replace(task) { previous.abort(); }
+        if let Some(previous) = conn.observer.replace(observer) { previous.close().await; }
+        conn.observing = true;
+        Ok(())
     }
 
     /// On focusing a tab: make sure it has a connection and refresh usage.
@@ -714,6 +749,12 @@ impl GuiSession {
 
         match builder.send().await {
             Ok(stream) => {
+                if self.conns.get(&tab_id).is_some_and(|conn| conn.observing) {
+                    // The observer receives the authoritative new-turn snapshot;
+                    // do not also apply the initiating connection's deltas.
+                    drop(stream);
+                    return Ok(());
+                }
                 let user_block = {
                     let tab = self.workspace.tab_mut(tab_id).expect("tab exists");
                     tab.model.submit(prompt);
@@ -777,11 +818,13 @@ impl GuiSession {
                 if let Some(client) = &conn.client {
                     let _ = client.interrupt().await;
                 }
+                if conn.observing { task.abort(); }
                 let _ = task.await;
             }
             if let Some(client) = conn.client.take() {
                 client.close().await;
             }
+            if let Some(observer) = conn.observer.take() { observer.close().await; }
         }
 
         let session_id = self
@@ -828,6 +871,21 @@ impl GuiSession {
             let before = tab.model.blocks.len();
 
             match event.frame {
+                Some(Ok(ServerMessage::SessionSnapshot { session_id, messages, frames, busy, .. })) => {
+                    let mut model = gewu_client::SessionModel::new();
+                    model.set_session(Some(session_id));
+                    for message in &messages { model.apply_message(message); }
+                    for frame in frames {
+                        if let ServerMessage::Event { event, .. } = frame {
+                            if let Ok(event) = serde_json::from_value::<AgentEvent>(event) { model.apply_event(&event); }
+                        }
+                    }
+                    model.phase = if busy { Phase::Busy } else { Phase::Idle };
+                    let changed = tab.model.blocks != model.blocks || tab.model.phase != model.phase;
+                    tab.model = model;
+                    terminal = !busy;
+                    update = if changed { TabUpdate::Full } else { TabUpdate::None };
+                }
                 None => {
                     terminal = true;
                     update = TabUpdate::Full;
@@ -904,7 +962,7 @@ impl GuiSession {
         }
 
         if terminal && let Some(conn) = self.conns.get_mut(&event.tab_id) {
-            conn.task = None;
+            if !conn.observing { conn.task = None; }
             conn.last_stream_render = None;
         }
 
@@ -912,6 +970,10 @@ impl GuiSession {
         // the terminal status is rendered.
         if terminal {
             self.refresh_usage(event.tab_id).await;
+            let session_id = self.workspace.tab(event.tab_id).and_then(|tab| tab.model.session_id.clone());
+            if !self.conns.get(&event.tab_id).is_some_and(|conn| conn.observing) {
+                if let Some(session_id) = session_id { self.observe(event.tab_id, session_id, false).await?; }
+            }
         }
 
         let active = active_id == event.tab_id;
@@ -990,14 +1052,12 @@ impl GuiSession {
     async fn shutdown(&mut self) {
         for (_, mut conn) in self.conns.drain() {
             if let Some(task) = conn.task.take() {
-                if let Some(client) = &conn.client {
-                    let _ = client.interrupt().await;
-                }
-                let _ = task.await;
+                task.abort();
             }
             if let Some(client) = conn.client.take() {
                 client.close().await;
             }
+            if let Some(observer) = conn.observer.take() { observer.close().await; }
         }
         self.admin.close().await;
     }
@@ -1032,6 +1092,9 @@ fn spawn_ask_forwarder(
 ) -> JoinHandle<()> {
     tokio::spawn(async move {
         while let Some(frame) = stream.next_frame().await {
+            let terminal = frame.as_ref().is_ok_and(|message| message.is_ask_terminal().is_some()
+                || matches!(message, ServerMessage::SessionSnapshot { busy: false, .. }))
+                || frame.is_err();
             if tx
                 .send(TabEvent {
                     tab_id,
@@ -1041,6 +1104,7 @@ fn spawn_ask_forwarder(
             {
                 return; // event loop gone
             }
+            if terminal { return; }
         }
         let _ = tx.send(TabEvent {
             tab_id,

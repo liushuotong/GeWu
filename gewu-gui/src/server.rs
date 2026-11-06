@@ -297,6 +297,15 @@ mod tests {
             let id = request.get("id").cloned().unwrap_or(Value::Null);
             let op = request.get("op").and_then(Value::as_str).unwrap_or("");
             let replies: Vec<Value> = match op {
+                "subscribe_session" => vec![
+                    json!({"type":"ready", "id":id, "request_id":"", "session_id":"sess-1", "agent":"build"}),
+                    json!({"type":"session_snapshot", "session_id":"sess-1", "messages":[{"role":"user", "content":[{"type":"text", "text":"run a tool"}]}], "frames":[
+                        {"type":"event", "id":null, "request_id":"req-1", "event":{"type":"content_delta", "delta":"Working"}},
+                        {"type":"event", "id":null, "request_id":"req-1", "event":{"type":"tool_start", "tool":"bash", "input":"seq 10"}},
+                        {"type":"event", "id":null, "request_id":"req-1", "event":{"type":"tool_finish", "tool":"bash", "title":"seq 10", "output":"line 1\nline 2\nline 3\nline 4\nline 5\nline 6\nline 7\nline 8\nline 9\nline 10"}},
+                        {"type":"event", "id":null, "request_id":"req-1", "event":{"type":"content_delta", "delta":"hello world"}}
+                    ], "busy":false, "seq":4}),
+                ],
                 "info" => vec![json!({
                     "type": "info", "id": id, "model": "fake-model", "provider": "fake",
                     "working_directory": "/tmp/fake-project",
@@ -796,7 +805,7 @@ mod tests {
                     assert!(!html.contains("+4 lines"), "{html}");
                     return;
                 }
-                "transcript" => panic!("a toggle must not resend the whole transcript"),
+                "transcript" => panic!("a toggle must not resend the whole transcript: {value}"),
                 _ => {}
             }
         }

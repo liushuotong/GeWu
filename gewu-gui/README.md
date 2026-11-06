@@ -69,13 +69,25 @@ file, with traversal names sanitized and existing files overwritten.
 
 ## Tabs
 
+Running turns belong to the upstream server, not the browser connection.
+Closing or refreshing the browser detaches without interrupting work; opening
+the GUI again restores the saved transcript and subscribes to active turns.
+Stop explicitly cancels a turn; closing a conversation tab cancels and deletes
+that session. Turns do not survive an agent-server restart.
+
+Active-turn reconnect history is limited to 16 MiB; exceeding it cancels the
+turn. Turns also have a one-hour execution limit. These are currently fixed
+server safeguards, not configurable options.
+
 On startup the GUI opens **every stored session as a tab** — oldest on the
 left, newest on the right — and focuses the newest. Titles come from the first
 user prompt, falling back to the short session id or `new`. Each tab has its
 own upstream connection, so an ask can keep streaming in a background tab while
 you work in another. `+` opens a fresh session; `×` closes the tab **and
 permanently deletes that session from the server's store**, with no
-confirmation.
+confirmation. Subagent sessions spawned by the `task` tool are not listed:
+they belong to the conversation that launched them and are deleted together
+with it. Subagents cannot spawn further subagents.
 
 ## Interaction
 
