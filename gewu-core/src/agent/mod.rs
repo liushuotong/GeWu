@@ -236,6 +236,10 @@ impl Agent {
 
             self.memory.add_message(Message::User { content: vec![ContentPart::Text { text: user_message.to_string() }] }).await;
             self.reminder.on_user_turn();
+            // Due mode reminders become part of conversation history, so
+            // every request in this turn — and later turns — still carries
+            // them instead of only the first provider call.
+            self.reminder.apply(self.memory.messages_mut());
 
             let mut turn = 0;
             let mut doom_loop = DoomLoopDetector::new(3);
@@ -265,7 +269,7 @@ impl Agent {
                 let mut messages = self.memory.messages().to_vec();
                 // Persisted history may belong to a different agent profile.
                 // Replace its base system prompt for this provider request,
-                // without rewriting conversation history or accumulating reminders.
+                // without rewriting conversation history.
                 if !self.system_prompt.is_empty() {
                     if let Some(Message::System { content }) = messages.first_mut() {
                         *content = self.system_prompt.clone();
@@ -273,9 +277,7 @@ impl Agent {
                         messages.insert(0, Message::System { content: self.system_prompt.clone() });
                     }
                 }
-                self.reminder.inject(&mut messages);
                 trace!("LLM request messages: {:?}", messages);
-
                 let tools_clone = self.tools.clone();
 
                 // Interleave provider status messages (retry backoff) with
@@ -846,7 +848,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn reminders_reach_requests_without_changing_memory() -> Result<()> {
+    async fn reminders_persist_in_history_across_requests() -> Result<()> {
         let response = vec![ProviderEvent::ContentDelta { delta: "ok".into() }, ProviderEvent::Finish { reason: None }];
         let provider = Arc::new(MockProvider::new(vec![response; 25]));
         let mut agent = Agent::builder()
@@ -859,11 +861,59 @@ mod tests {
             }
             let requests = provider.captured_requests.lock().unwrap();
             let request = serde_json::to_string(requests.last().unwrap())?;
-            assert_eq!(request.contains("FULL MODE REMINDER"), turn == 1 || turn == 25, "turn {turn}");
-            assert_eq!(request.contains("SPARSE MODE REMINDER"), turn % 5 == 0 && turn != 25, "turn {turn}");
-            assert!(!serde_json::to_string(agent.memory.messages())?.contains("MODE REMINDER"));
+            // Reminders live in history: the switch reminder from turn 1 is
+            // visible in every later request, and due heartbeats accumulate.
+            let fulls = request.matches("FULL MODE REMINDER").count();
+            let sparses = request.matches("SPARSE MODE REMINDER").count();
+            assert_eq!(fulls, 1 + usize::from(turn % 25 == 0), "turn {turn}");
+            assert_eq!(sparses, turn / 5 - turn / 25, "turn {turn}");
         }
+        // And they are part of stored memory, not just the wire request.
+        let memory = serde_json::to_string(agent.memory.messages())?;
+        assert!(memory.contains("FULL MODE REMINDER"));
+        assert!(memory.contains("SPARSE MODE REMINDER"));
         agent.set_profile(String::new(), Vec::new(), Reminder::default());
+        Ok(())
+    }
+
+    /// The plan-mode regression: a reminder applied to history must still be
+    /// visible in later LLM rounds of the same turn, not only the first.
+    #[tokio::test]
+    async fn reminder_survives_tool_rounds_within_one_turn() -> Result<()> {
+        let tool_call = vec![
+            ProviderEvent::ToolCallStart {
+                id: "call_1".to_string(),
+                name: "missing_tool".to_string(),
+            },
+            ProviderEvent::ToolCallDelta {
+                id: "call_1".to_string(),
+                delta: "{}".to_string(),
+            },
+            ProviderEvent::Finish {
+                reason: Some("tool_calls".to_string()),
+            },
+        ];
+        let final_response = vec![
+            ProviderEvent::ContentDelta { delta: "done".into() },
+            ProviderEvent::Finish { reason: None },
+        ];
+        let provider = Arc::new(MockProvider::new(vec![tool_call, final_response]));
+        let mut agent = Agent::builder()
+            .llm(provider.clone())
+            .with_reminder(Reminder::switch("FULL MODE REMINDER", None))
+            .build()?;
+        for event in agent.ask("hello").collect::<Vec<_>>().await {
+            event?;
+        }
+        let requests = provider.captured_requests.lock().unwrap();
+        assert_eq!(requests.len(), 2, "one tool round plus the final response");
+        for (round, request) in requests.iter().enumerate() {
+            let request = serde_json::to_string(request)?;
+            assert!(
+                request.contains("FULL MODE REMINDER"),
+                "round {round} lost the reminder"
+            );
+        }
         Ok(())
     }
 

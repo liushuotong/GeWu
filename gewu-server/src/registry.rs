@@ -442,7 +442,7 @@ mod tests {
             let mut reminder = profile_reminder(previous, target);
             reminder.on_user_turn();
             let mut messages = vec![Message::User { content: vec![] }];
-            reminder.inject(&mut messages);
+            reminder.apply(&mut messages);
             let Message::User { content } = &messages[0] else { unreachable!() };
             match expected {
                 Some(expected) => assert!(matches!(&content[0], ContentPart::Text { text } if text.contains(expected))),
@@ -450,7 +450,7 @@ mod tests {
             }
             reminder.on_user_turn();
             let mut next = vec![Message::User { content: vec![] }];
-            reminder.inject(&mut next);
+            reminder.apply(&mut next);
             assert_eq!(next, vec![Message::User { content: vec![] }]);
         }
     }
