@@ -18,6 +18,12 @@ pub struct Config {
     /// Reasoning models spend thinking tokens from this budget; raise it when
     /// turns come back empty or truncated (`stop_reason: "max_tokens"`).
     pub max_tokens: Option<u32>,
+    /// Model context window in tokens, used to trigger history compaction.
+    /// Must match the actual model limit — the built-in default (256,000) is
+    /// larger than many models, and compaction that never fires lets the
+    /// history grow until the provider rejects requests. E.g. `131072` for a
+    /// 128k model.
+    pub context_limit: Option<usize>,
     /// Optional directories to scan for skills (files named `SKILL.md`).
     #[serde(default)]
     pub skills: Option<Vec<String>>,
@@ -127,6 +133,14 @@ mod tests {
     fn parses_max_tokens_option() {
         let config: Config = serde_json::from_str(r#"{"max_tokens": 65536}"#).unwrap();
         assert_eq!(config.max_tokens, Some(65536));
+    }
+
+    #[test]
+    fn parses_context_limit_option() {
+        let config: Config = serde_json::from_str(r#"{"context_limit": 131072}"#).unwrap();
+        assert_eq!(config.context_limit, Some(131_072));
+        let config: Config = serde_json::from_str("{}").unwrap();
+        assert_eq!(config.context_limit, None);
     }
 
     #[test]

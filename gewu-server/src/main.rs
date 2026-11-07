@@ -253,6 +253,7 @@ async fn run(cli: RunArgs) -> Result<()> {
         boot.log_writer,
         boot.skills,
         boot.enforcement,
+        boot.context_limit,
     )
     .await?;
     info!("Initialized agent: {}", cli.common.agent);

@@ -1,4 +1,8 @@
-use gewu_core::compaction::{estimate_message_tokens, estimate_tokens, is_overflow, prune};
+use gewu_core::compaction::{
+    build_checkpoint_message, build_summary_prompt, estimate_message_tokens, estimate_tokens,
+    find_checkpoint, is_overflow, select_recent_tail, serialize_messages, KEEP_TOKENS,
+    TOOL_OUTPUT_MAX_CHARS,
+};
 use gewu_core::types::{ContentPart, Message};
 
 #[test]
@@ -119,214 +123,132 @@ fn test_estimate_message_tokens_tool() {
     );
 }
 
-#[test]
-fn test_prune_does_nothing_when_empty() {
-    let mut messages: Vec<Message> = vec![];
-    assert_eq!(prune(&mut messages), 0);
-}
-
-#[test]
-fn test_prune_does_nothing_when_under_threshold() {
-    let mut messages = vec![
-        Message::System {
-            content: "You are helpful".to_string(),
-        },
-        Message::User {
-            content: vec![ContentPart::Text {
-                text: "Hello".to_string(),
-            }],
-        },
-        Message::Assistant {
-            content: Some("Hi".to_string()),
-            tool_calls: None,
-        },
-        Message::Tool {
-            tool_call_id: "call_1".to_string(),
-            tool_name: Some("tool".to_string()),
-            content: "Short output".to_string(),
-            media: vec![],
-        },
-    ];
-    let saved = prune(&mut messages);
-    assert_eq!(saved, 0);
-}
-
-#[test]
-fn test_prune_does_nothing_when_recent_tool_output() {
-    let mut messages = vec![
-        Message::System {
-            content: "You are helpful".to_string(),
-        },
-        Message::User {
-            content: vec![ContentPart::Text {
-                text: "Hello".to_string(),
-            }],
-        },
-        Message::Assistant {
-            content: Some("Output".to_string()),
-            tool_calls: None,
-        },
-        Message::Tool {
-            tool_call_id: "call_1".to_string(),
-            tool_name: Some("tool".to_string()),
-            content: "x".repeat(50_000),
-            media: vec![],
-        },
-    ];
-    let saved = prune(&mut messages);
-    assert_eq!(saved, 0);
-}
-
-#[test]
-fn test_prune_protects_recent_turns() {
-    let mut messages = vec![
-        Message::System {
-            content: "You are helpful".to_string(),
-        },
-        Message::User {
-            content: vec![ContentPart::Text {
-                text: "First".to_string(),
-            }],
-        },
-        Message::Assistant {
-            content: Some("Response 1".to_string()),
-            tool_calls: None,
-        },
-        Message::Tool {
-            tool_call_id: "call_1".to_string(),
-            tool_name: Some("tool1".to_string()),
-            content: "Old output 1".to_string(),
-            media: vec![],
-        },
-        Message::User {
-            content: vec![ContentPart::Text {
-                text: "Second".to_string(),
-            }],
-        },
-        Message::Assistant {
-            content: Some("Response 2".to_string()),
-            tool_calls: None,
-        },
-        Message::Tool {
-            tool_call_id: "call_2".to_string(),
-            tool_name: Some("tool2".to_string()),
-            content: "Recent output".to_string(),
-            media: vec![],
-        },
-    ];
-
-    prune(&mut messages);
-
-    if let Message::Tool { content, .. } = &messages[3] {
-        assert_eq!(content, "Old output 1");
-    } else {
-        panic!("Expected Tool message at index 3");
-    }
-    if let Message::Tool { content, .. } = &messages[6] {
-        assert_eq!(content, "Recent output");
-    } else {
-        panic!("Expected Tool message at index 6");
+fn tool_message(content: &str) -> Message {
+    Message::Tool {
+        tool_call_id: "call_1".to_string(),
+        tool_name: Some("tool".to_string()),
+        content: content.to_string(),
+        media: vec![],
     }
 }
 
 #[test]
-fn test_prune_stops_at_summary() {
-    let mut messages = vec![
-        Message::System {
-            content: "You are helpful".to_string(),
-        },
-        Message::Assistant {
-            content: Some("Summary: Previous conversation...".to_string()),
-            tool_calls: None,
-        },
+fn truncate_tool_outputs_in_transcripts_at_two_thousand_chars() {
+    let messages = vec![
         Message::User {
             content: vec![ContentPart::Text {
-                text: "Recent".to_string(),
+                text: "run it".to_string(),
             }],
         },
-        Message::Tool {
-            tool_call_id: "call_1".to_string(),
-            tool_name: Some("tool".to_string()),
-            content: "Should not be pruned".to_string(),
-            media: vec![],
+        Message::Assistant {
+            content: None,
+            tool_calls: Some(vec![gewu_core::types::ToolCall {
+                id: "c1".into(),
+                r#type: "function".into(),
+                function: gewu_core::types::FunctionCall {
+                    name: "bash".into(),
+                    arguments: r#"{"command":"cat big.log"}"#.into(),
+                },
+            }]),
         },
+        tool_message(&"x".repeat(50_000)),
     ];
 
-    prune(&mut messages);
-
-    if let Message::Tool { content, .. } = &messages[3] {
-        assert_eq!(content, "Should not be pruned");
-    } else {
-        panic!("Expected Tool message at index 3");
-    }
+    let transcript = serialize_messages(&messages);
+    assert!(transcript.contains("[User]: run it"), "{transcript}");
+    assert!(
+        transcript.contains("[Assistant tool call]: bash("),
+        "{transcript}"
+    );
+    assert!(
+        transcript.contains("[Tool result]:"),
+        "{transcript}"
+    );
+    assert!(
+        transcript.contains("[truncated]"),
+        "oversized tool output must be marked truncated"
+    );
+    // The transcript is capped: 50KB of content collapses to the 2,000-char
+    // cap plus markers.
+    let tool_line = transcript
+        .lines()
+        .find(|l| l.starts_with("[Tool result]:"))
+        .unwrap();
+    assert!(tool_line.len() < TOOL_OUTPUT_MAX_CHARS + 200, "{tool_line}");
 }
 
-/// Regression: real compaction summaries start with
-/// `SUMMARY_PREFIX` ("Summary of previous conversation:"), not "Summary:".
-/// Pruning must stop at them instead of walking straight through and
-/// destroying the pre-summary history.
 #[test]
-fn test_prune_stops_at_real_compaction_summary() {
-    let mut messages = vec![
+fn small_tool_outputs_pass_through_unmarked() {
+    let transcript = serialize_messages(&[tool_message("short and fine")]);
+    assert!(transcript.contains("short and fine"), "{transcript}");
+    assert!(!transcript.contains("[truncated]"), "{transcript}");
+}
+
+#[test]
+fn select_recent_tail_keeps_the_newest_messages_under_budget() {
+    let small = Message::User {
+        content: vec![ContentPart::Text {
+            text: "a".repeat(400), // ~100 tokens
+        }],
+    };
+    let big = tool_message(&"x".repeat(40_000)); // ~10k tokens
+
+    // Newest-first accumulation: only the small message fits in 8k tokens.
+    let messages = vec![big.clone(), small.clone()];
+    let split = select_recent_tail(&messages, KEEP_TOKENS);
+    assert_eq!(split, 1, "the 10k-token tool blob must stay in the head");
+    assert_eq!(&messages[split..], &[small]);
+
+    // Everything fits when the budget is large.
+    assert_eq!(select_recent_tail(&messages, 20_000), 0);
+
+    // Empty history keeps nothing.
+    assert_eq!(select_recent_tail(&[], KEEP_TOKENS), 0);
+}
+
+#[test]
+fn checkpoint_message_round_trips_through_find() {
+    let summary = "## Objective\n- test the checkpoint";
+    let recent = "[User]: hi\n\n[Assistant]: hello";
+    let checkpoint = build_checkpoint_message(summary, recent);
+
+    let history = vec![
         Message::System {
-            content: "You are helpful".to_string(),
+            content: "system".to_string(),
         },
+        checkpoint,
         Message::User {
             content: vec![ContentPart::Text {
-                text: "Pre-summary request".to_string(),
+                text: "newest prompt".to_string(),
             }],
-        },
-        // Pre-summary tool output: large enough to exceed both prune
-        // thresholds, so the walk would prune it if it blew past the summary.
-        Message::Tool {
-            tool_call_id: "call_pre".to_string(),
-            tool_name: Some("tool".to_string()),
-            content: "x".repeat(200_000),
-            media: vec![],
-        },
-        // The boundary the compactor actually writes.
-        Message::Assistant {
-            content: Some(format!(
-                "{}\nHere is what happened before.",
-                gewu_core::compaction::SUMMARY_PREFIX
-            )),
-            tool_calls: None,
-        },
-        Message::User {
-            content: vec![ContentPart::Text {
-                text: "Post-summary request 1".to_string(),
-            }],
-        },
-        Message::Tool {
-            tool_call_id: "call_post1".to_string(),
-            tool_name: Some("tool".to_string()),
-            content: "Post-summary output 1".to_string(),
-            media: vec![],
-        },
-        Message::User {
-            content: vec![ContentPart::Text {
-                text: "Post-summary request 2".to_string(),
-            }],
-        },
-        Message::Tool {
-            tool_call_id: "call_post2".to_string(),
-            tool_name: Some("tool".to_string()),
-            content: "Post-summary output 2".to_string(),
-            media: vec![],
         },
     ];
 
-    prune(&mut messages);
+    let (found_summary, found_recent) = find_checkpoint(&history).expect("checkpoint found");
+    assert_eq!(found_summary, summary);
+    assert_eq!(found_recent, recent);
 
-    // The tool output below the summary must be intact — pruning may only
-    // touch messages newer than the summary boundary.
-    if let Message::Tool { content, .. } = &messages[2] {
-        assert_eq!(
-            content.len(),
-            200_000,
-            "pre-summary content must not be pruned"
-        );
-    } else {
-        panic!("Expected Tool message at index 2");
-    }
+    // No checkpoint in plain history.
+    assert_eq!(find_checkpoint(&[Message::User {
+        content: vec![ContentPart::Text {
+            text: "just a prompt".to_string(),
+        }],
+    }]), None);
+}
+
+#[test]
+fn summary_prompt_includes_template_and_prior_summary() {
+    let fresh = build_summary_prompt(None, &["[User]: hello".to_string()]);
+    assert!(fresh.contains("<conversation>"), "{fresh}");
+    assert!(fresh.contains("[User]: hello"), "{fresh}");
+    assert!(fresh.contains("## Objective"), "{fresh}");
+    assert!(!fresh.contains("prior-summary"), "{fresh}");
+
+    let updated = build_summary_prompt(
+        Some("## Objective\n- old goal"),
+        &["[prior recent]".to_string(), "[User]: next".to_string()],
+    );
+    assert!(updated.contains("<prior-summary>"), "{updated}");
+    assert!(updated.contains("## Objective\n- old goal"), "{updated}");
+    assert!(updated.contains("[User]: next"), "{updated}");
 }

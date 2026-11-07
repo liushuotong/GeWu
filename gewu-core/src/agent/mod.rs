@@ -65,7 +65,7 @@ use uuid::Uuid;
 
 use self::execution::{DoomLoopDetector, LlmResponseAggregator, execute_tool_call};
 use crate::agent::media::extract_media_parts;
-use crate::compaction::{estimate_message_tokens, prune};
+use crate::compaction::estimate_message_tokens;
 
 /// Maximum number of tool calls from a single LLM turn that execute at the
 /// same time. Extra calls queue behind the semaphore until a slot frees up.
@@ -253,8 +253,6 @@ impl Agent {
                     }
                 }
                 turn += 1;
-
-                prune(self.memory.messages_mut());
 
                 let mut aggregator = LlmResponseAggregator::new();
                 let mut messages = self.memory.messages().to_vec();
@@ -723,6 +721,8 @@ mod tests {
         status_sink: std::sync::Mutex<Option<crate::traits::StatusSink>>,
         /// When set, the stream yields one event then a mid-stream error.
         fail_stream: bool,
+        /// Every request `build` produced, for wire-shape assertions.
+        captured_requests: std::sync::Mutex<Vec<Value>>,
     }
 
     impl MockProvider {
@@ -733,6 +733,7 @@ mod tests {
                 status_message: None,
                 status_sink: std::sync::Mutex::new(None),
                 fail_stream: false,
+                captured_requests: std::sync::Mutex::new(Vec::new()),
             }
         }
 
@@ -761,6 +762,16 @@ mod tests {
             messages: &[Message],
             tools: &[Arc<dyn Tool>],
         ) -> Result<Value, Box<dyn Error + Send + Sync>> {
+            // Record the full built request so tests can assert on what the
+            // wire would have carried.
+            self.captured_requests
+                .lock()
+                .unwrap()
+                .push(serde_json::json!({
+                    "model": "mock",
+                    "messages": messages,
+                    "tools": tools.len(),
+                }));
             Ok(serde_json::json!({
                 "model": "mock",
                 "messages": messages.len(),
@@ -889,12 +900,22 @@ mod tests {
             .build()?;
 
         // The reserved buffer is clamped to half the window, so
-        // usable = 20_100 - 10_050 = 10_050 tokens; ~10_100 tokens overflows.
+        // usable = 20_100 - 10_050 = 10_050 tokens; the history below is
+        // ~10_150 tokens and overflows. The last message fits the kept tail
+        // (8k tokens), so the big first message becomes the summarized head.
         agent
             .memory
             .add_message(Message::User {
                 content: vec![ContentPart::Text {
                     text: "x".repeat(40_400),
+                }],
+            })
+            .await;
+        agent
+            .memory
+            .add_message(Message::User {
+                content: vec![ContentPart::Text {
+                    text: "continue".to_string(),
                 }],
             })
             .await;
@@ -910,6 +931,75 @@ mod tests {
         );
         assert_eq!(entries[0]["request"]["model"], "mock");
         assert_eq!(entries[1]["response"]["outcome"], "ok");
+
+        // History collapses into a checkpoint message carrying the summary
+        // and the serialized recent tail.
+        let messages = agent.memory.messages();
+        assert_eq!(messages.len(), 1, "no system prompt: just the checkpoint");
+        let text = match &messages[0] {
+            Message::User { content } => match &content[0] {
+                ContentPart::Text { text } => text.clone(),
+                _ => panic!("expected text checkpoint"),
+            },
+            _ => panic!("expected user checkpoint message"),
+        };
+        assert!(text.contains("<conversation-checkpoint>"), "{text}");
+        assert!(text.contains("summary"), "{text}");
+        assert!(text.contains("[User]: continue"), "{text}");
+        assert!(
+            !text.contains("xxxx"),
+            "the summarized head must not appear in the checkpoint"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn compaction_truncates_tool_outputs_in_the_summary_view() -> Result<()> {
+        let provider = Arc::new(MockProvider::single_content("summary"));
+        let mut agent = Agent::builder()
+            .llm(provider.clone())
+            .context_limit(20_100)
+            .build()?;
+
+        // A huge tool output in old history: the summarizer must see it
+        // truncated, not verbatim.
+        agent
+            .memory
+            .add_message(Message::Tool {
+                tool_call_id: "c1".into(),
+                tool_name: Some("read_file".into()),
+                content: "y".repeat(80_000),
+                media: vec![],
+            })
+            .await;
+        agent
+            .memory
+            .add_message(Message::User {
+                content: vec![ContentPart::Text {
+                    text: "continue".to_string(),
+                }],
+            })
+            .await;
+
+        assert!(agent.compact_if_needed().await?);
+
+        // The summary request's transcript carries the truncated form.
+        let requests = provider.captured_requests.lock().unwrap();
+        assert_eq!(requests.len(), 1, "one summary request");
+        let serialized = serde_json::to_string(&requests[0])?;
+        assert!(
+            serialized.contains("[Tool result]:"),
+            "summary input uses the transcript format: {serialized}"
+        );
+        assert!(
+            serialized.contains("[truncated]"),
+            "summary input must mark truncation"
+        );
+        let shown = serialized.matches("yyyy").count();
+        assert!(
+            shown < 3_000,
+            "summary input must cap tool output at ~2k chars, saw {shown} y's"
+        );
         Ok(())
     }
 

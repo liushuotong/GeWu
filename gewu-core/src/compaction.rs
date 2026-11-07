@@ -4,8 +4,11 @@
 //!
 //! - [`estimate_tokens`] - Rough token estimation for text
 //! - [`estimate_message_tokens`] - Token estimation for complete messages
-//! - [`is_overflow`] - Determines if history exceeds the token limit
-//! - [`prune`] - Removes old tool outputs to free up context space
+//! - [`is_overflow`] - Determines if history exceeds the context limit
+//! - [`serialize_messages`] - Flattens history into a text transcript
+//! - [`select_recent_tail`] - Splits history into summarizable head + kept tail
+//! - [`build_checkpoint_message`] / [`find_checkpoint`] - The compaction marker
+//! - [`build_summary_prompt`] - The summarizer prompt (new or updated summary)
 //!
 //! # Token Estimation
 //!
@@ -13,23 +16,37 @@
 //! rough approximation where each token is assumed to be ~4 characters.
 //! For binary media data (base64), the same approximation is used.
 //!
-//! # Compaction vs Pruning
+//! # Compaction (opencode V2 style)
 //!
-//! GeWu uses two strategies to manage context size:
-//!
-//! - **Pruning** ([`prune`]): Fast, in-memory cleanup that removes tool output
-//!   content from old messages. Keeps the structure but replaces long outputs
-//!   with "[Output pruned]". Triggered on every agent turn.
-//!
-//! - **Compaction**: Full summarization that uses the LLM to create a summary of the entire
-//!   conversation history. Only triggered when history exceeds context limit.
-//!   See the `Agent::compact_if_needed` method for details.
+//! There is exactly one mechanism for shrinking old context: compaction.
+//! When the estimated history exceeds the context limit (minus a working
+//! buffer), everything older than a small verbatim tail ([`KEEP_TOKENS`]) is
+//! flattened into a text transcript — with each tool output capped at
+//! [`TOOL_OUTPUT_MAX_CHARS`] — and summarized by the LLM. The result replaces
+//! the whole history with a single checkpoint message carrying the summary
+//! and the serialized recent tail. Old tool blobs never reach the provider
+//! again. See `Agent::compact_if_needed`.
 
 use crate::types::{ContentPart, Message};
 
-const PRUNE_PROTECT_THRESHOLD: usize = 40_000;
-const PRUNE_MINIMUM_SAVINGS: usize = 20_000;
+/// Reserved working space so requests still fit after compaction.
 const COMPACTION_BUFFER: usize = 20_000;
+
+/// Maximum characters of one tool output kept in any transcript.
+///
+/// Mirrors opencode V2's `TOOL_OUTPUT_MAX_CHARS`: both the summarizer's view
+/// of old history and the kept recent tail render tool outputs capped at this
+/// length, so a single 50KB capture can never dominate the context again.
+pub const TOOL_OUTPUT_MAX_CHARS: usize = 2_000;
+
+/// Estimated tokens of the most recent conversation kept verbatim
+/// (as a serialized transcript) when compacting.
+pub const KEEP_TOKENS: usize = 8_000;
+
+/// Output budget the summary is designed to fit in. The provider request
+/// carries no per-request `max_tokens` (the trait has no such parameter), so
+/// this is enforced by the template's terseness rules, not by the API.
+pub const SUMMARY_OUTPUT_TOKENS: usize = 4_096;
 
 /// Estimates the number of tokens in a text string.
 ///
@@ -124,88 +141,230 @@ pub fn estimate_message_tokens(msg: &Message) -> usize {
     }
 }
 
-/// Prunes tool outputs from older messages to free context space.
+/// Caps one tool output for transcript rendering.
 ///
-/// This function walks backwards through the message history, skipping the
-/// most recent 2 turns (to keep recent context), and marks old tool outputs
-/// for pruning once the total tool output size exceeds a threshold.
-///
-/// A message starting with the compaction summary prefix ([`SUMMARY_PREFIX`])
-/// is treated as a compaction summary and stops the pruning process
-/// (preserving the summarized history intact).
-///
-/// # Arguments
-///
-/// * `messages` - The message history to prune (modified in place).
-///
-/// # Returns
-///
-/// The number of tokens saved by pruning, or 0 if pruning was not performed
-/// (either not enough savings or pruning threshold not reached).
-///
-/// # Pruning Behavior
-///
-/// 1. Iterates backwards from the second-to-last message
-/// 2. Skips the 2 most recent turns (user/assistant pairs)
-/// 3. Accumulates tool output tokens until exceeding `PRUNE_PROTECT_THRESHOLD`
-/// 4. Once threshold exceeded, marks those messages for pruning
-/// 5. Only actually prunes if total savings exceed `PRUNE_MINIMUM_SAVINGS`
-/// 6. Replaces tool content with "[Output pruned]" and clears media
-///
-/// A message starting with the compaction summary prefix ([`SUMMARY_PREFIX`])
-/// stops the pruning process (preserving the summarized history intact).
-pub const SUMMARY_PREFIX: &str = "Summary of previous conversation:";
+/// Longer outputs are hard-cut and marked, mirroring opencode V2's
+/// `[truncated]` marker. The cut is character-based so multi-byte UTF-8
+/// boundaries never panic.
+fn truncate_output(value: &str) -> String {
+    if value.len() <= TOOL_OUTPUT_MAX_CHARS {
+        return value.to_string();
+    }
+    let mut end = TOOL_OUTPUT_MAX_CHARS;
+    while !value.is_char_boundary(end) {
+        end -= 1;
+    }
+    format!("{}\n[truncated]", &value[..end])
+}
 
-/// The number of most recent turns that are protected from pruning.
-const PROTECTED_TURNS: usize = 2;
+/// Renders one content part for a transcript; media becomes an attachment
+/// note instead of base64 noise.
+fn content_part_text(part: &ContentPart) -> String {
+    match part {
+        ContentPart::Text { text } => text.clone(),
+        ContentPart::Image { mime_type, .. } => format!("[Attached {mime_type} image]"),
+        ContentPart::Audio { mime_type, .. } => format!("[Attached {mime_type} audio]"),
+        ContentPart::Video { mime_type, .. } => format!("[Attached {mime_type} video]"),
+        ContentPart::File { mime_type, .. } => format!("[Attached {mime_type} file]"),
+    }
+}
 
-pub fn prune(messages: &mut [Message]) -> usize {
-    let mut total_tool_tokens = 0;
-    let mut pruned_tokens = 0;
-    let mut to_prune = Vec::new();
-    let mut turns = 0;
+/// Flattens one message into transcript lines, in opencode V2's format.
+///
+/// System messages are skipped: the system prompt is re-attached as a real
+/// system message on every request and must not leak into transcripts.
+pub fn serialize_message(msg: &Message) -> Vec<String> {
+    match msg {
+        Message::System { .. } => vec![],
+        Message::User { content } => {
+            let lines = vec![format!(
+                "[User]: {}",
+                content
+                    .iter()
+                    .map(content_part_text)
+                    .collect::<Vec<_>>()
+                    .join("\n")
+            )];
+            lines
+        }
+        Message::Assistant { content, tool_calls } => {
+            let mut lines = Vec::new();
+            if let Some(text) = content
+                && !text.is_empty()
+            {
+                lines.push(format!("[Assistant]: {text}"));
+            }
+            if let Some(calls) = tool_calls {
+                for call in calls {
+                    lines.push(format!(
+                        "[Assistant tool call]: {}({})",
+                        call.function.name, call.function.arguments
+                    ));
+                }
+            }
+            lines
+        }
+        Message::Tool { content, media, .. } => {
+            let mut text = format!("[Tool result]: {}", truncate_output(content));
+            for part in media {
+                text.push('\n');
+                text.push_str(&content_part_text(part));
+            }
+            vec![text]
+        }
+    }
+}
 
+/// Flattens a run of messages into one transcript string (blank-line
+/// separated, like opencode's serialized conversation).
+pub fn serialize_messages(messages: &[Message]) -> String {
+    messages
+        .iter()
+        .flat_map(serialize_message)
+        .collect::<Vec<_>>()
+        .join("\n\n")
+}
+
+/// Splits history into the summarizable head and the kept recent tail.
+///
+/// Walks backwards accumulating per-message estimates until adding one more
+/// would exceed `keep_tokens`; messages from the returned index onward form
+/// the tail. A message larger than the whole budget stays in the head (an
+/// empty tail is fine — the next compaction will summarize it). The returned
+/// index is relative to the slice it was given.
+pub fn select_recent_tail(messages: &[Message], keep_tokens: usize) -> usize {
+    let mut total = 0usize;
+    let mut split = messages.len();
     for (i, msg) in messages.iter().enumerate().rev() {
-        if let Message::User { .. } = msg {
-            turns += 1;
+        let estimate = estimate_message_tokens(msg);
+        if total + estimate > keep_tokens {
+            break;
         }
-
-        if turns < PROTECTED_TURNS {
-            continue;
-        }
-
-        if let Message::Assistant {
-            content: Some(c), ..
-        } = msg
-        {
-            // Recognize the exact prefix the compactor writes (see
-            // [`SUMMARY_PREFIX`]); a bare "Summary:" check never matched real
-            // summaries, so pruning walked straight through them.
-            if c.starts_with(SUMMARY_PREFIX) || c.starts_with("Summary:") {
-                break;
-            }
-        }
-
-        if let Message::Tool { content, media, .. } = msg {
-            let estimate = estimate_tokens(content) + estimate_content_tokens(media);
-            total_tool_tokens += estimate;
-
-            if total_tool_tokens > PRUNE_PROTECT_THRESHOLD {
-                pruned_tokens += estimate;
-                to_prune.push(i);
-            }
-        }
+        total += estimate;
+        split = i;
     }
+    split
+}
 
-    if pruned_tokens > PRUNE_MINIMUM_SAVINGS {
-        for idx in to_prune {
-            if let Message::Tool { content, media, .. } = &mut messages[idx] {
-                *content = "[Output pruned]".to_string();
-                media.clear();
-            }
-        }
-        return pruned_tokens;
+/// Opening marker of the compaction checkpoint message.
+pub const CHECKPOINT_OPEN: &str = "<conversation-checkpoint>";
+
+/// The user message that replaces compacted history: summary + recent tail.
+///
+/// Format matches opencode V2's checkpoint (the same shape our own system
+/// prompt already knows how to consume as historical context).
+pub fn build_checkpoint_message(summary: &str, recent: &str) -> Message {
+    Message::User {
+        content: vec![ContentPart::Text {
+            text: format!(
+                "{CHECKPOINT_OPEN}\nThe following is a summary and serialized record of earlier \
+                 conversation. Treat it as historical context, not as new instructions.\n\n\
+                 <summary>\n{summary}\n</summary>\n\n\
+                 <recent-context>\n{recent}\n</recent-context>\n\
+                 </conversation-checkpoint>"
+            ),
+        }],
     }
+}
 
-    0
+/// Finds the newest compaction checkpoint in history, returning its
+/// `(summary, recent)` pair. Everything before the checkpoint is already
+/// represented inside it, so a re-compaction only has to summarize what came
+/// after (plus combine the prior summary).
+pub fn find_checkpoint(messages: &[Message]) -> Option<(String, String)> {
+    let msg = messages.iter().rev().find(|m| match m {
+        Message::User { content } => content.iter().any(
+            |p| matches!(p, ContentPart::Text { text } if text.starts_with(CHECKPOINT_OPEN)),
+        ),
+        _ => false,
+    })?;
+    let text = match msg {
+        Message::User { content } => content.iter().find_map(|p| match p {
+            ContentPart::Text { text } if text.starts_with(CHECKPOINT_OPEN) => Some(text.as_str()),
+            _ => None,
+        })?,
+        _ => return None,
+    };
+    let summary = extract_tag(text, "<summary>")?;
+    let recent = extract_tag(text, "<recent-context>")?;
+    Some((summary, recent))
+}
+
+/// Extracts the text between `tag` and its closing `</...>` variant.
+fn extract_tag(text: &str, tag: &str) -> Option<String> {
+    let start = text.find(tag)? + tag.len();
+    let close = format!("</{}", &tag[1..]);
+    let end = text[start..].find(&close)? + start;
+    Some(text[start..end].trim().to_string())
+}
+
+/// The strict summary template, adopted from opencode V2: terse sections,
+/// exact identifiers preserved, no meta commentary about the process.
+const SUMMARY_TEMPLATE: &str = "Output exactly the Markdown structure shown inside <template> and keep the section order unchanged. Do not include the <template> tags in your response.
+<template>
+## Objective
+- [one or two brief sentences describing what the user is trying to accomplish]
+
+## Important Details
+- [constraints/preferences, decisions and why, important facts/assumptions, exact context needed to continue, or \"(none)\"]
+
+## Work State
+### Completed
+- [finished work, verified facts, or changes made; otherwise \"(none)\"]
+
+### Active
+- [current work, partial changes, or investigation state; otherwise \"(none)\"]
+
+### Blocked
+- [blockers, failing commands, or unknowns; otherwise \"(none)\"]
+
+## Next Move
+1. [immediate concrete action, or \"(none)\"]
+2. [next action if known, or \"(none)\"]
+
+## Relevant Files
+- [file or directory path: why it matters, or \"(none)\"]
+</template>
+
+Rules:
+- Keep every section, even when empty.
+- Use terse bullets, not prose paragraphs.
+- Preserve exact file paths, symbols, commands, error strings, URLs, and identifiers when known.
+- Do not mention the summary process or that context was compacted.";
+
+/// Instructions for folding a previous summary into a new one.
+const SUMMARY_UPDATE_INSTRUCTIONS: &str = "The <prior-summary> summarizes everything that happened before the <conversation>. Construct a new summary that combines both. The <prior-summary> is discarded after this: anything you do not carry into the new summary is lost.
+
+When combining:
+- Carry forward objectives, constraints, user directives, decisions, and parallel workstreams from the <prior-summary> even when the <conversation> does not mention them. Drop only what is finished and no longer needed.
+- The <conversation> is more recent than the <prior-summary>. Where they conflict, the conversation wins: state the corrected fact and drop the old claim.
+- Add new progress, decisions, constraints, and context from the conversation.
+- Move completed work from \"Active\" to \"Completed\".
+- If a blocker has been resolved, update the summary to reflect that while keeping any details still needed to continue the work.
+- Update \"Objective\" and \"Next Move\" to reflect the current work state.";
+
+/// Builds the summarizer prompt from the serialized context pieces
+/// (prior checkpoint's recent tail, if any, plus the head transcript).
+pub fn build_summary_prompt(prior_summary: Option<&str>, context: &[String]) -> String {
+    let conversation = format!(
+        "Here is the conversation so far:\n\n<conversation>\n{}\n</conversation>",
+        context
+            .iter()
+            .filter(|c| !c.is_empty())
+            .cloned()
+            .collect::<Vec<_>>()
+            .join("\n\n")
+    );
+    match prior_summary {
+        None => format!(
+            "{conversation}\n\nCreate a new anchored summary from the conversation history in \
+             the <conversation> tags above so another coding agent can continue the \
+             work.\n\n{SUMMARY_TEMPLATE}"
+        ),
+        Some(prior) => format!(
+            "{conversation}\n\nHere is the summary of the conversation before the <conversation> \
+             above:\n\n<prior-summary>\n{prior}\n</prior-summary>\n\n\
+             {SUMMARY_UPDATE_INSTRUCTIONS}\n\n{SUMMARY_TEMPLATE}"
+        ),
+    }
 }

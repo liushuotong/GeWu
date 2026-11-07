@@ -377,6 +377,7 @@ impl ServerState {
             self.bootstrap.log_writer.clone(),
             self.bootstrap.skills.clone(),
             self.bootstrap.enforcement,
+            self.bootstrap.context_limit,
         )
         .await?;
         info!("Created session {} (agent: {})", session_id, agent_name);
@@ -597,7 +598,7 @@ async fn handle_request(
             if !state.claim_session(&current.session_id).await {
                 return Err(RequestError::Failed("session is busy on another connection".into()));
             }
-            let replacement = registry::agent_profile(&target, state.bootstrap.provider.clone(), state.bootstrap.pool.clone(), state.bootstrap.working_directory.clone().into(), state.bootstrap.mcp_tools.clone(), state.bootstrap.skills.clone(), state.bootstrap.enforcement, &current.session_id);
+            let replacement = registry::agent_profile(&target, state.bootstrap.provider.clone(), state.bootstrap.pool.clone(), state.bootstrap.working_directory.clone().into(), state.bootstrap.mcp_tools.clone(), state.bootstrap.skills.clone(), state.bootstrap.enforcement, state.bootstrap.context_limit, &current.session_id);
             let result = match replacement {
                 Ok((tools, prompt, _)) => match gewu_storage::set_session_agent(&state.bootstrap.pool, &current.session_id, &target).await {
                     Ok(()) => {
@@ -2115,6 +2116,7 @@ mod tests {
                 provider_name: "test".to_string(),
                 working_directory: "/tmp/gewu-test".to_string(),
                 enforcement: PathEnforcement::None,
+                context_limit: None,
             },
             token: token.map(str::to_string),
             busy_sessions: Mutex::new(HashSet::new()),
@@ -2482,6 +2484,7 @@ mod tests {
                 provider_name: "test".to_string(),
                 working_directory: "/tmp/gewu-test".to_string(),
                 enforcement: PathEnforcement::None,
+                context_limit: None,
             },
             token: None,
             busy_sessions: Mutex::new(HashSet::new()),

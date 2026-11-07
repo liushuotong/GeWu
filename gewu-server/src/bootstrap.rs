@@ -70,6 +70,9 @@ pub struct Bootstrap {
     pub working_directory: String,
     /// File-path confinement level for tools and file-tree operations.
     pub enforcement: PathEnforcement,
+    /// Model context window (tokens) forwarded to agents for compaction;
+    /// `None` keeps the agent's built-in default.
+    pub context_limit: Option<usize>,
 }
 
 /// Initialize tracing from the `--log-level` flag.
@@ -260,6 +263,7 @@ pub async fn bootstrap(args: &CommonArgs) -> Result<Bootstrap> {
             .to_string_lossy()
             .to_string(),
         enforcement: loaded_config.config.sandbox,
+        context_limit: loaded_config.config.context_limit,
     })
 }
 

@@ -89,6 +89,8 @@ struct SqliteAgentFactory {
     pool: SqlitePool,
     skills: Vec<SkillInfo>,
     enforcement: PathEnforcement,
+    /// Model context window forwarded to subagent agents for compaction.
+    context_limit: Option<usize>,
     /// Session owning this task tool. Subagent sessions are recorded with it
     /// as parent, hiding them from the session list and enabling the depth
     /// limit for nested spawns.
@@ -124,6 +126,7 @@ impl AgentFactory for SqliteAgentFactory {
             None,
             self.skills.clone(),
             self.enforcement,
+            self.context_limit,
         )
         .await
         .map_err(|e| -> Box<dyn Error + Send + Sync> { e.to_string().into() })?;
@@ -138,6 +141,7 @@ fn task_tool(
     pool: SqlitePool,
     skills: Vec<SkillInfo>,
     enforcement: PathEnforcement,
+    context_limit: Option<usize>,
     allowed: &[&str],
     parent_session: &str,
 ) -> TaskTool {
@@ -146,6 +150,7 @@ fn task_tool(
         pool,
         skills,
         enforcement,
+        context_limit,
         parent_session: parent_session.to_string(),
     });
     let agents = list_available_agents()
@@ -164,13 +169,14 @@ fn build_tool_registry_and_list(
     additional_tools: Vec<Arc<dyn Tool>>,
     skills: Vec<SkillInfo>,
     enforcement: PathEnforcement,
+    context_limit: Option<usize>,
     session_id: &str,
 ) -> Result<(Arc<dyn ToolRegistry>, Vec<Arc<dyn Tool>>)> {
     let mut tools: Vec<Box<dyn Tool>> = match name {
         "build" => {
             let todos = Arc::new(Mutex::new(Vec::<TodoItem>::new()));
             vec![
-                Box::new(task_tool(provider.clone(), pool.clone(), skills.clone(), enforcement, &[], session_id)),
+                Box::new(task_tool(provider.clone(), pool.clone(), skills.clone(), enforcement, context_limit, &[], session_id)),
                 Box::new(ReadFileTool {
                     working_directory: working_directory.clone(),
                 }),
@@ -206,7 +212,7 @@ fn build_tool_registry_and_list(
         "plan" => {
             let todos = Arc::new(Mutex::new(Vec::<TodoItem>::new()));
             vec![
-                Box::new(task_tool(provider.clone(), pool.clone(), skills.clone(), enforcement, &["explore"], session_id)),
+                Box::new(task_tool(provider.clone(), pool.clone(), skills.clone(), enforcement, context_limit, &["explore"], session_id)),
                 Box::new(ReadFileTool { working_directory: working_directory.clone() }),
                 Box::new(GlobTool { working_directory: working_directory.clone() }),
                 Box::new(GrepTool { working_directory: working_directory.clone() }),
@@ -247,7 +253,7 @@ fn build_tool_registry_and_list(
         "general" => {
             let todos = Arc::new(Mutex::new(Vec::<TodoItem>::new()));
             vec![
-                Box::new(task_tool(provider.clone(), pool.clone(), skills.clone(), enforcement, &[], session_id)),
+                Box::new(task_tool(provider.clone(), pool.clone(), skills.clone(), enforcement, context_limit, &[], session_id)),
                 Box::new(ReadFileTool {
                     working_directory: working_directory.clone(),
                 }),
@@ -327,6 +333,7 @@ pub async fn create_agent(
     log: Option<RequestLog>,
     skills: Vec<SkillInfo>,
     enforcement: PathEnforcement,
+    context_limit: Option<usize>,
 ) -> Result<(Agent, Arc<dyn ToolRegistry>)> {
     let working_directory = std::env::current_dir()?;
 
@@ -340,6 +347,7 @@ pub async fn create_agent(
         additional_tools,
         skills.clone(),
         enforcement,
+        context_limit,
         &session_id,
     )?;
     let mut builder = Agent::builder()
@@ -348,6 +356,9 @@ pub async fn create_agent(
         .memory(Box::new(memory))
         .system_prompt(&system_prompt)
         .with_enforcement(enforcement);
+    if let Some(limit) = context_limit {
+        builder = builder.context_limit(limit);
+    }
     if let Some(log) = log { builder = builder.with_log(log); }
     Ok((builder.build()?, registry))
 }
@@ -364,9 +375,10 @@ pub fn agent_profile(
     additional_tools: Vec<Arc<dyn Tool>>,
     skills: Vec<SkillInfo>,
     enforcement: PathEnforcement,
+    context_limit: Option<usize>,
     session_id: &str,
 ) -> Result<(Vec<Arc<dyn Tool>>, String, Arc<dyn ToolRegistry>)> {
-    let (registry, tools_arc) = build_tool_registry_and_list(name, provider, pool, working_directory, additional_tools, skills.clone(), enforcement, session_id)?;
+    let (registry, tools_arc) = build_tool_registry_and_list(name, provider, pool, working_directory, additional_tools, skills.clone(), enforcement, context_limit, session_id)?;
 
     let mut system_prompt = match name {
         "build" => include_str!("prompts/build.txt"),
@@ -395,7 +407,7 @@ mod tests {
     async fn plan_has_no_editing_tools() {
         let pool = sqlx::sqlite::SqlitePoolOptions::new().connect("sqlite::memory:").await.unwrap();
         let dir = tempfile::tempdir().unwrap();
-        let (_, tools) = build_tool_registry_and_list("plan", Arc::new(DummyLlm), pool, dir.path().to_path_buf(), vec![Arc::new(NamedTool("external_mutator"))], vec![], PathEnforcement::Contain, "session").unwrap();
+        let (_, tools) = build_tool_registry_and_list("plan", Arc::new(DummyLlm), pool, dir.path().to_path_buf(), vec![Arc::new(NamedTool("external_mutator"))], vec![], PathEnforcement::Contain, None, "session").unwrap();
         let names: Vec<_> = tools.iter().map(|tool| tool.name()).collect();
         for expected in ["read_file", "glob", "grep", "list", "webfetch", "websearch", "bash", "task", "todowrite", "todoread"] {
             assert!(names.contains(&expected), "Plan is missing {expected}");
@@ -508,6 +520,7 @@ mod tests {
                 Vec::new(),
                 Vec::new(),
                 PathEnforcement::Contain,
+                None,
                 "session",
             )
             .unwrap();
@@ -522,6 +535,7 @@ mod tests {
             Vec::new(),
             Vec::new(),
             PathEnforcement::Contain,
+            None,
             "session",
         )
         .unwrap();
@@ -543,6 +557,7 @@ mod tests {
             Some(log),
             Vec::new(),
             PathEnforcement::Contain,
+            None,
         )
         .await
         .expect("create_agent should accept a request log");
@@ -573,6 +588,7 @@ mod tests {
             None,
             skills,
             PathEnforcement::Contain,
+            None,
         )
         .await
         .expect("create_agent should register the skill tool");
@@ -594,6 +610,7 @@ mod tests {
             vec![Arc::new(NamedTool("apply_patch"))],
             Vec::new(),
             PathEnforcement::Contain,
+            None,
             "session",
         );
         assert!(reserved.err().unwrap().to_string().contains("reserved"));
@@ -606,6 +623,7 @@ mod tests {
             vec![Arc::new(NamedTool("websearch"))],
             Vec::new(),
             PathEnforcement::Contain,
+            None,
             "session",
         );
         assert!(
@@ -630,6 +648,7 @@ mod tests {
             pool: pool.clone(),
             skills: Vec::new(),
             enforcement: PathEnforcement::None,
+            context_limit: None,
             parent_session: "root".to_string(),
         };
         let (_, subagent_id) = factory.create("explore", None).await.unwrap();
@@ -644,6 +663,7 @@ mod tests {
             pool,
             skills: Vec::new(),
             enforcement: PathEnforcement::None,
+            context_limit: None,
             parent_session: subagent_id,
         };
         let error = match nested.create("explore", None).await {
