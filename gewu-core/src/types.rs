@@ -56,6 +56,10 @@ pub struct ToolCall {
 pub enum ContentPart {
     /// Plain text content.
     Text { text: String },
+    /// Model-facing instruction scaffolding (for example, mode reminders)
+    /// appended to user messages. Sent to providers as plain text, but
+    /// hidden from chat UIs, which should not render it as user content.
+    Reminder { text: String },
     /// An image with base64-encoded data and MIME type (e.g., "image/png").
     Image { data: String, mime_type: String },
     /// An audio file with base64-encoded data and MIME type (e.g., "audio/mp3").
@@ -73,7 +77,7 @@ impl ContentPart {
     /// specific MIME type of that media.
     pub fn mime_type(&self) -> String {
         match self {
-            ContentPart::Text { .. } => "text/plain".to_string(),
+            ContentPart::Text { .. } | ContentPart::Reminder { .. } => "text/plain".to_string(),
             ContentPart::Image { mime_type, .. } => mime_type.clone(),
             ContentPart::Audio { mime_type, .. } => mime_type.clone(),
             ContentPart::Video { mime_type, .. } => mime_type.clone(),
@@ -416,4 +420,23 @@ pub struct ExperienceQuery {
 pub struct RecalledExperience {
     pub experience: Experience,
     pub similarity_score: f32,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Reminder parts persist in stored history, so they must round-trip
+    /// through the internally-tagged JSON representation with their own
+    /// type tag (distinct from plain text).
+    #[test]
+    fn reminder_part_round_trips_with_distinct_type_tag() {
+        let part = ContentPart::Reminder {
+            text: "<system-reminder>Plan mode is active.</system-reminder>".to_string(),
+        };
+        let json = serde_json::to_value(&part).unwrap();
+        assert_eq!(json["type"], "reminder");
+        let back: ContentPart = serde_json::from_value(json).unwrap();
+        assert_eq!(back, part);
+    }
 }

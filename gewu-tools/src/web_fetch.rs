@@ -170,8 +170,8 @@ impl Tool for WebFetchTool {
         let output = match input.format.as_str() {
             "html" => html,
             _ => {
-                let markdown = html2md::parse_html(&html);
-                markdown
+                
+                html2md::parse_html(&html)
             }
         };
 

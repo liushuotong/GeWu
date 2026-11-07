@@ -15,7 +15,7 @@ use std::path::{Component, Path, PathBuf};
 use tokio::fs;
 
 pub fn into_tool_error(e: impl Into<anyhow::Error>) -> Box<dyn std::error::Error + Send + Sync> {
-    Box::new(std::io::Error::new(std::io::ErrorKind::Other, e.into()))
+    Box::new(std::io::Error::other(e.into()))
 }
 
 pub fn parse_empty_args(tool_name: &str, required_params: &[(&str, &str)]) -> String {
@@ -299,14 +299,11 @@ pub async fn is_binary_file(path: impl AsRef<Path>, file_size: u64) -> Result<bo
 
     // Binary extensions list (same as legacy). `Path::extension()` yields the
     // name WITHOUT the leading dot, so the patterns must not include one.
-    match ext.as_deref() {
-        Some(
+    if let Some(
             "zip" | "tar" | "gz" | "exe" | "dll" | "so" | "class" | "jar" | "war" | "7z"
             | "doc" | "docx" | "xls" | "xlsx" | "ppt" | "pptx" | "odt" | "ods" | "odp"
             | "bin" | "dat" | "obj" | "o" | "a" | "lib" | "wasm" | "pyc" | "pyo",
-        ) => return Ok(true),
-        _ => {}
-    }
+        ) = ext.as_deref() { return Ok(true) }
 
     if file_size == 0 {
         return Ok(false);
@@ -322,11 +319,11 @@ pub async fn is_binary_file(path: impl AsRef<Path>, file_size: u64) -> Result<bo
     }
 
     let mut non_printable_count = 0;
-    for i in 0..result {
-        if bytes[i] == 0 {
+    for &byte in &bytes[..result] {
+        if byte == 0 {
             return Ok(true);
         }
-        if bytes[i] < 9 || (bytes[i] > 13 && bytes[i] < 32) {
+        if byte < 9 || (byte > 13 && byte < 32) {
             non_printable_count += 1;
         }
     }

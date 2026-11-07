@@ -46,7 +46,7 @@ async fn print_sessions(pool: &SqlitePool) -> Result<()> {
         return Ok(());
     }
 
-    println!("{:<38} {:>8}  {}", "SESSION ID", "MESSAGES", "UPDATED");
+    println!("{:<38} {:>8}  UPDATED", "SESSION ID", "MESSAGES");
     for session in sessions {
         println!(
             "{:<38} {:>8}  {}",
@@ -120,7 +120,7 @@ fn format_content_parts(parts: &[ContentPart]) -> String {
     parts
         .iter()
         .map(|part| match part {
-            ContentPart::Text { text } => text.clone(),
+            ContentPart::Text { text } | ContentPart::Reminder { text } => text.clone(),
             ContentPart::Image { mime_type, .. } => format!("[image: {}]", mime_type),
             ContentPart::Audio { mime_type, .. } => format!("[audio: {}]", mime_type),
             ContentPart::Video { mime_type, .. } => format!("[video: {}]", mime_type),

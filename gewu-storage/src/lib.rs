@@ -52,6 +52,31 @@ use tracing::{error, info};
 
 async fn ensure_reverts(pool: &SqlitePool) -> Result<()> {
     sqlx::query("CREATE TABLE IF NOT EXISTS chat_reverts (session_id TEXT PRIMARY KEY, messages TEXT NOT NULL)").execute(pool).await?;
+    // Reminders became durable after chat_reverts existed; add the column
+    // best-effort so older databases keep working.
+    let _ = sqlx::query("ALTER TABLE chat_reverts ADD COLUMN reminder_state TEXT").execute(pool).await;
+    Ok(())
+}
+
+async fn ensure_reminders(pool: &SqlitePool) -> Result<()> {
+    sqlx::query("CREATE TABLE IF NOT EXISTS session_reminders (session_id TEXT PRIMARY KEY, state TEXT NOT NULL)").execute(pool).await?;
+    Ok(())
+}
+
+/// The durable per-session reminder state, or `None` when the session has
+/// never persisted one.
+pub async fn get_reminder_opt(pool: &SqlitePool, session_id: &str) -> Result<Option<gewu_core::agent::Reminder>> {
+    ensure_reminders(pool).await?;
+    let state: Option<String> = sqlx::query_scalar("SELECT state FROM session_reminders WHERE session_id = ?")
+        .bind(session_id).fetch_optional(pool).await?;
+    Ok(state.and_then(|text| serde_json::from_str(&text).ok()))
+}
+
+/// Persist the per-session reminder state (upsert).
+pub async fn set_reminder(pool: &SqlitePool, session_id: &str, reminder: &gewu_core::agent::Reminder) -> Result<()> {
+    ensure_reminders(pool).await?;
+    sqlx::query("INSERT INTO session_reminders (session_id, state) VALUES (?, ?) ON CONFLICT(session_id) DO UPDATE SET state = excluded.state")
+        .bind(session_id).bind(serde_json::to_string(reminder)?).execute(pool).await?;
     Ok(())
 }
 
@@ -147,14 +172,34 @@ mod revert_tests {
             memory.add_message(Message::User { content: vec![gewu_core::types::ContentPart::Text { text: text.into() }] }).await;
         }
         let original = memory.messages().to_vec();
-        assert!(revert_chat(&pool, "chat", Some(9), false).await.is_err());
-        assert_eq!(revert_chat(&pool, "chat", None, false).await.unwrap(), original[..1]);
+        let reminder = gewu_core::agent::Reminder::switch("FULL", Some("SPARSE".into()));
+        assert!(revert_chat(&pool, "chat", Some(9), false, Some(&reminder)).await.is_err());
+        let (reverted, restored) = revert_chat(&pool, "chat", None, false, Some(&reminder)).await.unwrap();
+        assert_eq!(reverted, original[..1]);
+        assert!(restored.is_none(), "forward reverts never restore a reminder");
         assert_eq!(SqliteMemory::new(pool.clone(), "chat".into()).await.unwrap().messages().len(), 1);
-        assert_eq!(revert_chat(&pool, "chat", None, true).await.unwrap(), original);
-        assert!(revert_chat(&pool, "chat", None, true).await.is_err());
-        revert_chat(&pool, "chat", Some(0), false).await.unwrap();
+        let (restored_messages, restored_reminder) = revert_chat(&pool, "chat", None, true, None).await.unwrap();
+        assert_eq!(restored_messages, original);
+        assert_eq!(restored_reminder.as_ref().unwrap().texts(), reminder.texts());
+        assert!(revert_chat(&pool, "chat", None, true, None).await.is_err());
+        revert_chat(&pool, "chat", Some(0), false, Some(&reminder)).await.unwrap();
         commit_chat_revert(&pool, "chat").await.unwrap();
-        assert!(revert_chat(&pool, "chat", None, true).await.is_err());
+        assert!(revert_chat(&pool, "chat", None, true, None).await.is_err());
+    }
+
+    #[tokio::test]
+    async fn reminder_state_round_trips_through_sql() {
+        let pool = sqlx::sqlite::SqlitePoolOptions::new().max_connections(1).connect("sqlite::memory:").await.unwrap();
+        assert!(get_reminder_opt(&pool, "sess").await.unwrap().is_none());
+        let reminder = gewu_core::agent::Reminder::switch("FULL", None);
+        set_reminder(&pool, "sess", &reminder).await.unwrap();
+        let stored = get_reminder_opt(&pool, "sess").await.unwrap().unwrap();
+        assert_eq!(stored.texts(), reminder.texts());
+        // Upsert replaces the state.
+        let updated = gewu_core::agent::Reminder::continue_at("FULL", Some("SPARSE".into()), 7);
+        set_reminder(&pool, "sess", &updated).await.unwrap();
+        let stored = get_reminder_opt(&pool, "sess").await.unwrap().unwrap();
+        assert_eq!(stored.texts(), updated.texts());
     }
 }
 
@@ -166,21 +211,28 @@ pub async fn commit_chat_revert(pool: &SqlitePool, session_id: &str) -> Result<(
 
 /// Revert to the zero-based user turn, or restore the last staged revert.
 /// Only conversation rows are touched, never workspace files.
-pub async fn revert_chat(pool: &SqlitePool, session_id: &str, turn: Option<usize>, undo: bool) -> Result<Vec<Message>> {
+///
+/// The reminder state is snapshotted alongside the messages and returned
+/// restored on undo; on a forward revert the caller recomputes it from the
+/// retained history and persists it separately.
+pub async fn revert_chat(pool: &SqlitePool, session_id: &str, turn: Option<usize>, undo: bool, reminder: Option<&gewu_core::agent::Reminder>) -> Result<(Vec<Message>, Option<gewu_core::agent::Reminder>)> {
     ensure_reverts(pool).await?;
     let mut tx = pool.begin().await?;
     let rows: Vec<(String,)> = sqlx::query_as("SELECT content FROM memory_messages WHERE session_id = ? ORDER BY id").bind(session_id).fetch_all(&mut *tx).await?;
     let current: Vec<Message> = rows.iter().map(|(text,)| serde_json::from_str(text)).collect::<std::result::Result<_, _>>()?;
-    let next = if undo {
-        let saved: Option<String> = sqlx::query_scalar("SELECT messages FROM chat_reverts WHERE session_id = ?").bind(session_id).fetch_optional(&mut *tx).await?;
-        serde_json::from_str(&saved.ok_or_else(|| anyhow::anyhow!("no chat revert to undo"))?)?
+    let (next, restored_reminder) = if undo {
+        let saved: Option<(String, Option<String>)> = sqlx::query_as("SELECT messages, reminder_state FROM chat_reverts WHERE session_id = ?").bind(session_id).fetch_optional(&mut *tx).await?;
+        let (saved_messages, saved_reminder) = saved.ok_or_else(|| anyhow::anyhow!("no chat revert to undo"))?;
+        let next: Vec<Message> = serde_json::from_str(&saved_messages)?;
+        let restored = saved_reminder.and_then(|text| serde_json::from_str(&text).ok());
+        (next, restored)
     } else {
         let users: Vec<usize> = current.iter().enumerate().filter_map(|(i,m)| matches!(m, Message::User { .. }).then_some(i)).collect();
         let target = turn.unwrap_or_else(|| users.len().saturating_sub(1));
         let boundary = *users.get(target).ok_or_else(|| anyhow::anyhow!("user turn not found"))?;
-        sqlx::query("INSERT INTO chat_reverts(session_id, messages) VALUES (?, ?) ON CONFLICT(session_id) DO UPDATE SET messages = excluded.messages")
-            .bind(session_id).bind(serde_json::to_string(&current)?).execute(&mut *tx).await?;
-        current[..boundary].to_vec()
+        sqlx::query("INSERT INTO chat_reverts(session_id, messages, reminder_state) VALUES (?, ?, ?) ON CONFLICT(session_id) DO UPDATE SET messages = excluded.messages, reminder_state = excluded.reminder_state")
+            .bind(session_id).bind(serde_json::to_string(&current)?).bind(reminder.map(serde_json::to_string).transpose()?).execute(&mut *tx).await?;
+        (current[..boundary].to_vec(), None)
     };
     sqlx::query("DELETE FROM memory_messages WHERE session_id = ?").bind(session_id).execute(&mut *tx).await?;
     for message in &next {
@@ -188,7 +240,7 @@ pub async fn revert_chat(pool: &SqlitePool, session_id: &str, turn: Option<usize
     }
     if undo { sqlx::query("DELETE FROM chat_reverts WHERE session_id = ?").bind(session_id).execute(&mut *tx).await?; }
     tx.commit().await?;
-    Ok(next)
+    Ok((next, restored_reminder))
 }
 
 /// Session profile metadata is separate from message history (legacy sessions

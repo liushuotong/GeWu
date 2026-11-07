@@ -69,7 +69,7 @@ impl Agent {
         // Prior checkpoint's recent tail is context for the new summary too.
         let prior_recent = prior_checkpoint.as_ref().map(|(_, recent)| recent.clone());
 
-        if head.is_empty() && prior_recent.as_ref().map_or(true, |r| r.is_empty()) {
+        if head.is_empty() && prior_recent.as_ref().is_none_or(|r| r.is_empty()) {
             // Nothing older than the tail exists to summarize (e.g. one huge
             // message). Compaction cannot shrink this further; let the
             // request through and surface any provider overflow directly.

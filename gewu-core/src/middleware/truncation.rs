@@ -99,13 +99,13 @@ impl TruncationService {
         let mut bytes = 0;
         let mut hit_bytes = false;
 
-        for i in 0..lines.len().min(self.max_lines) {
-            let line_size = lines[i].len() + if i > 0 { 1 } else { 0 };
+        for (i, line) in lines.iter().enumerate().take(lines.len().min(self.max_lines)) {
+            let line_size = line.len() + if i > 0 { 1 } else { 0 };
             if bytes + line_size > self.max_bytes {
                 hit_bytes = true;
                 break;
             }
-            out_lines.push(lines[i]);
+            out_lines.push(line);
             bytes += line_size;
         }
 
@@ -124,17 +124,10 @@ impl TruncationService {
             Full output saved to the file above. \
             Use grep to search the full content or read with offset/limit to view specific sections.";
 
-        let truncated_content = if hit_bytes {
-            format!(
-                "{}\n\n...{} {} truncated...\n\n{}",
-                preview, removed, unit, hint
-            )
-        } else {
-            format!(
-                "{}\n\n...{} {} truncated...\n\n{}",
-                preview, removed, unit, hint
-            )
-        };
+        let truncated_content = format!(
+            "{}\n\n...{} {} truncated...\n\n{}",
+            preview, removed, unit, hint
+        );
 
         let dir_created = std::fs::create_dir_all(&self.truncation_dir).is_ok();
         let write_ok = dir_created && std::fs::write(&file_path, text).is_ok();

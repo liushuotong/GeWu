@@ -26,11 +26,11 @@ fn levenshtein(a: &str, b: &str) -> f64 {
 
     let mut matrix = vec![vec![0usize; b_len + 1]; a_len + 1];
 
-    for i in 0..=a_len {
-        matrix[i][0] = i;
+    for (i, row) in matrix.iter_mut().enumerate() {
+        row[0] = i;
     }
-    for j in 0..=b_len {
-        matrix[0][j] = j;
+    for (j, cell) in matrix[0].iter_mut().enumerate() {
+        *cell = j;
     }
 
     for i in 1..=a_len {
@@ -83,10 +83,10 @@ fn line_trimmed_replace(content: &str, search: &str) -> Option<(usize, usize)> {
         }
 
         if matches_line {
-            let mut match_start_index = 0;
-            for k in 0..i {
-                match_start_index += original_lines[k].len() + 1;
-            }
+            let match_start_index: usize = original_lines[..i]
+                .iter()
+                .map(|line| line.len() + 1)
+                .sum();
 
             let mut match_end_index = match_start_index;
             for k in 0..search_lines.len() {
@@ -171,8 +171,8 @@ fn block_anchor_replace(content: &str, search: &str) -> Option<(usize, usize)> {
             continue;
         }
 
-        for j in (i + 2)..original_lines.len() {
-            if original_lines[j].trim() == last_line_search {
+        for (j, line) in original_lines.iter().enumerate().skip(i + 2) {
+            if line.trim() == last_line_search {
                 candidates.push(Candidate {
                     start_line: i,
                     end_line: j,
@@ -191,22 +191,22 @@ fn block_anchor_replace(content: &str, search: &str) -> Option<(usize, usize)> {
         let actual_block_size = cand.end_line - cand.start_line + 1;
 
         let lines_to_check = (search_block_size - 2).min(actual_block_size.saturating_sub(2));
-        let similarity;
+        
 
-        if lines_to_check > 0 {
+        let similarity = if lines_to_check > 0 {
             // Average similarity across ALL middle lines of the candidate
             // block, then gate on the threshold. Checking a single line and
             // breaking early would make the gate a no-op (any two non-empty
             // lines have Levenshtein similarity > 0), allowing wildly
             // different blocks to match and corrupting the file.
             let mut total = 0.0;
-            for j in 1..search_block_size - 1 {
+            for (j, raw_search_line) in search_lines.iter().enumerate().take(search_block_size - 1).skip(1) {
                 let orig_idx = cand.start_line + j;
                 if orig_idx >= original_lines.len() {
                     break;
                 }
                 let original_line = original_lines[orig_idx].trim();
-                let search_line = search_lines[j].trim();
+                let search_line = raw_search_line.trim();
                 let max_len = original_line.len().max(search_line.len());
                 if max_len == 0 {
                     continue;
@@ -214,19 +214,24 @@ fn block_anchor_replace(content: &str, search: &str) -> Option<(usize, usize)> {
                 let distance = levenshtein(original_line, search_line);
                 total += 1.0 - distance / max_len as f64;
             }
-            similarity = total / lines_to_check as f64;
+            total / lines_to_check as f64
         } else {
-            similarity = 1.0;
-        }
+            1.0
+        };
 
         if similarity >= SINGLE_CANDIDATE_SIMILARITY_THRESHOLD {
-            let mut match_start_index = 0;
-            for k in 0..cand.start_line {
-                match_start_index += original_lines[k].len() + 1;
-            }
+            let match_start_index: usize = original_lines[..cand.start_line]
+                .iter()
+                .map(|line| line.len() + 1)
+                .sum();
             let mut match_end_index = match_start_index;
-            for k in cand.start_line..=cand.end_line {
-                match_end_index += original_lines[k].len();
+            for (k, line) in original_lines
+                .iter()
+                .enumerate()
+                .take(cand.end_line + 1)
+                .skip(cand.start_line)
+            {
+                match_end_index += line.len();
                 if k < cand.end_line {
                     match_end_index += 1;
                 }
@@ -245,13 +250,13 @@ fn block_anchor_replace(content: &str, search: &str) -> Option<(usize, usize)> {
         let lines_to_check = (search_block_size - 2).min(actual_block_size.saturating_sub(2));
 
         if lines_to_check > 0 {
-            for j in 1..search_block_size - 1 {
+            for (j, raw_search_line) in search_lines.iter().enumerate().take(search_block_size - 1).skip(1) {
                 let orig_idx = cand.start_line + j;
                 if orig_idx >= original_lines.len() {
                     continue;
                 }
                 let original_line = original_lines[orig_idx].trim();
-                let search_line = search_lines[j].trim();
+                let search_line = raw_search_line.trim();
                 let max_len = original_line.len().max(search_line.len());
                 if max_len == 0 {
                     continue;
@@ -270,22 +275,26 @@ fn block_anchor_replace(content: &str, search: &str) -> Option<(usize, usize)> {
         }
     }
 
-    if max_similarity >= MULTIPLE_CANDIDATES_SIMILARITY_THRESHOLD {
-        if let Some(best) = best_match {
-            let mut match_start_index = 0;
-            for k in 0..best.start_line {
-                match_start_index += original_lines[k].len() + 1;
-            }
+    if max_similarity >= MULTIPLE_CANDIDATES_SIMILARITY_THRESHOLD
+        && let Some(best) = best_match {
+            let match_start_index: usize = original_lines[..best.start_line]
+                .iter()
+                .map(|line| line.len() + 1)
+                .sum();
             let mut match_end_index = match_start_index;
-            for k in best.start_line..=best.end_line {
-                match_end_index += original_lines[k].len();
+            for (k, line) in original_lines
+                .iter()
+                .enumerate()
+                .take(best.end_line + 1)
+                .skip(best.start_line)
+            {
+                match_end_index += line.len();
                 if k < best.end_line {
                     match_end_index += 1;
                 }
             }
             return Some((match_start_index, match_end_index));
         }
-    }
 
     None
 }
@@ -299,10 +308,7 @@ fn whitespace_normalized_replace(content: &str, search: &str) -> Option<(usize, 
         let normalized_line = normalize(line);
 
         if normalized_line == normalized_search {
-            let mut start = 0;
-            for j in 0..i {
-                start += lines[j].len() + 1;
-            }
+            let start: usize = lines[..i].iter().map(|line| line.len() + 1).sum();
             return Some((start, start + line.len()));
         }
     }
@@ -324,10 +330,10 @@ fn indentation_flexible_replace(content: &str, search: &str) -> Option<(usize, u
         let block = content_lines[i..i + find_lines.len()].join("\n");
         let (normalized_block, _) = remove_indentation(&block);
         if normalized_block == normalized_find {
-            let mut start = 0;
-            for j in 0..i {
-                start += content_lines[j].len() + 1;
-            }
+            let start: usize = content_lines[..i]
+                .iter()
+                .map(|line| line.len() + 1)
+                .sum();
             let end = start + block.len();
             return Some((start, end));
         }
@@ -450,10 +456,10 @@ fn context_aware_replace(content: &str, search: &str) -> Option<(usize, usize)> 
                     };
 
                     if ratio >= 0.5 {
-                        let mut start = 0;
-                        for k in 0..i {
-                            start += content_lines[k].len() + 1;
-                        }
+                        let start: usize = content_lines[..i]
+                            .iter()
+                            .map(|line| line.len() + 1)
+                            .sum();
                         let end = start + block.len();
                         return Some((start, end));
                     }

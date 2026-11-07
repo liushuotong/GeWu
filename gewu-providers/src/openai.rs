@@ -542,15 +542,11 @@ impl FunctionObjectArgs {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Default)]
 pub struct ChatCompletionRequestSystemMessageArgs {
     content: Option<String>,
 }
 
-impl Default for ChatCompletionRequestSystemMessageArgs {
-    fn default() -> Self {
-        Self { content: None }
-    }
-}
 
 impl ChatCompletionRequestSystemMessageArgs {
     pub fn content(mut self, content: String) -> Self {
@@ -566,15 +562,11 @@ impl ChatCompletionRequestSystemMessageArgs {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Default)]
 pub struct ChatCompletionRequestUserMessageArgs {
     content: Option<Vec<ChatCompletionRequestUserMessageContentPart>>,
 }
 
-impl Default for ChatCompletionRequestUserMessageArgs {
-    fn default() -> Self {
-        Self { content: None }
-    }
-}
 
 impl ChatCompletionRequestUserMessageArgs {
     pub fn content(mut self, content: Vec<ChatCompletionRequestUserMessageContentPart>) -> Self {
@@ -590,19 +582,12 @@ impl ChatCompletionRequestUserMessageArgs {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Default)]
 pub struct ChatCompletionRequestToolMessageArgs {
     tool_call_id: Option<String>,
     content: Option<String>,
 }
 
-impl Default for ChatCompletionRequestToolMessageArgs {
-    fn default() -> Self {
-        Self {
-            tool_call_id: None,
-            content: None,
-        }
-    }
-}
 
 impl ChatCompletionRequestToolMessageArgs {
     pub fn tool_call_id(mut self, tool_call_id: String) -> Self {

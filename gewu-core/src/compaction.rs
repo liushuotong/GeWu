@@ -100,7 +100,7 @@ fn estimate_content_tokens(content: &[ContentPart]) -> usize {
     content
         .iter()
         .map(|part| match part {
-            ContentPart::Text { text } => estimate_tokens(text),
+            ContentPart::Text { text } | ContentPart::Reminder { text } => estimate_tokens(text),
             ContentPart::Image { data, .. } => estimate_tokens(data),
             ContentPart::Audio { data, .. } => estimate_tokens(data),
             ContentPart::Video { data, .. } => estimate_tokens(data),
@@ -161,7 +161,7 @@ fn truncate_output(value: &str) -> String {
 /// note instead of base64 noise.
 fn content_part_text(part: &ContentPart) -> String {
     match part {
-        ContentPart::Text { text } => text.clone(),
+        ContentPart::Text { text } | ContentPart::Reminder { text } => text.clone(),
         ContentPart::Image { mime_type, .. } => format!("[Attached {mime_type} image]"),
         ContentPart::Audio { mime_type, .. } => format!("[Attached {mime_type} audio]"),
         ContentPart::Video { mime_type, .. } => format!("[Attached {mime_type} video]"),

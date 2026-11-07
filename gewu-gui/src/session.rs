@@ -565,9 +565,8 @@ impl GuiSession {
                 if let Err(e) = self.ensure_client(tab).await { return self.send_error(sender, e.to_string()).await; }
                 let client = self.client(tab).expect("ensured");
                 // Bind resumed tabs before switching so their conversation is retained.
-                if let Some(id) = self.workspace.tab(tab).and_then(|tab| tab.model.session_id.clone()) {
-                    if let Err(e) = client.usage(Some(&id)).await { return self.send_error(sender, e.to_string()).await; }
-                }
+                if let Some(id) = self.workspace.tab(tab).and_then(|tab| tab.model.session_id.clone())
+                    && let Err(e) = client.usage(Some(&id)).await { return self.send_error(sender, e.to_string()).await; }
                 match client.switch_agent(agent.clone()).await {
                     Ok((id, tools)) => {
                         let tab_state = self.workspace.tab_mut(tab).expect("known tab");
@@ -898,9 +897,8 @@ impl GuiSession {
                     model.set_session(Some(session_id));
                     for message in &messages { model.apply_message(message); }
                     for frame in frames {
-                        if let ServerMessage::Event { event, .. } = frame {
-                            if let Ok(event) = serde_json::from_value::<AgentEvent>(event) { model.apply_event(&event); }
-                        }
+                        if let ServerMessage::Event { event, .. } = frame
+                            && let Ok(event) = serde_json::from_value::<AgentEvent>(event) { model.apply_event(&event); }
                     }
                     model.phase = if busy { Phase::Busy } else { Phase::Idle };
                     let changed = tab.model.blocks != model.blocks || tab.model.phase != model.phase;
@@ -1007,9 +1005,8 @@ impl GuiSession {
         if terminal {
             self.refresh_usage(event.tab_id).await;
             let session_id = self.workspace.tab(event.tab_id).and_then(|tab| tab.model.session_id.clone());
-            if !self.conns.get(&event.tab_id).is_some_and(|conn| conn.observing) {
-                if let Some(session_id) = session_id { self.observe(event.tab_id, session_id, false).await?; }
-            }
+            if !self.conns.get(&event.tab_id).is_some_and(|conn| conn.observing)
+                && let Some(session_id) = session_id { self.observe(event.tab_id, session_id, false).await?; }
         }
 
         let active = active_id == event.tab_id;

@@ -61,8 +61,6 @@ pub const DEFAULT_TCP_PORT: u16 = 8421;
 /// instead of being buffered without bound.
 pub const MAX_LINE_BYTES: usize = 1024 * 1024;
 
-/// Default agent profile used when the client does not specify one.
-
 /// Shared server context handed to each connection handler.
 struct ServerState {
     bootstrap: Bootstrap,
@@ -117,9 +115,8 @@ impl LiveTurn {
         let line = message.to_line();
         self.bytes += line.len();
         self.frames.push(message);
-        if self.bytes > 16 * 1024 * 1024 {
-            if let Some(cancel) = self.cancel.take() { let _ = cancel.send(()); }
-        }
+        if self.bytes > 16 * 1024 * 1024
+            && let Some(cancel) = self.cancel.take() { let _ = cancel.send(()); }
         // Disconnect slow readers rather than silently losing updates.
         self.subscribers.retain(|subscriber| subscriber.send(&line));
     }
@@ -369,15 +366,18 @@ impl ServerState {
         }
 
         let (agent, _registry) = create_agent(
-            &agent_name,
-            self.bootstrap.provider.clone(),
-            self.bootstrap.pool.clone(),
-            session_id.clone(),
-            self.bootstrap.mcp_tools.clone(),
+            registry::ProfileInputs {
+                name: &agent_name,
+                provider: self.bootstrap.provider.clone(),
+                pool: self.bootstrap.pool.clone(),
+                working_directory: self.bootstrap.working_directory.clone().into(),
+                additional_tools: self.bootstrap.mcp_tools.clone(),
+                skills: self.bootstrap.skills.clone(),
+                enforcement: self.bootstrap.enforcement,
+                context_limit: self.bootstrap.context_limit,
+                session_id: &session_id,
+            },
             self.bootstrap.log_writer.clone(),
-            self.bootstrap.skills.clone(),
-            self.bootstrap.enforcement,
-            self.bootstrap.context_limit,
         )
         .await?;
         info!("Created session {} (agent: {})", session_id, agent_name);
@@ -544,9 +544,8 @@ async fn handle_request(
     running: &mut Option<RunningAsk>,
     request: ClientRequest,
 ) -> Result<Handled, RequestError> {
-    if let Some(active) = running.as_ref() {
-        if !state.busy_sessions.lock().await.contains(&active.session_id) { *running = None; }
-    }
+    if let Some(active) = running.as_ref()
+        && !state.busy_sessions.lock().await.contains(&active.session_id) { *running = None; }
     match request.op {
         Op::SubscribeSession => {
             let current = state.get_or_create_session(session, request.session_id, request.agent)
@@ -558,9 +557,35 @@ async fn handle_request(
             let current = state.get_or_create_session(session, request.session_id, None).await.map_err(|e| RequestError::Failed(e.to_string()))?;
             if !state.claim_session(&current.session_id).await { return Err(RequestError::Failed("session is busy".into())); }
             let result = async {
-                let messages = gewu_storage::revert_chat(&state.bootstrap.pool, &current.session_id, turn, undo).await?;
+                let reminder = current.agent.lock().await.reminder().clone();
+                let (messages, restored_reminder) = gewu_storage::revert_chat(
+                    &state.bootstrap.pool, &current.session_id, turn, undo, Some(&reminder),
+                ).await?;
                 let memory = gewu_storage::SqliteMemory::new(state.bootstrap.pool.clone(), current.session_id.clone()).await?;
-                current.agent.lock().await.memory = Box::new(memory);
+                {
+                    let mut agent = current.agent.lock().await;
+                    agent.memory = Box::new(memory);
+                    let next = match restored_reminder {
+                        // Undo restores the exact state snapshotted with the messages.
+                        Some(restored) => restored,
+                        // Forward revert: if the retained history lost its
+                        // reminder (the boundary cut the message carrying it),
+                        // re-arm so the profile never becomes unenforced.
+                        None => {
+                            let (full, sparse) = agent.reminder().texts();
+                            if gewu_core::agent::Reminder::in_history(&messages) {
+                                let user_turns = messages.iter().filter(|m| matches!(m, Message::User { .. })).count();
+                                gewu_core::agent::Reminder::continue_at(full, sparse, user_turns)
+                            } else {
+                                registry::profile_reminder(None, &current.agent_name)
+                            }
+                        }
+                    };
+                    agent.set_reminder(next);
+                    if let Err(e) = gewu_storage::set_reminder(&state.bootstrap.pool, &current.session_id, agent.reminder()).await {
+                        tracing::error!("failed to persist reminder state after revert: {e}");
+                    }
+                }
                 Ok::<_, anyhow::Error>(messages)
             }.await;
             state.release_session(&current.session_id).await;
@@ -598,13 +623,26 @@ async fn handle_request(
             if !state.claim_session(&current.session_id).await {
                 return Err(RequestError::Failed("session is busy on another connection".into()));
             }
-            let replacement = registry::agent_profile(&target, state.bootstrap.provider.clone(), state.bootstrap.pool.clone(), state.bootstrap.working_directory.clone().into(), state.bootstrap.mcp_tools.clone(), state.bootstrap.skills.clone(), state.bootstrap.enforcement, state.bootstrap.context_limit, &current.session_id);
+            let replacement = registry::agent_profile(registry::ProfileInputs {
+                name: &target,
+                provider: state.bootstrap.provider.clone(),
+                pool: state.bootstrap.pool.clone(),
+                working_directory: state.bootstrap.working_directory.clone().into(),
+                additional_tools: state.bootstrap.mcp_tools.clone(),
+                skills: state.bootstrap.skills.clone(),
+                enforcement: state.bootstrap.enforcement,
+                context_limit: state.bootstrap.context_limit,
+                session_id: &current.session_id,
+            });
             let result = match replacement {
                 Ok((tools, prompt, _)) => match gewu_storage::set_session_agent(&state.bootstrap.pool, &current.session_id, &target).await {
                     Ok(()) => {
                         let mut agent = current.agent.lock().await;
                         let reminder = registry::profile_reminder(Some(&current.agent_name), &target);
                         agent.set_profile(prompt, tools, reminder);
+                        if let Err(e) = gewu_storage::set_reminder(&state.bootstrap.pool, &current.session_id, agent.reminder()).await {
+                            tracing::error!("failed to persist reminder state after switch: {e}");
+                        }
                         let tools = agent.list_tools();
                          *session = Some(ConnectionSession { agent: current.agent.clone(), session_id: current.session_id.clone(), agent_name: target.clone(), tools: tools.clone() });
                         state.sessions.lock().await.insert(current.session_id.clone(), session.as_ref().unwrap().clone());
@@ -1001,6 +1039,7 @@ async fn execute_ask<E, Fut>(
     session: &ConnectionSession,
     request_id: &str,
     prompt: &str,
+    pool: &sqlx::SqlitePool,
     mut emit: E,
 ) where
     E: FnMut(ServerMessage) -> Fut,
@@ -1010,38 +1049,52 @@ async fn execute_ask<E, Fut>(
     // Repair any history left inconsistent by a previous interrupt.
     patch_dangling_tool_calls(&mut agent).await;
 
-    let mut stream = Box::pin(agent.ask(prompt));
-    // Whether a terminal frame (`result` or `error`) has been sent. Only
-    // the `Finish` event and stream errors are terminal; an `AgentEvent::Error`
-    // can be mid-stream (e.g. one failed tool among several).
+    let mut client_gone = false;
     let mut terminal_sent = false;
-    while let Some(event_result) = stream.next().await {
-        let message = match event_result {
-            Ok(AgentEvent::Finish { response }) => {
-                terminal_sent = true;
-                ServerMessage::Result {
+    {
+        let mut stream = Box::pin(agent.ask(prompt));
+        // Whether a terminal frame (`result` or `error`) has been sent. Only
+        // the `Finish` event and stream errors are terminal; an `AgentEvent::Error`
+        // can be mid-stream (e.g. one failed tool among several).
+        while let Some(event_result) = stream.next().await {
+            let message = match event_result {
+                Ok(AgentEvent::Finish { response }) => {
+                    terminal_sent = true;
+                    ServerMessage::Result {
+                        id: Value::Null,
+                        request_id: request_id.to_string(),
+                        session_id: session.session_id.clone(),
+                        response: response.clone(),
+                    }
+                }
+                Ok(event) => ServerMessage::Event {
                     id: Value::Null,
                     request_id: request_id.to_string(),
-                    session_id: session.session_id.clone(),
-                    response: response.clone(),
+                    event: protocol::agent_event_to_value(&event),
+                },
+                Err(e) => {
+                    terminal_sent = true;
+                    ServerMessage::Error {
+                        id: None,
+                        error: e.to_string(),
+                    }
                 }
+            };
+            if emit(message).await.is_err() {
+                client_gone = true; // client went away; drop the stream and release the lock
+                break;
             }
-            Ok(event) => ServerMessage::Event {
-                id: Value::Null,
-                request_id: request_id.to_string(),
-                event: protocol::agent_event_to_value(&event),
-            },
-            Err(e) => {
-                terminal_sent = true;
-                ServerMessage::Error {
-                    id: None,
-                    error: e.to_string(),
-                }
-            }
-        };
-        if emit(message).await.is_err() {
-            return; // client went away; drop the stream and release the lock
         }
+    }
+
+    // The reminder cadence advanced during this turn (counter, pending
+    // consumption); make the new state durable before releasing the agent.
+    if let Err(e) = gewu_storage::set_reminder(pool, &session.session_id, agent.reminder()).await {
+        tracing::error!("failed to persist reminder state after turn: {e}");
+    }
+    drop(agent);
+    if client_gone {
+        return;
     }
 
     // The agent stream ended without a terminal event (e.g. max turns
@@ -1087,11 +1140,12 @@ async fn start_session_turn(
         }
     }
     if subscriber.send(&ready.to_line()) { live.lock().await.subscribers.push(subscriber); }
+    let worker_pool = state.bootstrap.pool.clone();
     tokio::spawn(async move {
         let worker_session = session.clone();
         let worker_live = live.clone();
         let mut worker = tokio::spawn(async move {
-            execute_ask(&worker_session, &request_id, &prompt, |message| {
+            execute_ask(&worker_session, &request_id, &prompt, &worker_pool, |message| {
                 let live = worker_live.clone();
                 async move {
                     let mut live = live.lock().await;
@@ -1733,12 +1787,13 @@ mod tests {
     }
 
     async fn collect_ask(session: &ConnectionSession, prompt: &str) -> Vec<String> {
+        let pool = sqlx::sqlite::SqlitePoolOptions::new().connect("sqlite::memory:").await.unwrap();
         let (tx, mut rx) = mpsc::channel::<String>(256);
         let handle = tokio::spawn({
             let session = session.clone();
             let prompt = prompt.to_string();
             async move {
-                execute_ask(&session, "req-test", &prompt, |msg| {
+                execute_ask(&session, "req-test", &prompt, &pool, |msg| {
                     let tx = tx.clone();
                     async move { tx.send(msg.to_line()).await.map_err(anyhow::Error::from) }
                 })
@@ -2143,6 +2198,65 @@ mod tests {
         assert_eq!(current.agent.lock().await.memory.messages().len(), 1);
         handle_request(&state, &mut session, &mut running, ClientRequest::revert_chat(2, None, true)).await.unwrap();
         assert_eq!(current.agent.lock().await.memory.messages().len(), 2);
+    }
+
+    /// Reverting past the message carrying the plan reminder must re-arm it:
+    /// otherwise the profile stays plan (restricted tools) while the model
+    /// loses every plan-mode signal — the original README-edit regression.
+    #[tokio::test]
+    async fn revert_past_the_switch_reminder_re_arms_it() {
+        let state = server_state_with(TestLlm::plain());
+        let mut session = None;
+        let current = state.get_or_create_session(&mut session, Some("revert-plan".into()), Some("plan".into())).await.unwrap();
+        {
+            let mut agent = current.agent.lock().await;
+            // Simulate the first plan turn: reminder consumed into history.
+            let (full, sparse) = agent.reminder().texts();
+            agent.set_reminder(gewu_core::agent::Reminder::continue_at(full, sparse, 1));
+            agent.memory.add_message(Message::User { content: vec![
+                gewu_core::types::ContentPart::Text { text: "Update README.md".into() },
+                gewu_core::types::ContentPart::Reminder { text: "Plan mode is active".into() },
+            ]}).await;
+        }
+        let mut running = None;
+        handle_request(&state, &mut session, &mut running, ClientRequest::revert_chat(0, None, false)).await.unwrap();
+        let agent = current.agent.lock().await;
+        assert!(
+            agent.memory.messages().iter().all(|m| !matches!(m, Message::User { .. })),
+            "revert to turn 0 truncates every user message"
+        );
+        let reminder = agent.reminder();
+        assert!(reminder.pending().is_some(), "a fresh reminder must be pending after the revert");
+        assert_eq!(reminder.user_turns(), 0);
+    }
+
+    /// When the retained history still carries the reminder, reverting must
+    /// not re-arm it — the next ask would append a duplicate.
+    #[tokio::test]
+    async fn revert_with_retained_reminder_does_not_duplicate_it() {
+        let state = server_state_with(TestLlm::plain());
+        let mut session = None;
+        let current = state.get_or_create_session(&mut session, Some("revert-keep".into()), Some("plan".into())).await.unwrap();
+        {
+            let mut agent = current.agent.lock().await;
+            let (full, sparse) = agent.reminder().texts();
+            agent.set_reminder(gewu_core::agent::Reminder::continue_at(full, sparse, 2));
+            agent.memory.add_message(Message::User { content: vec![
+                gewu_core::types::ContentPart::Text { text: "first".into() },
+                gewu_core::types::ContentPart::Reminder { text: "Plan mode is active".into() },
+            ]}).await;
+            agent.memory.add_message(Message::User { content: vec![
+                gewu_core::types::ContentPart::Text { text: "second".into() },
+            ]}).await;
+        }
+        let mut running = None;
+        // Revert to turn 1: the first user message (with its reminder) stays.
+        handle_request(&state, &mut session, &mut running, ClientRequest::revert_chat(1, None, false)).await.unwrap();
+        let agent = current.agent.lock().await;
+        assert_eq!(agent.memory.messages().len(), 1);
+        let reminder = agent.reminder();
+        assert!(reminder.pending().is_none(), "retained reminder must not be duplicated");
+        assert_eq!(reminder.user_turns(), 1, "cadence realigns with retained history");
     }
 
     #[tokio::test]
@@ -2897,10 +3011,11 @@ mod tests {
         };
 
         let (tx, mut rx) = mpsc::channel::<String>(256);
+        let pool = sqlx::sqlite::SqlitePoolOptions::new().connect("sqlite::memory:").await.unwrap();
         let handle = tokio::spawn({
             let session = session.clone();
             async move {
-                execute_ask(&session, "req-test", "go", |msg| {
+                execute_ask(&session, "req-test", "go", &pool, |msg| {
                     let tx = tx.clone();
                     async move { tx.send(msg.to_line()).await.map_err(anyhow::Error::from) }
                 })

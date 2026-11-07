@@ -1,13 +1,17 @@
 //! Conversation-turn-based mode reminders, independent of tool-call rounds.
 
 use crate::types::{ContentPart, Message};
+use serde::{Deserialize, Serialize};
 
 /// Full instructions on entry, sparse reminders every five user turns, and
 /// full refreshes every twenty-five turns. A missing sparse reminder makes
 /// this a one-shot notice (for example, when leaving plan mode). Applied
 /// reminders are appended to conversation history so they stay visible to
 /// every later provider request.
-#[derive(Debug, Default)]
+///
+/// The state is serializable so the server can persist it per session and
+/// restore it across reverts and reconnects.
+#[derive(Debug, Default, Clone, Serialize, Deserialize)]
 pub struct Reminder {
     full: String,
     sparse: Option<String>,
@@ -25,6 +29,40 @@ impl Reminder {
             sparse,
             user_turns: 0,
         }
+    }
+
+    /// Rebuild state for history that already carries a reminder: the
+    /// cadence continues from `user_turns` and nothing is pending.
+    pub fn continue_at(full: impl Into<String>, sparse: Option<String>, user_turns: usize) -> Self {
+        Self {
+            full: full.into(),
+            sparse,
+            user_turns,
+            pending: None,
+        }
+    }
+
+    /// The configured full and sparse reminder texts.
+    pub fn texts(&self) -> (String, Option<String>) {
+        (self.full.clone(), self.sparse.clone())
+    }
+
+    /// The reminder waiting to be applied, if any.
+    pub fn pending(&self) -> Option<&str> {
+        self.pending.as_deref()
+    }
+
+    /// How many user turns this reminder has counted.
+    pub fn user_turns(&self) -> usize {
+        self.user_turns
+    }
+
+    /// Whether any user message in `messages` carries a reminder part.
+    pub fn in_history(messages: &[Message]) -> bool {
+        messages.iter().any(
+            |message| matches!(message, Message::User { content }
+                if content.iter().any(|part| matches!(part, ContentPart::Reminder { .. }))),
+        )
     }
 
     /// Advance once per user prompt, never once per provider/tool iteration.
@@ -60,7 +98,7 @@ impl Reminder {
             return;
         };
         if let Some(text) = self.pending.take() {
-            content.push(ContentPart::Text { text });
+            content.push(ContentPart::Reminder { text });
         }
     }
 }
@@ -97,7 +135,7 @@ mod tests {
             assert_eq!(
                 content.first(),
                 expected
-                    .map(|text| ContentPart::Text { text: text.into() })
+                    .map(|text| ContentPart::Reminder { text: text.into() })
                     .as_ref(),
                 "turn {turn}"
             );

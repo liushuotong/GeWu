@@ -182,6 +182,16 @@ impl Agent {
         self.tools = Arc::new(tools);
         self.reminder = reminder;
     }
+
+    /// The current mode reminder state (for persistence).
+    pub fn reminder(&self) -> &Reminder {
+        &self.reminder
+    }
+
+    /// Replace the mode reminder state (restored from persistence).
+    pub fn set_reminder(&mut self, reminder: Reminder) {
+        self.reminder = reminder;
+    }
     /// Creates a new `AgentBuilder` for constructing `Agent` instances.
     pub fn builder() -> AgentBuilder {
         AgentBuilder::default()
@@ -257,12 +267,11 @@ impl Agent {
                     info!("History compacted.");
                 }
 
-                if let Some(max) = self.max_turns {
-                    if turn >= max {
+                if let Some(max) = self.max_turns
+                    && turn >= max {
                         yield AgentEvent::Error { error: "Max turns reached without final answer.".to_string() };
                         break;
                     }
-                }
                 turn += 1;
 
                 let mut aggregator = LlmResponseAggregator::new();

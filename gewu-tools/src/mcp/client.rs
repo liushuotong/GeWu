@@ -16,6 +16,11 @@ use tokio::sync::Mutex;
 /// call, every other tool on the same client behind it as well.
 pub const REQUEST_TIMEOUT: Duration = Duration::from_secs(120);
 
+/// In-flight JSON-RPC request ids mapped to the one-shot channel that
+/// delivers each request's response.
+type PendingRequests =
+    Arc<Mutex<std::collections::HashMap<u64, tokio::sync::oneshot::Sender<Result<Value>>>>>;
+
 enum Transport {
     Stdio {
         stdin: ChildStdin,
@@ -35,8 +40,7 @@ pub struct McpClient {
     transport: Arc<Mutex<Transport>>,
     // stdout/SSE stream is continuously read in a background task
     // We need a mechanism to correlate requests with responses
-    pending_requests:
-        Arc<Mutex<std::collections::HashMap<u64, tokio::sync::oneshot::Sender<Result<Value>>>>>,
+    pending_requests: PendingRequests,
     next_id: Arc<Mutex<u64>>,
 
     // Server capabilities/info
@@ -74,9 +78,7 @@ impl McpClient {
         let stdin = child.stdin.take().context("Failed to open stdin")?;
         let stdout = child.stdout.take().context("Failed to open stdout")?;
 
-        let pending_requests: Arc<
-            Mutex<std::collections::HashMap<u64, tokio::sync::oneshot::Sender<Result<Value>>>>,
-        > = Arc::new(Mutex::new(std::collections::HashMap::new()));
+        let pending_requests: PendingRequests = Arc::new(Mutex::new(std::collections::HashMap::new()));
         let pending_requests_clone = pending_requests.clone();
 
         tokio::spawn(async move {
@@ -143,9 +145,7 @@ impl McpClient {
             ));
         }
 
-        let pending_requests: Arc<
-            Mutex<std::collections::HashMap<u64, tokio::sync::oneshot::Sender<Result<Value>>>>,
-        > = Arc::new(Mutex::new(std::collections::HashMap::new()));
+        let pending_requests: PendingRequests = Arc::new(Mutex::new(std::collections::HashMap::new()));
         let pending_requests_clone = pending_requests.clone();
 
         // We need to wait for the first event which MUST be 'endpoint'
@@ -175,10 +175,10 @@ impl McpClient {
                                 let mut data = String::new();
 
                                 for line in event_block.lines() {
-                                    if line.starts_with("event: ") {
-                                        event_type = line[7..].trim().to_string();
-                                    } else if line.starts_with("data: ") {
-                                        data.push_str(&line[6..]);
+                                    if let Some(event) = line.strip_prefix("event: ") {
+                                        event_type = event.trim().to_string();
+                                    } else if let Some(payload) = line.strip_prefix("data: ") {
+                                        data.push_str(payload);
                                     }
                                 }
 
@@ -187,12 +187,11 @@ impl McpClient {
                                     if let Some(tx) = tx_opt.take() {
                                         let _ = tx.send(Ok(data.trim().to_string()));
                                     }
-                                } else if event_type == "message" {
-                                    if let Ok(msg) = serde_json::from_str::<Value>(&data) {
+                                } else if event_type == "message"
+                                    && let Ok(msg) = serde_json::from_str::<Value>(&data) {
                                         Self::handle_incoming_message(msg, &pending_requests_clone)
                                             .await;
                                     }
-                                }
                             }
                         }
                     }
@@ -215,16 +214,8 @@ impl McpClient {
             endpoint
         } else {
             // Basic join logic
-            let base = if url.ends_with('/') {
-                &url[..url.len() - 1]
-            } else {
-                url
-            };
-            let path = if endpoint.starts_with('/') {
-                &endpoint[1..]
-            } else {
-                &endpoint
-            };
+            let base = url.strip_suffix('/').unwrap_or(url);
+            let path = endpoint.strip_prefix('/').unwrap_or(&endpoint);
             format!("{}/{}", base, path) // Very naive URL join
         };
 
@@ -240,12 +231,7 @@ impl McpClient {
         })
     }
 
-    async fn abort_pending_requests(
-        pending: &Arc<
-            Mutex<std::collections::HashMap<u64, tokio::sync::oneshot::Sender<Result<Value>>>>,
-        >,
-        reason: &str,
-    ) {
+    async fn abort_pending_requests(pending: &PendingRequests, reason: &str) {
         let mut p = pending.lock().await;
         for (_, sender) in p.drain() {
             if sender.send(Err(anyhow::anyhow!("{}", reason))).is_err() {
@@ -254,14 +240,9 @@ impl McpClient {
         }
     }
 
-    async fn handle_incoming_message(
-        msg: Value,
-        pending_requests: &Arc<
-            Mutex<std::collections::HashMap<u64, tokio::sync::oneshot::Sender<Result<Value>>>>,
-        >,
-    ) {
-        if let Ok(response) = serde_json::from_value::<JsonRpcResponse>(msg.clone()) {
-            if let Some(id) = response.id {
+    async fn handle_incoming_message(msg: Value, pending_requests: &PendingRequests) {
+        if let Ok(response) = serde_json::from_value::<JsonRpcResponse>(msg.clone())
+            && let Some(id) = response.id {
                 let mut pending = pending_requests.lock().await;
                 if let Some(sender) = pending.remove(&id) {
                     if let Some(error) = response.error {
@@ -287,12 +268,11 @@ impl McpClient {
                 }
                 return;
             }
-        }
 
         if let Ok(notification) = serde_json::from_value::<JsonRpcNotification>(msg) {
             if notification.method == "notifications/message" {
-                if let Some(params) = notification.params {
-                    if let Ok(log_params) = serde_json::from_value::<LogMessageParams>(params) {
+                if let Some(params) = notification.params
+                    && let Ok(log_params) = serde_json::from_value::<LogMessageParams>(params) {
                         let logger = log_params.logger.unwrap_or_else(|| "server".to_string());
                         match log_params.level.as_str() {
                             "error" | "critical" => {
@@ -310,7 +290,6 @@ impl McpClient {
                             _ => tracing::info!(target: "mcp", "[{}] {}", logger, log_params.data),
                         }
                     }
-                }
             } else {
                 tracing::debug!(target: "mcp", "Received notification: {}", notification.method);
             }
@@ -449,19 +428,19 @@ impl McpClient {
                     let body_text = response.text().await?;
 
                     // Simple SSE parser for "event: message\ndata: {JSON}"
-                    let mut lines = body_text.lines();
+                    let lines = body_text.lines();
                     let mut current_event = String::new();
                     let mut current_data = String::new();
 
-                    while let Some(line) = lines.next() {
-                        if line.starts_with("event: ") {
-                            current_event = line[7..].trim().to_string();
-                        } else if line.starts_with("data: ") {
-                            current_data.push_str(&line[6..]);
+                    for line in lines {
+                        if let Some(event) = line.strip_prefix("event: ") {
+                            current_event = event.trim().to_string();
+                        } else if let Some(payload) = line.strip_prefix("data: ") {
+                            current_data.push_str(payload);
                         } else if line.is_empty() {
                             // End of event block
-                            if current_event == "message" && !current_data.is_empty() {
-                                if let Ok(msg) = serde_json::from_str::<Value>(&current_data) {
+                            if current_event == "message" && !current_data.is_empty()
+                                && let Ok(msg) = serde_json::from_str::<Value>(&current_data) {
                                     // We need to handle this message to resolve the pending request
                                     // Since we are inside the write_result block which holds the transport lock,
                                     // we must NOT call self.handle_incoming_message directly if it tries to lock transport again (it doesn't seem to).
@@ -489,9 +468,8 @@ impl McpClient {
 
                                     if let Ok(response) =
                                         serde_json::from_value::<JsonRpcResponse>(msg.clone())
-                                    {
-                                        if let Some(resp_id) = response.id {
-                                            if resp_id == id {
+                                        && let Some(resp_id) = response.id
+                                            && resp_id == id {
                                                 // Found our response!
                                                 // We can return it directly?
                                                 // The `request` function waits on `rx`.
@@ -504,12 +482,9 @@ impl McpClient {
                                                 // We can return the message from this block and handle it after releasing transport lock?
                                                 return Ok(Some(msg));
                                             }
-                                        }
-                                    }
                                     // Handle other messages (notifications, logs) if necessary?
                                     // For HttpPost request-response, usually we only get the result.
                                 }
-                            }
                             current_event.clear();
                             current_data.clear();
                         }
@@ -524,8 +499,8 @@ impl McpClient {
         match write_result {
             Ok(Some(msg)) => {
                 let mut pending = self.pending_requests.lock().await;
-                if let Some(sender) = pending.remove(&id) {
-                    if let Ok(response) = serde_json::from_value::<JsonRpcResponse>(msg) {
+                if let Some(sender) = pending.remove(&id)
+                    && let Ok(response) = serde_json::from_value::<JsonRpcResponse>(msg) {
                         if let Some(error) = response.error {
                             if sender
                                 .send(Err(anyhow::anyhow!(
@@ -547,7 +522,6 @@ impl McpClient {
                             }
                         }
                     }
-                }
             }
             Ok(None) => {
                 // Standard case or no direct response found

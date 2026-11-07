@@ -245,15 +245,18 @@ async fn run(cli: RunArgs) -> Result<()> {
 
     // Create Agent
     let (mut agent, _registry) = registry::create_agent(
-        &cli.common.agent,
-        boot.provider,
-        boot.pool,
-        session_id,
-        boot.mcp_tools,
+        registry::ProfileInputs {
+            name: &cli.common.agent,
+            provider: boot.provider,
+            pool: boot.pool.clone(),
+            working_directory: boot.working_directory.clone().into(),
+            additional_tools: boot.mcp_tools,
+            skills: boot.skills,
+            enforcement: boot.enforcement,
+            context_limit: boot.context_limit,
+            session_id: &session_id,
+        },
         boot.log_writer,
-        boot.skills,
-        boot.enforcement,
-        boot.context_limit,
     )
     .await?;
     info!("Initialized agent: {}", cli.common.agent);

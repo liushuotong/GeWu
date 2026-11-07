@@ -371,6 +371,9 @@ fn parts_text(parts: &[ContentPart]) -> String {
         .iter()
         .filter_map(|part| match part {
             ContentPart::Text { text } => Some(text.as_str()),
+            // Reminders are model-facing scaffolding appended to user
+            // messages; they must never render as user content.
+            ContentPart::Reminder { .. } => None,
             _ => None,
         })
         .collect::<Vec<_>>()
@@ -434,6 +437,24 @@ mod tests {
         m.submit("hi".into());
         assert_eq!(m.blocks, vec![Block::User("hi".into())]);
         assert_eq!(m.phase, Phase::Busy);
+    }
+
+    /// Reminder parts appended to user messages are model-facing
+    /// scaffolding; history replay must not render them as user content.
+    #[test]
+    fn reminders_in_history_are_not_rendered_as_user_content() {
+        let mut m = model();
+        m.apply_message(&Message::User {
+            content: vec![
+                ContentPart::Text {
+                    text: "Update README.md".into(),
+                },
+                ContentPart::Reminder {
+                    text: "<system-reminder>Plan mode is active.</system-reminder>".into(),
+                },
+            ],
+        });
+        assert_eq!(m.blocks, vec![Block::User("Update README.md".into())]);
     }
 
     #[test]

@@ -1629,11 +1629,10 @@ async fn cleanup_backups(journal: &[JournalEntry]) {
             | JournalEntry::Moved { backup, .. } => Some(backup),
             JournalEntry::Created { .. } => None,
         };
-        if let Some(backup) = backup {
-            if let Err(error) = remove_if_exists(backup).await {
+        if let Some(backup) = backup
+            && let Err(error) = remove_if_exists(backup).await {
                 tracing::warn!(path = ?backup, %error, "failed to remove apply_patch backup");
             }
-        }
     }
 }
 

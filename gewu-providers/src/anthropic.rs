@@ -479,14 +479,16 @@ pub struct ContentBlockDeltaChunk {
 #[derive(Debug, Clone, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum ContentDelta {
-    TextDelta {
+    #[serde(rename = "text_delta")]
+    Text {
         text: String,
     },
-    InputJsonDelta {
+    #[serde(rename = "input_json_delta")]
+    InputJson {
         partial_json: String,
     },
     #[serde(rename = "thinking_delta")]
-    ThinkingDelta {
+    Thinking {
         thinking: String,
     },
 }
@@ -633,7 +635,7 @@ mod tests {
         assert_eq!(events.len(), 1);
         match &events[0] {
             AnthropicChunk::ContentBlockDelta(chunk) => match &chunk.delta {
-                ContentDelta::TextDelta { text } => assert_eq!(text, "hello"),
+                ContentDelta::Text { text } => assert_eq!(text, "hello"),
                 other => panic!("expected TextDelta, got {:?}", other),
             },
             other => panic!("expected ContentBlockDelta, got {:?}", other),

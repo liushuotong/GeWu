@@ -240,19 +240,21 @@ impl OpenAIProvider {
         part: &ContentPart,
     ) -> Option<ChatCompletionRequestUserMessageContentPart> {
         match part {
-            ContentPart::Text { text } => Some(ChatCompletionRequestUserMessageContentPart::Text(
-                ChatCompletionRequestMessageContentPartText {
-                    content_type: "text".to_string(),
-                    text: text.clone(),
-                },
-            )),
+            ContentPart::Text { text } | ContentPart::Reminder { text } => Some(
+                ChatCompletionRequestUserMessageContentPart::Text(
+                    ChatCompletionRequestMessageContentPartText {
+                        content_type: "text".to_string(),
+                        text: text.clone(),
+                    },
+                ),
+            ),
             ContentPart::Image { data, mime_type } => {
                 let url = format!("data:{};base64,{}", mime_type, data);
                 Some(ChatCompletionRequestUserMessageContentPart::ImageUrl(
                     ChatCompletionRequestMessageContentPartImage {
                         content_type: "image_url".to_string(),
                         image_url: ImageUrl {
-                            url: url.into(),
+                            url,
                             detail: None,
                         },
                     },
@@ -477,11 +479,10 @@ impl OpenAIProvider {
             if matches!(msg, Message::Tool { .. }) {
                 let mut converted = self.convert_message(msg)?;
                 openai_messages.append(&mut converted);
-                if let Message::Tool { tool_name, media, .. } = msg {
-                    if !media.is_empty() {
+                if let Message::Tool { tool_name, media, .. } = msg
+                    && !media.is_empty() {
                         pending_media.push((tool_name.clone(), media.clone()));
                     }
-                }
             } else {
                 self.flush_pending_media(&mut openai_messages, &mut pending_media);
                 let mut converted = self.convert_message(msg)?;
@@ -563,34 +564,30 @@ impl ToolCallAggregator {
 
         let state = &mut self.states[index];
 
-        if let Some(id) = &chunk.id {
-            if !id.is_empty() {
+        if let Some(id) = &chunk.id
+            && !id.is_empty() {
                 state.id = Some(id.clone());
             }
-        }
 
         if let Some(function) = &chunk.function {
-            if let Some(name) = &function.name {
-                if !name.is_empty() {
+            if let Some(name) = &function.name
+                && !name.is_empty() {
                     state.name = Some(name.clone());
                 }
-            }
 
-            if let Some(args) = &function.arguments {
-                if !args.is_empty() && !state.finalized {
+            if let Some(args) = &function.arguments
+                && !args.is_empty() && !state.finalized {
                     state.argument_buffer.push_str(args);
                     Self::update_finalized_flag(state);
-                    if state.started {
-                        if let Some(id) = state.id.clone() {
+                    if state.started
+                        && let Some(id) = state.id.clone() {
                             Self::emit_pending_arguments(state, &id, &mut events);
                         }
-                    }
                 }
-            }
         }
 
-        if !state.started {
-            if let (Some(id), Some(name)) = (state.id.clone(), state.name.clone()) {
+        if !state.started
+            && let (Some(id), Some(name)) = (state.id.clone(), state.name.clone()) {
                 events.push(ProviderEvent::ToolCallStart {
                     id: id.clone(),
                     name,
@@ -599,7 +596,6 @@ impl ToolCallAggregator {
 
                 Self::emit_pending_arguments(state, &id, &mut events);
             }
-        }
 
         events
     }
@@ -683,17 +679,15 @@ impl ResponseParser for OpenAIProvider {
                 if let Some(choice) = response.choices.first() {
                     let delta = &choice.delta;
 
-                    if let Some(reasoning) = &delta.reasoning_content {
-                        if !reasoning.is_empty() {
+                    if let Some(reasoning) = &delta.reasoning_content
+                        && !reasoning.is_empty() {
                             yield ProviderEvent::ReasoningDelta { delta: reasoning.clone() };
                         }
-                    }
 
-                    if let Some(content) = &delta.content {
-                        if !content.is_empty() {
+                    if let Some(content) = &delta.content
+                        && !content.is_empty() {
                             yield ProviderEvent::ContentDelta { delta: content.clone() };
                         }
-                    }
 
                     if let Some(tool_calls) = &delta.tool_calls {
                         for tool_call in tool_calls {
@@ -962,7 +956,9 @@ impl AnthropicProvider {
 
     fn convert_content_part(&self, part: &ContentPart) -> Option<ContentBlock> {
         match part {
-            ContentPart::Text { text } => Some(ContentBlock::Text { text: text.clone() }),
+            ContentPart::Text { text } | ContentPart::Reminder { text } => {
+                Some(ContentBlock::Text { text: text.clone() })
+            }
             ContentPart::Image { data, mime_type } => Some(ContentBlock::Image {
                 source: SourceBlock {
                     source_type: "base64".to_string(),
@@ -1014,11 +1010,10 @@ impl AnthropicProvider {
                 tool_calls,
             } => {
                 let mut blocks: Vec<ContentBlock> = Vec::new();
-                if let Some(text) = content {
-                    if !text.is_empty() {
+                if let Some(text) = content
+                    && !text.is_empty() {
                         blocks.push(ContentBlock::Text { text: text.clone() });
                     }
-                }
                 if let Some(calls) = tool_calls {
                     for call in calls {
                         // An empty arguments string (e.g. a no-argument tool
@@ -1164,8 +1159,8 @@ impl AnthropicToolCallAggregator {
                 // block for some calls (notably no-argument tools) and sends
                 // no `input_json_delta` fragments afterwards. Seed the buffer
                 // so the arguments reach the agent instead of ending up empty.
-                if let Some(input) = input {
-                    if input.as_object().map(|o| !o.is_empty()).unwrap_or(false) {
+                if let Some(input) = input
+                    && input.as_object().map(|o| !o.is_empty()).unwrap_or(false) {
                         state.argument_buffer = input.to_string();
                         let new_len = state.argument_buffer.len();
                         let delta = state.argument_buffer[state.sent_len..new_len].to_string();
@@ -1177,7 +1172,6 @@ impl AnthropicToolCallAggregator {
                             });
                         }
                     }
-                }
             }
             ContentBlockStart::Thinking { thinking, .. } => {
                 if !thinking.is_empty() {
@@ -1206,7 +1200,7 @@ impl AnthropicToolCallAggregator {
         let state = &mut self.states[idx];
 
         match &chunk.delta {
-            ContentDelta::InputJsonDelta { partial_json } => {
+            ContentDelta::InputJson { partial_json } => {
                 if !state.started {
                     return events;
                 }
@@ -1222,14 +1216,14 @@ impl AnthropicToolCallAggregator {
                     }
                 }
             }
-            ContentDelta::ThinkingDelta { thinking } => {
+            ContentDelta::Thinking { thinking } => {
                 if !thinking.is_empty() {
                     events.push(ProviderEvent::ReasoningDelta {
                         delta: thinking.clone(),
                     });
                 }
             }
-            ContentDelta::TextDelta { .. } => {}
+            ContentDelta::Text { .. } => {}
         }
 
         events
@@ -1282,7 +1276,7 @@ impl AnthropicProvider {
                             yield event;
                         }
                         match &chunk.delta {
-                            ContentDelta::TextDelta { text } => {
+                            ContentDelta::Text { text } => {
                                 if !text.is_empty() {
                                     yield ProviderEvent::ContentDelta { delta: text.clone() };
                                 }
@@ -1290,8 +1284,8 @@ impl AnthropicProvider {
                             // ThinkingDelta is already emitted by the
                             // aggregator above; emitting it here too would
                             // duplicate every reasoning token in the stream.
-                            ContentDelta::ThinkingDelta { .. } => {}
-                            ContentDelta::InputJsonDelta { .. } => {}
+                            ContentDelta::Thinking { .. } => {}
+                            ContentDelta::InputJson { .. } => {}
                         }
                     }
                     AnthropicChunk::ContentBlockStop(_) => {}
@@ -1462,6 +1456,39 @@ mod tests {
             )
             .expect("request builds");
         assert_eq!(request.max_tokens, Some(65_536));
+    }
+
+    /// Reminder parts are model-facing scaffolding: both providers must
+    /// carry them on the wire as plain text so the model still sees them.
+    #[test]
+    fn reminder_parts_reach_providers_as_text() {
+        let reminder_text = "<system-reminder>Plan mode is active.</system-reminder>";
+        let messages = [Message::User {
+            content: vec![
+                ContentPart::Text {
+                    text: "prompt".to_string(),
+                },
+                ContentPart::Reminder {
+                    text: reminder_text.to_string(),
+                },
+            ],
+        }];
+
+        let openai = OpenAIProvider::new("test-key", "gpt-4")
+            .build_typed(&messages, &[])
+            .expect("openai request builds");
+        let wire = serde_json::to_string(&openai).unwrap();
+        assert!(wire.contains(reminder_text), "OpenAI wire lost the reminder");
+
+        let anthropic = AnthropicProvider::new("test-key", "claude-3-5-sonnet")
+            .build_typed(&messages, &[])
+            .expect("anthropic request builds");
+        let AnthropicMessage::User(UserMessage { content }) = &anthropic.messages[0] else {
+            panic!("expected a user message");
+        };
+        assert!(content.iter().any(
+            |block| matches!(block, ContentBlock::Text { text } if text == reminder_text)
+        ));
     }
 
     #[test]
