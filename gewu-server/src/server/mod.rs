@@ -603,7 +603,8 @@ async fn handle_request(
                 Ok((tools, prompt, _)) => match gewu_storage::set_session_agent(&state.bootstrap.pool, &current.session_id, &target).await {
                     Ok(()) => {
                         let mut agent = current.agent.lock().await;
-                        agent.set_profile(prompt, tools);
+                        let reminder = registry::profile_reminder(Some(&current.agent_name), &target);
+                        agent.set_profile(prompt, tools, reminder);
                         let tools = agent.list_tools();
                          *session = Some(ConnectionSession { agent: current.agent.clone(), session_id: current.session_id.clone(), agent_name: target.clone(), tools: tools.clone() });
                         state.sessions.lock().await.insert(current.session_id.clone(), session.as_ref().unwrap().clone());

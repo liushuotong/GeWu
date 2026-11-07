@@ -356,6 +356,9 @@ pub async fn create_agent(
         .memory(Box::new(memory))
         .system_prompt(&system_prompt)
         .with_enforcement(enforcement);
+    if name == "plan" {
+        builder = builder.with_reminder(profile_reminder(None, name));
+    }
     if let Some(limit) = context_limit {
         builder = builder.context_limit(limit);
     }
@@ -381,16 +384,12 @@ pub fn agent_profile(
     let (registry, tools_arc) = build_tool_registry_and_list(name, provider, pool, working_directory, additional_tools, skills.clone(), enforcement, context_limit, session_id)?;
 
     let mut system_prompt = match name {
-        "build" => include_str!("prompts/build.txt"),
-        "plan" => include_str!("prompts/plan.txt"),
+        "build" | "plan" => include_str!("prompts/build.txt"),
         "explore" => include_str!("prompts/explore.txt"),
         "general" => include_str!("prompts/general.txt"),
         _ => return Err(anyhow!("Unknown agent type: {}", name)),
     }
     .to_string();
-    if name == "build" {
-        system_prompt.push_str("\n\nBuild mode is active. Earlier Plan-mode read-only restrictions no longer apply. You may implement changes using the available tools, within the user's requested scope.");
-    }
     if !skills.is_empty() {
         system_prompt.push_str("\n\n");
         system_prompt.push_str(&gewu_tools::skill::available_skills_section(&skills));
@@ -399,9 +398,62 @@ pub fn agent_profile(
     Ok((tools_arc, system_prompt, registry))
 }
 
+/// Mode instructions live in conversation reminders, not the base prompt.
+pub fn profile_reminder(previous: Option<&str>, target: &str) -> gewu_core::agent::Reminder {
+    use gewu_core::agent::Reminder;
+    match target {
+        "plan" => Reminder::switch(
+            include_str!("prompts/switch-to-plan.txt"),
+            Some(include_str!("prompts/plan-heartbeat.txt").into()),
+        ),
+        "build" if previous == Some("plan") => Reminder::switch(
+            include_str!("prompts/switch-to-build.txt"), None,
+        ),
+        _ => Reminder::default(),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn build_and_plan_share_base_prompt() {
+        let pool = SqlitePool::connect_lazy("sqlite::memory:").unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let mut prompts = Vec::new();
+        for profile in ["build", "plan"] {
+            let (_, prompt, _) = agent_profile(profile, Arc::new(DummyLlm), pool.clone(),
+                dir.path().to_path_buf(), vec![], vec![], PathEnforcement::None, None, "session").unwrap();
+            prompts.push(prompt);
+        }
+        assert_eq!(prompts[0], prompts[1]);
+    }
+
+    #[test]
+    fn profile_reminders_follow_mode_transitions() {
+        use gewu_core::types::{ContentPart, Message};
+        for (previous, target, expected) in [
+            (None, "plan", Some("Plan mode is active")),
+            (Some("build"), "plan", Some("Plan mode is active")),
+            (Some("plan"), "build", Some("no longer in read-only mode")),
+            (Some("build"), "build", None),
+        ] {
+            let mut reminder = profile_reminder(previous, target);
+            reminder.on_user_turn();
+            let mut messages = vec![Message::User { content: vec![] }];
+            reminder.inject(&mut messages);
+            let Message::User { content } = &messages[0] else { unreachable!() };
+            match expected {
+                Some(expected) => assert!(matches!(&content[0], ContentPart::Text { text } if text.contains(expected))),
+                None => assert!(content.is_empty()),
+            }
+            reminder.on_user_turn();
+            let mut next = vec![Message::User { content: vec![] }];
+            reminder.inject(&mut next);
+            assert_eq!(next, vec![Message::User { content: vec![] }]);
+        }
+    }
 
     #[tokio::test]
     async fn plan_has_no_editing_tools() {

@@ -38,6 +38,8 @@
 //! ```
 
 mod compaction;
+mod reminder;
+pub use reminder::Reminder;
 mod execution;
 mod experiences;
 mod media;
@@ -105,6 +107,7 @@ pub struct Agent {
     /// Provider-reported token usage accumulated across the whole session
     /// (every completed LLM request, including compaction requests).
     provider_usage: TokenUsage,
+    reminder: Reminder,
 }
 
 /// Builder for constructing `Agent` instances.
@@ -115,6 +118,7 @@ pub struct AgentBuilder {
     tools: Arc<Vec<Arc<dyn Tool>>>,
     /// System prompt (defaults to empty).
     system_prompt: String,
+    reminder: Reminder,
     /// Maximum turns limit (optional).
     max_turns: Option<usize>,
     /// Memory store (defaults to in-memory Vec).
@@ -159,6 +163,7 @@ impl Default for AgentBuilder {
             llm: None,
             tools: Arc::new(Vec::new()),
             system_prompt: String::new(),
+            reminder: Reminder::default(),
             max_turns: None,
             memory: None,
             context_limit: 256_000,
@@ -172,9 +177,10 @@ impl Default for AgentBuilder {
 impl Agent {
     /// Change behavior while retaining memory and all other runtime state.
     /// The caller must ensure the agent is idle.
-    pub fn set_profile(&mut self, system_prompt: String, tools: Vec<Arc<dyn Tool>>) {
+    pub fn set_profile(&mut self, system_prompt: String, tools: Vec<Arc<dyn Tool>>, reminder: Reminder) {
         self.system_prompt = system_prompt;
         self.tools = Arc::new(tools);
+        self.reminder = reminder;
     }
     /// Creates a new `AgentBuilder` for constructing `Agent` instances.
     pub fn builder() -> AgentBuilder {
@@ -229,6 +235,7 @@ impl Agent {
             }
 
             self.memory.add_message(Message::User { content: vec![ContentPart::Text { text: user_message.to_string() }] }).await;
+            self.reminder.on_user_turn();
 
             let mut turn = 0;
             let mut doom_loop = DoomLoopDetector::new(3);
@@ -266,6 +273,7 @@ impl Agent {
                         messages.insert(0, Message::System { content: self.system_prompt.clone() });
                     }
                 }
+                self.reminder.inject(&mut messages);
                 trace!("LLM request messages: {:?}", messages);
 
                 let tools_clone = self.tools.clone();
@@ -578,6 +586,12 @@ impl AgentBuilder {
         self
     }
 
+    /// Configure mode reminders for a newly created agent.
+    pub fn with_reminder(mut self, reminder: Reminder) -> Self {
+        self.reminder = reminder;
+        self
+    }
+
     /// Sets the maximum number of conversation turns.
     ///
     /// A turn consists of a user message, LLM response, and any tool executions.
@@ -659,6 +673,7 @@ impl AgentBuilder {
             log: self.log,
             enforcement: self.enforcement,
             provider_usage: TokenUsage::default(),
+            reminder: self.reminder,
         };
         Ok(agent)
     }
@@ -828,6 +843,28 @@ mod tests {
             .filter(|line| !line.is_empty())
             .map(|line| serde_json::from_str(line).expect("log line must be valid JSON"))
             .collect()
+    }
+
+    #[tokio::test]
+    async fn reminders_reach_requests_without_changing_memory() -> Result<()> {
+        let response = vec![ProviderEvent::ContentDelta { delta: "ok".into() }, ProviderEvent::Finish { reason: None }];
+        let provider = Arc::new(MockProvider::new(vec![response; 25]));
+        let mut agent = Agent::builder()
+            .llm(provider.clone())
+            .with_reminder(Reminder::switch("FULL MODE REMINDER", Some("SPARSE MODE REMINDER".into())))
+            .build()?;
+        for turn in 1..=25 {
+            for event in agent.ask("hello").collect::<Vec<_>>().await {
+                event?;
+            }
+            let requests = provider.captured_requests.lock().unwrap();
+            let request = serde_json::to_string(requests.last().unwrap())?;
+            assert_eq!(request.contains("FULL MODE REMINDER"), turn == 1 || turn == 25, "turn {turn}");
+            assert_eq!(request.contains("SPARSE MODE REMINDER"), turn % 5 == 0 && turn != 25, "turn {turn}");
+            assert!(!serde_json::to_string(agent.memory.messages())?.contains("MODE REMINDER"));
+        }
+        agent.set_profile(String::new(), Vec::new(), Reminder::default());
+        Ok(())
     }
 
     #[tokio::test]
