@@ -1,8 +1,8 @@
 //! Tab state for the web GUI.
 //!
-//! One tab per conversation session, mirroring `gewu-tui`'s workspace. The
-//! conversation itself lives in `gewu_client::session::SessionModel`; this
-//! module adds only the tab list and the per-tab view state.
+//! One tab per conversation session. The conversation itself lives in
+//! `gewu_client::session::SessionModel`; this module adds only the tab list
+//! and the per-tab view state.
 
 use std::collections::HashSet;
 

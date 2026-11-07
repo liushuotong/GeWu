@@ -137,9 +137,8 @@ tool/assistant output are kept (with dangling tool calls repaired).
 
 #### Rust client
 
-The `gewu-client` library implements this protocol, with the `gewu-tui`
-terminal UI (`cargo run -p gewu-tui`) and the `gewu-gui` browser UI
-(`cargo run -p gewu-gui`) as front-ends:
+The `gewu-client` library implements this protocol, with the `gewu-gui`
+browser UI (`cargo run -p gewu-gui`) as its front-end:
 
 ```rust
 use gewu_client::Client;

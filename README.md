@@ -16,7 +16,6 @@ GeWu (格物) is a comprehensive framework for building and deploying AI agents.
 | **`gewu-server`** | Command-line interface for interacting with GeWu agents. Supports build, explore, and general agent profiles with configurable tools and permissions. Also runs as a server (`gewu-server serve`) exposing agents over WebSocket and TCP so other programs can send prompts and receive streamed agent events. |
 | **`gewu-protocol`** | Wire protocol shared by the server and its clients: request parsing/serialization (`ClientRequest`) and server reply types (`ServerMessage`). |
 | **`gewu-client`** | Async Rust client library for the GeWu server: streaming asks (`Client::ask`), `interrupt`, session listing/loading, tool/agent introspection, and the UI-agnostic conversation model (`SessionModel`) shared by the TUI and GUI. |
-| **`gewu-tui`** | Full-screen terminal chat UI built on `gewu-client`: streaming transcript, `$ <command>` tool-call display, scrollback, and session resume. |
 | **`gewu-gui`** | Browser-based chat UI served by a small axum proxy: Rust-rendered HTML/Markdown, streaming transcript, tabs, tool groups, context usage, and session resume over one HTTP/WebSocket port. Supports remote browsers with an optional access token. |
 | **`gewu-graph`** | Stateful graph execution library for building complex workflow orchestration with conditional routing, parallel execution, and nested subgraphs. |
 | **`gewu-rag`** | RAG (Retrieval Augmented Generation) system with document processing (PDF, text), embedding generation, and vector storage integration (Qdrant). |
@@ -132,14 +131,6 @@ cargo run -p gewu-server -- serve
 cargo run -p gewu-server -- serve --host 0.0.0.0 --token "$(openssl rand -hex 16)"
 ```
 
-Connect from the terminal with the `gewu-tui` TUI (pass the same `--token`
-when the server requires one):
-
-```bash
-cargo run -p gewu-tui                    # full-screen chat TUI
-cargo run -p gewu-tui -- --session-id <ID>   # resume a conversation
-```
-
 Or from a browser with the `gewu-gui` web UI (open
 <http://127.0.0.1:8430>; `--server-token` when the upstream server requires
 one):
@@ -160,8 +151,7 @@ let client = Client::tcp("127.0.0.1", 8421).await?;
 let response = client.ask("Hello").send().await?.final_response().await?;
 ```
 
-(See `gewu-client/README.md` for the library, `gewu-tui/README.md` for the
-terminal UI, and `gewu-gui/README.md` for the web UI.)
+(See `gewu-client/README.md` for the library and `gewu-gui/README.md` for the web UI.)
 
 ### Configuration
 

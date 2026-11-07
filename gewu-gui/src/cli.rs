@@ -207,7 +207,7 @@ mod tests {
                 port: 8421
             }
         );
-        // A bare host:port is treated as TCP, matching gewu-tui's default.
+        // A bare host:port is treated as TCP.
         assert_eq!(
             Endpoint::parse("127.0.0.1:8421").unwrap(),
             Endpoint::Tcp {

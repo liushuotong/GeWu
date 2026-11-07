@@ -37,8 +37,7 @@ browser, so the server does not need to be exposed to every browser.
 | `--open` | off | Open the GUI in the default browser after starting |
 | `--log-level` | `info` | `error`, `warn`, `info`, `debug`, or `trace` |
 
-A bare `host:port` in `--server` is treated as TCP, matching `gewu-tui`'s
-default.
+A bare `host:port` in `--server` is treated as TCP.
 
 ## Remote access
 
@@ -151,7 +150,6 @@ gewu-gui
   assets/fonts/     Inter and JetBrains Mono (woff2, SIL OFL 1.1; see OFL-*.txt)
 ```
 
-Conversation state lives in `gewu-client::session` and is shared with
-`gewu-tui`, so both front-ends replay history and apply streamed events
-identically. Rendering stays in Rust; the browser script only swaps in HTML
-snapshots and appends text deltas.
+Conversation state lives in `gewu-client::session`, which replays history
+and applies streamed events. Rendering stays in Rust; the browser script only
+swaps in HTML snapshots and appends text deltas.

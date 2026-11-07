@@ -2,8 +2,7 @@
 //!
 //! Each browser gets an isolated [`Workspace`] and its own lazily-created
 //! `gewu_client::Client` per tab (the server pins one session per connection).
-//! The control flow mirrors `gewu-tui/src/main.rs`, but the output is JSON
-//! messages carrying rendered HTML instead of ratatui frames.
+//! The output is JSON messages carrying rendered HTML.
 
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::time::{Duration, Instant};
@@ -144,7 +143,7 @@ impl GuiSession {
         let mut workspace = Workspace::new();
 
         // `list_sessions` is newest-first; opening in reverse puts the oldest
-        // tab on the left and focuses the newest, like gewu-tui.
+        // tab on the left and focuses the newest.
         match admin.list_sessions().await {
             Ok(sessions) => {
                 for summary in sessions.into_iter().rev() {

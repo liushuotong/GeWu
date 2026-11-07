@@ -6,9 +6,9 @@
 //! ```
 //!
 //! `gewu-gui` is a thin, stateful proxy: it serves a browser app over HTTP and
-//! opens one upstream connection per conversation tab, exactly like
-//! `gewu-tui`. Rendering happens in Rust ([`view`]), so the browser only
-//! applies HTML snapshots and streamed text deltas.
+//! opens one upstream connection per conversation tab. Rendering happens in
+//! Rust ([`view`]), so the browser only applies HTML snapshots and streamed
+//! text deltas.
 
 pub mod cli;
 mod protocol;

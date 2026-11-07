@@ -1,8 +1,7 @@
 //! HTML rendering for the web GUI.
 //!
-//! Mirrors `gewu-tui`'s `tui_view`: transcript blocks, Markdown, tool runs,
-//! and the status line. Everything user- or model-authored is escaped, and
-//! raw HTML in Markdown is neutralized.
+//! Transcript blocks, Markdown, tool runs, and the status line. Everything
+//! user- or model-authored is escaped, and raw HTML in Markdown is neutralized.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt::Write as _;
