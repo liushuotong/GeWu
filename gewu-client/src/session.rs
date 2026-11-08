@@ -253,6 +253,7 @@ impl SessionModel {
             Message::Assistant {
                 content,
                 reasoning,
+                replay: _,
                 tool_calls,
             } => {
                 // Reasoning replays as a finalized thought block (duration is
@@ -771,6 +772,7 @@ mod tests {
             Message::Assistant {
                 content: Some("checking".into()),
                 reasoning: None,
+                replay: None,
                 tool_calls: Some(vec![gewu_protocol::ToolCall {
                     id: "c1".into(),
                     r#type: "function".into(),
@@ -808,11 +810,13 @@ mod tests {
         m.apply_message(&Message::Assistant {
             content: Some("done".into()),
             reasoning: Some("step by step…".into()),
+            replay: None,
             tool_calls: None,
         });
         m.apply_message(&Message::Assistant {
             content: Some("no thought".into()),
             reasoning: None,
+            replay: None,
             tool_calls: None,
         });
         assert_eq!(
@@ -843,6 +847,7 @@ mod tests {
         m.apply_message(&Message::Assistant {
             content: None,
             reasoning: None,
+            replay: None,
             tool_calls: Some(vec![call("1", "read_file"), call("2", "bash")]),
         });
         m.apply_message(&Message::Tool {

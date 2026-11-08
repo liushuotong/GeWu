@@ -2,16 +2,35 @@ use anyhow::{Context, Result};
 use serde::Deserialize;
 use std::path::PathBuf;
 use tracing::warn;
+use gewu_providers::ProviderProfile;
+use std::collections::BTreeMap;
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ModelConfig {
+    pub provider: ProviderProfile,
+    /// API model ID; defaults to the catalog key.
+    pub model: Option<String>,
+}
+
+#[derive(Debug, Deserialize, Default)]
+#[serde(deny_unknown_fields)]
+pub struct ProviderConfig {
+    pub base_url: Option<String>,
+    pub api_key: Option<String>,
+}
 
 use gewu_core::types::PathEnforcement;
 use gewu_tools::mcp::types::McpServerConfig;
 
 #[derive(Debug, Deserialize, Default)]
+#[serde(deny_unknown_fields)]
 pub struct Config {
-    pub base_url: Option<String>,
-    pub api_key: Option<String>,
+    #[serde(default)]
+    pub models: BTreeMap<String, ModelConfig>,
+    #[serde(default)]
+    pub providers: BTreeMap<String, ProviderConfig>,
     pub model: Option<String>,
-    pub provider: Option<String>,
     /// Optional path to a log file recording every wire LLM request as JSONL.
     pub log: Option<String>,
     /// Output token budget sent as `max_tokens` on every Anthropic request.
@@ -66,11 +85,28 @@ impl LoadedConfig {
 
         let config: Config = serde_json::from_str(&content)
             .with_context(|| format!("Failed to parse config file: {}", path.display()))?;
+        config.validate()?;
 
         Ok(LoadedConfig {
             config,
             path: Some(path),
         })
+    }
+}
+
+impl Config {
+    pub fn validate(&self) -> Result<()> {
+        for name in self.providers.keys() {
+            name.parse::<ProviderProfile>().map_err(anyhow::Error::msg)?;
+        }
+        if let Some(model) = &self.model {
+            anyhow::ensure!(self.models.contains_key(model), "default model '{model}' is not defined in models");
+        }
+        for (name, model) in &self.models {
+            anyhow::ensure!(!name.trim().is_empty(), "model catalog keys cannot be empty");
+            anyhow::ensure!(model.model.as_ref().is_none_or(|id| !id.trim().is_empty()), "API model ID for '{name}' cannot be empty");
+        }
+        Ok(())
     }
 }
 
@@ -116,6 +152,25 @@ fn resolve_config_path(config_path: Option<&str>) -> Result<PathBuf> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn models_require_known_providers() {
+        assert!(serde_json::from_str::<Config>(r#"{"models":{"m":{}}}"#).is_err());
+        assert!(serde_json::from_str::<Config>(r#"{"models":{"m":{"provider":"typo"}}}"#).is_err());
+        let config: Config = serde_json::from_str(r#"{"model":"m","models":{"m":{"provider":"deepseek"}},"providers":{"deepseek":{"api_key":"test"}}}"#).unwrap();
+        config.validate().unwrap();
+        assert_eq!(config.models["m"].provider, ProviderProfile::Deepseek);
+        assert!(config.models["m"].model.is_none());
+    }
+
+    #[test]
+    fn rejects_invalid_defaults_and_removed_settings() {
+        let config: Config = serde_json::from_str(r#"{"model":"missing"}"#).unwrap();
+        assert!(config.validate().is_err());
+        for field in ["reasoning_field", "require_reasoning", "provider", "api_key", "base_url"] {
+            assert!(serde_json::from_str::<Config>(&format!(r#"{{"{field}":null}}"#)).is_err());
+        }
+    }
 
     #[test]
     fn parses_log_option() {

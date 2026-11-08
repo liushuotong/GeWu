@@ -80,6 +80,7 @@ fn format_message(message: &Message) -> (&'static str, String) {
         Message::Assistant {
             content,
             reasoning,
+            replay: _,
             tool_calls,
         } => {
             let mut output = content.clone().unwrap_or_default();
@@ -228,6 +229,7 @@ mod tests {
             &Message::Assistant {
                 content: Some("second".to_string()),
                 reasoning: None,
+                replay: None,
                 tool_calls: None,
             },
             1,
@@ -253,6 +255,7 @@ mod tests {
         let assistant = Message::Assistant {
             content: None,
             reasoning: None,
+            replay: None,
             tool_calls: Some(vec![ToolCall {
                 id: "call-1".to_string(),
                 r#type: "function".to_string(),

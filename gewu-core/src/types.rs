@@ -185,6 +185,8 @@ impl TokenUsage {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum ProviderEvent {
+    /// Native reasoning state required to replay this assistant response.
+    ReasoningReplay { replay: ReasoningReplay },
     /// A delta of reasoning content (e.g., chain-of-thought) from the model.
     ReasoningDelta { delta: String },
     /// A delta of content (text response) from the model.
@@ -280,6 +282,8 @@ pub enum Message {
         content: Option<String>,
         /// Reasoning (chain-of-thought) text streamed before the answer, if any.
         reasoning: Option<String>,
+        /// Provider-native replay state; opaque values are never displayed.
+        replay: Option<ReasoningReplay>,
         /// Tool calls requested by the assistant, if any.
         tool_calls: Option<Vec<ToolCall>>,
     },
@@ -296,6 +300,16 @@ pub enum Message {
         #[serde(default, skip_serializing_if = "Vec::is_empty")]
         media: Vec<ContentPart>,
     },
+}
+
+/// Replay state belongs to exactly one endpoint and model. Anthropic stores
+/// its ordered native assistant blocks, including thinking signatures.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ReasoningReplay {
+    pub origin: String,
+    pub model: String,
+    pub field: Option<String>,
+    pub blocks: Vec<serde_json::Value>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]

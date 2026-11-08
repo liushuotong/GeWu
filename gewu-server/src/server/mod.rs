@@ -1909,6 +1909,7 @@ mod tests {
             .add_message(Message::Assistant {
                 content: None,
                 reasoning: None,
+                replay: None,
                 tool_calls: Some(vec![gewu_core::types::ToolCall {
                     id: "call-1".to_string(),
                     r#type: "function".to_string(),
@@ -1950,6 +1951,7 @@ mod tests {
             .add_message(Message::Assistant {
                 content: None,
                 reasoning: None,
+                replay: None,
                 tool_calls: Some(vec![gewu_core::types::ToolCall {
                     id: "call-1".to_string(),
                     r#type: "function".to_string(),
@@ -3422,6 +3424,7 @@ mod tests {
             .add_message(Message::Assistant {
                 content: None,
                 reasoning: None,
+                replay: None,
                 tool_calls: Some(vec![gewu_core::types::ToolCall {
                     id: "call-1".to_string(),
                     r#type: "function".to_string(),

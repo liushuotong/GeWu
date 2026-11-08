@@ -83,9 +83,24 @@ fn test_estimate_message_tokens_assistant() {
     let msg = Message::Assistant {
         content: Some("Hello".to_string()),
         reasoning: None,
+        replay: None,
         tool_calls: None,
     };
     assert_eq!(estimate_message_tokens(&msg), 5 / 4);
+}
+
+#[test]
+fn reasoning_payload_counts_but_is_not_in_compaction_summary() {
+    let message = Message::Assistant {
+        content: Some("answer".into()),
+        reasoning: Some("reasoning text".repeat(100)),
+        replay: None,
+        tool_calls: None,
+    };
+    assert!(estimate_message_tokens(&message) > 100);
+    let summary = gewu_core::compaction::serialize_messages(&[message]);
+    assert!(summary.contains("answer"));
+    assert!(!summary.contains("reasoning text"));
 }
 
 #[test]
@@ -93,6 +108,7 @@ fn test_estimate_message_tokens_assistant_with_tool_calls() {
     let msg = Message::Assistant {
         content: Some("Calling tool".to_string()),
         reasoning: None,
+        replay: None,
         tool_calls: Some(vec![gewu_core::types::ToolCall {
             id: "call_1".to_string(),
             r#type: "function".to_string(),
@@ -145,6 +161,7 @@ fn truncate_tool_outputs_in_transcripts_at_two_thousand_chars() {
         Message::Assistant {
             content: None,
             reasoning: None,
+            replay: None,
             tool_calls: Some(vec![gewu_core::types::ToolCall {
                 id: "c1".into(),
                 r#type: "function".into(),

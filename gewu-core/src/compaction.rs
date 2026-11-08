@@ -123,12 +123,19 @@ pub fn estimate_message_tokens(msg: &Message) -> usize {
         Message::Assistant {
             content,
             reasoning,
+            replay,
             tool_calls,
         } => {
-            // Reasoning is display-only context; it is not resent to
-            // providers, so it must not count toward the prompt estimate.
-            let _ = reasoning;
+            // Anthropic replays ordered native blocks, including opaque
+            // signatures. Estimate that payload rather than counting the
+            // separate display strings a second time.
+            if let Some(replay) = replay
+                && !replay.blocks.is_empty()
+            {
+                return estimate_tokens(&serde_json::to_string(&replay.blocks).unwrap_or_default());
+            }
             let mut count = content.as_ref().map(|s| estimate_tokens(s)).unwrap_or(0);
+            count += reasoning.as_deref().map(estimate_tokens).unwrap_or(0);
             if let Some(calls) = tool_calls {
                 for call in calls {
                     count += estimate_tokens(&call.function.arguments);
@@ -191,7 +198,7 @@ pub fn serialize_message(msg: &Message) -> Vec<String> {
             )];
             lines
         }
-        Message::Assistant { content, reasoning, tool_calls } => {
+        Message::Assistant { content, reasoning, tool_calls, .. } => {
             let _ = reasoning;
             let mut lines = Vec::new();
             if let Some(text) = content

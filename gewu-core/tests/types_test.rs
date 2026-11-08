@@ -204,12 +204,14 @@ fn test_message_assistant_with_content() {
     let msg = Message::Assistant {
         content: Some("I can help".to_string()),
         reasoning: Some("thinking".to_string()),
+        replay: None,
         tool_calls: None,
     };
 
     if let Message::Assistant {
         content,
         reasoning,
+        replay: _,
         tool_calls,
     } = msg
     {
@@ -224,6 +226,7 @@ fn test_message_assistant_with_tool_calls() {
     let msg = Message::Assistant {
         content: None,
         reasoning: None,
+        replay: None,
         tool_calls: Some(vec![ToolCall {
             id: "call_1".to_string(),
             r#type: "function".to_string(),
@@ -237,6 +240,7 @@ fn test_message_assistant_with_tool_calls() {
     if let Message::Assistant {
         content,
         reasoning,
+        replay: _,
         tool_calls,
     } = msg
     {

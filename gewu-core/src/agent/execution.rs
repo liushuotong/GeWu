@@ -97,6 +97,7 @@ impl DoomLoopDetector {
 pub(super) struct LlmResponseAggregator {
     content: String,
     reasoning: String,
+    replay: Option<crate::types::ReasoningReplay>,
     tool_calls: Vec<ToolCall>,
 }
 
@@ -106,6 +107,7 @@ impl LlmResponseAggregator {
         Self {
             content: String::new(),
             reasoning: String::new(),
+            replay: None,
             tool_calls: Vec::new(),
         }
     }
@@ -125,6 +127,10 @@ impl LlmResponseAggregator {
     /// `Some(AgentEvent)` if the event should be yielded, `None` if it's internal
     pub(super) fn process_event(&mut self, event: ProviderEvent) -> Option<AgentEvent> {
         match event {
+            ProviderEvent::ReasoningReplay { replay } => {
+                self.replay = Some(replay);
+                None
+            }
             ProviderEvent::ContentDelta { delta } => {
                 self.content.push_str(&delta);
                 Some(AgentEvent::ContentDelta { delta })
@@ -166,12 +172,13 @@ impl LlmResponseAggregator {
     ///
     /// # Returns
     ///
-    /// A tuple of (content string, reasoning string, tool calls vector)
-    pub(super) fn take_parts(&mut self) -> (String, String, Vec<ToolCall>) {
+    /// Content, display reasoning, tool calls, and native reasoning replay state.
+    pub(super) fn take_parts(&mut self) -> (String, String, Vec<ToolCall>, Option<crate::types::ReasoningReplay>) {
         (
             std::mem::take(&mut self.content),
             std::mem::take(&mut self.reasoning),
             std::mem::take(&mut self.tool_calls),
+            self.replay.take(),
         )
     }
 }

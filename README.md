@@ -183,10 +183,15 @@ in the project directory, then `~/.gewu/config.json(c)`. If both `.json` and
 ```jsonc
 {
   // LLM settings
-  "base_url": "https://api.openai.com/v1",   // custom endpoint (OpenAI-compatible)
-  "api_key": "sk-...",
-  "model": "gpt-4o",                         // default: gpt-5.3-codex
-  "provider": "openai",                      // "openai" (default) or "anthropic"
+  "model": "coding",                         // catalog key selected by default
+  "models": {
+    "coding": { "provider": "openai", "model": "gpt-4o" },
+    "deepseek-reasoner": { "provider": "deepseek" }
+  },
+  "providers": {
+    "openai": { "base_url": "https://api.openai.com/v1", "api_key": "sk-..." },
+    "deepseek": { "api_key": "your-deepseek-key" }
+  },
 
   // Optional
   "log": "gewu-requests.jsonl",              // record every wire LLM request/response as JSONL
@@ -208,7 +213,19 @@ in the project directory, then `~/.gewu/config.json(c)`. If both `.json` and
 1. CLI arguments (`--base-url`, `--endpoint`, `--api-key`, `--model`, `--provider`, `--llm-config`)
 2. Environment variables (`OPENAI_BASE_URL`, `OPENAI_API_KEY`, `OPENAI_ENDPOINT`, `OPENAI_MODEL`, `GEWU_PROVIDER`)
 3. Config file
-4. Defaults (`provider: openai`, `model: gpt-5.3-codex`; API key required)
+4. Provider-specific endpoint defaults (where available)
+
+Every model entry requires `provider`; its optional `model` is the API model
+ID and defaults to the catalog key. `--model` / `OPENAI_MODEL` selects a catalog
+key when `models` is populated. A conflicting `--provider` is rejected. Without
+a model catalog, direct CLI use requires both `--model` and `--provider`.
+Top-level `provider`, `api_key`, `base_url`, `reasoning_field`, and
+`require_reasoning` configuration fields are not supported.
+
+Provider credentials may instead come from `OPENAI_API_KEY`,
+`ANTHROPIC_API_KEY`, `DEEPSEEK_API_KEY`, `MOONSHOT_API_KEY`, or `GLM_API_KEY`.
+Explicit `--api-key` overrides provider credentials. `glm` and
+`openai-compatible` require an explicit endpoint (config or CLI).
 
 Agent state is persisted by default in `~/.gewu/gewu.db` (override with
 `--db-path`).
@@ -229,6 +246,31 @@ Agent state is persisted by default in `~/.gewu/gewu.db` (override with
 - **Anthropic**: Claude with extended thinking support and configurable `max_tokens`
 - **Multi-modal**: Image, audio, video, and file inputs where model capabilities allow (detected from the model name)
 - **Streaming**: Server-Sent Events (SSE) with reasoning/content deltas
+
+Reasoning is persisted and replayed to the same endpoint and model. Chat
+Completions uses fixed provider profiles, not model-name detection or user
+reasoning settings:
+
+`DeepSeekProvider`, `GlmProvider`, and `MoonshotProvider` each implement
+`LlmProvider` with fixed service policies. They share the Chat Completions
+request builder, SSE parser, and HTTP retry implementation with
+`OpenAIProvider`. `AnthropicProvider` handles the Messages protocol.
+The configuration provider ID selects the implementation at startup; agents
+continue to depend only on `Arc<dyn LlmProvider>`.
+
+| Provider | Reasoning field | Empty field required |
+| --- | --- | --- |
+| `deepseek`, `moonshot` | `reasoning_content` | yes |
+| `glm` | `reasoning` | yes |
+| `openai`, `openai-compatible` | detected standard streamed field | no |
+| `anthropic` | native signed thinking blocks | not applicable |
+
+Anthropic replay preserves ordered thinking, text, and tool-use blocks,
+including streamed signatures and redacted thinking. Incomplete thinking
+without a signature produces an explicit error. Compaction replaces the
+original blocks with a text checkpoint, so it does not replay signatures
+against compacted context. OpenAI Responses API encrypted reasoning is not
+supported by the Chat Completions transport.
 - **Resilience**: Automatic retry with exponential backoff; honors `Retry-After`; transient waits surface as status events
 
 ### Memory (`gewu-storage`)

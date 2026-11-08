@@ -662,12 +662,19 @@ mod tests {
         mem.add_message(Message::Assistant {
             content: Some("answer".to_string()),
             reasoning: Some("step by step".to_string()),
+            replay: Some(gewu_core::types::ReasoningReplay {
+                origin: "anthropic:https://api.anthropic.com".into(),
+                model: "claude-test".into(),
+                field: None,
+                blocks: vec![serde_json::json!({"type":"thinking","thinking":"step by step","signature":"sig"})],
+            }),
             tool_calls: None,
         })
         .await;
         mem.add_message(Message::Assistant {
             content: Some("plain".to_string()),
             reasoning: None,
+            replay: None,
             tool_calls: None,
         })
         .await;
@@ -678,10 +685,12 @@ mod tests {
             Message::Assistant {
                 content,
                 reasoning,
+                replay,
                 tool_calls,
             } => {
                 assert_eq!(content.as_deref(), Some("answer"));
                 assert_eq!(reasoning.as_deref(), Some("step by step"));
+                assert_eq!(replay.as_ref().unwrap().blocks[0]["signature"], "sig");
                 assert!(tool_calls.is_none());
             }
             _ => panic!("Wrong type"),
@@ -717,6 +726,7 @@ mod tests {
         let assistant = Message::Assistant {
             content: Some("second".to_string()),
             reasoning: None,
+            replay: None,
             tool_calls: None,
         };
         for (session, message, at) in [

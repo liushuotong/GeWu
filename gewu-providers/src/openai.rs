@@ -383,6 +383,8 @@ pub struct UserMessage {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AssistantMessage {
+    #[serde(flatten)]
+    pub reasoning: std::collections::BTreeMap<String, String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub content: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -633,15 +635,15 @@ pub struct ChatDelta {
     #[serde(default)]
     pub content: Option<String>,
     // Reasoning models stream their thinking under different field names:
-    // GLM (and some other gateways) use "reasoning", DeepSeek-style APIs use
-    // "reasoning_content". Accept both on deserialize; serialize as
-    // "reasoning_content" to preserve the existing wire behavior.
+    // Keep the native field name: alternative/custom reasoning fields are
+    // retained in `extra` and detected by the provider's stream parser.
     #[serde(
         rename = "reasoning_content",
-        alias = "reasoning",
         skip_serializing_if = "Option::is_none"
     )]
     pub reasoning_content: Option<String>,
+    #[serde(flatten)]
+    pub extra: std::collections::BTreeMap<String, serde_json::Value>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub tool_calls: Option<Vec<ChatCompletionMessageToolCallChunk>>,
 }
@@ -712,7 +714,7 @@ mod tests {
     fn chat_delta_parses_glm_reasoning_field() {
         // GLM-style gateways stream thinking under "reasoning".
         let delta: ChatDelta = serde_json::from_str(r#"{"reasoning":"thinking..."}"#).unwrap();
-        assert_eq!(delta.reasoning_content.as_deref(), Some("thinking..."));
+        assert_eq!(delta.extra.get("reasoning").and_then(serde_json::Value::as_str), Some("thinking..."));
     }
 
     #[test]
@@ -764,7 +766,7 @@ mod tests {
         let mut reasoning = String::new();
         while let Some(ev) = stream.next().await {
             let chunk = ev.expect("chunk should parse");
-            if let Some(r) = &chunk.choices[0].delta.reasoning_content {
+            if let Some(r) = chunk.choices[0].delta.extra.get("reasoning").and_then(serde_json::Value::as_str) {
                 reasoning.push_str(r);
             }
         }

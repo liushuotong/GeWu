@@ -8,6 +8,7 @@
 //!
 //! - **OpenAI** - OpenAI's official API and OpenAI-compatible endpoints
 //! - **Anthropic** - Anthropic's Claude API
+//! - **DeepSeek**, **GLM**, **Moonshot** - service-specific Chat Completions providers
 //!
 //! # Example
 //!
@@ -25,5 +26,9 @@ mod anthropic;
 mod http;
 mod openai;
 mod providers;
+mod profile;
+mod services;
 
 pub use providers::{AnthropicProvider, OpenAIProvider};
+pub use profile::ProviderProfile;
+pub use services::{DeepSeekProvider, GlmProvider, MoonshotProvider};

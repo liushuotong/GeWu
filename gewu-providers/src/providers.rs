@@ -42,7 +42,7 @@ use futures::StreamExt;
 use futures::stream::BoxStream;
 use gewu_core::traits::{LlmProvider, StatusSink, Tool};
 use gewu_core::types::{
-    Capabilities, ContentPart, Message, ProviderEvent, TokenUsage,
+    Capabilities, ContentPart, Message, ProviderEvent, TokenUsage, ReasoningReplay,
 };
 use serde_json::Value;
 use std::error::Error;
@@ -131,6 +131,9 @@ pub trait ResponseParser: Send + Sync {
 /// );
 /// ```
 pub struct OpenAIProvider {
+    base_url: String,
+    reasoning_field: Option<String>,
+    require_reasoning: bool,
     client: OpenAIClient,
     model: String,
     capabilities: Capabilities,
@@ -144,6 +147,12 @@ pub struct OpenAIProvider {
 }
 
 impl OpenAIProvider {
+    pub(crate) fn for_service(api_key: &str, base_url: &str, model: &str, policy: crate::services::ChatPolicy) -> Self {
+        let mut provider = Self::new_with_endpoint(api_key, base_url, model);
+        provider.reasoning_field = Some(policy.reasoning_field.to_string());
+        provider.require_reasoning = policy.require_reasoning;
+        provider
+    }
     /// Creates a new provider for the official OpenAI API.
     ///
     /// # Arguments
@@ -154,6 +163,9 @@ impl OpenAIProvider {
         let config = OpenAIConfig::new(api_key, "https://api.openai.com/v1");
         let capabilities = Self::default_capabilities_for_model(model);
         Self {
+            base_url: "https://api.openai.com/v1".to_string(),
+            reasoning_field: None,
+            require_reasoning: false,
             client: OpenAIClient::with_config(config),
             model: model.to_string(),
             capabilities,
@@ -177,6 +189,9 @@ impl OpenAIProvider {
         let config = OpenAIConfig::new(api_key, base_url);
         let capabilities = Self::default_capabilities_for_model(model);
         Self {
+            base_url: base_url.trim_end_matches('/').to_string(),
+            reasoning_field: None,
+            require_reasoning: false,
             client: OpenAIClient::with_config(config),
             model: model.to_string(),
             capabilities,
@@ -335,12 +350,23 @@ impl OpenAIProvider {
             Message::Assistant {
                 content,
                 reasoning,
+                replay,
                 tool_calls,
             } => {
-                // Reasoning is deliberately not resent: it is display-only
-                // context, and providers with signed thinking (Anthropic)
-                // reject replayed blocks without their signatures.
-                let _ = reasoning;
+                let origin = format!("chat:{}", self.base_url);
+                let compatible = replay.as_ref().filter(|r| r.origin == origin && r.model == self.model);
+                let mut reasoning_fields = std::collections::BTreeMap::new();
+                let field = self.reasoning_field.as_deref()
+                    .or_else(|| compatible.and_then(|r| r.field.as_deref()))
+                    .unwrap_or("reasoning_content");
+                if ["role", "content", "refusal", "tool_calls"].contains(&field) {
+                    return Err("invalid reasoning field in stored replay state".into());
+                }
+                if let Some(text) = reasoning.as_ref().filter(|_| compatible.is_some()) {
+                    reasoning_fields.insert(field.to_string(), text.clone());
+                } else if self.require_reasoning {
+                    reasoning_fields.insert(field.to_string(), String::new());
+                }
                 let openai_calls = tool_calls.clone().map(|calls| {
                     calls
                         .iter()
@@ -368,6 +394,7 @@ impl OpenAIProvider {
 
                 Ok(vec![ChatCompletionRequestMessage::Assistant(
                     OpenAIAssistantMessage {
+                        reasoning: reasoning_fields,
                         content: content.clone(),
                         tool_calls: openai_calls,
                     },
@@ -645,6 +672,9 @@ impl ResponseParser for OpenAIProvider {
         &self,
         stream: ChatCompletionStream,
     ) -> BoxStream<'static, Result<ProviderEvent, Box<dyn Error + Send + Sync>>> {
+        let field = self.reasoning_field.clone();
+        let origin = format!("chat:{}", self.base_url);
+        let model = self.model.clone();
         let s = async_stream::try_stream! {
             let mut tool_aggregator = ToolCallAggregator::default();
 
@@ -684,9 +714,19 @@ impl ResponseParser for OpenAIProvider {
                 if let Some(choice) = response.choices.first() {
                     let delta = &choice.delta;
 
-                    if let Some(reasoning) = &delta.reasoning_content
+                    let reasoning = field.as_deref().and_then(|name| {
+                        if name == "reasoning_content" { delta.reasoning_content.as_deref() }
+                        else { delta.extra.get(name).and_then(Value::as_str) }
+                    }).map(|text| (field.as_deref().unwrap(), text))
+                    .or_else(|| delta.reasoning_content.as_deref().map(|text| ("reasoning_content", text)))
+                    .or_else(|| ["reasoning", "reasoning_text"].into_iter().find_map(|name|
+                        delta.extra.get(name).and_then(Value::as_str).map(|text| (name, text))));
+                    if let Some((name, reasoning)) = reasoning
                         && !reasoning.is_empty() {
-                            yield ProviderEvent::ReasoningDelta { delta: reasoning.clone() };
+                            yield ProviderEvent::ReasoningReplay { replay: ReasoningReplay {
+                                origin: origin.clone(), model: model.clone(), field: Some(name.to_string()), blocks: vec![],
+                            }};
+                            yield ProviderEvent::ReasoningDelta { delta: reasoning.to_string() };
                         }
 
                     if let Some(content) = &delta.content
@@ -1013,12 +1053,22 @@ impl AnthropicProvider {
             Message::Assistant {
                 content,
                 reasoning,
+                replay,
                 tool_calls,
             } => {
-                // Reasoning is deliberately not resent (see the OpenAI
-                // conversion): signed thinking blocks cannot be replayed
-                // without their signatures.
                 let _ = reasoning;
+                let origin = format!("anthropic:{}", self.client.config.base_url.trim_end_matches('/'));
+                if let Some(replay) = replay.as_ref().filter(|r| r.origin == origin && r.model == self.model) {
+                    let blocks: Vec<ContentBlock> = replay.blocks.iter().cloned()
+                        .map(serde_json::from_value).collect::<Result<_, _>>()?;
+                    for block in &blocks {
+                        if let ContentBlock::Thinking { signature, .. } = block
+                            && signature.is_empty() {
+                                return Err("cannot replay incomplete Anthropic thinking: missing signature".into());
+                            }
+                    }
+                    return Ok(vec![AnthropicMessage::Assistant(AnthropicAssistantMessage { content: Some(blocks) })]);
+                }
                 let mut blocks: Vec<ContentBlock> = Vec::new();
                 if let Some(text) = content
                     && !text.is_empty() {
@@ -1190,6 +1240,7 @@ impl AnthropicToolCallAggregator {
                     });
                 }
             }
+            ContentBlockStart::RedactedThinking { .. } => {}
             ContentBlockStart::Text { .. } => {}
         }
 
@@ -1234,6 +1285,7 @@ impl AnthropicToolCallAggregator {
                 }
             }
             ContentDelta::Text { .. } => {}
+            ContentDelta::Signature { .. } => {}
         }
 
         events
@@ -1246,8 +1298,13 @@ impl AnthropicProvider {
         stream: AnthropicStream,
     ) -> futures::stream::BoxStream<'static, Result<ProviderEvent, Box<dyn Error + Send + Sync>>>
     {
+        let origin = format!("anthropic:{}", self.client.config.base_url.trim_end_matches('/'));
+        let model = self.model.clone();
         let s = async_stream::try_stream! {
             let mut tool_aggregator = AnthropicToolCallAggregator::default();
+            let mut blocks = std::collections::BTreeMap::<u32, Value>::new();
+            let mut arguments = std::collections::BTreeMap::<u32, String>::new();
+            let mut has_reasoning = false;
             let mut stream = stream;
 
             // Cache figures may be zeroed on `message_start` by proxies
@@ -1277,11 +1334,46 @@ impl AnthropicProvider {
                         }
                     }
                     AnthropicChunk::ContentBlockStart(chunk) => {
+                        let block = match &chunk.content_block {
+                            ContentBlockStart::Thinking { thinking, signature } => {
+                                has_reasoning = true;
+                                serde_json::json!({"type":"thinking", "thinking":thinking, "signature":signature})
+                            }
+                            ContentBlockStart::RedactedThinking { data } => {
+                                has_reasoning = true;
+                                serde_json::json!({"type":"redacted_thinking", "data":data})
+                            }
+                            ContentBlockStart::Text { _text } => {
+                                if !_text.is_empty() {
+                                    yield ProviderEvent::ContentDelta { delta: _text.clone() };
+                                }
+                                serde_json::json!({"type":"text", "text":_text})
+                            }
+                            ContentBlockStart::ToolUse { id, name, input } =>
+                                serde_json::json!({"type":"tool_use", "id":id, "name":name, "input":input.clone().unwrap_or_else(|| serde_json::json!({}))}),
+                        };
+                        blocks.insert(chunk.index, block);
                         for event in tool_aggregator.process_chunk(&chunk, chunk.index) {
                             yield event;
                         }
                     }
                     AnthropicChunk::ContentBlockDelta(chunk) => {
+                        if let Some(block) = blocks.get_mut(&chunk.index) {
+                            let (field, delta) = match &chunk.delta {
+                                ContentDelta::Text { text } => ("text", text.as_str()),
+                                ContentDelta::Thinking { thinking } => ("thinking", thinking.as_str()),
+                                ContentDelta::Signature { signature } => ("signature", signature.as_str()),
+                                ContentDelta::InputJson { partial_json } => {
+                                    arguments.entry(chunk.index).or_default().push_str(partial_json);
+                                    ("", "")
+                                }
+                            };
+                            if !field.is_empty() {
+                                let mut text = block[field].as_str().unwrap_or("").to_string();
+                                text.push_str(delta);
+                                block[field] = Value::String(text);
+                            }
+                        }
                         for event in tool_aggregator.process_delta(&chunk, chunk.index) {
                             yield event;
                         }
@@ -1296,6 +1388,7 @@ impl AnthropicProvider {
                             // duplicate every reasoning token in the stream.
                             ContentDelta::Thinking { .. } => {}
                             ContentDelta::InputJson { .. } => {}
+                            ContentDelta::Signature { .. } => {}
                         }
                     }
                     AnthropicChunk::ContentBlockStop(_) => {}
@@ -1317,6 +1410,17 @@ impl AnthropicProvider {
                             usage.output_tokens = message_usage.output_tokens;
                         }
                         if let Some(reason) = chunk.delta.stop_reason {
+                            if has_reasoning {
+                                for (index, json) in &arguments {
+                                    if let Some(block) = blocks.get_mut(index) {
+                                        block["input"] = serde_json::from_str(json)?;
+                                    }
+                                }
+                                yield ProviderEvent::ReasoningReplay { replay: ReasoningReplay {
+                                    origin: origin.clone(), model: model.clone(), field: None,
+                                    blocks: blocks.values().cloned().collect(),
+                                }};
+                            }
                             // Emit once, with the terminal cumulative
                             // figures: some flows (server tools) deliver
                             // several cumulative `message_delta` events, and
@@ -1412,6 +1516,99 @@ impl LlmProvider for AnthropicProvider {
 
 #[cfg(test)]
 mod tests {
+    #[tokio::test]
+    async fn chat_reasoning_replays_detected_field_and_respects_origin() {
+        let body = concat!(
+            "data: {\"id\":\"1\",\"choices\":[{\"index\":0,\"delta\":{\"reasoning_text\":\"consider \"}}]}\n\n",
+            "data: {\"id\":\"1\",\"choices\":[{\"index\":0,\"delta\":{\"reasoning_text\":\"tools\"}}]}\n\n",
+            "data: [DONE]\n\n"
+        );
+        let addr = serve_canned(vec![http_response("HTTP/1.1 200 OK", &[("Content-Type", "text/event-stream")], body)]).await;
+        let provider = OpenAIProvider::new_with_endpoint("key", &format!("http://{addr}/v1"), "reasoner");
+        let mut stream = provider.stream_response(&[], &[], None).await.unwrap();
+        let mut text = String::new();
+        let mut replay = None;
+        while let Some(event) = stream.next().await {
+            match event.unwrap() {
+                ProviderEvent::ReasoningDelta { delta } => text.push_str(&delta),
+                ProviderEvent::ReasoningReplay { replay: state } => replay = Some(state),
+                _ => {}
+            }
+        }
+        let message = Message::Assistant { content: None, reasoning: Some(text), replay, tool_calls: Some(vec![gewu_core::types::ToolCall {
+            id: "call-1".into(), r#type: "function".into(),
+            function: gewu_core::types::FunctionCall { name: "read".into(), arguments: "{}".into() },
+        }]) };
+        let restored: Message = serde_json::from_str(&serde_json::to_string(&message).unwrap()).unwrap();
+        let wire = serde_json::to_value(provider.convert_message(&restored).unwrap()).unwrap();
+        assert_eq!(wire[0]["reasoning_text"], "consider tools");
+        let request = provider.build(&[restored.clone(), Message::Tool {
+            tool_call_id: "call-1".into(), tool_name: Some("read".into()), content: "result".into(), media: vec![],
+        }, Message::User { content: vec![ContentPart::Text { text: "continue".into() }] }], &[]).unwrap();
+        assert_eq!(request["messages"][0]["reasoning_text"], "consider tools");
+        assert_eq!(request["messages"][1]["role"], "tool");
+        assert_eq!(request["messages"][2]["role"], "user");
+        let other = OpenAIProvider::new("key", "other-model");
+        let wire = serde_json::to_value(other.convert_message(&restored).unwrap()).unwrap();
+        assert!(wire[0].get("reasoning_text").is_none());
+        let required = crate::GlmProvider::new("key", "other-model");
+        let wire = required.build(&[restored.clone()], &[]).unwrap();
+        assert_eq!(wire["messages"][0]["reasoning"], "");
+        drop(stream);
+        let custom = crate::DeepSeekProvider::new_with_endpoint("key", &provider.base_url, "reasoner");
+        let wire = custom.build(&[restored.clone()], &[]).unwrap();
+        assert_eq!(wire["messages"][0]["reasoning_content"], "consider tools");
+        let plain = Message::Assistant { content: Some("plain".into()), reasoning: None, replay: None, tool_calls: None };
+        let wire = custom.build(&[plain], &[]).unwrap();
+        assert_eq!(wire["messages"][0]["reasoning_content"], "");
+    }
+
+    #[tokio::test]
+    async fn anthropic_replays_ordered_signed_and_redacted_blocks() {
+        let events = [
+            serde_json::json!({"type":"content_block_start", "index":0,"content_block":{"type":"thinking","thinking":"consider", "signature":""}}),
+            serde_json::json!({"type":"content_block_delta", "index":0,"delta":{"type":"signature_delta","signature":"sig-"}}),
+            serde_json::json!({"type":"content_block_delta", "index":0,"delta":{"type":"signature_delta","signature":"123"}}),
+            serde_json::json!({"type":"content_block_start", "index":1,"content_block":{"type":"redacted_thinking","data":"opaque"}}),
+            serde_json::json!({"type":"content_block_start", "index":2,"content_block":{"type":"text","text":"checking"}}),
+            serde_json::json!({"type":"content_block_start", "index":3,"content_block":{"type":"tool_use","id":"call-1","name":"read","input":{}}}),
+            serde_json::json!({"type":"content_block_delta", "index":3,"delta":{"type":"input_json_delta","partial_json":"{\"path\":\"a\"}"}}),
+            serde_json::json!({"type":"content_block_start", "index":4,"content_block":{"type":"thinking","thinking":"again", "signature":"second-signature"}}),
+            serde_json::json!({"type":"message_delta","delta":{"stop_reason":"tool_use"},"usage":{"output_tokens":10}}),
+        ];
+        let body = events.iter().map(|e| format!("event: {}\ndata: {e}\n\n", e["type"].as_str().unwrap())).collect::<String>();
+        let addr = serve_canned(vec![http_response("HTTP/1.1 200 OK", &[("Content-Type", "text/event-stream")], &body)]).await;
+        let provider = AnthropicProvider::new_with_endpoint("key", &format!("http://{addr}"), "claude-test");
+        let mut stream = provider.stream_response(&[], &[], None).await.unwrap();
+        let mut replay = None;
+        while let Some(event) = stream.next().await {
+            if let ProviderEvent::ReasoningReplay { replay: state } = event.unwrap() { replay = Some(state); }
+        }
+        let message = Message::Assistant { content: Some("checking".into()), reasoning: Some("consider".into()), replay, tool_calls: None };
+        let restored: Message = serde_json::from_str(&serde_json::to_string(&message).unwrap()).unwrap();
+        let wire = serde_json::to_value(provider.convert_message(&restored).unwrap()).unwrap();
+        let blocks = &wire[0]["content"];
+        assert_eq!(blocks[0]["signature"], "sig-123");
+        assert_eq!(blocks[1]["type"], "redacted_thinking");
+        assert_eq!(blocks[1]["data"], "opaque");
+        assert_eq!(blocks[2]["text"], "checking");
+        assert_eq!(blocks[3]["input"]["path"], "a");
+        assert_eq!(blocks[4]["thinking"], "again");
+        assert_eq!(blocks[4]["signature"], "second-signature");
+        let request = provider.build(&[restored.clone(), Message::Tool {
+            tool_call_id: "call-1".into(), tool_name: Some("read".into()), content: "result".into(), media: vec![],
+        }], &[]).unwrap();
+        assert_eq!(request["messages"][0]["content"][0]["signature"], "sig-123");
+        assert_eq!(request["messages"][1]["content"][0]["tool_use_id"], "call-1");
+        let mut incomplete = restored.clone();
+        if let Message::Assistant { replay: Some(state), .. } = &mut incomplete {
+            state.blocks[0]["signature"] = serde_json::json!("");
+        }
+        assert!(provider.convert_message(&incomplete).is_err());
+        let other = AnthropicProvider::new("key", "other");
+        let wire = serde_json::to_value(other.convert_message(&restored).unwrap()).unwrap();
+        assert_eq!(wire[0]["content"].as_array().unwrap().len(), 1);
+    }
     use super::*;
     use crate::openai::FunctionCallStream;
     use async_trait::async_trait;
@@ -1546,6 +1743,7 @@ mod tests {
         let assistant = Message::Assistant {
             content: None,
             reasoning: None,
+            replay: None,
             tool_calls: None,
         };
         let request = provider
@@ -1708,6 +1906,7 @@ mod tests {
         let msg = Message::Assistant {
             content: Some("Hello world".to_string()),
             reasoning: None,
+            replay: None,
             tool_calls: None,
         };
         let converted = provider.convert_message(&msg).expect("convert success");
@@ -1726,6 +1925,7 @@ mod tests {
         let msg = Message::Assistant {
             content: None,
             reasoning: None,
+            replay: None,
             tool_calls: Some(vec![CoreToolCall {
                 id: "call_1".to_string(),
                 r#type: "function".to_string(),
@@ -1812,6 +2012,7 @@ mod tests {
         let msg = Message::Assistant {
             content: None,
             reasoning: None,
+            replay: None,
             tool_calls: Some(vec![CoreToolCall {
                 id: "toolu_1".to_string(),
                 r#type: "function".to_string(),
@@ -2079,6 +2280,7 @@ mod tests {
         let messages = vec![Message::Assistant {
             content: None,
             reasoning: None,
+            replay: None,
             tool_calls: Some(vec![CoreToolCall {
                 id: "call_1".to_string(),
                 r#type: "function".to_string(),

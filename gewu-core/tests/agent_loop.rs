@@ -50,8 +50,13 @@ impl LlmProvider for MockLlm {
 
         let s = async_stream::try_stream! {
             match response {
-                Message::Assistant { content, reasoning, tool_calls } => {
-                    let _ = reasoning;
+                Message::Assistant { content, reasoning, tool_calls, replay } => {
+                    if let Some(replay) = replay {
+                        yield ProviderEvent::ReasoningReplay { replay };
+                    }
+                    if let Some(delta) = reasoning {
+                        yield ProviderEvent::ReasoningDelta { delta };
+                    }
                     if let Some(c) = content {
                         yield ProviderEvent::ContentDelta { delta: c };
                     }
@@ -101,6 +106,12 @@ impl Tool for MockTool {
 
 #[tokio::test]
 async fn test_agent_loop() {
+    let replay = gewu_core::types::ReasoningReplay {
+        origin: "chat:https://example.com/v1".into(),
+        model: "reasoner".into(),
+        field: Some("reasoning_content".into()),
+        blocks: vec![],
+    };
     let tool_call = ToolCall {
         id: "call_1".to_string(),
         r#type: "function".to_string(),
@@ -113,12 +124,14 @@ async fn test_agent_loop() {
     let responses = vec![
         Message::Assistant {
             content: None,
-            reasoning: None,
+            reasoning: Some("I should call the tool".into()),
+            replay: Some(replay.clone()),
             tool_calls: Some(vec![tool_call]),
         },
         Message::Assistant {
             content: Some("Done: Tool output".to_string()),
             reasoning: None,
+            replay: None,
             tool_calls: None,
         },
     ];
@@ -159,6 +172,11 @@ async fn test_agent_loop() {
     assert_eq!(output, "Tool output");
     assert_eq!(metadata["kind"], serde_json::json!("mock"));
     assert_eq!(result, "Done: Tool output");
+    drop(stream);
+    assert!(agent.memory.messages().iter().any(|message| matches!(message,
+        Message::Assistant { reasoning: Some(text), replay: Some(state), .. }
+        if text == "I should call the tool" && state == &replay
+    )));
 }
 
 #[tokio::test]
@@ -166,6 +184,7 @@ async fn test_agent_emits_usage_at_turn_boundaries() {
     let responses = vec![Message::Assistant {
         content: Some("Done".to_string()),
         reasoning: None,
+        replay: None,
         tool_calls: None,
     }];
 
@@ -224,11 +243,13 @@ async fn test_apply_patch_metadata_through_agent_loop() {
             Message::Assistant {
                 content: None,
                 reasoning: None,
+                replay: None,
                 tool_calls: Some(vec![tool_call]),
             },
             Message::Assistant {
                 content: Some("patched".to_string()),
                 reasoning: None,
+                replay: None,
                 tool_calls: None,
             },
         ])),
@@ -312,6 +333,7 @@ async fn test_parallel_tool_calls_run_concurrently_in_call_order() {
         Message::Assistant {
             content: None,
             reasoning: None,
+            replay: None,
             tool_calls: Some(vec![
                 make_call(1, "call_1"),
                 make_call(2, "call_2"),
@@ -321,6 +343,7 @@ async fn test_parallel_tool_calls_run_concurrently_in_call_order() {
         Message::Assistant {
             content: Some("all done".to_string()),
             reasoning: None,
+            replay: None,
             tool_calls: None,
         },
     ];
@@ -384,6 +407,7 @@ async fn test_malformed_tool_calls_still_record_tool_results() {
         Message::Assistant {
             content: None,
             reasoning: None,
+            replay: None,
             tool_calls: Some(vec![
                 ToolCall {
                     id: "call_bad_json".to_string(),
@@ -406,6 +430,7 @@ async fn test_malformed_tool_calls_still_record_tool_results() {
         Message::Assistant {
             content: Some("recovered".to_string()),
             reasoning: None,
+            replay: None,
             tool_calls: None,
         },
     ];

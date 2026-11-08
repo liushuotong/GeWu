@@ -6,7 +6,7 @@
 use anyhow::{Context, Result};
 use gewu_core::traits::{LlmProvider, RequestLog};
 use gewu_core::types::PathEnforcement;
-use gewu_providers::{AnthropicProvider, OpenAIProvider};
+use gewu_providers::{AnthropicProvider, DeepSeekProvider, GlmProvider, MoonshotProvider, OpenAIProvider, ProviderProfile};
 use sqlx::SqlitePool;
 use sqlx::sqlite::SqlitePoolOptions;
 use std::env;
@@ -35,7 +35,7 @@ pub struct CommonArgs {
     #[arg(long, short, env = "OPENAI_MODEL")]
     pub model: Option<String>,
 
-    /// LLM Provider to use (openai or anthropic)
+    /// Provider profile for direct CLI use (configured models own their provider)
     #[arg(long, env = "GEWU_PROVIDER")]
     pub provider: Option<String>,
 
@@ -141,14 +141,32 @@ pub fn build_provider(
     args: &CommonArgs,
     file_config: &crate::config::Config,
 ) -> Result<(Arc<dyn LlmProvider>, String, String)> {
+    file_config.validate()?;
+    let selected = args.model.clone()
+        .or_else(|| env::var("OPENAI_MODEL").ok())
+        .or_else(|| file_config.model.clone())
+        .context("select a configured model with --model or the config's model field")?;
+    let entry = file_config.models.get(&selected);
+    anyhow::ensure!(entry.is_some() || file_config.models.is_empty(), "unknown configured model '{selected}'");
+    let override_provider = args.provider.clone().or_else(|| env::var("GEWU_PROVIDER").ok());
+    let profile = if let Some(entry) = entry {
+        if let Some(name) = &override_provider {
+            anyhow::ensure!(name.parse::<ProviderProfile>().map_err(anyhow::Error::msg)? == entry.provider,
+                "provider override conflicts with provider assigned to model '{selected}'");
+        }
+        entry.provider
+    } else {
+        override_provider.context("--provider is required for direct CLI model selection")?
+            .parse::<ProviderProfile>().map_err(anyhow::Error::msg)?
+    };
+    let settings = file_config.providers.get(profile.id());
+    let model = entry.and_then(|entry| entry.model.clone()).unwrap_or(selected);
     let api_key = args
         .api_key
         .clone()
-        .or_else(|| env::var("OPENAI_API_KEY").ok())
-        .or(file_config.api_key.clone())
-        .context(
-            "OPENAI_API_KEY not provided. Set via --api-key, OPENAI_API_KEY env var, or config.json",
-        )?;
+        .or_else(|| env::var(profile.api_key_env()).ok())
+        .or_else(|| settings.and_then(|settings| settings.api_key.clone()))
+        .with_context(|| format!("API key required: use --api-key, {}, or providers.{}.api_key", profile.api_key_env(), profile.id()))?;
 
     let base_url = args
         .base_url
@@ -156,28 +174,15 @@ pub fn build_provider(
         .or_else(|| env::var("OPENAI_BASE_URL").ok())
         .or(args.endpoint.clone())
         .or_else(|| env::var("OPENAI_ENDPOINT").ok())
-        .or(file_config.base_url.clone());
+        .or_else(|| settings.and_then(|settings| settings.base_url.clone()))
+        .or_else(|| profile.base_url().map(str::to_string))
+        .with_context(|| format!("providers.{}.base_url is required", profile.id()))?;
 
-    let provider_name = args
-        .provider
-        .clone()
-        .or_else(|| env::var("GEWU_PROVIDER").ok())
-        .or_else(|| file_config.provider.clone())
-        .unwrap_or_else(|| "openai".to_string());
+    let provider_name = profile.id().to_string();
 
-    let model = args
-        .model
-        .clone()
-        .or_else(|| env::var("OPENAI_MODEL").ok())
-        .or(file_config.model.clone())
-        .unwrap_or_else(|| "gpt-5.3-codex".to_string());
-
-    let provider: Arc<dyn LlmProvider> = match provider_name.to_lowercase().as_str() {
-        "anthropic" => {
-            let mut builder = match base_url {
-                Some(url) => AnthropicProvider::new_with_endpoint(&api_key, &url, &model),
-                None => AnthropicProvider::new(&api_key, &model),
-            };
+    let provider: Arc<dyn LlmProvider> = match profile {
+        ProviderProfile::Anthropic => {
+            let mut builder = AnthropicProvider::new_with_endpoint(&api_key, &base_url, &model);
             if let Some(max_tokens) = file_config.max_tokens {
                 builder = builder.with_max_tokens(max_tokens);
             }
@@ -187,13 +192,10 @@ pub fn build_provider(
             );
             Arc::new(builder)
         }
-        _ => {
-            if let Some(url) = base_url {
-                Arc::new(OpenAIProvider::new_with_endpoint(&api_key, &url, &model))
-            } else {
-                Arc::new(OpenAIProvider::new(&api_key, &model))
-            }
-        }
+        ProviderProfile::Deepseek => Arc::new(DeepSeekProvider::new_with_endpoint(&api_key, &base_url, &model)),
+        ProviderProfile::Glm => Arc::new(GlmProvider::new_with_endpoint(&api_key, &base_url, &model)),
+        ProviderProfile::Moonshot => Arc::new(MoonshotProvider::new_with_endpoint(&api_key, &base_url, &model)),
+        ProviderProfile::Openai | ProviderProfile::OpenaiCompatible => Arc::new(OpenAIProvider::new_with_endpoint(&api_key, &base_url, &model)),
     };
 
     Ok((provider, provider_name, model))
@@ -275,6 +277,41 @@ pub fn new_session_id() -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn configured_model_selects_provider_and_api_model_id() {
+        let config = serde_json::from_str(r#"{"model":"coding","models":{"coding":{"provider":"deepseek","model":"deepseek-reasoner"}},"providers":{"deepseek":{"api_key":"test"}}}"#).unwrap();
+        let args = CommonArgs { api_key: Some("test".into()), model: Some("coding".into()), provider: Some("deepseek".into()), ..Default::default() };
+        let (_, provider, model) = build_provider(&args, &config).unwrap();
+        assert_eq!(provider, "deepseek");
+        assert_eq!(model, "deepseek-reasoner");
+        let conflict = CommonArgs { provider: Some("openai".into()), ..args.clone() };
+        assert!(build_provider(&conflict, &config).is_err());
+        let unknown = CommonArgs { model: Some("missing".into()), ..args };
+        assert!(build_provider(&unknown, &config).is_err());
+    }
+
+    #[test]
+    fn startup_constructs_service_specific_providers() {
+        for (name, field) in [("deepseek", "reasoning_content"), ("moonshot", "reasoning_content"), ("glm", "reasoning")] {
+            let config = serde_json::from_value(serde_json::json!({
+                "models": {"coding": {"provider": name, "model": "arbitrary-model"}},
+                "providers": {(name): {"base_url": "https://example.com/v1"}}
+            })).unwrap();
+            let args = CommonArgs {
+                api_key: Some("key".into()), model: Some("coding".into()),
+                provider: Some(name.into()), base_url: Some("https://example.com/v1".into()),
+                ..Default::default()
+            };
+            let (provider, selected, model) = build_provider(&args, &config).unwrap();
+            assert_eq!(selected, name);
+            assert_eq!(model, "arbitrary-model");
+            let payload = provider.build(&[gewu_core::types::Message::Assistant {
+                content: Some("answer".into()), reasoning: None, replay: None, tool_calls: None,
+            }], &[]).unwrap();
+            assert_eq!(payload["messages"][0][field], "");
+        }
+    }
 
     #[test]
     fn init_tracing_is_idempotent() {

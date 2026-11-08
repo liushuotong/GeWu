@@ -151,6 +151,8 @@ pub struct AssistantMessage {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum ContentBlock {
+    Thinking { thinking: String, signature: String },
+    RedactedThinking { data: String },
     Text {
         text: String,
     },
@@ -465,9 +467,9 @@ pub enum ContentBlockStart {
     },
     Thinking {
         thinking: String,
-        #[serde(rename = "signature")]
-        _signature: String,
+        signature: String,
     },
+    RedactedThinking { data: String },
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -479,6 +481,8 @@ pub struct ContentBlockDeltaChunk {
 #[derive(Debug, Clone, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum ContentDelta {
+    #[serde(rename = "signature_delta")]
+    Signature { signature: String },
     #[serde(rename = "text_delta")]
     Text {
         text: String,
