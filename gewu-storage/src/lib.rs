@@ -493,6 +493,17 @@ impl SqliteMemory {
 
 #[async_trait]
 impl Memory for SqliteMemory {
+    async fn append_compaction(&mut self, summary: String, recent: String) -> anyhow::Result<()> {
+        let message = Message::Compaction { summary, recent };
+        let content = serde_json::to_string(&message)?;
+        sqlx::query("INSERT INTO memory_messages (session_id, content) VALUES (?, ?)")
+            .bind(&self.session_id)
+            .bind(content)
+            .execute(&self.pool)
+            .await?;
+        self.messages.push(message);
+        Ok(())
+    }
     fn messages(&self) -> &[Message] {
         &self.messages
     }
@@ -550,8 +561,7 @@ impl Memory for SqliteMemory {
 
     /// Replaces all messages with a new set.
     ///
-    /// This is used by the agent's compaction logic to replace the
-    /// full conversation history with a summarized version. The operation
+    /// Used for explicit history edits, not compaction. The operation
     /// is transactional:
     ///
     /// 1. Deletes all existing messages for this session
@@ -618,6 +628,53 @@ mod tests {
     use super::*;
     use gewu_core::types::{ContentPart, Message};
     use sqlx::sqlite::SqlitePoolOptions;
+
+    #[tokio::test]
+    async fn revert_and_undo_restore_compaction_context() -> Result<()> {
+        let pool = SqlitePoolOptions::new().connect("sqlite::memory:").await?;
+        let mut memory = SqliteMemory::new(pool.clone(), "boundaries".into()).await?;
+        let user = |text: &str| Message::User { content: vec![ContentPart::Text { text: text.into() }] };
+        memory.add_message(user("first")).await;
+        memory.add_message(user("second")).await;
+        memory.append_compaction("summary".into(), "tail".into()).await?;
+        memory.add_message(user("third")).await;
+        let original = memory.messages().to_vec();
+        let original_context = gewu_core::compaction::active_context(&original).to_messages();
+        let (retained, _) = revert_chat(&pool, "boundaries", Some(1), false, None).await?;
+        assert_eq!(retained, vec![user("first")]);
+        let loaded = SqliteMemory::new(pool.clone(), "boundaries".into()).await?;
+        assert_eq!(gewu_core::compaction::active_context(loaded.messages()).to_messages(), retained);
+        let (restored, _) = revert_chat(&pool, "boundaries", None, true, None).await?;
+        assert_eq!(restored, original);
+        let loaded = SqliteMemory::new(pool.clone(), "boundaries".into()).await?;
+        assert_eq!(gewu_core::compaction::active_context(loaded.messages()).to_messages(), original_context);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn compaction_preserves_original_rows_and_reloads_context() -> Result<()> {
+        let pool = SqlitePoolOptions::new().connect("sqlite::memory:").await?;
+        let mut memory = SqliteMemory::new(pool.clone(), "compact".into()).await?;
+        let original = Message::Tool { tool_call_id: "call".into(), tool_name: None,
+            content: "original".repeat(10_000), media: vec![] };
+        memory.add_message(original.clone()).await;
+        let original_id: i64 = sqlx::query_scalar("SELECT id FROM memory_messages WHERE session_id = 'compact'")
+            .fetch_one(&pool).await?;
+        memory.append_compaction("first".into(), "recent".into()).await?;
+        memory.append_compaction("latest".into(), "tail".into()).await?;
+        let loaded = SqliteMemory::new(pool.clone(), "compact".into()).await?;
+        assert_eq!(loaded.messages().len(), 3);
+        assert_eq!(loaded.messages()[0], original);
+        let retained_id: i64 = sqlx::query_scalar("SELECT MIN(id) FROM memory_messages WHERE session_id = 'compact'")
+            .fetch_one(&pool).await?;
+        assert_eq!(original_id, retained_id);
+        assert_eq!(gewu_core::compaction::active_context(loaded.messages()).to_messages(),
+            vec![gewu_core::compaction::build_checkpoint_message("latest", "tail")]);
+        pool.close().await;
+        assert!(memory.append_compaction("failed".into(), "".into()).await.is_err());
+        assert_eq!(memory.messages().len(), 3, "failed persistence cannot activate a boundary");
+        Ok(())
+    }
 
     #[tokio::test]
     async fn test_persistence() -> Result<()> {

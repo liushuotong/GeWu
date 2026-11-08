@@ -67,7 +67,6 @@ use uuid::Uuid;
 
 use self::execution::{DoomLoopDetector, LlmResponseAggregator, execute_tool_call};
 use crate::agent::media::extract_media_parts;
-use crate::compaction::estimate_message_tokens;
 
 /// Maximum number of tool calls from a single LLM turn that execute at the
 /// same time. Extra calls queue behind the semaphore until a slot frees up.
@@ -267,8 +266,22 @@ impl Agent {
             })));
 
             loop {
-                if self.compact_if_needed().await? {
+                let context_tokens = crate::compaction::active_context(self.memory.messages())
+                    .estimate_tokens();
+                let compacting = crate::compaction::is_overflow(context_tokens, self.context_limit);
+                if compacting {
+                    yield AgentEvent::Status { message: "Compacting context…".into() };
+                }
+                if self.compact_with_estimate(context_tokens).await? {
                     info!("History compacted.");
+                    let summary = match self.memory.messages().last() {
+                        Some(Message::Compaction { summary, .. }) => summary.clone(),
+                        _ => String::new(),
+                    };
+                    yield AgentEvent::Compacted { summary };
+                } else if compacting {
+                    // A skipped attempt must not leave the busy indicator stale.
+                    yield self.usage_event();
                 }
 
                 if let Some(max) = self.max_turns
@@ -279,7 +292,7 @@ impl Agent {
                 turn += 1;
 
                 let mut aggregator = LlmResponseAggregator::new();
-                let mut messages = self.memory.messages().to_vec();
+                let mut messages = crate::compaction::active_context(self.memory.messages()).to_messages();
                 // Persisted history may belong to a different agent profile.
                 // Replace its base system prompt for this provider request,
                 // without rewriting conversation history.
@@ -536,12 +549,8 @@ impl Agent {
     /// Builds the context-usage event from the current conversation estimate
     /// plus the provider-reported token accounting for the whole session.
     fn usage_event(&self) -> AgentEvent {
-        let used_tokens: usize = self
-            .memory
-            .messages()
-            .iter()
-            .map(estimate_message_tokens)
-            .sum();
+        let used_tokens: usize = crate::compaction::active_context(self.memory.messages())
+            .estimate_tokens();
         AgentEvent::Usage {
             used_tokens: used_tokens as u64,
             context_limit: self.context_limit as u64,
@@ -1005,6 +1014,76 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn profile_switch_after_compaction_uses_current_prompt_and_reminder() -> Result<()> {
+        let response = vec![ProviderEvent::ContentDelta { delta: "summary or answer".into() },
+            ProviderEvent::Finish { reason: Some("stop".into()) }];
+        let provider = Arc::new(MockProvider::new(vec![response; 3]));
+        let mut agent = Agent::builder().llm(provider.clone()).context_limit(20_100)
+            .system_prompt("old profile").build()?;
+        let original = Message::User { content: vec![ContentPart::Text { text: "x".repeat(40_400) }] };
+        agent.memory.add_message(original.clone()).await;
+        {
+            let events = agent.ask("continue");
+            futures::pin_mut!(events);
+            while let Some(event) = events.next().await { event?; }
+        }
+        assert!(agent.memory.messages().iter().any(|m| matches!(m, Message::Compaction { .. })));
+        let stored = agent.memory.messages().to_vec();
+        agent.set_profile("new profile".into(), vec![], Reminder::switch("NEW MODE REMINDER", None));
+        {
+            let events = agent.ask("next step");
+            futures::pin_mut!(events);
+            while let Some(event) = events.next().await { event?; }
+        }
+        assert_eq!(&agent.memory.messages()[..stored.len()], stored);
+        assert!(agent.memory.messages().contains(&original));
+        let requests = provider.captured_requests.lock().unwrap();
+        assert_eq!(requests.len(), 3, "one summary, two normal requests");
+        let final_request = &requests[2]["messages"];
+        assert_eq!(final_request[0]["content"], "new profile");
+        let serialized = serde_json::to_string(final_request)?;
+        assert!(serialized.contains("NEW MODE REMINDER"));
+        assert!(serialized.contains("<conversation-checkpoint>"));
+        assert!(!serialized.contains("xxxx"));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn repeated_compaction_preserves_transcript_and_folds_prior_context() -> Result<()> {
+        let summary = || vec![ProviderEvent::ContentDelta { delta: "summary".into() }, ProviderEvent::Finish { reason: None }];
+        let provider = Arc::new(MockProvider::new(vec![summary(), summary()]));
+        let mut agent = Agent::builder().llm(provider.clone()).context_limit(20_100).build()?;
+        let old = Message::User { content: vec![ContentPart::Text { text: "x".repeat(40_400) }] };
+        agent.memory.add_message(old.clone()).await;
+        agent.memory.add_message(Message::User { content: vec![ContentPart::Text { text: "prior tail".into() }] }).await;
+        assert!(agent.compact_if_needed().await?);
+        assert!(!agent.compact_if_needed().await?, "archived history must not trigger another compaction");
+        agent.memory.add_message(old.clone()).await;
+        assert!(agent.compact_if_needed().await?);
+        assert_eq!(agent.memory.messages().len(), 5);
+        assert_eq!(agent.memory.messages()[0], old);
+        let requests = provider.captured_requests.lock().unwrap();
+        let second = serde_json::to_string(&requests[1])?;
+        assert!(second.contains("<prior-summary>"));
+        assert!(second.contains("prior tail"));
+        let context = crate::compaction::active_context(agent.memory.messages()).to_messages();
+        assert_eq!(context.len(), 1);
+        assert!(!serde_json::to_string(&context)?.contains("xxxx"));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn empty_summary_does_not_append_compaction() -> Result<()> {
+        let mut agent = Agent::builder().llm(Arc::new(MockProvider::single_content("")))
+            .context_limit(20_100).build()?;
+        let old = Message::User { content: vec![ContentPart::Text { text: "x".repeat(40_400) }] };
+        agent.memory.add_message(old.clone()).await;
+        assert!(agent.compact_if_needed().await.is_err());
+        assert_eq!(agent.memory.messages(), &[old]);
+        Ok(())
+    }
+
+    #[tokio::test]
     async fn test_with_log_records_compaction_requests() -> Result<()> {
         let buffer = SharedBuffer::default();
         let mut agent = Agent::builder()
@@ -1046,10 +1125,10 @@ mod tests {
         assert_eq!(entries[0]["request"]["model"], "mock");
         assert_eq!(entries[1]["response"]["outcome"], "ok");
 
-        // History collapses into a checkpoint message carrying the summary
-        // and the serialized recent tail.
-        let messages = agent.memory.messages();
-        assert_eq!(messages.len(), 1, "no system prompt: just the checkpoint");
+        // Stored originals survive; only model context collapses.
+        assert_eq!(agent.memory.messages().len(), 3, "originals plus checkpoint");
+        let messages = crate::compaction::active_context(agent.memory.messages()).to_messages();
+        assert_eq!(messages.len(), 1, "model receives only the checkpoint");
         let text = match &messages[0] {
             Message::User { content } => match &content[0] {
                 ContentPart::Text { text } => text.clone(),

@@ -339,6 +339,8 @@ impl OpenAIProvider {
         msg: &Message,
     ) -> Result<Vec<ChatCompletionRequestMessage>, Box<dyn Error + Send + Sync>> {
         match msg {
+            Message::Compaction { summary, recent } => self.convert_message(
+                &gewu_core::compaction::build_checkpoint_message(summary, recent)),
             Message::System { content } => {
                 let m = ChatCompletionRequestSystemMessageArgs::default()
                     .content(content.clone())
@@ -1050,6 +1052,8 @@ impl AnthropicProvider {
         msg: &Message,
     ) -> Result<Vec<AnthropicMessage>, Box<dyn Error + Send + Sync>> {
         match msg {
+            Message::Compaction { summary, recent } => self.convert_message(
+                &gewu_core::compaction::build_checkpoint_message(summary, recent)),
             Message::System { content: _ } => Ok(vec![]),
             Message::User { content } => {
                 let blocks: Vec<ContentBlock> = content

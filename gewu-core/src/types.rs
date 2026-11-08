@@ -249,6 +249,11 @@ pub enum AgentEvent {
     /// Not part of the transcript: frontends render it in their busy
     /// indicator and replace or clear it with the next event.
     Status { message: String },
+    /// A compaction checkpoint was durably stored; recent context stays internal.
+    Compacted {
+        #[serde(default)]
+        summary: String,
+    },
     /// An error occurred during agent execution.
     Error { error: String },
 }
@@ -266,6 +271,9 @@ pub enum AgentEvent {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "role", rename_all = "lowercase")]
 pub enum Message {
+    /// Durable context boundary. Earlier messages remain in the transcript,
+    /// but only this checkpoint and subsequent messages reach the model.
+    Compaction { summary: String, recent: String },
     /// A system message, typically used to set agent behavior/instructions.
     System {
         /// The content of the system message.

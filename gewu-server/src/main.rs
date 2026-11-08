@@ -100,6 +100,11 @@ async fn run_agent(agent: &mut gewu_core::Agent, prompt: &str) -> Result<()> {
                             println!();
                         }
                         AgentEvent::Usage { .. } => {}
+                        AgentEvent::Compacted { summary } => {
+                            stop_spinner(&mut spinner_active, is_tty)?;
+                            println!("\n{DIM}── Context compacted ──{RESET}");
+                            println!("{summary}");
+                        }
                         // Transient provider status (e.g. retry backoff):
                         // shown as a dim line so a wait is visible in the CLI.
                         AgentEvent::Status { message } => {

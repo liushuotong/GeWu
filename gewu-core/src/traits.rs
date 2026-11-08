@@ -402,6 +402,13 @@ pub trait Memory: Send + Sync {
     /// Adds a message to the conversation history.
     async fn add_message(&mut self, message: Message);
 
+    /// Persist a completed compaction before activating its context boundary.
+    /// Backends that can fail writes must override this and propagate errors.
+    async fn append_compaction(&mut self, summary: String, recent: String) -> anyhow::Result<()> {
+        self.add_message(Message::Compaction { summary, recent }).await;
+        Ok(())
+    }
+
     /// Clears all messages from the conversation history.
     async fn clear(&mut self);
 

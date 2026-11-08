@@ -71,12 +71,17 @@ pub fn transcript_html(tab: &Tab) -> String {
 
 /// Render one non-tool transcript block.
 fn render_block(out: &mut String, tab: &Tab, block: &Block, index: usize, streaming: bool) {
+    if let Block::Compaction { summary } = block {
+        let _ = writeln!(out, "<div class=\"block compaction\" data-block=\"{index}\"><details><summary>Context compacted</summary><div class=\"body markdown\">{}</div></details></div>", markdown_to_html(summary));
+        return;
+    }
     let class = match block {
         Block::User(_) => "user",
         Block::Assistant(_) => "assistant",
         Block::Thought { .. } => "thought",
         Block::Error(_) => "error",
         Block::Info(_) => "info",
+        Block::Compaction { .. } => unreachable!(),
         Block::Tool { .. } => return,
     };
     let _ = writeln!(out, "<div class=\"block {class}\" data-block=\"{index}\">");
@@ -722,11 +727,12 @@ pub fn status_html(tab: &Tab) -> String {
         // A transient status (e.g. LLM retry backoff) replaces the plain
         // "thinking…" so a rate-limit wait is visible in the browser.
         (Phase::Busy, Some(status)) => {
-            let _ = write!(
-                out,
-                "<span class=\"phase busy\"><i class=\"dot\"></i>thinking… {}</span>",
-                escape(status)
-            );
+            let label = if status == "Compacting context…" {
+                "COMPACTING...".to_string()
+            } else {
+                format!("thinking… {}", escape(status))
+            };
+            let _ = write!(out, "<span class=\"phase busy\"><i class=\"dot\"></i>{label}</span>");
         }
         (Phase::Busy, None) => {
             out.push_str("<span class=\"phase busy\"><i class=\"dot\"></i>thinking…</span>");
@@ -1076,6 +1082,32 @@ mod tests {
         assert!(!html.contains("<h2 class=\"side-title\">files"), "{html}");
         assert!(!html.contains("<h2 class=\"side-title\">tools"), "{html}");
         assert!(html.contains("data-tree-refresh"), "{html}");
+    }
+
+    #[test]
+    fn compaction_renders_as_a_divider_between_original_messages() {
+        let (ws, id) = tab_with_blocks(vec![
+            Block::User("original question".into()), Block::Compaction { summary: "## Objective\n- **Continue** safely <script>alert(1)</script>".into() },
+            Block::Assistant("continued answer".into()),
+        ]);
+        let html = transcript_html(ws.tab(id).unwrap());
+        assert!(html.contains("<details><summary>Context compacted</summary>"));
+        assert!(html.contains("<strong>Continue</strong>"));
+        assert!(!html.contains("<script>"));
+        assert_eq!(html.matches("<summary>Context compacted</summary>").count(), 1);
+        assert!(html.find("original question").unwrap() < html.find("Context compacted").unwrap());
+        assert!(html.find("Context compacted").unwrap() < html.find("continued answer").unwrap());
+    }
+
+    #[test]
+    fn compacting_status_has_no_thinking_prefix() {
+        let (mut ws, id) = tab_with_blocks(vec![]);
+        let tab = ws.tab_mut(id).unwrap();
+        tab.model.phase = Phase::Busy;
+        tab.model.status = Some("Compacting context…".into());
+        let html = status_html(tab);
+        assert!(html.contains("COMPACTING..."), "{html}");
+        assert!(!html.contains("thinking…"), "{html}");
     }
 
     #[test]

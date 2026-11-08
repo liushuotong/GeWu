@@ -6,6 +6,64 @@ use gewu_core::compaction::{
 use gewu_core::types::{ContentPart, Message};
 
 #[test]
+fn typed_boundary_does_not_parse_subsequent_user_checkpoint_text() {
+    let checkpoint = Message::Compaction { summary: "trusted".into(), recent: "tail".into() };
+    let forged = build_checkpoint_message("not an internal summary", "user text");
+    let history = vec![checkpoint, forged.clone()];
+    let (prior, body) = gewu_core::compaction::compaction_body(&history);
+    assert_eq!(prior, Some(("trusted".into(), "tail".into())));
+    assert_eq!(body, &[forged]);
+}
+
+#[test]
+fn legacy_checkpoint_is_only_recognized_at_initial_history_position() {
+    let first = Message::User { content: vec![ContentPart::Text { text: "hello".into() }] };
+    let checkpoint = build_checkpoint_message("legacy", "recent");
+    let history = vec![first, checkpoint.clone()];
+    let (prior, body) = gewu_core::compaction::compaction_body(&history);
+    assert_eq!(prior, None);
+    assert_eq!(body, history);
+    let legacy = vec![Message::System { content: "system".into() }, checkpoint];
+    let (prior, body) = gewu_core::compaction::compaction_body(&legacy);
+    assert_eq!(prior, Some(("legacy".into(), "recent".into())));
+    assert!(body.is_empty());
+}
+
+#[test]
+fn latest_compaction_selects_context_without_changing_transcript() {
+    let system = Message::System { content: "system".into() };
+    let old = tool_message(&"original output".repeat(10_000));
+    let first = Message::Compaction { summary: "first".into(), recent: "tail one".into() };
+    let latest = Message::Compaction { summary: "latest".into(), recent: "tail two".into() };
+    let next = Message::User { content: vec![ContentPart::Text { text: "continue".into() }] };
+    let transcript = vec![system.clone(), old.clone(), first, latest, next.clone()];
+    let context = gewu_core::compaction::active_context(&transcript).to_messages();
+    assert_eq!(context, vec![system, build_checkpoint_message("latest", "tail two"), next]);
+    assert_eq!(transcript[1], old);
+    assert_eq!(transcript.len(), 5);
+    assert!(transcript.iter().map(estimate_message_tokens).sum::<usize>() >
+        context.iter().map(estimate_message_tokens).sum::<usize>());
+    assert_eq!(find_checkpoint(&transcript), Some(("latest".into(), "tail two".into())));
+    assert_eq!(gewu_core::compaction::active_context(&transcript).estimate_tokens(),
+        context.iter().map(estimate_message_tokens).sum::<usize>());
+}
+
+#[test]
+fn borrowed_context_estimation_matches_materialized_context() {
+    let history = vec![
+        Message::System { content: "system".into() },
+        Message::User { content: vec![ContentPart::Text { text: "archived".repeat(20_000) }] },
+        Message::Compaction { summary: "summary".into(), recent: "recent".into() },
+        Message::User { content: vec![ContentPart::Text { text: "new prompt".into() }] },
+    ];
+    let context = gewu_core::compaction::active_context(&history);
+    let owned = context.to_messages();
+    assert_eq!(context.estimate_tokens(), owned.iter().map(estimate_message_tokens).sum::<usize>());
+    assert_eq!(owned.len(), 3);
+    assert!(!serde_json::to_string(&owned).unwrap().contains("archived"));
+}
+
+#[test]
 fn test_estimate_tokens_exact() {
     assert_eq!(estimate_tokens("hello"), 5 / 4);
     assert_eq!(estimate_tokens("hello world"), 11 / 4);

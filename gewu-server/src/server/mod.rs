@@ -700,12 +700,8 @@ async fn handle_request(
                     provider_usage: None,
                 }));
             };
-            let used_tokens: usize = agent
-                .memory
-                .messages()
-                .iter()
-                .map(gewu_core::compaction::estimate_message_tokens)
-                .sum();
+            let used_tokens: usize = gewu_core::compaction::active_context(agent.memory.messages())
+                .estimate_tokens();
             let provider_usage = agent.provider_usage();
             Ok(Handled::Reply(ServerMessage::Usage {
                 id: request.id,
@@ -1540,6 +1536,41 @@ mod tests {
 
     // -- Test doubles -------------------------------------------------------
 
+    /// Pauses at a precise provider boundary without timing-based sleeps.
+    struct CompactionLlm {
+        block_call: Option<usize>,
+        calls: AtomicUsize,
+        blocked: tokio::sync::Notify,
+        requests: std::sync::Mutex<Vec<Vec<Message>>>,
+    }
+
+    #[async_trait::async_trait]
+    impl gewu_core::traits::LlmProvider for CompactionLlm {
+        fn build(&self, messages: &[Message], _tools: &[Arc<dyn gewu_core::traits::Tool>])
+            -> std::result::Result<Value, Box<dyn Error + Send + Sync>> {
+            self.requests.lock().unwrap().push(messages.to_vec());
+            Ok(serde_json::json!({}))
+        }
+
+        async fn send<'a>(&'a self, _request: Value) -> std::result::Result<
+            futures::stream::BoxStream<'a, std::result::Result<gewu_core::types::ProviderEvent, Box<dyn Error + Send + Sync>>>,
+            Box<dyn Error + Send + Sync>> {
+            let call = self.calls.fetch_add(1, Ordering::SeqCst);
+            Ok(Box::pin(async_stream::try_stream! {
+                yield gewu_core::types::ProviderEvent::ContentDelta { delta: "summary or answer".into() };
+                if self.block_call == Some(call) {
+                    self.blocked.notify_one();
+                    std::future::pending::<()>().await;
+                }
+                yield gewu_core::types::ProviderEvent::Finish { reason: Some("stop".into()) };
+            }))
+        }
+
+        async fn list_models(&self) -> std::result::Result<Vec<String>, Box<dyn Error + Send + Sync>> {
+            Ok(vec![])
+        }
+    }
+
     struct TestLlm {
         behavior: LlmBehavior,
         /// Artificial delay before yielding events (makes asks observably
@@ -2022,6 +2053,52 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn compaction_lifecycle_persists_requests_and_survives_interrupts() {
+        for block_call in [None, Some(0), Some(1)] {
+            tokio::time::timeout(std::time::Duration::from_secs(10), async {
+                let provider = Arc::new(CompactionLlm {
+                    block_call, calls: AtomicUsize::new(0), blocked: tokio::sync::Notify::new(),
+                    requests: std::sync::Mutex::new(vec![]),
+                });
+                let state = server_state_with(provider.clone());
+                let session = state.get_or_create_session(&mut None, Some("compact".into()), None).await.unwrap();
+                let original = Message::User { content: vec![ContentPart::Text { text: "archived-original".repeat(3200) }] };
+                {
+                    let mut agent = session.agent.lock().await;
+                    agent.context_limit = 24_000;
+                    agent.memory.add_message(original.clone()).await;
+                }
+                let (input, mut output, connection) = spawn_connection(state.clone()).await;
+                input.send(ClientRequest::ask(1, "continue").with_session("compact").to_line()).await.unwrap();
+                assert_eq!(recv_json(&mut output).await["type"], "ready");
+                if block_call.is_some() {
+                    provider.blocked.notified().await;
+                    input.send(ClientRequest::interrupt(2).with_session("compact").to_line()).await.unwrap();
+                    loop { if recv_json(&mut output).await["type"] == "interrupted" { break; } }
+                } else {
+                    loop { if recv_json(&mut output).await["type"] == "result" { break; } }
+                }
+                let loaded = gewu_storage::SqliteMemory::new(state.bootstrap.pool.clone(), "compact".into()).await.unwrap();
+                use gewu_core::traits::Memory;
+                assert!(loaded.messages().contains(&original), "original must survive reload");
+                let checkpoints = loaded.messages().iter().filter(|m| matches!(m, Message::Compaction { .. })).count();
+                assert_eq!(checkpoints, usize::from(block_call != Some(0)));
+                let requests = provider.requests.lock().unwrap().clone();
+                if block_call != Some(0) {
+                    assert_eq!(requests.len(), 2, "summary and post-compaction model request");
+                    let request = serde_json::to_string(&requests[1]).unwrap();
+                    assert!(request.contains("<conversation-checkpoint>"));
+                    assert!(!request.contains("archived-original"));
+                    let context = gewu_core::compaction::active_context(loaded.messages());
+                    assert!(context.estimate_tokens() < 1000);
+                }
+                drop(input);
+                connection.await.unwrap().unwrap();
+            }).await.expect("compaction lifecycle must complete");
+        }
+    }
+
+    #[tokio::test]
     async fn observer_receives_turns_started_after_idle_subscription() {
         let state = server_state_with(TestLlm::plain());
         let (observer, mut updates, observer_task) = spawn_connection(state.clone()).await;
@@ -2088,6 +2165,14 @@ mod tests {
         assert_eq!(messages.len(), 2, "system prompt plus the new user prompt");
         assert_eq!(messages[1]["role"], "user");
         assert!(serde_json::to_value(&messages[1]).unwrap().to_string().contains("again"));
+
+        // Keep both receivers alive until the second turn finishes. Closing
+        // them after the initial snapshot races with the remaining events
+        // and intentionally trips the subscriber-failure path.
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            loop { if recv_json(&mut updates).await["type"] == "result" { break; } }
+            loop { if recv_json(&mut replies).await["type"] == "result" { break; } }
+        }).await.unwrap();
 
         drop(observer); drop(writer); drop(updates); drop(replies);
         observer_task.await.unwrap().unwrap();

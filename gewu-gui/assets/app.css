@@ -522,6 +522,22 @@ body {
   border-left: 1px solid var(--line-strong);
 }
 
+.block.compaction {
+  color: var(--text-faint);
+  border-top: 1px solid var(--line);
+  padding-top: 8px;
+}
+
+.block.compaction summary {
+  cursor: pointer;
+  font-family: var(--mono);
+  font-size: 11px;
+}
+
+.block.compaction .body {
+  margin-top: 10px;
+}
+
 /* Collapsed thinking indicator: "Thinking… 1.2s" while reasoning streams,
  * settling into a dim "Thought 5.6s" line. When reasoning content exists the
  * label becomes a `+`/`−` toggle revealing the reasoning text. */

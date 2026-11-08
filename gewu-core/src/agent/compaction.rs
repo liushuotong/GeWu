@@ -3,11 +3,11 @@
 //! Implements opencode V2-style compaction: when history overflows the
 //! context limit, everything older than a small verbatim tail is summarized
 //! by the LLM (tool outputs truncated in the summarizer's view), and history
-//! collapses into a single checkpoint message carrying the summary plus the
-//! serialized recent tail.
+//! gains a durable checkpoint carrying the summary plus the serialized recent
+//! tail. Older messages are excluded from model context, never deleted.
 
 use crate::compaction::{
-    self, build_checkpoint_message, build_summary_prompt, estimate_message_tokens, find_checkpoint,
+    self, build_summary_prompt, compaction_body,
     is_overflow, serialize_messages, select_recent_tail, KEEP_TOKENS, SUMMARY_OUTPUT_TOKENS,
 };
 use crate::types::{ContentPart, Message, ProviderEvent};
@@ -33,11 +33,13 @@ impl std::fmt::Display for CompactionError {
 impl std::error::Error for CompactionError {}
 
 impl Agent {
+    #[cfg(test)]
     pub(super) async fn compact_if_needed(&mut self) -> Result<bool> {
-        let mut total_tokens: usize = 0;
-        for msg in self.memory.messages() {
-            total_tokens += estimate_message_tokens(msg);
-        }
+        let total_tokens = compaction::active_context(self.memory.messages()).estimate_tokens();
+        self.compact_with_estimate(total_tokens).await
+    }
+
+    pub(super) async fn compact_with_estimate(&mut self, total_tokens: usize) -> Result<bool> {
 
         if !is_overflow(total_tokens, self.context_limit) {
             return Ok(false);
@@ -48,18 +50,7 @@ impl Agent {
         // Body = everything the summarizer may touch: after the system
         // prompt, and after any prior checkpoint (whose summary/recent
         // already represent the older history).
-        let messages = self.memory.messages().to_vec();
-        let body_start = messages
-            .iter()
-            .position(|m| !matches!(m, Message::System { .. }))
-            .unwrap_or(messages.len());
-        let prior_checkpoint = find_checkpoint(&messages);
-        let body_start = match &prior_checkpoint {
-            // Skip past the checkpoint message itself.
-            Some(_) => body_start + 1,
-            None => body_start,
-        };
-        let body = &messages[body_start..];
+        let (prior_checkpoint, body) = compaction_body(self.memory.messages());
 
         // Keep the newest slice verbatim; summarize everything before it.
         let split = select_recent_tail(body, KEEP_TOKENS);
@@ -67,7 +58,7 @@ impl Agent {
         let recent = &body[split..];
 
         // Prior checkpoint's recent tail is context for the new summary too.
-        let prior_recent = prior_checkpoint.as_ref().map(|(_, recent)| recent.clone());
+        let prior_recent = prior_checkpoint.map(|(_, recent)| recent);
 
         if head.is_empty() && prior_recent.as_ref().is_none_or(|r| r.is_empty()) {
             // Nothing older than the tail exists to summarize (e.g. one huge
@@ -81,10 +72,10 @@ impl Agent {
         if let Some(recent) = &prior_recent
             && !recent.is_empty()
         {
-            context.push(recent.clone());
+            context.push((*recent).to_owned());
         }
         context.push(serialize_messages(head));
-        let prior_summary = prior_checkpoint.as_ref().map(|(summary, _)| summary.as_str());
+        let prior_summary = prior_checkpoint.map(|(summary, _)| summary);
         let prompt = build_summary_prompt(prior_summary, &context);
 
         // The summarizer sees a capped transcript, so the prompt is far
@@ -111,6 +102,7 @@ impl Agent {
                 // The compaction request is a real LLM request; its usage
                 // counts toward the session's provider-reported totals.
                 ProviderEvent::Usage { usage } => self.provider_usage.add(&usage),
+                ProviderEvent::Error { error } => return Err(anyhow!("Compaction failed: {error}")),
                 _ => {}
             }
         }
@@ -121,14 +113,7 @@ impl Agent {
             return Err(anyhow!("Compaction failed: LLM returned an empty summary"));
         }
 
-        let checkpoint = build_checkpoint_message(summary_text.trim(), &serialize_messages(recent));
-
-        let mut new_history = Vec::new();
-        if let Some(sys_msg) = messages.iter().find(|m| matches!(m, Message::System { .. })) {
-            new_history.push(sys_msg.clone());
-        }
-        new_history.push(checkpoint);
-        self.memory.replace(new_history).await;
+        self.memory.append_compaction(summary_text.trim().to_string(), serialize_messages(recent)).await?;
         Ok(true)
     }
 }

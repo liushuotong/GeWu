@@ -211,6 +211,12 @@ impl LlmProvider for OpenAIProvider {
         let mut instructions = Vec::new();
         for message in messages {
             match message {
+                Message::Compaction { summary, recent } => {
+                    let checkpoint = gewu_core::compaction::build_checkpoint_message(summary, recent);
+                    if let Message::User { content: parts } = checkpoint {
+                        input.push(json!({"role":"user", "content":content(&parts)?}));
+                    }
+                }
                 Message::System { content } => instructions.push(content.as_str()),
                 Message::User { content: parts } => input.push(json!({"role":"user", "content":content(parts)?})),
                 Message::Assistant { content, tool_calls, replay, .. } => {

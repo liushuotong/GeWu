@@ -38,6 +38,8 @@ pub enum Block {
     Error(String),
     /// A status line (e.g. "interrupted", session hints).
     Info(String),
+    /// Durable boundary between archived transcript and current model context.
+    Compaction { summary: String },
 }
 
 impl Block {
@@ -50,6 +52,7 @@ impl Block {
             Block::Tool { .. } => "tool",
             Block::Error(_) => "error",
             Block::Info(_) => "info",
+            Block::Compaction { .. } => "compaction",
         }
     }
 
@@ -62,6 +65,7 @@ impl Block {
             | Block::Info(text)
             | Block::Thought { text, .. } => text,
             Block::Tool { output, .. } => output.as_deref().unwrap_or("running…"),
+            Block::Compaction { summary } => summary,
         }
     }
 }
@@ -140,6 +144,11 @@ impl SessionModel {
             self.status = None;
         }
         match event {
+            AgentEvent::Compacted { summary } => {
+                self.end_thought();
+                self.blocks.push(Block::Compaction { summary: summary.clone() });
+                Some(self.blocks.len() - 1)
+            }
             AgentEvent::Status { message } => {
                 self.status = Some(message.clone());
                 None
@@ -258,6 +267,7 @@ impl SessionModel {
     pub fn apply_message(&mut self, message: &Message) {
         match message {
             Message::System { .. } => {}
+            Message::Compaction { summary, .. } => self.blocks.push(Block::Compaction { summary: summary.clone() }),
             Message::User { content } => {
                 let text = parts_text(content);
                 if !text.is_empty() {
@@ -459,6 +469,28 @@ fn truncate(text: &str, max_chars: usize) -> String {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn compaction_live_and_reloaded_summaries_match_without_recent_context() {
+        let mut live = SessionModel::default();
+        live.apply_event(&AgentEvent::Status { message: "Compacting context…".into() });
+        assert!(live.status.is_some());
+        assert_eq!(live.apply_event(&AgentEvent::Compacted { summary: "summary".into() }), Some(0));
+        assert!(live.status.is_none());
+        let mut loaded = SessionModel::default();
+        loaded.apply_message(&Message::Compaction { summary: "summary".into(), recent: "serialized context".into() });
+        assert_eq!(live.blocks, loaded.blocks);
+        assert_eq!(live.blocks, vec![Block::Compaction { summary: "summary".into() }]);
+        assert_eq!(live.blocks[0].text(), "summary");
+    }
+
+    #[test]
+    fn failed_compaction_clears_status_without_success_marker() {
+        let mut model = SessionModel::default();
+        model.apply_event(&AgentEvent::Status { message: "Compacting context…".into() });
+        model.apply_event(&AgentEvent::Error { error: "summary failed".into() });
+        assert!(model.status.is_none());
+        assert!(!model.blocks.iter().any(|block| matches!(block, Block::Compaction { .. })));
+    }
     use super::*;
     use gewu_protocol::FunctionCall;
 
