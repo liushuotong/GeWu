@@ -88,14 +88,15 @@ impl DoomLoopDetector {
     }
 }
 
-/// Aggregates streaming LLM responses into content and tool calls.
+/// Aggregates streaming LLM responses into content, reasoning, and tool calls.
 ///
 /// The `LlmResponseAggregator` processes [`ProviderEvent`] items from the LLM
-/// stream, collecting content deltas and building up complete tool calls
-/// from start/delta events. It yields [`AgentEvent`] items that should
-/// be immediately forwarded to the caller.
+/// stream, collecting content and reasoning deltas and building up complete
+/// tool calls from start/delta events. It yields [`AgentEvent`] items that
+/// should be immediately forwarded to the caller.
 pub(super) struct LlmResponseAggregator {
     content: String,
+    reasoning: String,
     tool_calls: Vec<ToolCall>,
 }
 
@@ -104,6 +105,7 @@ impl LlmResponseAggregator {
     pub(super) fn new() -> Self {
         Self {
             content: String::new(),
+            reasoning: String::new(),
             tool_calls: Vec::new(),
         }
     }
@@ -127,7 +129,10 @@ impl LlmResponseAggregator {
                 self.content.push_str(&delta);
                 Some(AgentEvent::ContentDelta { delta })
             }
-            ProviderEvent::ReasoningDelta { delta } => Some(AgentEvent::ReasoningDelta { delta }),
+            ProviderEvent::ReasoningDelta { delta } => {
+                self.reasoning.push_str(&delta);
+                Some(AgentEvent::ReasoningDelta { delta })
+            }
             ProviderEvent::ToolCallStart { id, name } => {
                 self.tool_calls.push(ToolCall {
                     id,
@@ -154,17 +159,18 @@ impl LlmResponseAggregator {
         }
     }
 
-    /// Extracts and returns the accumulated content and tool calls.
+    /// Extracts and returns the accumulated content, reasoning, and tool calls.
     ///
     /// After calling this method, the aggregator is empty and ready
     /// to aggregate a new response.
     ///
     /// # Returns
     ///
-    /// A tuple of (content string, tool calls vector)
-    pub(super) fn take_parts(&mut self) -> (String, Vec<ToolCall>) {
+    /// A tuple of (content string, reasoning string, tool calls vector)
+    pub(super) fn take_parts(&mut self) -> (String, String, Vec<ToolCall>) {
         (
             std::mem::take(&mut self.content),
+            std::mem::take(&mut self.reasoning),
             std::mem::take(&mut self.tool_calls),
         )
     }

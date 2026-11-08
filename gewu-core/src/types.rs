@@ -278,6 +278,8 @@ pub enum Message {
     Assistant {
         /// The text content of the assistant's response, if any.
         content: Option<String>,
+        /// Reasoning (chain-of-thought) text streamed before the answer, if any.
+        reasoning: Option<String>,
         /// Tool calls requested by the assistant, if any.
         tool_calls: Option<Vec<ToolCall>>,
     },

@@ -333,7 +333,7 @@ impl Agent {
                     }
                 }
 
-                let (content, tool_calls) = aggregator.take_parts();
+                let (content, reasoning, tool_calls) = aggregator.take_parts();
 
                 // Reasoning models spend thinking tokens from the same
                 // `max_tokens` budget; when it runs out the turn can end with
@@ -353,6 +353,7 @@ impl Agent {
 
                 self.memory.add_message(Message::Assistant {
                     content: if content.is_empty() { None } else { Some(content.clone()) },
+                    reasoning: if reasoning.is_empty() { None } else { Some(reasoning) },
                     tool_calls: if tool_calls.is_empty() { None } else { Some(tool_calls.clone()) },
                 }).await;
 

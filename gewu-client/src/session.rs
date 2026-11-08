@@ -21,6 +21,9 @@ pub enum Block {
     /// streams (`started` set), the text is the live "Thinking… Ns" label.
     Thought {
         text: String,
+        /// Reasoning (chain-of-thought) accumulated from `ReasoningDelta`
+        /// events, or replayed from stored history.
+        reasoning: String,
         /// When the reasoning segment started; `None` once it has ended.
         started: Option<std::time::Instant>,
     },
@@ -135,7 +138,7 @@ impl SessionModel {
                 self.status = Some(message.clone());
                 None
             }
-            AgentEvent::ReasoningDelta { .. } => self.extend_thought(),
+            AgentEvent::ReasoningDelta { delta } => self.extend_thought(delta),
             AgentEvent::ContentDelta { delta } => {
                 self.end_thought();
                 let idx = self.open_assistant();
@@ -201,16 +204,23 @@ impl SessionModel {
     }
 
     /// Update the open reasoning indicator with the elapsed time, or start a
-    /// new one. Returns the affected block index.
-    fn extend_thought(&mut self) -> Option<usize> {
-        if let Some(Block::Thought { text, started }) = self.blocks.last_mut()
+    /// new one. The delta accumulates into the block so the GUI can show the
+    /// reasoning content on expansion. Returns the affected block index.
+    fn extend_thought(&mut self, delta: &str) -> Option<usize> {
+        if let Some(Block::Thought {
+            text,
+            reasoning,
+            started,
+        }) = self.blocks.last_mut()
             && let Some(started_at) = started.as_ref()
         {
             *text = format!("Thinking… {:.1}s", started_at.elapsed().as_secs_f32());
+            reasoning.push_str(delta);
             return Some(self.blocks.len() - 1);
         }
         self.blocks.push(Block::Thought {
             text: "Thinking… 0.0s".to_string(),
+            reasoning: delta.to_string(),
             started: Some(std::time::Instant::now()),
         });
         Some(self.blocks.len() - 1)
@@ -218,7 +228,7 @@ impl SessionModel {
 
     /// Collapse an open reasoning indicator to its final "Thought Ns" label.
     fn end_thought(&mut self) {
-        if let Some(Block::Thought { text, started }) = self.blocks.last_mut()
+        if let Some(Block::Thought { text, started, .. }) = self.blocks.last_mut()
             && started.is_some()
         {
             let elapsed = started.unwrap().elapsed().as_secs_f32();
@@ -242,8 +252,18 @@ impl SessionModel {
             }
             Message::Assistant {
                 content,
+                reasoning,
                 tool_calls,
             } => {
+                // Reasoning replays as a finalized thought block (duration is
+                // unknown for stored history, so the label has no time).
+                if let Some(reasoning) = reasoning.as_deref().filter(|r| !r.is_empty()) {
+                    self.blocks.push(Block::Thought {
+                        text: "Thought".to_string(),
+                        reasoning: reasoning.to_string(),
+                        started: None,
+                    });
+                }
                 if let Some(text) = content.as_deref().filter(|t| !t.is_empty()) {
                     self.blocks.push(Block::Assistant(text.to_string()));
                 }
@@ -585,7 +605,10 @@ mod tests {
         let first = m.apply_event(&AgentEvent::ReasoningDelta { delta: "hm".into() });
         assert_eq!(first, Some(1));
         match &m.blocks[1] {
-            Block::Thought { started, .. } => assert!(started.is_some()),
+            Block::Thought { started, reasoning, .. } => {
+                assert!(started.is_some());
+                assert_eq!(reasoning, "hm");
+            }
             other => panic!("expected Thought block, got {other:?}"),
         }
 
@@ -595,6 +618,10 @@ mod tests {
             first
         );
         assert_eq!(m.blocks.len(), 2);
+        match &m.blocks[1] {
+            Block::Thought { reasoning, .. } => assert_eq!(reasoning, "hmmm"),
+            other => panic!("expected Thought block, got {other:?}"),
+        }
     }
 
     #[test]
@@ -607,7 +634,7 @@ mod tests {
         let content_idx = m.apply_event(&AgentEvent::ContentDelta { delta: "answer".into() });
         assert_eq!(content_idx, Some(2));
         match &m.blocks[1] {
-            Block::Thought { text, started } => {
+            Block::Thought { text, started, .. } => {
                 assert!(text.starts_with("Thought "), "{text}");
                 assert!(started.is_none());
             }
@@ -627,7 +654,7 @@ mod tests {
             input: "{}".into(),
         });
         match &m.blocks[1] {
-            Block::Thought { text, started } => {
+            Block::Thought { text, started, .. } => {
                 assert!(text.starts_with("Thought "), "{text}");
                 assert!(started.is_none());
             }
@@ -743,6 +770,7 @@ mod tests {
             },
             Message::Assistant {
                 content: Some("checking".into()),
+                reasoning: None,
                 tool_calls: Some(vec![gewu_protocol::ToolCall {
                     id: "c1".into(),
                     r#type: "function".into(),
@@ -775,6 +803,33 @@ mod tests {
     }
 
     #[test]
+    fn history_reasoning_replays_as_a_finalized_thought_block() {
+        let mut m = model();
+        m.apply_message(&Message::Assistant {
+            content: Some("done".into()),
+            reasoning: Some("step by step…".into()),
+            tool_calls: None,
+        });
+        m.apply_message(&Message::Assistant {
+            content: Some("no thought".into()),
+            reasoning: None,
+            tool_calls: None,
+        });
+        assert_eq!(
+            m.blocks,
+            vec![
+                Block::Thought {
+                    text: "Thought".into(),
+                    reasoning: "step by step…".into(),
+                    started: None,
+                },
+                Block::Assistant("done".into()),
+                Block::Assistant("no thought".into()),
+            ]
+        );
+    }
+
+    #[test]
     fn history_matches_parallel_tool_calls_in_order() {
         let mut m = model();
         let call = |id: &str, name: &str| gewu_protocol::ToolCall {
@@ -787,6 +842,7 @@ mod tests {
         };
         m.apply_message(&Message::Assistant {
             content: None,
+            reasoning: None,
             tool_calls: Some(vec![call("1", "read_file"), call("2", "bash")]),
         });
         m.apply_message(&Message::Tool {

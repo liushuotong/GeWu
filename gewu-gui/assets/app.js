@@ -614,6 +614,8 @@
       send({ op: "toggle_tool", tab, block });
     } else if (button.dataset.action === "toggle_group") {
       send({ op: "toggle_group", tab, block });
+    } else if (button.dataset.action === "toggle_thought") {
+      send({ op: "toggle_thought", tab, block });
     }
   });
 

@@ -334,8 +334,13 @@ impl OpenAIProvider {
             }
             Message::Assistant {
                 content,
+                reasoning,
                 tool_calls,
             } => {
+                // Reasoning is deliberately not resent: it is display-only
+                // context, and providers with signed thinking (Anthropic)
+                // reject replayed blocks without their signatures.
+                let _ = reasoning;
                 let openai_calls = tool_calls.clone().map(|calls| {
                     calls
                         .iter()
@@ -1007,8 +1012,13 @@ impl AnthropicProvider {
             }
             Message::Assistant {
                 content,
+                reasoning,
                 tool_calls,
             } => {
+                // Reasoning is deliberately not resent (see the OpenAI
+                // conversion): signed thinking blocks cannot be replayed
+                // without their signatures.
+                let _ = reasoning;
                 let mut blocks: Vec<ContentBlock> = Vec::new();
                 if let Some(text) = content
                     && !text.is_empty() {
@@ -1535,6 +1545,7 @@ mod tests {
         };
         let assistant = Message::Assistant {
             content: None,
+            reasoning: None,
             tool_calls: None,
         };
         let request = provider
@@ -1696,6 +1707,7 @@ mod tests {
         let provider = OpenAIProvider::new("test-key", "gpt-4");
         let msg = Message::Assistant {
             content: Some("Hello world".to_string()),
+            reasoning: None,
             tool_calls: None,
         };
         let converted = provider.convert_message(&msg).expect("convert success");
@@ -1713,6 +1725,7 @@ mod tests {
         let provider = OpenAIProvider::new("test-key", "gpt-4");
         let msg = Message::Assistant {
             content: None,
+            reasoning: None,
             tool_calls: Some(vec![CoreToolCall {
                 id: "call_1".to_string(),
                 r#type: "function".to_string(),
@@ -1798,6 +1811,7 @@ mod tests {
         let provider = AnthropicProvider::new("test-key", "claude-3-5-sonnet");
         let msg = Message::Assistant {
             content: None,
+            reasoning: None,
             tool_calls: Some(vec![CoreToolCall {
                 id: "toolu_1".to_string(),
                 r#type: "function".to_string(),
@@ -2064,6 +2078,7 @@ mod tests {
         let provider = OpenAIProvider::new("test-key", "gpt-4o");
         let messages = vec![Message::Assistant {
             content: None,
+            reasoning: None,
             tool_calls: Some(vec![CoreToolCall {
                 id: "call_1".to_string(),
                 r#type: "function".to_string(),

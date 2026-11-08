@@ -336,6 +336,18 @@ impl GuiSession {
         self.send_transcript(sender).await
     }
 
+    /// Send just a thought block's body, so toggling its reasoning does not
+    /// re-render the whole transcript. Falls back to a full transcript when
+    /// the block cannot be located.
+    async fn send_thought_body(&self, tab_id: u64, block: usize, sender: &mut Sender) -> Result<()> {
+        if let Some(tab) = self.workspace.tab(tab_id)
+            && let Some(html) = view::assistant_body_html(tab, block, false)
+        {
+            return send_msg(sender, &ServerMsg::StreamingBody { index: block, html }).await;
+        }
+        self.send_transcript(sender).await
+    }
+
     async fn send_transcript(&self, sender: &mut Sender) -> Result<()> {
         let tab = self
             .workspace
@@ -626,6 +638,14 @@ impl GuiSession {
                 }
                 if self.workspace.active_id() == tab {
                     self.send_tool_card(tab, block, sender).await?;
+                }
+            }
+            ClientMsg::ToggleThought { tab, block } => {
+                if let Some(tab) = self.workspace.tab_mut(tab) {
+                    toggle(&mut tab.expanded_thoughts, block);
+                }
+                if self.workspace.active_id() == tab {
+                    self.send_thought_body(tab, block, sender).await?;
                 }
             }
             ClientMsg::Refresh => {

@@ -32,6 +32,8 @@ pub struct Tab {
     pub expanded_groups: HashSet<usize>,
     /// Tool calls whose full output the user expanded (block index).
     pub expanded_outputs: HashSet<usize>,
+    /// Thought blocks whose reasoning text the user expanded (block index).
+    pub expanded_thoughts: HashSet<usize>,
 }
 
 impl Tab {
@@ -45,6 +47,7 @@ impl Tab {
             cache: None,
             expanded_groups: HashSet::new(),
             expanded_outputs: HashSet::new(),
+            expanded_thoughts: HashSet::new(),
         }
     }
 

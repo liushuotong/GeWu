@@ -654,6 +654,46 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn persists_assistant_reasoning() -> Result<()> {
+        let pool = SqlitePoolOptions::new().connect("sqlite::memory:").await?;
+        let session_id = "test_reasoning".to_string();
+
+        let mut mem = SqliteMemory::new(pool.clone(), session_id.clone()).await?;
+        mem.add_message(Message::Assistant {
+            content: Some("answer".to_string()),
+            reasoning: Some("step by step".to_string()),
+            tool_calls: None,
+        })
+        .await;
+        mem.add_message(Message::Assistant {
+            content: Some("plain".to_string()),
+            reasoning: None,
+            tool_calls: None,
+        })
+        .await;
+
+        let reloaded = SqliteMemory::new(pool, session_id).await?;
+        assert_eq!(reloaded.messages().len(), 2);
+        match &reloaded.messages()[0] {
+            Message::Assistant {
+                content,
+                reasoning,
+                tool_calls,
+            } => {
+                assert_eq!(content.as_deref(), Some("answer"));
+                assert_eq!(reasoning.as_deref(), Some("step by step"));
+                assert!(tool_calls.is_none());
+            }
+            _ => panic!("Wrong type"),
+        }
+        match &reloaded.messages()[1] {
+            Message::Assistant { reasoning, .. } => assert!(reasoning.is_none()),
+            _ => panic!("Wrong type"),
+        }
+        Ok(())
+    }
+
+    #[tokio::test]
     async fn lists_and_loads_sessions() -> Result<()> {
         let pool = SqlitePoolOptions::new().connect("sqlite::memory:").await?;
         sqlx::query(
@@ -676,6 +716,7 @@ mod tests {
         };
         let assistant = Message::Assistant {
             content: Some("second".to_string()),
+            reasoning: None,
             tool_calls: None,
         };
         for (session, message, at) in [

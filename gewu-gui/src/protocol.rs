@@ -36,6 +36,8 @@ pub enum ClientMsg {
     ToggleTool { tab: u64, block: usize },
     /// Show or hide a run of consecutive tool calls.
     ToggleGroup { tab: u64, block: usize },
+    /// Show or hide a thought block's reasoning text.
+    ToggleThought { tab: u64, block: usize },
     /// Ask for a fresh snapshot (e.g. after a transient UI error).
     Refresh,
     /// Expand or collapse a directory in the file tree.
@@ -123,6 +125,11 @@ mod tests {
         assert_eq!(
             serde_json::from_str::<ClientMsg>(r#"{"op":"toggle_tool","tab":1,"block":7}"#).unwrap(),
             ClientMsg::ToggleTool { tab: 1, block: 7 }
+        );
+        assert_eq!(
+            serde_json::from_str::<ClientMsg>(r#"{"op":"toggle_thought","tab":2,"block":5}"#)
+                .unwrap(),
+            ClientMsg::ToggleThought { tab: 2, block: 5 }
         );
         assert_eq!(
             serde_json::from_str::<ClientMsg>(r#"{"op":"open_tab"}"#).unwrap(),

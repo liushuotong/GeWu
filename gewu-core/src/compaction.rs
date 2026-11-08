@@ -122,8 +122,12 @@ pub fn estimate_message_tokens(msg: &Message) -> usize {
         Message::User { content } => estimate_content_tokens(content),
         Message::Assistant {
             content,
+            reasoning,
             tool_calls,
         } => {
+            // Reasoning is display-only context; it is not resent to
+            // providers, so it must not count toward the prompt estimate.
+            let _ = reasoning;
             let mut count = content.as_ref().map(|s| estimate_tokens(s)).unwrap_or(0);
             if let Some(calls) = tool_calls {
                 for call in calls {
@@ -187,7 +191,8 @@ pub fn serialize_message(msg: &Message) -> Vec<String> {
             )];
             lines
         }
-        Message::Assistant { content, tool_calls } => {
+        Message::Assistant { content, reasoning, tool_calls } => {
+            let _ = reasoning;
             let mut lines = Vec::new();
             if let Some(text) = content
                 && !text.is_empty()

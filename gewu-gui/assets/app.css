@@ -523,13 +523,44 @@ body {
 }
 
 /* Collapsed thinking indicator: "Thinking… 1.2s" while reasoning streams,
- * settling into a dim "Thought 5.6s" line. */
+ * settling into a dim "Thought 5.6s" line. When reasoning content exists the
+ * label becomes a `+`/`−` toggle revealing the reasoning text. */
 .block.thought .body {
   color: var(--text-faint);
   font-family: var(--mono);
   font-size: 12px;
   padding-left: 14px;
   font-style: italic;
+}
+
+.block.thought .thought-toggle {
+  background: none;
+  border: none;
+  padding: 0;
+  font: inherit;
+  color: inherit;
+  cursor: pointer;
+  text-align: left;
+  white-space: pre-wrap;
+}
+
+.block.thought .thought-toggle:hover {
+  color: var(--text-dim);
+  text-decoration: underline;
+}
+
+.block.thought .thought-body {
+  margin: 4px 0 0;
+  padding-left: 14px;
+  border-left: 1px solid var(--line-strong);
+  color: var(--text-faint);
+  font-family: var(--mono);
+  font-size: 12px;
+  font-style: italic;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+  max-height: 240px;
+  overflow-y: auto;
 }
 
 .block .body.plain {

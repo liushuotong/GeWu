@@ -62,7 +62,7 @@ pub fn transcript_html(tab: &Tab) -> String {
             index += run_len;
         } else {
             let streaming = tab.busy() && index == last;
-            render_block(&mut out, &tab.model.blocks[index], index, streaming);
+            render_block(&mut out, tab, &tab.model.blocks[index], index, streaming);
             index += 1;
         }
     }
@@ -70,7 +70,7 @@ pub fn transcript_html(tab: &Tab) -> String {
 }
 
 /// Render one non-tool transcript block.
-fn render_block(out: &mut String, block: &Block, index: usize, streaming: bool) {
+fn render_block(out: &mut String, tab: &Tab, block: &Block, index: usize, streaming: bool) {
     let class = match block {
         Block::User(_) => "user",
         Block::Assistant(_) => "assistant",
@@ -80,7 +80,7 @@ fn render_block(out: &mut String, block: &Block, index: usize, streaming: bool) 
         Block::Tool { .. } => return,
     };
     let _ = writeln!(out, "<div class=\"block {class}\" data-block=\"{index}\">");
-    write_block_body(out, block, streaming);
+    write_block_body(out, tab, block, index, streaming);
     if matches!(block, Block::User(_)) {
         let _ = write!(out, "<button type=\"button\" class=\"message-menu-trigger\" aria-label=\"Message actions\" aria-haspopup=\"menu\" aria-expanded=\"false\" aria-controls=\"message-menu-{index}\"></button><div id=\"message-menu-{index}\" class=\"message-menu\" role=\"menu\" hidden><button type=\"button\" role=\"menuitem\" class=\"chat-revert\" data-revert-block=\"{index}\" title=\"Revert conversation from here; files are not undone\">Revert chat</button></div>");
     }
@@ -88,7 +88,7 @@ fn render_block(out: &mut String, block: &Block, index: usize, streaming: bool) 
 }
 
 /// Render the inner `.body` div of one block (between the `.block` wrapper).
-fn write_block_body(out: &mut String, block: &Block, streaming: bool) {
+fn write_block_body(out: &mut String, tab: &Tab, block: &Block, index: usize, streaming: bool) {
     match block {
         // Streaming and final assistant bodies are both Markdown; streaming
         // only adds a class (the blinking cursor) so the text formats in
@@ -101,15 +101,8 @@ fn write_block_body(out: &mut String, block: &Block, streaming: bool) {
                 markdown_to_html(text)
             );
         }
-        // Live "Thinking… Ns" while reasoning streams, settling into the
-        // final "Thought Ns" indicator once it ends.
         Block::Thought { .. } => {
-            let _ = writeln!(
-                out,
-                "<div class=\"body plain thought{}\">{}</div>",
-                if streaming { " streaming" } else { "" },
-                escape(block.text())
-            );
+            out.push_str(&thought_body_html(tab, index, streaming));
         }
         _ => {
             let _ = writeln!(
@@ -121,6 +114,41 @@ fn write_block_body(out: &mut String, block: &Block, streaming: bool) {
     }
 }
 
+/// Render a thought block's body: the "Thinking… Ns"/"Thought Ns" label with
+/// a clickable `+`/`−` toggle when reasoning content exists, plus the escaped
+/// reasoning text when expanded. Used by the full transcript, targeted block
+/// renders, and streaming swaps so all three shapes stay identical.
+fn thought_body_html(tab: &Tab, index: usize, streaming: bool) -> String {
+    let Some(block @ Block::Thought { reasoning, .. }) = tab.model.blocks.get(index) else {
+        return String::new();
+    };
+    let class = if streaming { " streaming" } else { "" };
+    if reasoning.is_empty() {
+        // Providers without reasoning content keep the plain indicator line.
+        return format!(
+            "<div class=\"body plain thought{class}\">{}</div>\n",
+            escape(block.text())
+        );
+    }
+    let expanded = tab.expanded_thoughts.contains(&index);
+    let glyph = if expanded { "−" } else { "+" };
+    let mut out = format!(
+        "<div class=\"body plain thought{class}\">\
+         <button type=\"button\" class=\"thought-toggle\" data-action=\"toggle_thought\" \
+         data-tab=\"{}\" data-block=\"{index}\">{glyph} {}</button>",
+        tab.id,
+        escape(block.text())
+    );
+    if expanded {
+        out.push_str(&format!(
+            "<pre class=\"thought-body\">{}</pre>",
+            escape(reasoning.trim_end())
+        ));
+    }
+    out.push_str("</div>\n");
+    out
+}
+
 /// Render one block as a standalone `.block` div, for targeted appends.
 pub fn block_html(tab: &Tab, index: usize) -> Option<String> {
     let block = tab.model.blocks.get(index)?;
@@ -129,7 +157,7 @@ pub fn block_html(tab: &Tab, index: usize) -> Option<String> {
     }
     let streaming = tab.busy() && index == tab.model.blocks.len() - 1;
     let mut out = String::new();
-    render_block(&mut out, block, index, streaming);
+    render_block(&mut out, tab, block, index, streaming);
     Some(out)
 }
 
@@ -142,11 +170,7 @@ pub fn assistant_body_html(tab: &Tab, index: usize, streaming: bool) -> Option<S
             if streaming { " streaming" } else { "" },
             markdown_to_html(text)
         )),
-        Some(Block::Thought { .. }) => Some(format!(
-            "<div class=\"body plain thought{}\">{}</div>",
-            if streaming { " streaming" } else { "" },
-            escape(tab.model.blocks[index].text())
-        )),
+        Some(Block::Thought { .. }) => Some(thought_body_html(tab, index, streaming)),
         _ => None,
     }
 }
@@ -1456,6 +1480,7 @@ mod tests {
             Block::User("hi".into()),
             Block::Thought {
                 text: "Thought 5.6s".into(),
+                reasoning: String::new(),
                 started: None,
             },
             Block::Assistant("answer".into()),
@@ -1464,15 +1489,40 @@ mod tests {
         assert!(html.contains("class=\"block thought\""), "{html}");
         assert!(html.contains("class=\"body plain thought\""), "{html}");
         assert!(html.contains("Thought 5.6s"), "{html}");
+        // Without reasoning content there is no toggle.
+        assert!(!html.contains("toggle_thought"), "{html}");
 
         // Block text is escaped like other plain bodies.
         let (ws, id) = tab_with_blocks(vec![Block::Thought {
             text: "Thought <b>1.0s</b>".into(),
+            reasoning: String::new(),
             started: None,
         }]);
         let html = block_html(ws.tab(id).unwrap(), 0).unwrap();
         assert!(html.contains("Thought &lt;b&gt;1.0s&lt;/b&gt;"), "{html}");
         assert!(!html.contains("<b>"), "{html}");
+    }
+
+    #[test]
+    fn thought_with_reasoning_renders_a_toggle() {
+        let (mut ws, id) = tab_with_blocks(vec![Block::Thought {
+            text: "Thought 5.6s".into(),
+            reasoning: "step <one>".into(),
+            started: None,
+        }]);
+        let html = block_html(ws.tab(id).unwrap(), 0).expect("thought block renders");
+        // Collapsed by default: a '+' toggle, no reasoning text.
+        assert!(html.contains("data-action=\"toggle_thought\""), "{html}");
+        assert!(html.contains(">+ Thought 5.6s</button>"), "{html}");
+        assert!(!html.contains("thought-body"), "{html}");
+
+        // Expanded: a '−' toggle and the escaped reasoning text.
+        ws.tab_mut(id).unwrap().expanded_thoughts.insert(0);
+        let html = block_html(ws.tab(id).unwrap(), 0).unwrap();
+        assert!(html.contains(">− Thought 5.6s</button>"), "{html}");
+        assert!(html.contains("class=\"thought-body\""), "{html}");
+        assert!(html.contains("step &lt;one&gt;"), "{html}");
+        assert!(!html.contains("<one>"), "{html}");
     }
 
     #[test]

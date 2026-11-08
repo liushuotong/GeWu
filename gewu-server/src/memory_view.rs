@@ -79,9 +79,16 @@ fn format_message(message: &Message) -> (&'static str, String) {
         Message::User { content } => ("USER", format_content_parts(content)),
         Message::Assistant {
             content,
+            reasoning,
             tool_calls,
         } => {
             let mut output = content.clone().unwrap_or_default();
+            if let Some(reasoning) = reasoning.as_deref().filter(|r| !r.is_empty()) {
+                if !output.is_empty() {
+                    output.push('\n');
+                }
+                output.push_str(&format!("Reasoning: {reasoning}"));
+            }
             if let Some(tool_calls) = tool_calls {
                 for call in tool_calls {
                     if !output.is_empty() {
@@ -220,6 +227,7 @@ mod tests {
             "session",
             &Message::Assistant {
                 content: Some("second".to_string()),
+                reasoning: None,
                 tool_calls: None,
             },
             1,
@@ -244,6 +252,7 @@ mod tests {
     fn formats_tool_calls_and_results() {
         let assistant = Message::Assistant {
             content: None,
+            reasoning: None,
             tool_calls: Some(vec![ToolCall {
                 id: "call-1".to_string(),
                 r#type: "function".to_string(),

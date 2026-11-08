@@ -50,7 +50,8 @@ impl LlmProvider for MockLlm {
 
         let s = async_stream::try_stream! {
             match response {
-                Message::Assistant { content, tool_calls } => {
+                Message::Assistant { content, reasoning, tool_calls } => {
+                    let _ = reasoning;
                     if let Some(c) = content {
                         yield ProviderEvent::ContentDelta { delta: c };
                     }
@@ -112,10 +113,12 @@ async fn test_agent_loop() {
     let responses = vec![
         Message::Assistant {
             content: None,
+            reasoning: None,
             tool_calls: Some(vec![tool_call]),
         },
         Message::Assistant {
             content: Some("Done: Tool output".to_string()),
+            reasoning: None,
             tool_calls: None,
         },
     ];
@@ -162,6 +165,7 @@ async fn test_agent_loop() {
 async fn test_agent_emits_usage_at_turn_boundaries() {
     let responses = vec![Message::Assistant {
         content: Some("Done".to_string()),
+        reasoning: None,
         tool_calls: None,
     }];
 
@@ -219,10 +223,12 @@ async fn test_apply_patch_metadata_through_agent_loop() {
         responses: Arc::new(Mutex::new(vec![
             Message::Assistant {
                 content: None,
+                reasoning: None,
                 tool_calls: Some(vec![tool_call]),
             },
             Message::Assistant {
                 content: Some("patched".to_string()),
+                reasoning: None,
                 tool_calls: None,
             },
         ])),
@@ -305,6 +311,7 @@ async fn test_parallel_tool_calls_run_concurrently_in_call_order() {
     let responses = vec![
         Message::Assistant {
             content: None,
+            reasoning: None,
             tool_calls: Some(vec![
                 make_call(1, "call_1"),
                 make_call(2, "call_2"),
@@ -313,6 +320,7 @@ async fn test_parallel_tool_calls_run_concurrently_in_call_order() {
         },
         Message::Assistant {
             content: Some("all done".to_string()),
+            reasoning: None,
             tool_calls: None,
         },
     ];
@@ -375,6 +383,7 @@ async fn test_malformed_tool_calls_still_record_tool_results() {
     let responses = vec![
         Message::Assistant {
             content: None,
+            reasoning: None,
             tool_calls: Some(vec![
                 ToolCall {
                     id: "call_bad_json".to_string(),
@@ -396,6 +405,7 @@ async fn test_malformed_tool_calls_still_record_tool_results() {
         },
         Message::Assistant {
             content: Some("recovered".to_string()),
+            reasoning: None,
             tool_calls: None,
         },
     ];

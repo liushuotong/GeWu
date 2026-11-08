@@ -339,7 +339,18 @@ mod tests {
                         "type": "ready", "id": id, "request_id": request_id,
                         "session_id": "sess-1", "agent": "build",
                     })];
-                    // Prompts mentioning "tool" exercise the tool-card path.
+                    // Prompts mentioning "think" exercise the thought-block
+                    // path; "tool" the tool-card path.
+                    if prompt.contains("think") {
+                        replies.push(json!({
+                            "type": "event", "id": null, "request_id": request_id,
+                            "event": {"type": "reasoning_delta", "delta": "pondering "},
+                        }));
+                        replies.push(json!({
+                            "type": "event", "id": null, "request_id": request_id,
+                            "event": {"type": "reasoning_delta", "delta": "deeply"},
+                        }));
+                    }
                     if prompt.contains("tool") {
                         let output = (1..=10)
                             .map(|n| format!("line {n}"))
@@ -810,6 +821,88 @@ mod tests {
             }
         }
         panic!("expected a tool_card message");
+    }
+
+    #[tokio::test]
+    async fn toggling_a_thought_sends_only_that_body() {
+        let upstream = spawn_fake_upstream().await;
+        let addr = spawn_gui(AppState {
+            endpoint: Endpoint::Tcp {
+                host: "127.0.0.1".to_string(),
+                port: upstream.port(),
+            },
+            token: None,
+            server_token: None,
+        })
+        .await;
+
+        let (mut ws, _) = tokio_tungstenite::connect_async(format!("ws://{addr}/ws"))
+            .await
+            .unwrap();
+        let snapshot = next_json(&mut ws).await;
+        assert_eq!(snapshot["type"], "snapshot");
+
+        ws.send(WsMessage::text(
+            json!({"op": "ask", "tab": 1, "prompt": "think hard"}).to_string(),
+        ))
+        .await
+        .unwrap();
+
+        let mut transcript = String::new();
+        for _ in 0..80 {
+            let value = next_json(&mut ws).await;
+            match value["type"].as_str().unwrap_or("") {
+                "transcript" => transcript = value["html"].as_str().unwrap_or("").to_string(),
+                "tabs" => {
+                    let tab = &value["tabs"][0];
+                    if tab["session_id"] == "sess-1" && tab["busy"] == false {
+                        break;
+                    }
+                }
+                _ => {}
+            }
+        }
+        assert!(transcript.contains("toggle_thought"), "{transcript}");
+        assert!(
+            !transcript.contains("thought-body"),
+            "reasoning must be collapsed by default: {transcript}"
+        );
+
+        // Let the ask's remaining terminal messages drain so the only thing
+        // after the toggle is its own reply.
+        while tokio::time::timeout(std::time::Duration::from_millis(150), next_json(&mut ws))
+            .await
+            .is_ok()
+        {}
+
+        // Take the block index straight from the rendered toggle.
+        let marker = "data-action=\"toggle_thought\"";
+        let tail = &transcript[transcript.find(marker).expect("thought toggle")..];
+        let start = tail.find("data-block=\"").expect("block") + "data-block=\"".len();
+        let end = start + tail[start..].find('"').expect("closing quote");
+        let block: usize = tail[start..end].parse().expect("numeric block");
+
+        ws.send(WsMessage::text(
+            json!({"op": "toggle_thought", "tab": 1, "block": block}).to_string(),
+        ))
+        .await
+        .unwrap();
+
+        for _ in 0..20 {
+            let value = next_json(&mut ws).await;
+            match value["type"].as_str().unwrap_or("") {
+                "streaming_body" => {
+                    assert_eq!(value["index"], block);
+                    let html = value["html"].as_str().unwrap();
+                    assert!(html.contains("thought-body"), "{html}");
+                    assert!(html.contains("pondering deeply"), "{html}");
+                    return;
+                }
+                "transcript" => panic!("a toggle must not resend the whole transcript: {value}"),
+                _ => {}
+            }
+        }
+        panic!("expected a streaming_body message");
     }
 
     #[tokio::test]

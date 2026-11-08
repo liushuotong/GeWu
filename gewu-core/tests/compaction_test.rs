@@ -82,6 +82,7 @@ fn test_estimate_message_tokens_user_with_media() {
 fn test_estimate_message_tokens_assistant() {
     let msg = Message::Assistant {
         content: Some("Hello".to_string()),
+        reasoning: None,
         tool_calls: None,
     };
     assert_eq!(estimate_message_tokens(&msg), 5 / 4);
@@ -91,6 +92,7 @@ fn test_estimate_message_tokens_assistant() {
 fn test_estimate_message_tokens_assistant_with_tool_calls() {
     let msg = Message::Assistant {
         content: Some("Calling tool".to_string()),
+        reasoning: None,
         tool_calls: Some(vec![gewu_core::types::ToolCall {
             id: "call_1".to_string(),
             r#type: "function".to_string(),
@@ -142,6 +144,7 @@ fn truncate_tool_outputs_in_transcripts_at_two_thousand_chars() {
         },
         Message::Assistant {
             content: None,
+            reasoning: None,
             tool_calls: Some(vec![gewu_core::types::ToolCall {
                 id: "c1".into(),
                 r#type: "function".into(),

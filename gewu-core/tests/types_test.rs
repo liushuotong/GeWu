@@ -203,15 +203,18 @@ fn test_message_user() {
 fn test_message_assistant_with_content() {
     let msg = Message::Assistant {
         content: Some("I can help".to_string()),
+        reasoning: Some("thinking".to_string()),
         tool_calls: None,
     };
 
     if let Message::Assistant {
         content,
+        reasoning,
         tool_calls,
     } = msg
     {
         assert_eq!(content.unwrap(), "I can help");
+        assert_eq!(reasoning.unwrap(), "thinking");
         assert!(tool_calls.is_none());
     }
 }
@@ -220,6 +223,7 @@ fn test_message_assistant_with_content() {
 fn test_message_assistant_with_tool_calls() {
     let msg = Message::Assistant {
         content: None,
+        reasoning: None,
         tool_calls: Some(vec![ToolCall {
             id: "call_1".to_string(),
             r#type: "function".to_string(),
@@ -232,10 +236,12 @@ fn test_message_assistant_with_tool_calls() {
 
     if let Message::Assistant {
         content,
+        reasoning,
         tool_calls,
     } = msg
     {
         assert!(content.is_none());
+        assert!(reasoning.is_none());
         let calls = tool_calls.unwrap();
         assert_eq!(calls.len(), 1);
         assert_eq!(calls[0].function.name, "bash");
