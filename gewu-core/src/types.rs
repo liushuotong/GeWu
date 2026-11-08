@@ -303,7 +303,8 @@ pub enum Message {
 }
 
 /// Replay state belongs to exactly one endpoint and model. Anthropic stores
-/// its ordered native assistant blocks, including thinking signatures.
+/// its ordered native assistant blocks, including thinking signatures. OpenAI
+/// Responses stores output items, including encrypted reasoning and call IDs.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct ReasoningReplay {
     pub origin: String,

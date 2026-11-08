@@ -183,20 +183,24 @@ in the project directory, then `~/.gewu/config.json(c)`. If both `.json` and
 ```jsonc
 {
   // LLM settings
-  "model": "coding",                         // catalog key selected by default
-  "models": {
-    "coding": { "provider": "openai", "model": "gpt-4o" },
-    "deepseek-reasoner": { "provider": "deepseek" }
-  },
-  "providers": {
-    "openai": { "base_url": "https://api.openai.com/v1", "api_key": "sk-..." },
-    "deepseek": { "api_key": "your-deepseek-key" }
+  "model": "WestlakeHPC/glm-flash",
+  "endpoints": {
+    "WestlakeHPC": {
+      "base_url": "https://hpc-api.westlake.edu.cn/v1",
+      "api_key": "...",
+      "models": {
+        "glm-flash": { "provider": "glm", "context_limit": 131072 },
+        "deepseek-flash": { "provider": "deepseek" },
+        "gpt": {
+          "provider": "openai", "model": "actual-gpt-model-id",
+          "reasoning_effort": "high", "max_tokens": 32768
+        }
+      }
+    }
   },
 
   // Optional
   "log": "gewu-requests.jsonl",              // record every wire LLM request/response as JSONL
-  "max_tokens": 8192,                        // Anthropic output budget (incl. thinking tokens)
-  "context_limit": 131072,                   // model context window; triggers history compaction
   "sandbox": "none",                         // path confinement: "none" | "contain" | "strict"
   "skills": ["skills"],                      // directories scanned for SKILL.md
   "mcpServers": {                            // MCP servers (stdio or SSE)
@@ -216,11 +220,15 @@ in the project directory, then `~/.gewu/config.json(c)`. If both `.json` and
 4. Provider-specific endpoint defaults (where available)
 
 Every model entry requires `provider`; its optional `model` is the API model
-ID and defaults to the catalog key. `--model` / `OPENAI_MODEL` selects a catalog
-key when `models` is populated. A conflicting `--provider` is rejected. Without
+ID and defaults to the catalog key. `--model` / `OPENAI_MODEL` selects an
+`endpoint/model` entry when `endpoints` is populated. Endpoint names cannot
+contain `/`; model keys may (selectors split at the first slash).
+A conflicting `--provider` is rejected. Without
 a model catalog, direct CLI use requires both `--model` and `--provider`.
-Top-level `provider`, `api_key`, `base_url`, `reasoning_field`, and
-`require_reasoning` configuration fields are not supported.
+Credentials and URLs belong to endpoints; generation options (`max_tokens`,
+`reasoning_effort`, `context_limit`) belong to models. `reasoning_effort` is
+only supported for `openai` models. The previous top-level `models` and
+`providers` maps and top-level generation settings are not supported.
 
 Provider credentials may instead come from `OPENAI_API_KEY`,
 `ANTHROPIC_API_KEY`, `DEEPSEEK_API_KEY`, `MOONSHOT_API_KEY`, or `GLM_API_KEY`.
@@ -242,7 +250,8 @@ Agent state is persisted by default in `~/.gewu/gewu.db` (override with
 - **Experiences**: Optional semantic recall of past problem-solving experiences via the `Experiences` trait
 
 ### LLM Providers (`gewu-providers`)
-- **OpenAI-compatible**: Official API or any compatible endpoint (proxies, local models, MiniMax, deepseek, etc.)
+- **OpenAI**: Responses API (`/responses`) with encrypted reasoning replay and function calling
+- **OpenAI-compatible**: Chat Completions (`/chat/completions`) for proxies, local models, and compatible services
 - **Anthropic**: Claude with extended thinking support and configurable `max_tokens`
 - **Multi-modal**: Image, audio, video, and file inputs where model capabilities allow (detected from the model name)
 - **Streaming**: Server-Sent Events (SSE) with reasoning/content deltas
@@ -254,7 +263,8 @@ reasoning settings:
 `DeepSeekProvider`, `GlmProvider`, and `MoonshotProvider` each implement
 `LlmProvider` with fixed service policies. They share the Chat Completions
 request builder, SSE parser, and HTTP retry implementation with
-`OpenAIProvider`. `AnthropicProvider` handles the Messages protocol.
+`ChatCompletionsProvider`. `OpenAIProvider` uses the Responses protocol;
+`AnthropicProvider` handles the Messages protocol.
 The configuration provider ID selects the implementation at startup; agents
 continue to depend only on `Arc<dyn LlmProvider>`.
 
@@ -262,15 +272,25 @@ continue to depend only on `Arc<dyn LlmProvider>`.
 | --- | --- | --- |
 | `deepseek`, `moonshot` | `reasoning_content` | yes |
 | `glm` | `reasoning` | yes |
-| `openai`, `openai-compatible` | detected standard streamed field | no |
+| `openai-compatible` | detected standard streamed field | no |
+| `openai` | Responses reasoning items with encrypted content | not applicable |
 | `anthropic` | native signed thinking blocks | not applicable |
 
 Anthropic replay preserves ordered thinking, text, and tool-use blocks,
 including streamed signatures and redacted thinking. Incomplete thinking
 without a signature produces an explicit error. Compaction replaces the
 original blocks with a text checkpoint, so it does not replay signatures
-against compacted context. OpenAI Responses API encrypted reasoning is not
-supported by the Chat Completions transport.
+against compacted context.
+
+Models assigned `"provider": "openai"` use `/responses` automatically, including
+custom OpenAI endpoints. Requests use `store: false` and request
+`reasoning.encrypted_content`; output items are persisted and replayed in order
+on subsequent requests, including function calls and their outputs. Set
+`reasoning_effort` (for example `"high"`) and `max_tokens` on the model entry
+to send `reasoning.effort` and `max_output_tokens`. Effort support depends on the
+selected model. Text, images, PDF inputs, and tool-result media are supported;
+unsupported attachment types return an explicit error. To use a proxy that
+only supports Chat Completions, select `"provider": "openai-compatible"`.
 - **Resilience**: Automatic retry with exponential backoff; honors `Retry-After`; transient waits surface as status events
 
 ### Memory (`gewu-storage`)

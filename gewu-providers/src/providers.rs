@@ -130,7 +130,8 @@ pub trait ResponseParser: Send + Sync {
 ///     "gpt-4"
 /// );
 /// ```
-pub struct OpenAIProvider {
+pub struct ChatCompletionsProvider {
+    max_tokens: Option<u32>,
     base_url: String,
     reasoning_field: Option<String>,
     require_reasoning: bool,
@@ -146,7 +147,14 @@ pub struct OpenAIProvider {
     status_sink: Mutex<Option<StatusSink>>,
 }
 
+// Internal shorthand retained for the protocol adapter's existing tests.
+type OpenAIProvider = ChatCompletionsProvider;
+
 impl OpenAIProvider {
+    pub fn with_max_tokens(mut self, limit: Option<u32>) -> Self {
+        self.max_tokens = limit;
+        self
+    }
     pub(crate) fn for_service(api_key: &str, base_url: &str, model: &str, policy: crate::services::ChatPolicy) -> Self {
         let mut provider = Self::new_with_endpoint(api_key, base_url, model);
         provider.reasoning_field = Some(policy.reasoning_field.to_string());
@@ -163,6 +171,7 @@ impl OpenAIProvider {
         let config = OpenAIConfig::new(api_key, "https://api.openai.com/v1");
         let capabilities = Self::default_capabilities_for_model(model);
         Self {
+            max_tokens: None,
             base_url: "https://api.openai.com/v1".to_string(),
             reasoning_field: None,
             require_reasoning: false,
@@ -189,6 +198,7 @@ impl OpenAIProvider {
         let config = OpenAIConfig::new(api_key, base_url);
         let capabilities = Self::default_capabilities_for_model(model);
         Self {
+            max_tokens: None,
             base_url: base_url.trim_end_matches('/').to_string(),
             reasoning_field: None,
             require_reasoning: false,
@@ -543,7 +553,7 @@ impl OpenAIProvider {
             stream_options: Some(crate::openai::StreamOptions {
                 include_usage: Some(true),
             }),
-            max_tokens: None,
+            max_tokens: self.max_tokens,
             temperature: None,
         })
     }
@@ -1552,11 +1562,11 @@ mod tests {
         let wire = serde_json::to_value(other.convert_message(&restored).unwrap()).unwrap();
         assert!(wire[0].get("reasoning_text").is_none());
         let required = crate::GlmProvider::new("key", "other-model");
-        let wire = required.build(&[restored.clone()], &[]).unwrap();
+        let wire = required.build(std::slice::from_ref(&restored), &[]).unwrap();
         assert_eq!(wire["messages"][0]["reasoning"], "");
         drop(stream);
         let custom = crate::DeepSeekProvider::new_with_endpoint("key", &provider.base_url, "reasoner");
-        let wire = custom.build(&[restored.clone()], &[]).unwrap();
+        let wire = custom.build(std::slice::from_ref(&restored), &[]).unwrap();
         assert_eq!(wire["messages"][0]["reasoning_content"], "consider tools");
         let plain = Message::Assistant { content: Some("plain".into()), reasoning: None, replay: None, tool_calls: None };
         let wire = custom.build(&[plain], &[]).unwrap();

@@ -1,5 +1,5 @@
 //! Service-specific providers sharing the Chat Completions implementation.
-use crate::OpenAIProvider;
+use crate::ChatCompletionsProvider as OpenAIProvider;
 use async_trait::async_trait;
 use futures::stream::BoxStream;
 use gewu_core::traits::{LlmProvider, StatusSink, Tool};
@@ -22,6 +22,10 @@ macro_rules! chat_service {
         }
 
         impl $name {
+            pub fn with_max_tokens(mut self, limit: Option<u32>) -> Self {
+                self.chat = self.chat.with_max_tokens(limit);
+                self
+            }
             pub fn new(api_key: &str, model: &str) -> Self {
                 Self::new_with_endpoint(api_key, $endpoint, model)
             }

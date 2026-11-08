@@ -11,13 +11,19 @@ pub struct ModelConfig {
     pub provider: ProviderProfile,
     /// API model ID; defaults to the catalog key.
     pub model: Option<String>,
+    pub reasoning_effort: Option<String>,
+    /// Output budget, including reasoning tokens.
+    pub max_tokens: Option<u32>,
+    /// Context window used by history compaction.
+    pub context_limit: Option<usize>,
 }
 
 #[derive(Debug, Deserialize, Default)]
 #[serde(deny_unknown_fields)]
-pub struct ProviderConfig {
-    pub base_url: Option<String>,
+pub struct EndpointConfig {
+    pub base_url: String,
     pub api_key: Option<String>,
+    pub models: BTreeMap<String, ModelConfig>,
 }
 
 use gewu_core::types::PathEnforcement;
@@ -27,22 +33,10 @@ use gewu_tools::mcp::types::McpServerConfig;
 #[serde(deny_unknown_fields)]
 pub struct Config {
     #[serde(default)]
-    pub models: BTreeMap<String, ModelConfig>,
-    #[serde(default)]
-    pub providers: BTreeMap<String, ProviderConfig>,
+    pub endpoints: BTreeMap<String, EndpointConfig>,
     pub model: Option<String>,
     /// Optional path to a log file recording every wire LLM request as JSONL.
     pub log: Option<String>,
-    /// Output token budget sent as `max_tokens` on every Anthropic request.
-    /// Reasoning models spend thinking tokens from this budget; raise it when
-    /// turns come back empty or truncated (`stop_reason: "max_tokens"`).
-    pub max_tokens: Option<u32>,
-    /// Model context window in tokens, used to trigger history compaction.
-    /// Must match the actual model limit — the built-in default (256,000) is
-    /// larger than many models, and compaction that never fires lets the
-    /// history grow until the provider rejects requests. E.g. `131072` for a
-    /// 128k model.
-    pub context_limit: Option<usize>,
     /// Optional directories to scan for skills (files named `SKILL.md`).
     #[serde(default)]
     pub skills: Option<Vec<String>>,
@@ -96,17 +90,30 @@ impl LoadedConfig {
 
 impl Config {
     pub fn validate(&self) -> Result<()> {
-        for name in self.providers.keys() {
-            name.parse::<ProviderProfile>().map_err(anyhow::Error::msg)?;
-        }
         if let Some(model) = &self.model {
-            anyhow::ensure!(self.models.contains_key(model), "default model '{model}' is not defined in models");
+            self.resolve_model(model)?;
         }
-        for (name, model) in &self.models {
-            anyhow::ensure!(!name.trim().is_empty(), "model catalog keys cannot be empty");
-            anyhow::ensure!(model.model.as_ref().is_none_or(|id| !id.trim().is_empty()), "API model ID for '{name}' cannot be empty");
+        for (endpoint, settings) in &self.endpoints {
+            anyhow::ensure!(!endpoint.trim().is_empty() && !endpoint.contains('/'), "endpoint names must be nonempty and cannot contain '/'");
+            anyhow::ensure!(settings.base_url.starts_with("https://") || settings.base_url.starts_with("http://"), "endpoint '{endpoint}' needs an HTTP(S) base_url");
+            for (name, model) in &settings.models {
+                anyhow::ensure!(!name.trim().is_empty(), "model catalog keys cannot be empty");
+                anyhow::ensure!(model.model.as_ref().is_none_or(|id| !id.trim().is_empty()), "API model ID for '{name}' cannot be empty");
+                anyhow::ensure!(model.max_tokens != Some(0) && model.context_limit != Some(0), "model '{endpoint}/{name}' limits must be positive");
+                if let Some(effort) = &model.reasoning_effort {
+                    anyhow::ensure!(model.provider == ProviderProfile::Openai, "reasoning_effort is only supported by openai models ({endpoint}/{name})");
+                    anyhow::ensure!(["none", "minimal", "low", "medium", "high", "xhigh"].contains(&effort.as_str()), "invalid reasoning_effort for '{endpoint}/{name}'");
+                }
+            }
         }
         Ok(())
+    }
+
+    pub fn resolve_model(&self, selected: &str) -> Result<(&EndpointConfig, &ModelConfig, &str)> {
+        let (endpoint, name) = selected.split_once('/').context("model selector must be endpoint/model")?;
+        let settings = self.endpoints.get(endpoint).with_context(|| format!("unknown endpoint '{endpoint}'"))?;
+        let (key, model) = settings.models.get_key_value(name).with_context(|| format!("unknown model '{selected}'"))?;
+        Ok((settings, model, key.as_str()))
     }
 }
 
@@ -154,13 +161,29 @@ mod tests {
     use super::*;
 
     #[test]
-    fn models_require_known_providers() {
-        assert!(serde_json::from_str::<Config>(r#"{"models":{"m":{}}}"#).is_err());
-        assert!(serde_json::from_str::<Config>(r#"{"models":{"m":{"provider":"typo"}}}"#).is_err());
-        let config: Config = serde_json::from_str(r#"{"model":"m","models":{"m":{"provider":"deepseek"}},"providers":{"deepseek":{"api_key":"test"}}}"#).unwrap();
+    fn validates_model_options_and_selectors() {
+        let mut config: Config = serde_json::from_value(serde_json::json!({"endpoints":{"shared":{
+            "base_url":"https://example.com/v1","models":{"vendor/model":{"provider":"openai", "max_tokens":1}}
+        }}})).unwrap();
         config.validate().unwrap();
-        assert_eq!(config.models["m"].provider, ProviderProfile::Deepseek);
-        assert!(config.models["m"].model.is_none());
+        assert_eq!(config.resolve_model("shared/vendor/model").unwrap().2,"vendor/model");
+        for selected in ["shared", "missing/model", "shared/missing"] { assert!(config.resolve_model(selected).is_err()); }
+        config.endpoints.get_mut("shared").unwrap().models.get_mut("vendor/model").unwrap().max_tokens = Some(0);
+        assert!(config.validate().is_err());
+        let config: Config = serde_json::from_value(serde_json::json!({"endpoints":{"shared":{
+            "base_url":"https://example.com/v1","models":{"glm":{"provider":"glm", "reasoning_effort":"high"}}
+        }}})).unwrap();
+        assert!(config.validate().is_err());
+    }
+
+    #[test]
+    fn models_require_known_providers() {
+        assert!(serde_json::from_str::<ModelConfig>(r#"{}"#).is_err());
+        assert!(serde_json::from_str::<ModelConfig>(r#"{"provider":"typo"}"#).is_err());
+        let config: Config = serde_json::from_str(r#"{"model":"west/m","endpoints":{"west":{"base_url":"https://example.com/v1","models":{"m":{"provider":"deepseek"}}}}}"#).unwrap();
+        config.validate().unwrap();
+        assert_eq!(config.endpoints["west"].models["m"].provider, ProviderProfile::Deepseek);
+        assert!(config.endpoints["west"].models["m"].model.is_none());
     }
 
     #[test]
@@ -186,21 +209,21 @@ mod tests {
 
     #[test]
     fn parses_max_tokens_option() {
-        let config: Config = serde_json::from_str(r#"{"max_tokens": 65536}"#).unwrap();
+        let config: ModelConfig = serde_json::from_str(r#"{"provider":"openai", "max_tokens": 65536}"#).unwrap();
         assert_eq!(config.max_tokens, Some(65536));
     }
 
     #[test]
     fn parses_context_limit_option() {
-        let config: Config = serde_json::from_str(r#"{"context_limit": 131072}"#).unwrap();
+        let config: ModelConfig = serde_json::from_str(r#"{"provider":"glm", "context_limit": 131072}"#).unwrap();
         assert_eq!(config.context_limit, Some(131_072));
-        let config: Config = serde_json::from_str("{}").unwrap();
+        let config: ModelConfig = serde_json::from_str(r#"{"provider":"glm"}"#).unwrap();
         assert_eq!(config.context_limit, None);
     }
 
     #[test]
     fn max_tokens_is_optional() {
-        let config: Config = serde_json::from_str("{}").unwrap();
+        let config: ModelConfig = serde_json::from_str(r#"{"provider":"glm"}"#).unwrap();
         assert!(config.max_tokens.is_none());
     }
 

@@ -6,7 +6,7 @@
 use anyhow::{Context, Result};
 use gewu_core::traits::{LlmProvider, RequestLog};
 use gewu_core::types::PathEnforcement;
-use gewu_providers::{AnthropicProvider, DeepSeekProvider, GlmProvider, MoonshotProvider, OpenAIProvider, ProviderProfile};
+use gewu_providers::{AnthropicProvider, ChatCompletionsProvider, DeepSeekProvider, GlmProvider, MoonshotProvider, OpenAIProvider, ProviderProfile};
 use sqlx::SqlitePool;
 use sqlx::sqlite::SqlitePoolOptions;
 use std::env;
@@ -146,8 +146,8 @@ pub fn build_provider(
         .or_else(|| env::var("OPENAI_MODEL").ok())
         .or_else(|| file_config.model.clone())
         .context("select a configured model with --model or the config's model field")?;
-    let entry = file_config.models.get(&selected);
-    anyhow::ensure!(entry.is_some() || file_config.models.is_empty(), "unknown configured model '{selected}'");
+    let resolved = if file_config.endpoints.is_empty() { None } else { Some(file_config.resolve_model(&selected)?) };
+    let entry = resolved.map(|(_, entry, _)| entry);
     let override_provider = args.provider.clone().or_else(|| env::var("GEWU_PROVIDER").ok());
     let profile = if let Some(entry) = entry {
         if let Some(name) = &override_provider {
@@ -159,14 +159,15 @@ pub fn build_provider(
         override_provider.context("--provider is required for direct CLI model selection")?
             .parse::<ProviderProfile>().map_err(anyhow::Error::msg)?
     };
-    let settings = file_config.providers.get(profile.id());
-    let model = entry.and_then(|entry| entry.model.clone()).unwrap_or(selected);
+    let settings = resolved.map(|(endpoint, _, _)| endpoint);
+    let model = entry.and_then(|entry| entry.model.clone()).unwrap_or_else(|| resolved.map(|(_, _, name)| name.to_string()).unwrap_or(selected));
+    let max_tokens = entry.and_then(|entry| entry.max_tokens);
     let api_key = args
         .api_key
         .clone()
         .or_else(|| env::var(profile.api_key_env()).ok())
         .or_else(|| settings.and_then(|settings| settings.api_key.clone()))
-        .with_context(|| format!("API key required: use --api-key, {}, or providers.{}.api_key", profile.api_key_env(), profile.id()))?;
+        .with_context(|| format!("API key required: use --api-key, {}, or endpoints.<name>.api_key", profile.api_key_env()))?;
 
     let base_url = args
         .base_url
@@ -174,7 +175,7 @@ pub fn build_provider(
         .or_else(|| env::var("OPENAI_BASE_URL").ok())
         .or(args.endpoint.clone())
         .or_else(|| env::var("OPENAI_ENDPOINT").ok())
-        .or_else(|| settings.and_then(|settings| settings.base_url.clone()))
+        .or_else(|| settings.map(|settings| settings.base_url.clone()))
         .or_else(|| profile.base_url().map(str::to_string))
         .with_context(|| format!("providers.{}.base_url is required", profile.id()))?;
 
@@ -183,7 +184,7 @@ pub fn build_provider(
     let provider: Arc<dyn LlmProvider> = match profile {
         ProviderProfile::Anthropic => {
             let mut builder = AnthropicProvider::new_with_endpoint(&api_key, &base_url, &model);
-            if let Some(max_tokens) = file_config.max_tokens {
+            if let Some(max_tokens) = max_tokens {
                 builder = builder.with_max_tokens(max_tokens);
             }
             info!(
@@ -192,13 +193,26 @@ pub fn build_provider(
             );
             Arc::new(builder)
         }
-        ProviderProfile::Deepseek => Arc::new(DeepSeekProvider::new_with_endpoint(&api_key, &base_url, &model)),
-        ProviderProfile::Glm => Arc::new(GlmProvider::new_with_endpoint(&api_key, &base_url, &model)),
-        ProviderProfile::Moonshot => Arc::new(MoonshotProvider::new_with_endpoint(&api_key, &base_url, &model)),
-        ProviderProfile::Openai | ProviderProfile::OpenaiCompatible => Arc::new(OpenAIProvider::new_with_endpoint(&api_key, &base_url, &model)),
+        ProviderProfile::Deepseek => Arc::new(DeepSeekProvider::new_with_endpoint(&api_key, &base_url, &model).with_max_tokens(max_tokens)),
+        ProviderProfile::Glm => Arc::new(GlmProvider::new_with_endpoint(&api_key, &base_url, &model).with_max_tokens(max_tokens)),
+        ProviderProfile::Moonshot => Arc::new(MoonshotProvider::new_with_endpoint(&api_key, &base_url, &model).with_max_tokens(max_tokens)),
+        ProviderProfile::Openai => {
+            let mut provider = OpenAIProvider::new_with_endpoint(&api_key, &base_url, &model);
+            if let Some(limit) = max_tokens { provider = provider.with_max_output_tokens(limit)?; }
+            if let Some(effort) = entry.and_then(|entry| entry.reasoning_effort.as_ref()) { provider = provider.with_reasoning_effort(effort)?; }
+            Arc::new(provider)
+        }
+        ProviderProfile::OpenaiCompatible => Arc::new(ChatCompletionsProvider::new_with_endpoint(&api_key, &base_url, &model).with_max_tokens(max_tokens)),
     };
 
     Ok((provider, provider_name, model))
+}
+
+fn selected_context_limit(args: &CommonArgs, config: &crate::config::Config) -> Result<Option<usize>> {
+    if config.endpoints.is_empty() { return Ok(None); }
+    let selected = args.model.clone().or_else(|| env::var("OPENAI_MODEL").ok()).or_else(|| config.model.clone())
+        .context("select a configured model")?;
+    Ok(config.resolve_model(&selected)?.1.context_limit)
 }
 
 /// Open the optional LLM request log file when configured.
@@ -265,7 +279,7 @@ pub async fn bootstrap(args: &CommonArgs) -> Result<Bootstrap> {
             .to_string_lossy()
             .to_string(),
         enforcement: loaded_config.config.sandbox,
-        context_limit: loaded_config.config.context_limit,
+        context_limit: selected_context_limit(args, file_config)?,
     })
 }
 
@@ -279,9 +293,30 @@ mod tests {
     use super::*;
 
     #[test]
+    fn mixed_models_share_endpoint_and_keep_their_own_settings() {
+        let config = serde_json::from_value(serde_json::json!({
+            "endpoints": {"shared": {"base_url":"https://example.com/v1", "api_key":"shared-key", "models": {
+                "glm": {"provider":"glm", "max_tokens":1024, "context_limit":131072},
+                "deepseek": {"provider":"deepseek", "max_tokens":2048},
+                "gpt": {"provider":"openai", "model":"gpt-api-id", "max_tokens":4096, "reasoning_effort":"high"}
+            }}}
+        })).unwrap();
+        for (key, profile, budget) in [("glm", "glm",1024), ("deepseek","deepseek",2048), ("gpt","openai",4096)] {
+            let args = CommonArgs { model:Some(format!("shared/{key}")), api_key:Some("shared-key".into()),
+                base_url:Some("https://example.com/v1".into()), provider:Some(profile.into()), ..Default::default() };
+            let (provider, actual, model) = build_provider(&args,&config).unwrap();
+            assert_eq!(actual,profile);
+            let payload = provider.build(&[],&[]).unwrap();
+            assert_eq!(payload[if key == "gpt" {"max_output_tokens"} else {"max_tokens"}],budget);
+            assert_eq!(model,if key == "gpt" {"gpt-api-id"} else {key});
+            assert_eq!(selected_context_limit(&args,&config).unwrap(),if key == "glm" {Some(131072)} else {None});
+        }
+    }
+
+    #[test]
     fn configured_model_selects_provider_and_api_model_id() {
-        let config = serde_json::from_str(r#"{"model":"coding","models":{"coding":{"provider":"deepseek","model":"deepseek-reasoner"}},"providers":{"deepseek":{"api_key":"test"}}}"#).unwrap();
-        let args = CommonArgs { api_key: Some("test".into()), model: Some("coding".into()), provider: Some("deepseek".into()), ..Default::default() };
+        let config = serde_json::from_str(r#"{"model":"west/coding","endpoints":{"west":{"base_url":"https://example.com/v1","api_key":"test","models":{"coding":{"provider":"deepseek","model":"deepseek-reasoner"}}}}}"#).unwrap();
+        let args = CommonArgs { api_key: Some("test".into()), model: Some("west/coding".into()), provider: Some("deepseek".into()), ..Default::default() };
         let (_, provider, model) = build_provider(&args, &config).unwrap();
         assert_eq!(provider, "deepseek");
         assert_eq!(model, "deepseek-reasoner");
@@ -295,11 +330,10 @@ mod tests {
     fn startup_constructs_service_specific_providers() {
         for (name, field) in [("deepseek", "reasoning_content"), ("moonshot", "reasoning_content"), ("glm", "reasoning")] {
             let config = serde_json::from_value(serde_json::json!({
-                "models": {"coding": {"provider": name, "model": "arbitrary-model"}},
-                "providers": {(name): {"base_url": "https://example.com/v1"}}
+                "endpoints": {"west": {"base_url": "https://example.com/v1", "models": {"coding": {"provider": name, "model": "arbitrary-model"}}}}
             })).unwrap();
             let args = CommonArgs {
-                api_key: Some("key".into()), model: Some("coding".into()),
+                api_key: Some("key".into()), model: Some("west/coding".into()),
                 provider: Some(name.into()), base_url: Some("https://example.com/v1".into()),
                 ..Default::default()
             };
@@ -310,6 +344,31 @@ mod tests {
                 content: Some("answer".into()), reasoning: None, replay: None, tool_calls: None,
             }], &[]).unwrap();
             assert_eq!(payload["messages"][0][field], "");
+        }
+    }
+
+    #[test]
+    fn openai_selects_responses_and_compatible_selects_chat() {
+        for (name, key) in [("openai", "input"), ("openai-compatible", "messages")] {
+            let config = serde_json::from_value(serde_json::json!({
+                "endpoints": {"west": {"base_url": "https://example.com/v1", "models": {"coding": {
+                    "provider": name, "model": "test-model", "max_tokens": 2048,
+                    "reasoning_effort": if name == "openai" { Some("high") } else { None }
+                }}}}
+            })).unwrap();
+            let args = CommonArgs {
+                api_key: Some("key".into()), model: Some("west/coding".into()),
+                provider: Some(name.into()), base_url: Some("https://example.com/v1".into()),
+                ..Default::default()
+            };
+            let (provider, _, _) = build_provider(&args, &config).unwrap();
+            let payload = provider.build(&[], &[]).unwrap();
+            assert!(payload.get(key).is_some());
+            if name == "openai" {
+                assert_eq!(payload["store"], false);
+                assert_eq!(payload["reasoning"]["effort"], "high");
+                assert_eq!(payload["max_output_tokens"], 2048);
+            }
         }
     }
 

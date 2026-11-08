@@ -6,7 +6,8 @@
 //!
 //! # Supported Providers
 //!
-//! - **OpenAI** - OpenAI's official API and OpenAI-compatible endpoints
+//! - **OpenAI** - OpenAI Responses API with encrypted reasoning replay
+//! - **Chat Completions** - OpenAI-compatible endpoints
 //! - **Anthropic** - Anthropic's Claude API
 //! - **DeepSeek**, **GLM**, **Moonshot** - service-specific Chat Completions providers
 //!
@@ -28,7 +29,9 @@ mod openai;
 mod providers;
 mod profile;
 mod services;
+mod responses;
 
-pub use providers::{AnthropicProvider, OpenAIProvider};
+pub use providers::{AnthropicProvider, ChatCompletionsProvider};
+pub use responses::OpenAIProvider;
 pub use profile::ProviderProfile;
 pub use services::{DeepSeekProvider, GlmProvider, MoonshotProvider};
