@@ -374,6 +374,28 @@ mod tests {
                             },
                         }));
                     }
+                    if prompt.contains("rerun") {
+                        // Two rounds of tool calls: the second round's tool
+                        // block joins the first round's run, so its collapsed
+                        // thought cannot ride on a tool_card_start swap.
+                        for label in ["first", "second"] {
+                            replies.push(json!({
+                                "type": "event", "id": null, "request_id": request_id,
+                                "event": {"type": "reasoning_delta", "delta": format!("pondering {label} ")},
+                            }));
+                            replies.push(json!({
+                                "type": "event", "id": null, "request_id": request_id,
+                                "event": {"type": "tool_start", "tool": "bash", "input": format!("seq {label}")},
+                            }));
+                            replies.push(json!({
+                                "type": "event", "id": null, "request_id": request_id,
+                                "event": {
+                                    "type": "tool_finish", "tool": "bash",
+                                    "title": format!("seq {label}"), "output": format!("{label} out"),
+                                },
+                            }));
+                        }
+                    }
                     replies.push(json!({
                         "type": "event", "id": null, "request_id": request_id,
                         "event": {"type": "content_delta", "delta": "hello "},
@@ -821,6 +843,75 @@ mod tests {
             }
         }
         panic!("expected a tool_card message");
+    }
+
+    /// A thought that ends because a second round of tool calls starts must
+    /// collapse even though its tool block joins the previous run: the
+    /// collapsed block needs its own settled-body swap.
+    #[tokio::test]
+    async fn second_round_tool_call_settles_the_rounds_thought() {
+        let upstream = spawn_fake_upstream().await;
+        let addr = spawn_gui(AppState {
+            endpoint: Endpoint::Tcp {
+                host: "127.0.0.1".to_string(),
+                port: upstream.port(),
+            },
+            token: None,
+            server_token: None,
+        })
+        .await;
+
+        let (mut ws, _) = tokio_tungstenite::connect_async(format!("ws://{addr}/ws"))
+            .await
+            .unwrap();
+        let snapshot = next_json(&mut ws).await;
+        assert_eq!(snapshot["type"], "snapshot");
+
+        ws.send(WsMessage::text(
+            json!({"op": "ask", "tab": 1, "prompt": "rerun"}).to_string(),
+        ))
+        .await
+        .unwrap();
+
+        // The snapshot already fills the transcript; block indices are
+        // derived from the first run's card. The second round's thought sits
+        // directly after it and must be settled by a body swap even though
+        // its tool block joins the same run.
+        let mut settled = Vec::new();
+        let mut second_thought = None;
+        for _ in 0..120 {
+            let value = next_json(&mut ws).await;
+            match value["type"].as_str().unwrap_or("") {
+                "tool_card_start" => {
+                    // The first run starts right after the first thought, so
+                    // its payload already carries the settled body.
+                    let html = value["assistant"][1].as_str().expect("assistant html");
+                    assert!(html.contains("Thought "), "{html}");
+                    assert!(!html.contains("Thinking"), "{html}");
+                    second_thought =
+                        Some(value["first"].as_u64().expect("run start") as usize + 1);
+                }
+                "streaming_body" => {
+                    let index = value["index"].as_u64().expect("body index") as usize;
+                    let html = value["html"].as_str().unwrap_or("").to_string();
+                    if Some(index) == second_thought && html.contains("Thought ") {
+                        assert!(!html.contains("Thinking"), "{html}");
+                        settled.push(html);
+                    }
+                }
+                "tabs" => {
+                    let tab = &value["tabs"][0];
+                    if tab["session_id"] == "sess-1" && tab["busy"] == false {
+                        break;
+                    }
+                }
+                _ => {}
+            }
+        }
+        assert!(
+            !settled.is_empty(),
+            "the second round's collapsed thought must receive a settled body swap"
+        );
     }
 
     #[tokio::test]

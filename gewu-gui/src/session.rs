@@ -902,6 +902,10 @@ impl GuiSession {
         let mut update = TabUpdate::None;
         let mut terminal = false;
         let mut usage_updated = false;
+        // Index of a thought block that an applied event collapsed (live
+        // "Thinking…" settled to "Thought Ns"); the triggering event usually
+        // appends a different block, so the settled body needs its own swap.
+        let mut collapsed = None;
         // Decide the throttle before borrowing the tab below.
         let stream_due = self.stream_update_due(event.tab_id);
 
@@ -936,6 +940,7 @@ impl GuiSession {
                             let affected = tab
                                 .model
                                 .apply_event(&AgentEvent::ContentDelta { delta: text });
+                            collapsed = tab.model.take_collapsed();
                             if tab.model.blocks.len() != before {
                                 // A fresh block: render it immediately; the
                                 // throttle window starts on its first update.
@@ -970,14 +975,22 @@ impl GuiSession {
                                 update = affected.map_or(TabUpdate::Full, TabUpdate::StreamingBody);
                             }
                         }
-                        Ok(AgentEvent::Finish { .. }) => {}
+                        // Applying Finish settles a thought left open by a
+                        // turn that produced no visible output; nothing else
+                        // in the transcript changes.
+                        Ok(agent_event @ AgentEvent::Finish { .. }) => {
+                            tab.model.apply_event(&agent_event);
+                            collapsed = tab.model.take_collapsed();
+                        }
                         Ok(AgentEvent::Error { error }) => {
                             let affected = tab.model.apply_event(&AgentEvent::Error { error });
+                            collapsed = tab.model.take_collapsed();
                             update = affected.map_or(TabUpdate::Full, TabUpdate::BlockAppend);
                         }
                         Ok(agent_event) => {
                             // ToolStart / ToolFinish: update just the run's card.
                             let affected = tab.model.apply_event(&agent_event);
+                            collapsed = tab.model.take_collapsed();
                             let appended = tab.model.blocks.len() != before;
                             update = tool_update(&tab.model.blocks, affected, appended);
                         }
@@ -1030,6 +1043,17 @@ impl GuiSession {
         }
 
         let active = active_id == event.tab_id;
+        // An event can collapse an open thought while appending a different
+        // block (tool card, assistant text) whose targeted update never
+        // re-renders the thought; swap the settled "Thought Ns" body in
+        // place so the live label does not stick until the next full render.
+        // Full renders (and background tabs, rebuilt on focus) need no swap.
+        if active
+            && !matches!(update, TabUpdate::Full)
+            && let Some(index) = collapsed
+        {
+            self.send_thought_body(event.tab_id, index, sender).await?;
+        }
         match update {
             TabUpdate::None => {}
             TabUpdate::Full => {

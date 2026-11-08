@@ -87,6 +87,10 @@ pub struct SessionModel {
     /// Transient status message (e.g. LLM retry backoff) shown in the busy
     /// indicator; cleared by the next non-status event.
     pub status: Option<String>,
+    /// Block index of a thought collapsed during the last [`apply_event`];
+    /// front-ends re-render it so the live "Thinking…" label settles even
+    /// when the triggering event appends a different block.
+    collapsed: Option<usize>,
 }
 
 impl Default for SessionModel {
@@ -103,6 +107,7 @@ impl SessionModel {
             phase: Phase::Idle,
             session_id: None,
             status: None,
+            collapsed: None,
         }
     }
 
@@ -127,6 +132,7 @@ impl SessionModel {
     /// Returns the index of the block the event affected, if any — callers
     /// can re-render just that block instead of the whole transcript.
     pub fn apply_event(&mut self, event: &AgentEvent) -> Option<usize> {
+        self.collapsed = None;
         // A status message is transient UI state, not transcript content:
         // any other event supersedes it. Status does not end an open
         // thought — it can arrive mid-setup, before reasoning starts.
@@ -227,6 +233,7 @@ impl SessionModel {
     }
 
     /// Collapse an open reasoning indicator to its final "Thought Ns" label.
+    /// The collapsed block's index is reported via [`take_collapsed`].
     fn end_thought(&mut self) {
         if let Some(Block::Thought { text, started, .. }) = self.blocks.last_mut()
             && started.is_some()
@@ -234,7 +241,14 @@ impl SessionModel {
             let elapsed = started.unwrap().elapsed().as_secs_f32();
             *text = format!("Thought {elapsed:.1}s");
             *started = None;
+            self.collapsed = Some(self.blocks.len() - 1);
         }
+    }
+
+    /// The block index whose live "Thinking…" label collapsed during the
+    /// last [`apply_event`], if any. Reset per event.
+    pub fn take_collapsed(&mut self) -> Option<usize> {
+        self.collapsed.take()
     }
 
     /// Append a stored conversation [`Message`] (used when loading history).
@@ -661,6 +675,46 @@ mod tests {
             }
             other => panic!("expected Thought block, got {other:?}"),
         }
+    }
+
+    /// A collapse caused by an event that appends a different block (here a
+    /// ToolStart) is still reported, so front-ends can re-render the settled
+    /// label; the report is per event and clears once taken.
+    #[test]
+    fn tool_start_collapsing_a_thought_reports_the_collapsed_index() {
+        let mut m = model();
+        m.submit("hi".into());
+        m.apply_event(&AgentEvent::ReasoningDelta { delta: "hm".into() });
+
+        assert_eq!(m.take_collapsed(), None);
+        assert_eq!(
+            m.apply_event(&AgentEvent::ToolStart {
+                tool: "bash".into(),
+                input: "{}".into(),
+            }),
+            Some(2)
+        );
+        assert_eq!(m.take_collapsed(), Some(1));
+        // Taken once: the next event without a collapse reports nothing.
+        m.apply_event(&AgentEvent::ToolFinish {
+            tool: "bash".into(),
+            title: String::new(),
+            output: "ok".into(),
+            metadata: Default::default(),
+        });
+        assert_eq!(m.take_collapsed(), None);
+    }
+
+    /// Content after reasoning also collapses the thought (the trigger
+    /// appends an assistant block, not the thought it settled).
+    #[test]
+    fn content_delta_collapsing_a_thought_reports_the_collapsed_index() {
+        let mut m = model();
+        m.submit("hi".into());
+        m.apply_event(&AgentEvent::ReasoningDelta { delta: "hm".into() });
+
+        m.apply_event(&AgentEvent::ContentDelta { delta: "answer".into() });
+        assert_eq!(m.take_collapsed(), Some(1));
     }
 
     #[test]
