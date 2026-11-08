@@ -549,9 +549,13 @@
   });
 
   el.sidebarToggle.addEventListener("click", toggleSidebar);
+  el.status.addEventListener("mousedown", (event) => {
+    if (event.target.closest("[data-mode]")) event.preventDefault();
+  });
   el.status.addEventListener("click", (event) => {
     const button = event.target.closest("[data-mode]");
     if (button && !state.busy) send({ op: "switch_agent", tab: state.active, agent: button.dataset.mode });
+    el.prompt.focus();
   });
 
   el.newTab.addEventListener("click", () => send({ op: "open_tab" }));
