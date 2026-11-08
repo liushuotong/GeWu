@@ -131,6 +131,9 @@ pub struct AgentBuilder {
     log: Option<RequestLog>,
     /// File-path confinement level passed to tools (defaults to none).
     enforcement: PathEnforcement,
+    /// Session id surfaced to tools via [`ToolContext`]; defaults to a fresh
+    /// UUID.
+    session_id: Option<String>,
 }
 
 /// Extracts a readable message from a panic payload.
@@ -170,6 +173,7 @@ impl Default for AgentBuilder {
             experiences: None,
             log: None,
             enforcement: PathEnforcement::default(),
+            session_id: None,
         }
     }
 }
@@ -659,6 +663,16 @@ impl AgentBuilder {
         self
     }
 
+    /// Sets the session id surfaced to tools via [`ToolContext`].
+    ///
+    /// When the agent backs a durable conversation, this should be the same
+    /// id the memory store is keyed by, so tools observe the real
+    /// conversation identity. Defaults to a fresh UUID.
+    pub fn session_id(mut self, session_id: impl Into<String>) -> Self {
+        self.session_id = Some(session_id.into());
+        self
+    }
+
     /// Builds the `Agent` instance.
     ///
     /// # Errors
@@ -681,7 +695,9 @@ impl AgentBuilder {
             memory: self.memory.unwrap_or_else(|| Box::new(Vec::new())),
             context_limit: self.context_limit,
             truncation: TruncationService::new(),
-            session_id: Uuid::new_v4().to_string(),
+            session_id: self
+                .session_id
+                .unwrap_or_else(|| Uuid::new_v4().to_string()),
             experiences: self.experiences,
             log: self.log,
             enforcement: self.enforcement,

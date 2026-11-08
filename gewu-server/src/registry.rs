@@ -105,6 +105,11 @@ impl ToolRegistry for ToolRegistryImpl {
 }
 
 /// Creates sub-agents through the CLI registry for the [`TaskTool`].
+///
+/// Stateless: everything is derived from the factory's shared wiring plus
+/// the per-call arguments. The parent conversation arrives per call (from
+/// the task tool's [`ToolContext`]) so subagent lineage is recorded without
+/// the factory holding any session state.
 struct SqliteAgentFactory {
     provider: Arc<dyn LlmProvider>,
     pool: SqlitePool,
@@ -112,10 +117,6 @@ struct SqliteAgentFactory {
     enforcement: PathEnforcement,
     /// Model context window forwarded to subagent agents for compaction.
     context_limit: Option<usize>,
-    /// Session owning this task tool. Subagent sessions are recorded with it
-    /// as parent, hiding them from the session list and enabling the depth
-    /// limit for nested spawns.
-    parent_session: String,
 }
 
 /// How deep `task` calls may nest: a top-level session may spawn subagents,
@@ -128,8 +129,9 @@ impl AgentFactory for SqliteAgentFactory {
         &self,
         subagent_type: &str,
         resume: Option<String>,
+        parent_session: &str,
     ) -> Result<(Agent, String), Box<dyn Error + Send + Sync>> {
-        let depth = gewu_storage::subagent_depth(&self.pool, &self.parent_session).await?;
+        let depth = gewu_storage::subagent_depth(&self.pool, parent_session).await?;
         if depth >= MAX_SUBAGENT_DEPTH {
             return Err(format!(
                 "subagent depth limit reached ({MAX_SUBAGENT_DEPTH}); subagents cannot launch further subagents"
@@ -137,7 +139,7 @@ impl AgentFactory for SqliteAgentFactory {
             .into());
         }
         let session_id = resume.unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
-        gewu_storage::record_subagent_session(&self.pool, &session_id, &self.parent_session, subagent_type).await?;
+        gewu_storage::record_subagent_session(&self.pool, &session_id, parent_session, subagent_type).await?;
         let working_directory = std::env::current_dir()
             .map_err(|e| -> Box<dyn Error + Send + Sync> { e.to_string().into() })?;
         let (agent, _registry) = create_agent(
@@ -169,7 +171,6 @@ fn task_tool(
     enforcement: PathEnforcement,
     context_limit: Option<usize>,
     allowed: &[&str],
-    parent_session: &str,
 ) -> TaskTool {
     let factory = Arc::new(SqliteAgentFactory {
         provider,
@@ -177,7 +178,6 @@ fn task_tool(
         skills,
         enforcement,
         context_limit,
-        parent_session: parent_session.to_string(),
     });
     let agents = list_available_agents()
         .into_iter()
@@ -197,13 +197,13 @@ fn build_tool_registry_and_list(inputs: &ProfileInputs) -> Result<RegistryBundle
         skills,
         enforcement,
         context_limit,
-        session_id,
+        ..
     } = inputs;
     let mut tools: Vec<Box<dyn Tool>> = match *name {
         "build" => {
             let todos = Arc::new(Mutex::new(Vec::<TodoItem>::new()));
             vec![
-                Box::new(task_tool(provider.clone(), pool.clone(), skills.clone(), *enforcement, *context_limit, &[], session_id)),
+                Box::new(task_tool(provider.clone(), pool.clone(), skills.clone(), *enforcement, *context_limit, &[])),
                 Box::new(ReadFileTool {
                     working_directory: working_directory.clone(),
                 }),
@@ -239,7 +239,7 @@ fn build_tool_registry_and_list(inputs: &ProfileInputs) -> Result<RegistryBundle
         "plan" => {
             let todos = Arc::new(Mutex::new(Vec::<TodoItem>::new()));
             vec![
-                Box::new(task_tool(provider.clone(), pool.clone(), skills.clone(), *enforcement, *context_limit, &["explore"], session_id)),
+                Box::new(task_tool(provider.clone(), pool.clone(), skills.clone(), *enforcement, *context_limit, &["explore"])),
                 Box::new(ReadFileTool { working_directory: working_directory.clone() }),
                 Box::new(GlobTool { working_directory: working_directory.clone() }),
                 Box::new(GrepTool { working_directory: working_directory.clone() }),
@@ -280,7 +280,7 @@ fn build_tool_registry_and_list(inputs: &ProfileInputs) -> Result<RegistryBundle
         "general" => {
             let todos = Arc::new(Mutex::new(Vec::<TodoItem>::new()));
             vec![
-                Box::new(task_tool(provider.clone(), pool.clone(), skills.clone(), *enforcement, *context_limit, &[], session_id)),
+                Box::new(task_tool(provider.clone(), pool.clone(), skills.clone(), *enforcement, *context_limit, &[])),
                 Box::new(ReadFileTool {
                     working_directory: working_directory.clone(),
                 }),
@@ -386,7 +386,10 @@ pub async fn create_agent(
         .with_tools(all_tools)
         .memory(Box::new(memory))
         .system_prompt(&system_prompt)
-        .with_enforcement(enforcement);
+        .with_enforcement(enforcement)
+        // Tools observe the real conversation identity (e.g. the task tool
+        // records subagent lineage against it), not a random UUID.
+        .session_id(session_id);
     // Restore the durable reminder state; a session without one (fresh, or
     // created before reminders were persisted) starts from the profile
     // default. The initial state is written immediately so it is durable
@@ -409,8 +412,9 @@ pub async fn create_agent(
 
 /// Build profile configuration without opening or reloading conversation memory.
 ///
-/// `session_id` is the owning conversation: its task tool records spawned
-/// subagent sessions against it.
+/// `session_id` keys the conversation's memory and reminder storage; the task
+/// tool no longer reads it from here (it receives the parent per call via the
+/// tool context).
 pub fn agent_profile(inputs: ProfileInputs) -> Result<ProfileBundle> {
     let ProfileInputs {
         name,
@@ -780,24 +784,16 @@ mod tests {
             skills: Vec::new(),
             enforcement: PathEnforcement::None,
             context_limit: None,
-            parent_session: "root".to_string(),
         };
-        let (_, subagent_id) = factory.create("explore", None).await.unwrap();
+        // The parent conversation is passed per call, not held by the factory.
+        let (_, subagent_id) = factory.create("explore", None, "root").await.unwrap();
         // The subagent session is recorded with its parent, so the session
         // list can hide it while task resume keeps working.
         assert_eq!(gewu_storage::subagent_depth(&pool, "root").await.unwrap(), 0);
         assert_eq!(gewu_storage::subagent_depth(&pool, &subagent_id).await.unwrap(), 1);
 
         // A subagent cannot launch further subagents.
-        let nested = SqliteAgentFactory {
-            provider,
-            pool,
-            skills: Vec::new(),
-            enforcement: PathEnforcement::None,
-            context_limit: None,
-            parent_session: subagent_id,
-        };
-        let error = match nested.create("explore", None).await {
+        let error = match factory.create("explore", None, &subagent_id).await {
             Err(e) => e.to_string(),
             Ok(_) => panic!("nested subagent spawn should be rejected"),
         };

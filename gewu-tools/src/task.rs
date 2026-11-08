@@ -31,13 +31,17 @@ use gewu_core::traits::Tool;
 /// Implement this trait to wire the task tool into an agent registry.
 /// Pass a prior session id in `resume` to continue that session; the
 /// returned string is the actual session id used (a fresh one when
-/// `resume` is `None`).
+/// `resume` is `None`). `parent_session` is the conversation running the
+/// task tool (from [`ToolContext::session_id`](gewu_core::types::ToolContext));
+/// implementations may use it to track lineage. The factory itself holds no
+/// per-session state.
 #[async_trait]
 pub trait AgentFactory: Send + Sync {
     async fn create(
         &self,
         subagent_type: &str,
         resume: Option<String>,
+        parent_session: &str,
     ) -> Result<(Agent, String), Box<dyn Error + Send + Sync>>;
 }
 
@@ -115,7 +119,7 @@ impl Tool for TaskTool {
     async fn execute(
         &self,
         args: serde_json::Value,
-        _ctx: &ToolContext,
+        ctx: &ToolContext,
     ) -> Result<ToolResult, Box<dyn Error + Send + Sync>> {
         let input: TaskArgs = serde_json::from_value(args)?;
 
@@ -132,7 +136,7 @@ impl Tool for TaskTool {
 
         let (mut agent, session_id) = self
             .factory
-            .create(&input.subagent_type, input.task_id)
+            .create(&input.subagent_type, input.task_id, &ctx.session_id)
             .await
             .map_err(|e| format!("Failed to create agent: {}", e))?;
 
@@ -144,7 +148,7 @@ impl Tool for TaskTool {
             // Stop consuming the subagent stream once the parent turn has
             // been aborted; otherwise a canceled turn waits for the entire
             // subagent run to finish anyway.
-            if _ctx.is_aborted() {
+            if ctx.is_aborted() {
                 return Ok(ToolResult::new(
                     input.description,
                     "Error: task aborted because the parent turn was canceled.",
@@ -226,7 +230,7 @@ mod tests {
         events: Vec<ProviderEvent>,
         fail_stream: bool,
         fail_create: bool,
-        requests: Mutex<Vec<(String, Option<String>)>>,
+        requests: Mutex<Vec<(String, Option<String>, String)>>,
     }
 
     impl MockFactory {
@@ -246,6 +250,7 @@ mod tests {
             &self,
             subagent_type: &str,
             resume: Option<String>,
+            parent_session: &str,
         ) -> Result<(Agent, String), Box<dyn Error + Send + Sync>> {
             if self.fail_create {
                 return Err("unknown agent type".into());
@@ -253,7 +258,7 @@ mod tests {
             self.requests
                 .lock()
                 .unwrap()
-                .push((subagent_type.to_string(), resume.clone()));
+                .push((subagent_type.to_string(), resume.clone(), parent_session.to_string()));
             let agent = Agent::builder()
                 .llm(Arc::new(MockLlm {
                     events: self.events.clone(),
@@ -318,6 +323,7 @@ mod tests {
         assert_eq!(requests.len(), 1);
         assert_eq!(requests[0].0, "build");
         assert_eq!(requests[0].1, None);
+        assert_eq!(requests[0].2, "s");
     }
 
     #[tokio::test]
@@ -337,6 +343,7 @@ mod tests {
         let requests = factory.requests.lock().unwrap();
         assert_eq!(requests[0].0, "explore");
         assert_eq!(requests[0].1.as_deref(), Some("prior-1"));
+        assert_eq!(requests[0].2, "s");
     }
 
     #[tokio::test]
