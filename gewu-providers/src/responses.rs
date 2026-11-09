@@ -14,6 +14,7 @@ pub struct OpenAIProvider {
     model: String,
     max_output_tokens: Option<u32>,
     effort: Option<String>,
+    reasoning_summary: bool,
     backoff: Duration,
     max_wait: Duration,
     status: Mutex<Option<StatusSink>>,
@@ -131,7 +132,8 @@ mod tests {
         let events = state.process(&json!({"type":"response.incomplete","response":{"output":[],"incomplete_details":{"reason":"max_output_tokens"}}}).to_string(),"origin","model").unwrap();
         assert!(events.iter().any(|e| matches!(e,ProviderEvent::Finish { reason: Some(reason) } if reason == "max_tokens")));
         assert!(ResponseState::default().process(r#"{"type":"response.failed","response":{"error":{"message":"failed"}}}"#,"o","m").is_err());
-        assert!(OpenAIProvider::new("key","m").with_reasoning_effort("invalid").is_err());
+        let arbitrary = OpenAIProvider::new("key","m").with_reasoning_effort("vendor-defined").unwrap().build(&[], &[]).unwrap();
+        assert_eq!(arbitrary["reasoning"]["effort"], "vendor-defined");
         assert!(OpenAIProvider::new("key","m").with_max_output_tokens(0).is_err());
         let provider = OpenAIProvider::new("key","m");
         let payload = provider.build(&[Message::User { content:vec![ContentPart::Image { data:"a".into(),mime_type:"image/png".into() },ContentPart::File { data:"b".into(),mime_type:"application/pdf".into() }] }],&[]).unwrap();
@@ -146,6 +148,20 @@ mod tests {
         let events = parse_stream(source,"origin".into(),"model".into()).collect::<Vec<_>>().await;
         assert!(events.last().unwrap().is_err());
     }
+
+    #[test]
+    fn summary_defaults_and_effort_are_independent() {
+        let default = OpenAIProvider::new("key", "gpt").build(&[], &[]).unwrap();
+        assert_eq!(default["reasoning"], json!({"summary":"auto"}));
+        let disabled = OpenAIProvider::new("key", "gpt").with_reasoning_summary(false).build(&[], &[]).unwrap();
+        assert!(disabled.get("reasoning").is_none());
+        assert_eq!(disabled["include"], json!(["reasoning.encrypted_content"]));
+        let effort_only = OpenAIProvider::new("key", "gpt").with_reasoning_summary(false)
+            .with_reasoning_effort("high").unwrap().build(&[], &[]).unwrap();
+        assert_eq!(effort_only["reasoning"], json!({"effort":"high"}));
+        let both = OpenAIProvider::new("key", "gpt").with_reasoning_effort("low").unwrap().build(&[], &[]).unwrap();
+        assert_eq!(both["reasoning"], json!({"summary":"auto", "effort":"low"}));
+    }
 }
 
 impl OpenAIProvider {
@@ -157,7 +173,7 @@ impl OpenAIProvider {
         Self {
             client: crate::http::client(), api_key: api_key.into(),
             base_url: base_url.trim_end_matches('/').into(), model: model.into(),
-            max_output_tokens: None, effort: None, backoff: crate::http::RETRY_BACKOFF,
+            max_output_tokens: None, effort: None, reasoning_summary: true, backoff: crate::http::RETRY_BACKOFF,
             max_wait: crate::http::MAX_RETRY_WAIT, status: Mutex::new(None),
         }
     }
@@ -169,9 +185,14 @@ impl OpenAIProvider {
     }
 
     pub fn with_reasoning_effort(mut self, effort: &str) -> anyhow::Result<Self> {
-        anyhow::ensure!(["none", "minimal", "low", "medium", "high", "xhigh"].contains(&effort), "invalid reasoning effort '{effort}'");
         self.effort = Some(effort.into());
         Ok(self)
+    }
+
+    /// Request a visible reasoning summary without overriding model effort.
+    pub fn with_reasoning_summary(mut self, enabled: bool) -> Self {
+        self.reasoning_summary = enabled;
+        self
     }
 
     pub fn with_retry_backoff(mut self, delay: Duration) -> Self { self.backoff = delay; self }
@@ -258,7 +279,10 @@ impl LlmProvider for OpenAIProvider {
         if !instructions.is_empty() { request["instructions"] = instructions.join("\n\n").into(); }
         if !functions.is_empty() { request["tools"] = functions.into(); }
         if let Some(limit) = self.max_output_tokens { request["max_output_tokens"] = limit.into(); }
-        if let Some(effort) = &self.effort { request["reasoning"] = json!({"effort":effort, "summary":"auto"}); }
+        let mut reasoning = serde_json::Map::new();
+        if self.reasoning_summary { reasoning.insert("summary".into(), json!("auto")); }
+        if let Some(effort) = &self.effort { reasoning.insert("effort".into(), json!(effort)); }
+        if !reasoning.is_empty() { request["reasoning"] = Value::Object(reasoning); }
         Ok(request)
     }
 

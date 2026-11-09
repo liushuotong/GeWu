@@ -131,6 +131,7 @@ pub trait ResponseParser: Send + Sync {
 /// );
 /// ```
 pub struct ChatCompletionsProvider {
+    reasoning_effort: Option<String>,
     max_tokens: Option<u32>,
     base_url: String,
     reasoning_field: Option<String>,
@@ -150,6 +151,10 @@ pub struct ChatCompletionsProvider {
 type OpenAIProvider = ChatCompletionsProvider;
 
 impl OpenAIProvider {
+    pub fn with_reasoning_effort(mut self, effort: &str) -> Self {
+        self.reasoning_effort = Some(effort.to_owned());
+        self
+    }
     pub fn with_max_tokens(mut self, limit: Option<u32>) -> Self {
         self.max_tokens = limit;
         self
@@ -170,6 +175,7 @@ impl OpenAIProvider {
         let capabilities = Self::default_capabilities_for_model(model);
         Self {
             max_tokens: None,
+            reasoning_effort: None,
             base_url: "https://api.openai.com/v1".to_string(),
             reasoning_field: None,
             client: OpenAIClient::with_config(config),
@@ -196,6 +202,7 @@ impl OpenAIProvider {
         let capabilities = Self::default_capabilities_for_model(model);
         Self {
             max_tokens: None,
+            reasoning_effort: None,
             base_url: base_url.trim_end_matches('/').to_string(),
             reasoning_field: None,
             client: OpenAIClient::with_config(config),
@@ -536,6 +543,7 @@ impl OpenAIProvider {
         let openai_tools = self.convert_tools(tools)?;
 
         Ok(CreateChatCompletionRequest {
+            reasoning_effort: self.reasoning_effort.clone(),
             model: self.model.clone(),
             messages: openai_messages,
             tools: if openai_tools.is_empty() {
@@ -871,6 +879,7 @@ const ANTHROPIC_LEGACY_MAX_TOKENS: u32 = 8192;
 const ANTHROPIC_REASONING_MODEL_MAX_TOKENS: u32 = 32768;
 
 pub struct AnthropicProvider {
+    reasoning_effort: Option<String>,
     client: AnthropicClient,
     model: String,
     #[allow(dead_code)]
@@ -914,6 +923,7 @@ impl AnthropicProvider {
             retry_backoff: crate::http::RETRY_BACKOFF,
             retry_max_wait: crate::http::MAX_RETRY_WAIT,
             max_tokens: Self::default_max_tokens_for_model(model),
+            reasoning_effort: None,
             status_sink: Mutex::new(None),
         }
     }
@@ -938,6 +948,7 @@ impl AnthropicProvider {
             retry_backoff: crate::http::RETRY_BACKOFF,
             retry_max_wait: crate::http::MAX_RETRY_WAIT,
             max_tokens: Self::default_max_tokens_for_model(model),
+            reasoning_effort: None,
             status_sink: Mutex::new(None),
         }
     }
@@ -971,6 +982,11 @@ impl AnthropicProvider {
     /// turns come back empty or truncated (`stop_reason: "max_tokens"`).
     pub fn with_max_tokens(mut self, max_tokens: u32) -> Self {
         self.max_tokens = max_tokens;
+        self
+    }
+
+    pub fn with_reasoning_effort(mut self, effort: &str) -> Self {
+        self.reasoning_effort = Some(effort.to_owned());
         self
     }
 
@@ -1190,6 +1206,7 @@ impl AnthropicProvider {
         let anthropic_tools = self.convert_tools(tools)?;
 
         Ok(CreateMessageRequest {
+            output_config: self.reasoning_effort.as_ref().map(|effort| serde_json::json!({"effort": effort})),
             model: self.model.clone(),
             messages: anthropic_messages,
             system: if system_prompt.is_empty() {

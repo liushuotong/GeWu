@@ -21,6 +21,10 @@ macro_rules! chat_service {
         }
 
         impl $name {
+            pub fn with_reasoning_effort(mut self, effort: &str) -> Self {
+                self.chat = self.chat.with_reasoning_effort(effort);
+                self
+            }
             pub fn with_max_tokens(mut self, limit: Option<u32>) -> Self {
                 self.chat = self.chat.with_max_tokens(limit);
                 self

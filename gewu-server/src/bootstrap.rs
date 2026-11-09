@@ -208,6 +208,7 @@ pub fn build_provider(
         &model,
         max_tokens,
         entry.and_then(|entry| entry.reasoning_effort.as_deref()),
+        entry.and_then(|entry| entry.reasoning_summary),
     )?;
 
     Ok((provider, provider_name, model))
@@ -221,10 +222,12 @@ fn construct_provider(
     model: &str,
     max_tokens: Option<u32>,
     reasoning_effort: Option<&str>,
+    reasoning_summary: Option<bool>,
 ) -> Result<Arc<dyn LlmProvider>> {
     let provider: Arc<dyn LlmProvider> = match profile {
         ProviderProfile::Anthropic => {
             let mut builder = AnthropicProvider::new_with_endpoint(api_key, base_url, model);
+            if let Some(effort) = reasoning_effort { builder = builder.with_reasoning_effort(effort); }
             if let Some(max_tokens) = max_tokens {
                 builder = builder.with_max_tokens(max_tokens);
             }
@@ -234,16 +237,33 @@ fn construct_provider(
             );
             Arc::new(builder)
         }
-        ProviderProfile::Deepseek => Arc::new(DeepSeekProvider::new_with_endpoint(api_key, base_url, model).with_max_tokens(max_tokens)),
-        ProviderProfile::Glm => Arc::new(GlmProvider::new_with_endpoint(api_key, base_url, model).with_max_tokens(max_tokens)),
-        ProviderProfile::Moonshot => Arc::new(MoonshotProvider::new_with_endpoint(api_key, base_url, model).with_max_tokens(max_tokens)),
+        ProviderProfile::Deepseek => {
+            let mut provider = DeepSeekProvider::new_with_endpoint(api_key, base_url, model).with_max_tokens(max_tokens);
+            if let Some(effort) = reasoning_effort { provider = provider.with_reasoning_effort(effort); }
+            Arc::new(provider)
+        }
+        ProviderProfile::Glm => {
+            let mut provider = GlmProvider::new_with_endpoint(api_key, base_url, model).with_max_tokens(max_tokens);
+            if let Some(effort) = reasoning_effort { provider = provider.with_reasoning_effort(effort); }
+            Arc::new(provider)
+        }
+        ProviderProfile::Moonshot => {
+            let mut provider = MoonshotProvider::new_with_endpoint(api_key, base_url, model).with_max_tokens(max_tokens);
+            if let Some(effort) = reasoning_effort { provider = provider.with_reasoning_effort(effort); }
+            Arc::new(provider)
+        }
         ProviderProfile::Openai => {
             let mut provider = OpenAIProvider::new_with_endpoint(api_key, base_url, model);
+            if let Some(enabled) = reasoning_summary { provider = provider.with_reasoning_summary(enabled); }
             if let Some(limit) = max_tokens { provider = provider.with_max_output_tokens(limit)?; }
             if let Some(effort) = reasoning_effort { provider = provider.with_reasoning_effort(effort)?; }
             Arc::new(provider)
         }
-        ProviderProfile::OpenaiCompatible => Arc::new(ChatCompletionsProvider::new_with_endpoint(api_key, base_url, model).with_max_tokens(max_tokens)),
+        ProviderProfile::OpenaiCompatible => {
+            let mut provider = ChatCompletionsProvider::new_with_endpoint(api_key, base_url, model).with_max_tokens(max_tokens);
+            if let Some(effort) = reasoning_effort { provider = provider.with_reasoning_effort(effort); }
+            Arc::new(provider)
+        }
     };
     Ok(provider)
 }
@@ -281,6 +301,7 @@ pub fn build_model_catalog(
                 &label,
                 model_config.max_tokens,
                 model_config.reasoning_effort.as_deref(),
+                model_config.reasoning_summary,
             ) {
                 Ok(provider) => {
                     catalog.insert(selector.clone(), ModelEntry {
@@ -468,6 +489,42 @@ mod tests {
             }], &[]).unwrap();
             assert!(payload["messages"][0].get(field).is_none());
         }
+    }
+
+    #[test]
+    fn arbitrary_effort_is_forwarded_in_provider_native_shape() {
+        for profile in [ProviderProfile::Openai, ProviderProfile::Glm, ProviderProfile::Deepseek,
+            ProviderProfile::Moonshot, ProviderProfile::OpenaiCompatible, ProviderProfile::Anthropic] {
+            for effort in ["max", "vendor-custom", ""] {
+                let provider = construct_provider(profile, "key", "https://example.com/v1", "model", None, Some(effort), None).unwrap();
+                let body = provider.build(&[], &[]).unwrap();
+                let forwarded = match profile {
+                    ProviderProfile::Openai => &body["reasoning"]["effort"],
+                    ProviderProfile::Anthropic => &body["output_config"]["effort"],
+                    _ => &body["reasoning_effort"],
+                };
+                assert_eq!(forwarded, effort);
+            }
+        }
+    }
+
+    #[test]
+    fn reasoning_summary_opt_out_reaches_default_and_catalog_providers() {
+        let config: crate::config::Config = serde_json::from_value(serde_json::json!({
+            "model":"relay/gpt", "endpoints":{"relay":{"base_url":"https://example.com/v1", "api_key":"test-key",
+                "models":{"gpt":{"provider":"openai", "reasoning_summary":false}}}}
+        })).unwrap();
+        config.validate().unwrap();
+        let args = CommonArgs::default();
+        let (provider, _, _) = build_provider(&args, &config).unwrap();
+        assert!(provider.build(&[], &[]).unwrap().get("reasoning").is_none());
+        let catalog = build_model_catalog(&args, &config);
+        assert!(catalog["relay/gpt"].provider.build(&[], &[]).unwrap().get("reasoning").is_none());
+        let invalid: crate::config::Config = serde_json::from_value(serde_json::json!({
+            "endpoints":{"relay":{"base_url":"https://example.com/v1",
+                "models":{"chat":{"provider":"openai-compatible", "reasoning_summary":false}}}}
+        })).unwrap();
+        assert!(invalid.validate().is_err());
     }
 
     #[test]

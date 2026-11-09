@@ -119,6 +119,8 @@ pub struct Messages<'a> {
 
 #[derive(Debug, Serialize, Deserialize)]
 pub struct CreateMessageRequest {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub output_config: Option<serde_json::Value>,
     pub model: String,
     pub messages: Vec<AnthropicMessage>,
     #[serde(skip_serializing_if = "Option::is_none")]

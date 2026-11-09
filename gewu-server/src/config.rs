@@ -12,6 +12,8 @@ pub struct ModelConfig {
     /// API model ID; defaults to the catalog key.
     pub model: Option<String>,
     pub reasoning_effort: Option<String>,
+    /// Request visible reasoning summaries (OpenAI Responses only; default true).
+    pub reasoning_summary: Option<bool>,
     /// Output budget, including reasoning tokens.
     pub max_tokens: Option<u32>,
     /// Context window used by history compaction.
@@ -100,9 +102,8 @@ impl Config {
                 anyhow::ensure!(!name.trim().is_empty(), "model catalog keys cannot be empty");
                 anyhow::ensure!(model.model.as_ref().is_none_or(|id| !id.trim().is_empty()), "API model ID for '{name}' cannot be empty");
                 anyhow::ensure!(model.max_tokens != Some(0) && model.context_limit != Some(0), "model '{endpoint}/{name}' limits must be positive");
-                if let Some(effort) = &model.reasoning_effort {
-                    anyhow::ensure!(model.provider == ProviderProfile::Openai, "reasoning_effort is only supported by openai models ({endpoint}/{name})");
-                    anyhow::ensure!(["none", "minimal", "low", "medium", "high", "xhigh"].contains(&effort.as_str()), "invalid reasoning_effort for '{endpoint}/{name}'");
+                if model.reasoning_summary.is_some() {
+                    anyhow::ensure!(model.provider == ProviderProfile::Openai, "reasoning_summary is only supported by openai models ({endpoint}/{name})");
                 }
             }
         }
@@ -173,7 +174,7 @@ mod tests {
         let config: Config = serde_json::from_value(serde_json::json!({"endpoints":{"shared":{
             "base_url":"https://example.com/v1","models":{"glm":{"provider":"glm", "reasoning_effort":"high"}}
         }}})).unwrap();
-        assert!(config.validate().is_err());
+        assert!(config.validate().is_ok());
     }
 
     #[test]

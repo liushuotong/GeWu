@@ -339,6 +339,8 @@ pub struct Model {
 
 #[derive(Debug, Serialize, Deserialize)]
 pub struct CreateChatCompletionRequest {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reasoning_effort: Option<String>,
     pub model: String,
     pub messages: Vec<ChatCompletionRequestMessage>,
     #[serde(skip_serializing_if = "Option::is_none")]
