@@ -1123,32 +1123,6 @@ body {
   font-variant-numeric: tabular-nums;
 }
 
-.gauge {
-  position: relative;
-  width: 84px;
-  height: 4px;
-  background: var(--bg-inset);
-  border: 1px solid var(--line);
-  border-radius: 1px;
-  overflow: hidden;
-}
-
-/* 25% graduation ticks */
-.gauge::after {
-  content: "";
-  position: absolute;
-  inset: 0;
-  background: repeating-linear-gradient(90deg, transparent 0 calc(25% - 1px), var(--line-strong) calc(25% - 1px) 25%);
-}
-
-.gauge-fill {
-  display: block;
-  height: 100%;
-  width: 0;
-  background: var(--accent);
-  box-shadow: 0 0 6px var(--accent-glow);
-}
-
 .usage.warn {
   color: var(--warn);
 }
@@ -1156,33 +1130,6 @@ body {
 .usage.warn .v {
   color: var(--warn);
 }
-
-.usage.warn .gauge-fill {
-  background: var(--warn);
-  box-shadow: 0 0 6px var(--warn-soft);
-}
-
-.g0 { width: 0; }
-.g5 { width: 5%; }
-.g10 { width: 10%; }
-.g15 { width: 15%; }
-.g20 { width: 20%; }
-.g25 { width: 25%; }
-.g30 { width: 30%; }
-.g35 { width: 35%; }
-.g40 { width: 40%; }
-.g45 { width: 45%; }
-.g50 { width: 50%; }
-.g55 { width: 55%; }
-.g60 { width: 60%; }
-.g65 { width: 65%; }
-.g70 { width: 70%; }
-.g75 { width: 75%; }
-.g80 { width: 80%; }
-.g85 { width: 85%; }
-.g90 { width: 90%; }
-.g95 { width: 95%; }
-.g100 { width: 100%; }
 
 .composer {
   display: flex;
@@ -1478,6 +1425,10 @@ body {
 .mode-button { background: transparent; border: 1px solid var(--line); color: var(--text-dim); font: inherit; cursor: pointer; border-radius: 3px; }
 .mode-button[aria-pressed="true"] { color: var(--accent); border-color: var(--accent); }
 .mode-button:disabled { opacity: .5; cursor: default; }
+.model-picker { background: transparent; border: 1px solid var(--line); border-radius: 3px; color: var(--text-dim); font: 11px var(--mono); padding: 2px 4px; cursor: pointer; max-width: 180px; }
+.model-picker:hover:not(:disabled) { color: var(--accent); border-color: var(--accent); }
+.model-picker:disabled { opacity: .5; cursor: default; }
+.model-picker option { background: var(--bg, #111); color: var(--text, #eee); }
 
 .sidebar {
   grid-row: 1 / -1;
@@ -1641,9 +1592,6 @@ body {
     max-width: 150px;
   }
 
-  .gauge {
-    width: 48px;
-  }
 }
 
 /* -- reduced motion ---------------------------------------------------- */

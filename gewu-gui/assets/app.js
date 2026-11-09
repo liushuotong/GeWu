@@ -555,7 +555,11 @@
   el.status.addEventListener("click", (event) => {
     const button = event.target.closest("[data-mode]");
     if (button && !state.busy) send({ op: "switch_agent", tab: state.active, agent: button.dataset.mode });
-    el.prompt.focus();
+    if (!event.target.closest("[data-model-picker]")) el.prompt.focus();
+  });
+  el.status.addEventListener("change", (event) => {
+    const picker = event.target.closest("[data-model-picker]");
+    if (picker && !state.busy) send({ op: "switch_model", tab: Number(picker.dataset.tab), model: picker.value });
   });
 
   el.newTab.addEventListener("click", () => send({ op: "open_tab" }));

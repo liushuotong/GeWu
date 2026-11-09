@@ -134,7 +134,6 @@ pub struct ChatCompletionsProvider {
     max_tokens: Option<u32>,
     base_url: String,
     reasoning_field: Option<String>,
-    require_reasoning: bool,
     client: OpenAIClient,
     model: String,
     capabilities: Capabilities,
@@ -158,7 +157,6 @@ impl OpenAIProvider {
     pub(crate) fn for_service(api_key: &str, base_url: &str, model: &str, policy: crate::services::ChatPolicy) -> Self {
         let mut provider = Self::new_with_endpoint(api_key, base_url, model);
         provider.reasoning_field = Some(policy.reasoning_field.to_string());
-        provider.require_reasoning = policy.require_reasoning;
         provider
     }
     /// Creates a new provider for the official OpenAI API.
@@ -174,7 +172,6 @@ impl OpenAIProvider {
             max_tokens: None,
             base_url: "https://api.openai.com/v1".to_string(),
             reasoning_field: None,
-            require_reasoning: false,
             client: OpenAIClient::with_config(config),
             model: model.to_string(),
             capabilities,
@@ -201,7 +198,6 @@ impl OpenAIProvider {
             max_tokens: None,
             base_url: base_url.trim_end_matches('/').to_string(),
             reasoning_field: None,
-            require_reasoning: false,
             client: OpenAIClient::with_config(config),
             model: model.to_string(),
             capabilities,
@@ -376,9 +372,11 @@ impl OpenAIProvider {
                 }
                 if let Some(text) = reasoning.as_ref().filter(|_| compatible.is_some()) {
                     reasoning_fields.insert(field.to_string(), text.clone());
-                } else if self.require_reasoning {
-                    reasoning_fields.insert(field.to_string(), String::new());
                 }
+                let content = if compatible.is_none() {
+                    [reasoning.as_deref(), content.as_deref()].into_iter().flatten()
+                        .filter(|text| !text.is_empty()).collect::<Vec<_>>().join("\n\n")
+                } else { content.clone().unwrap_or_default() };
                 let openai_calls = tool_calls.clone().map(|calls| {
                     calls
                         .iter()
@@ -407,7 +405,7 @@ impl OpenAIProvider {
                 Ok(vec![ChatCompletionRequestMessage::Assistant(
                     OpenAIAssistantMessage {
                         reasoning: reasoning_fields,
-                        content: content.clone(),
+                        content: (!content.is_empty()).then_some(content),
                         tool_calls: openai_calls,
                     },
                 )])
@@ -691,6 +689,9 @@ impl ResponseParser for OpenAIProvider {
             let mut tool_aggregator = ToolCallAggregator::default();
 
             let mut stream = stream;
+            yield ProviderEvent::ReasoningReplay { replay: ReasoningReplay {
+                origin: origin.clone(), model: model.clone(), field: field.clone(), blocks: vec![],
+            }};
             while let Some(result) = stream.next().await {
                 let response = result.map_err(|e| Box::new(e) as Box<dyn Error + Send + Sync>)?;
                 // The final chunk (requested via `stream_options.include_usage`)
@@ -1070,7 +1071,6 @@ impl AnthropicProvider {
                 replay,
                 tool_calls,
             } => {
-                let _ = reasoning;
                 let origin = format!("anthropic:{}", self.client.config.base_url.trim_end_matches('/'));
                 if let Some(replay) = replay.as_ref().filter(|r| r.origin == origin && r.model == self.model) {
                     let blocks: Vec<ContentBlock> = replay.blocks.iter().cloned()
@@ -1084,6 +1084,9 @@ impl AnthropicProvider {
                     return Ok(vec![AnthropicMessage::Assistant(AnthropicAssistantMessage { content: Some(blocks) })]);
                 }
                 let mut blocks: Vec<ContentBlock> = Vec::new();
+                if let Some(text) = reasoning.as_ref().filter(|text| !text.is_empty()) {
+                    blocks.push(ContentBlock::Text { text: text.clone() });
+                }
                 if let Some(text) = content
                     && !text.is_empty() {
                         blocks.push(ContentBlock::Text { text: text.clone() });
@@ -1567,14 +1570,14 @@ mod tests {
         assert!(wire[0].get("reasoning_text").is_none());
         let required = crate::GlmProvider::new("key", "other-model");
         let wire = required.build(std::slice::from_ref(&restored), &[]).unwrap();
-        assert_eq!(wire["messages"][0]["reasoning"], "");
+        assert!(wire["messages"][0].get("reasoning").is_none());
         drop(stream);
         let custom = crate::DeepSeekProvider::new_with_endpoint("key", &provider.base_url, "reasoner");
         let wire = custom.build(std::slice::from_ref(&restored), &[]).unwrap();
         assert_eq!(wire["messages"][0]["reasoning_content"], "consider tools");
         let plain = Message::Assistant { content: Some("plain".into()), reasoning: None, replay: None, tool_calls: None };
         let wire = custom.build(&[plain], &[]).unwrap();
-        assert_eq!(wire["messages"][0]["reasoning_content"], "");
+        assert!(wire["messages"][0].get("reasoning_content").is_none());
     }
 
     #[tokio::test]
@@ -1621,7 +1624,9 @@ mod tests {
         assert!(provider.convert_message(&incomplete).is_err());
         let other = AnthropicProvider::new("key", "other");
         let wire = serde_json::to_value(other.convert_message(&restored).unwrap()).unwrap();
-        assert_eq!(wire[0]["content"].as_array().unwrap().len(), 1);
+        assert_eq!(wire[0]["content"].as_array().unwrap().len(), 2);
+        assert_eq!(wire[0]["content"][0]["type"], "text");
+        assert_eq!(wire[0]["content"][0]["text"], "consider");
     }
     use super::*;
     use crate::openai::FunctionCallStream;

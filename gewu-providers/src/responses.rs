@@ -109,7 +109,8 @@ mod tests {
         assert_eq!(second["input"][2]["type"],"function_call_output");
         assert_eq!(second["input"][2]["output"],"file contents");
         let other = OpenAIProvider::new("key","other").build(&[restored],&[]).unwrap();
-        assert!(other["input"].as_array().unwrap().is_empty());
+        assert_eq!(other["input"][0]["role"], "assistant");
+        assert!(!other.to_string().contains("encrypted-state"));
         server.await.unwrap();
     }
 
@@ -219,7 +220,7 @@ impl LlmProvider for OpenAIProvider {
                 }
                 Message::System { content } => instructions.push(content.as_str()),
                 Message::User { content: parts } => input.push(json!({"role":"user", "content":content(parts)?})),
-                Message::Assistant { content, tool_calls, replay, .. } => {
+                Message::Assistant { content, reasoning, tool_calls, replay } => {
                     if let Some(replay) = replay.as_ref().filter(|r| r.origin == self.origin() && r.model == self.model) {
                         for item in &replay.blocks {
                             if item["type"] == "reasoning" {
@@ -230,7 +231,9 @@ impl LlmProvider for OpenAIProvider {
                         }
                         continue;
                     }
-                    if let Some(text) = content.as_ref().filter(|text| !text.is_empty()) {
+                    let text = [reasoning.as_deref(), content.as_deref()].into_iter().flatten()
+                        .filter(|text| !text.is_empty()).collect::<Vec<_>>().join("\n\n");
+                    if !text.is_empty() {
                         input.push(json!({"role":"assistant", "content":[{"type":"output_text", "text":text, "annotations":[]}]}));
                     }
                     for call in tool_calls.iter().flatten() {

@@ -161,6 +161,25 @@ impl Client {
             other => Err(unexpected(other, "agent_switched")),
         }
     }
+    /// Every switchable model as `endpoint/model` selectors with display labels.
+    pub async fn list_models(&self) -> Result<Vec<gewu_protocol::ModelSummary>> {
+        let request = ClientRequest::list_models(self.next_correlation_id());
+        match self.request(request).await? {
+            ServerMessage::Models { models, .. } => Ok(models),
+            ServerMessage::Error { error, .. } => Err(Error::Server(error)),
+            other => Err(unexpected(other, "models")),
+        }
+    }
+    /// Switch the LLM model on an idle session, retaining its stored history.
+    /// Returns the session id and the new model's display label.
+    pub async fn switch_model(&self, model: impl Into<String>) -> Result<(String, String)> {
+        let request = ClientRequest::switch_model(self.next_correlation_id(), model);
+        match self.request(request).await? {
+            ServerMessage::ModelSwitched { session_id, label, .. } => Ok((session_id, label)),
+            ServerMessage::Error { error, .. } => Err(Error::Server(error)),
+            other => Err(unexpected(other, "model_switched")),
+        }
+    }
     /// Connect over TCP (newline-delimited JSON; the server listens on
     /// port 8421 by default).
     pub async fn tcp(host: &str, port: u16) -> Result<Self> {

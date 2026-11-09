@@ -186,6 +186,12 @@ impl Agent {
         self.reminder = reminder;
     }
 
+    /// Swap the LLM provider while retaining memory and all other runtime
+    /// state. The caller must ensure the agent is idle.
+    pub fn set_llm(&mut self, llm: Arc<dyn LlmProvider>) {
+        self.llm = llm;
+    }
+
     /// The current mode reminder state (for persistence).
     pub fn reminder(&self) -> &Reminder {
         &self.reminder

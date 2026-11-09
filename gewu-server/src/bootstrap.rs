@@ -9,9 +9,10 @@ use gewu_core::types::PathEnforcement;
 use gewu_providers::{AnthropicProvider, ChatCompletionsProvider, DeepSeekProvider, GlmProvider, MoonshotProvider, OpenAIProvider, ProviderProfile};
 use sqlx::SqlitePool;
 use sqlx::sqlite::SqlitePoolOptions;
+use std::collections::BTreeMap;
 use std::env;
 use std::sync::{Arc, Mutex};
-use tracing::info;
+use tracing::{info, warn};
 use uuid::Uuid;
 
 use crate::config::LoadedConfig;
@@ -56,6 +57,20 @@ pub struct CommonArgs {
     pub llm_config: Option<String>,
 }
 
+/// One switchable model: a ready provider plus the settings agents need.
+#[derive(Clone)]
+pub struct ModelEntry {
+    pub provider: Arc<dyn LlmProvider>,
+    pub provider_name: String,
+    /// API model id (or catalog key) shown in UIs.
+    pub label: String,
+    /// Resolved context window used for compaction.
+    pub context_limit: usize,
+}
+
+/// AgentBuilder's default context window, used when a model configures none.
+const DEFAULT_CONTEXT_LIMIT: usize = 256_000;
+
 /// Everything needed to build agents, resolved from CLI args + config + env.
 pub struct Bootstrap {
     pub provider: Arc<dyn LlmProvider>,
@@ -73,6 +88,11 @@ pub struct Bootstrap {
     /// Model context window (tokens) forwarded to agents for compaction;
     /// `None` keeps the agent's built-in default.
     pub context_limit: Option<usize>,
+    /// Every switchable model by `endpoint/model` selector. Always contains
+    /// the default model, so sessions can always resolve their selector.
+    pub models: BTreeMap<String, ModelEntry>,
+    /// The default model's selector (the key it occupies in `models`).
+    pub model_selector: String,
 }
 
 /// Initialize tracing from the `--log-level` flag.
@@ -181,9 +201,30 @@ pub fn build_provider(
 
     let provider_name = profile.id().to_string();
 
+    let provider = construct_provider(
+        profile,
+        &api_key,
+        &base_url,
+        &model,
+        max_tokens,
+        entry.and_then(|entry| entry.reasoning_effort.as_deref()),
+    )?;
+
+    Ok((provider, provider_name, model))
+}
+
+/// Construct the provider for one resolved model entry.
+fn construct_provider(
+    profile: ProviderProfile,
+    api_key: &str,
+    base_url: &str,
+    model: &str,
+    max_tokens: Option<u32>,
+    reasoning_effort: Option<&str>,
+) -> Result<Arc<dyn LlmProvider>> {
     let provider: Arc<dyn LlmProvider> = match profile {
         ProviderProfile::Anthropic => {
-            let mut builder = AnthropicProvider::new_with_endpoint(&api_key, &base_url, &model);
+            let mut builder = AnthropicProvider::new_with_endpoint(api_key, base_url, model);
             if let Some(max_tokens) = max_tokens {
                 builder = builder.with_max_tokens(max_tokens);
             }
@@ -193,19 +234,67 @@ pub fn build_provider(
             );
             Arc::new(builder)
         }
-        ProviderProfile::Deepseek => Arc::new(DeepSeekProvider::new_with_endpoint(&api_key, &base_url, &model).with_max_tokens(max_tokens)),
-        ProviderProfile::Glm => Arc::new(GlmProvider::new_with_endpoint(&api_key, &base_url, &model).with_max_tokens(max_tokens)),
-        ProviderProfile::Moonshot => Arc::new(MoonshotProvider::new_with_endpoint(&api_key, &base_url, &model).with_max_tokens(max_tokens)),
+        ProviderProfile::Deepseek => Arc::new(DeepSeekProvider::new_with_endpoint(api_key, base_url, model).with_max_tokens(max_tokens)),
+        ProviderProfile::Glm => Arc::new(GlmProvider::new_with_endpoint(api_key, base_url, model).with_max_tokens(max_tokens)),
+        ProviderProfile::Moonshot => Arc::new(MoonshotProvider::new_with_endpoint(api_key, base_url, model).with_max_tokens(max_tokens)),
         ProviderProfile::Openai => {
-            let mut provider = OpenAIProvider::new_with_endpoint(&api_key, &base_url, &model);
+            let mut provider = OpenAIProvider::new_with_endpoint(api_key, base_url, model);
             if let Some(limit) = max_tokens { provider = provider.with_max_output_tokens(limit)?; }
-            if let Some(effort) = entry.and_then(|entry| entry.reasoning_effort.as_ref()) { provider = provider.with_reasoning_effort(effort)?; }
+            if let Some(effort) = reasoning_effort { provider = provider.with_reasoning_effort(effort)?; }
             Arc::new(provider)
         }
-        ProviderProfile::OpenaiCompatible => Arc::new(ChatCompletionsProvider::new_with_endpoint(&api_key, &base_url, &model).with_max_tokens(max_tokens)),
+        ProviderProfile::OpenaiCompatible => Arc::new(ChatCompletionsProvider::new_with_endpoint(api_key, base_url, model).with_max_tokens(max_tokens)),
     };
+    Ok(provider)
+}
 
-    Ok((provider, provider_name, model))
+/// Build a provider for every configured endpoint model so sessions can
+/// switch models at runtime. Models whose API key cannot be resolved (or
+/// whose options fail provider construction) are skipped with a warning;
+/// the default model is guaranteed present via `bootstrap()`.
+pub fn build_model_catalog(
+    args: &CommonArgs,
+    file_config: &crate::config::Config,
+) -> BTreeMap<String, ModelEntry> {
+    let mut catalog = BTreeMap::new();
+    for (endpoint_name, settings) in &file_config.endpoints {
+        for (key, model_config) in &settings.models {
+            let selector = format!("{endpoint_name}/{key}");
+            let profile = model_config.provider;
+            let Some(api_key) = args
+                .api_key
+                .clone()
+                .or_else(|| env::var(profile.api_key_env()).ok())
+                .or_else(|| settings.api_key.clone())
+            else {
+                warn!(
+                    "model '{selector}' is not switchable: no API key (set endpoints.{endpoint_name}.api_key or {})",
+                    profile.api_key_env()
+                );
+                continue;
+            };
+            let label = model_config.model.clone().unwrap_or_else(|| key.clone());
+            match construct_provider(
+                profile,
+                &api_key,
+                &settings.base_url,
+                &label,
+                model_config.max_tokens,
+                model_config.reasoning_effort.as_deref(),
+            ) {
+                Ok(provider) => {
+                    catalog.insert(selector.clone(), ModelEntry {
+                        provider,
+                        provider_name: profile.id().to_string(),
+                        label,
+                        context_limit: model_config.context_limit.unwrap_or(DEFAULT_CONTEXT_LIMIT),
+                    });
+                }
+                Err(e) => warn!("model '{selector}' is not switchable: {e}"),
+            }
+        }
+    }
+    catalog
 }
 
 fn selected_context_limit(args: &CommonArgs, config: &crate::config::Config) -> Result<Option<usize>> {
@@ -245,6 +334,38 @@ pub async fn bootstrap(args: &CommonArgs) -> Result<Bootstrap> {
     info!("Using model: {}", model);
     info!("Using provider: {}", provider_name);
 
+    let context_limit = selected_context_limit(args, file_config)?;
+    let mut models = build_model_catalog(args, file_config);
+    // The default model's catalog selector. Direct CLI use (no configured
+    // endpoints) has no selector, so the default joins the catalog under its
+    // display name.
+    let model_selector = if file_config.endpoints.is_empty() {
+        let selector = model.clone();
+        models.insert(selector.clone(), ModelEntry {
+            provider: provider.clone(),
+            provider_name: provider_name.clone(),
+            label: model.clone(),
+            context_limit: context_limit.unwrap_or(DEFAULT_CONTEXT_LIMIT),
+        });
+        selector
+    } else {
+        // `build_provider` validated the selection, so the entry exists.
+        let selected = args
+            .model
+            .clone()
+            .or_else(|| env::var("OPENAI_MODEL").ok())
+            .or_else(|| file_config.model.clone())
+            .expect("build_provider validated the selected model");
+        models.entry(selected.clone()).or_insert_with(|| ModelEntry {
+            provider: provider.clone(),
+            provider_name: provider_name.clone(),
+            label: model.clone(),
+            context_limit: context_limit.unwrap_or(DEFAULT_CONTEXT_LIMIT),
+        });
+        selected
+    };
+    info!("Switchable models: {}", models.keys().cloned().collect::<Vec<_>>().join(", "));
+
     let db_path = resolve_db_path(args.db_path.clone())?;
     info!("Using database: {}", db_path);
     let db_url = format!("sqlite://{}?mode=rwc", db_path);
@@ -279,7 +400,9 @@ pub async fn bootstrap(args: &CommonArgs) -> Result<Bootstrap> {
             .to_string_lossy()
             .to_string(),
         enforcement: loaded_config.config.sandbox,
-        context_limit: selected_context_limit(args, file_config)?,
+        context_limit,
+        models,
+        model_selector,
     })
 }
 
@@ -343,7 +466,7 @@ mod tests {
             let payload = provider.build(&[gewu_core::types::Message::Assistant {
                 content: Some("answer".into()), reasoning: None, replay: None, tool_calls: None,
             }], &[]).unwrap();
-            assert_eq!(payload["messages"][0][field], "");
+            assert!(payload["messages"][0].get(field).is_none());
         }
     }
 
@@ -370,6 +493,29 @@ mod tests {
                 assert_eq!(payload["max_output_tokens"], 2048);
             }
         }
+    }
+
+    #[test]
+    fn catalog_covers_every_configured_model_with_own_settings() {
+        let config = serde_json::from_value(serde_json::json!({
+            "model": "west/coding",
+            "endpoints": {"west": {"base_url": "https://example.com/v1", "api_key": "shared", "models": {
+                "coding": {"provider": "deepseek", "model": "deepseek-reasoner", "max_tokens": 2048, "context_limit": 131072},
+                "fast": {"provider": "openai", "max_tokens": 4096}
+            }}}
+        })).unwrap();
+        let args = CommonArgs { api_key: Some("shared".into()), model: Some("west/coding".into()), base_url: Some("https://example.com/v1".into()), provider: Some("deepseek".into()), ..Default::default() };
+        let catalog = build_model_catalog(&args, &config);
+        let selectors: Vec<_> = catalog.keys().cloned().collect();
+        assert_eq!(selectors, vec!["west/coding", "west/fast"]);
+        assert_eq!(catalog["west/coding"].label, "deepseek-reasoner");
+        assert_eq!(catalog["west/coding"].provider_name, "deepseek");
+        assert_eq!(catalog["west/coding"].context_limit, 131_072);
+        assert_eq!(catalog["west/fast"].label, "fast");
+        assert_eq!(catalog["west/fast"].provider_name, "openai");
+        assert_eq!(catalog["west/fast"].context_limit, DEFAULT_CONTEXT_LIMIT);
+        assert_eq!(catalog["west/coding"].provider.build(&[], &[]).unwrap()["max_tokens"], 2048);
+        assert_eq!(catalog["west/fast"].provider.build(&[], &[]).unwrap()["max_output_tokens"], 4096);
     }
 
     #[test]

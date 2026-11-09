@@ -10,7 +10,6 @@ use std::{error::Error, sync::Arc, time::Duration};
 /// Fixed service policy, applied only when constructing a provider.
 pub(crate) struct ChatPolicy {
     pub reasoning_field: &'static str,
-    pub require_reasoning: bool,
 }
 
 macro_rules! chat_service {
@@ -34,7 +33,6 @@ macro_rules! chat_service {
                 Self {
                     chat: OpenAIProvider::for_service(api_key, base_url, model, ChatPolicy {
                         reasoning_field: $field,
-                        require_reasoning: true,
                     }),
                 }
             }
@@ -83,6 +81,31 @@ mod tests {
     use gewu_core::types::ReasoningReplay;
 
     #[test]
+    fn mixed_model_history_is_normalized_per_message_across_switches() {
+        let endpoint = "https://relay.example/v1";
+        let assistant = |model: &str, origin: &str| Message::Assistant {
+            content: Some(format!("{model} answer")), reasoning: Some(format!("{model} thought")),
+            replay: Some(ReasoningReplay { origin: format!("chat:{origin}"), model: model.into(),
+                field: Some("reasoning_content".into()), blocks: vec![] }), tool_calls: None,
+        };
+        let history = vec![assistant("glm", endpoint), assistant("deepseek", endpoint),
+            assistant("deepseek", "https://other.example/v1")];
+        for model in ["deepseek", "glm", "deepseek"] {
+            let provider = DeepSeekProvider::new_with_endpoint("key", endpoint, model);
+            let payload = provider.build(&history, &[]).unwrap();
+            for (index, source) in ["glm", "deepseek", "deepseek"].iter().enumerate() {
+                let message = &payload["messages"][index];
+                if *source == model && index != 2 {
+                    assert_eq!(message["reasoning_content"], format!("{source} thought"));
+                } else {
+                    assert!(message.get("reasoning_content").is_none());
+                    assert!(message["content"].as_str().unwrap().contains(&format!("{source} thought")));
+                }
+            }
+        }
+    }
+
+    #[test]
     fn service_providers_apply_fixed_rules_through_trait_objects() {
         let endpoint = "https://example.com/v1";
         let providers: Vec<(Box<dyn LlmProvider>, &str)> = vec![
@@ -104,7 +127,7 @@ mod tests {
             }];
             let payload = provider.build(&messages, &[]).unwrap();
             assert_eq!(payload["messages"][0][field], "consider tools");
-            assert_eq!(payload["messages"][1][field], "");
+            assert!(payload["messages"][1].get(field).is_none());
             assert!(payload["messages"][0].get("reasoning_text").is_none());
         }
         // A model name must never change the OpenAI provider's service rules.

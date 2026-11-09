@@ -20,6 +20,8 @@ pub struct TabInfo {
 pub enum ClientMsg {
     RevertChat { tab: u64, block: Option<usize>, undo: bool },
     SwitchAgent { tab: u64, agent: String },
+    /// Switch the tab's LLM model (an `endpoint/model` selector).
+    SwitchModel { tab: u64, model: String },
     /// First message when the GUI requires a token.
     Auth { token: String },
     /// Send a prompt to a tab.

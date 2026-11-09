@@ -257,6 +257,20 @@ pub async fn set_session_agent(pool: &SqlitePool, session_id: &str, agent: &str)
     Ok(())
 }
 
+/// Session model metadata: the `endpoint/model` selector the conversation
+/// runs on. `None` for legacy sessions (they use the server default).
+pub async fn session_model(pool: &SqlitePool, session_id: &str) -> Result<Option<String>> {
+    sqlx::query("CREATE TABLE IF NOT EXISTS session_models (session_id TEXT PRIMARY KEY, model TEXT NOT NULL)").execute(pool).await?;
+    let value: Option<String> = sqlx::query_scalar("SELECT model FROM session_models WHERE session_id = ?").bind(session_id).fetch_optional(pool).await?;
+    Ok(value)
+}
+
+pub async fn set_session_model(pool: &SqlitePool, session_id: &str, model: &str) -> Result<()> {
+    session_model(pool, session_id).await?;
+    sqlx::query("INSERT INTO session_models(session_id, model) VALUES (?, ?) ON CONFLICT(session_id) DO UPDATE SET model = excluded.model").bind(session_id).bind(model).execute(pool).await?;
+    Ok(())
+}
+
 /// One stored message together with its database identity.
 #[derive(Debug, Clone)]
 pub struct StoredMessage {
@@ -628,6 +642,18 @@ mod tests {
     use super::*;
     use gewu_core::types::{ContentPart, Message};
     use sqlx::sqlite::SqlitePoolOptions;
+
+    #[tokio::test]
+    async fn session_model_round_trips() -> Result<()> {
+        let pool = SqlitePoolOptions::new().connect("sqlite::memory:").await?;
+        assert_eq!(session_model(&pool, "s1").await?, None);
+        set_session_model(&pool, "s1", "west/coding").await?;
+        assert_eq!(session_model(&pool, "s1").await?.as_deref(), Some("west/coding"));
+        set_session_model(&pool, "s1", "east/m2").await?;
+        assert_eq!(session_model(&pool, "s1").await?.as_deref(), Some("east/m2"));
+        assert_eq!(session_model(&pool, "other").await?, None);
+        Ok(())
+    }
 
     #[tokio::test]
     async fn revert_and_undo_restore_compaction_context() -> Result<()> {

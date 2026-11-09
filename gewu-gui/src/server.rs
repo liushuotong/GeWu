@@ -310,6 +310,18 @@ mod tests {
                     "type": "info", "id": id, "model": "fake-model", "provider": "fake",
                     "working_directory": "/tmp/fake-project",
                 })],
+                "list_models" => vec![json!({
+                    "type": "models", "id": id,
+                    "models": [
+                        {"selector": "fake/one", "label": "fake-model"},
+                        {"selector": "fake/two", "label": "fake-other"},
+                    ],
+                })],
+                "switch_model" => vec![json!({
+                    "type": "model_switched", "id": id, "session_id": "sess-1",
+                    "model": request.get("model").and_then(Value::as_str).unwrap_or(""),
+                    "label": "fake-other",
+                })],
                 "list_sessions" => vec![json!({
                     "type": "sessions", "id": id, "sessions": [],
                 })],
@@ -761,6 +773,56 @@ mod tests {
         assert!(
             final_tabs,
             "the final tabs message should be idle with a session"
+        );
+    }
+
+    #[tokio::test]
+    async fn browser_can_switch_model_from_the_picker() {
+        let upstream = spawn_fake_upstream().await;
+        let addr = spawn_gui(AppState {
+            endpoint: Endpoint::Tcp {
+                host: "127.0.0.1".to_string(),
+                port: upstream.port(),
+            },
+            token: None,
+            server_token: None,
+        })
+        .await;
+
+        let (mut ws, _) = tokio_tungstenite::connect_async(format!("ws://{addr}/ws"))
+            .await
+            .unwrap();
+
+        // The initial snapshot renders the catalog as a picker with the
+        // server default selected.
+        let snapshot = next_json(&mut ws).await;
+        assert_eq!(snapshot["type"], "snapshot");
+        let status = snapshot["status"].as_str().unwrap();
+        assert!(status.contains("model-picker"), "{status}");
+        assert!(
+            status.contains("<option value=\"fake/one\" selected>fake-model</option>"),
+            "{status}"
+        );
+
+        ws.send(WsMessage::text(r#"{"op":"switch_model","tab":1,"model":"fake/two"}"#))
+            .await
+            .unwrap();
+        // Interim status updates (ping notes, usage refreshes) may precede
+        // the switch's own status; drain until the new selection appears.
+        let mut switched = None;
+        for _ in 0..20 {
+            let value = next_json(&mut ws).await;
+            if value["type"] == "status" {
+                let html = value["html"].as_str().unwrap();
+                if html.contains("<option value=\"fake/two\" selected>fake-other</option>") {
+                    switched = Some(html.to_string());
+                    break;
+                }
+            }
+        }
+        assert!(
+            switched.is_some(),
+            "the switched model should be selected in a status update"
         );
     }
 

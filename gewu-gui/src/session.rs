@@ -82,14 +82,24 @@ fn tool_update(blocks: &[Block], affected: Option<usize>, appended: bool) -> Tab
     }
 }
 
+/// The display label for a model selector within the catalog.
+fn label_for(models: &[gewu_protocol::ModelSummary], selector: &str) -> Option<String> {
+    models
+        .iter()
+        .find(|model| model.selector == selector)
+        .map(|model| model.label.clone())
+}
+
 /// One browser's isolated GUI session.
-pub struct GuiSession {
-    endpoint: Endpoint,
+pub struct GuiSession {    endpoint: Endpoint,
     server_token: Option<String>,
     admin: Client,
     workspace: Workspace,
     conns: HashMap<u64, Conn>,
     model_label: Option<String>,
+    /// Switchable models from the upstream's catalog (empty when the upstream
+    /// predates `list_models` or exposes a single model).
+    models: Vec<gewu_protocol::ModelSummary>,
     /// Tool names for the sidebar, fetched once; fixed for the default agent.
     tools: Result<Vec<String>, String>,
     /// Working directory the upstream server's agent operates in.
@@ -134,6 +144,14 @@ impl GuiSession {
             debug!("could not list tools: {e}");
             e.to_string()
         });
+
+        let models = match admin.list_models().await {
+            Ok(models) => models,
+            Err(e) => {
+                debug!("could not list models: {e}");
+                Vec::new()
+            }
+        };
 
         let mut file_cache = BTreeMap::new();
         if let Ok(entries) = admin.list_files("").await {
@@ -189,6 +207,7 @@ impl GuiSession {
             workspace,
             conns: HashMap::new(),
             model_label,
+            models,
             tools,
             working_directory,
             expanded_dirs: BTreeSet::new(),
@@ -285,7 +304,7 @@ impl GuiSession {
             tabs: self.workspace.infos(),
             active,
             transcript: view::transcript_html(tab),
-            status: view::status_html(tab),
+            status: view::status_html(tab, &self.models),
             sidebar: view::sidebar_tabs_html(
                 &self.tools,
                 self.working_directory.as_deref(),
@@ -316,7 +335,7 @@ impl GuiSession {
         send_msg(
             sender,
             &ServerMsg::Status {
-                html: view::status_html(tab),
+                html: view::status_html(tab, &self.models),
             },
         )
         .await?;
@@ -595,9 +614,28 @@ impl GuiSession {
                     Err(e) => self.send_error(sender, e.to_string()).await?,
                 }
             }
+            ClientMsg::SwitchModel { tab, model } => {
+                if self.workspace.tab(tab).is_none_or(|tab| tab.busy()) { return self.send_error(sender, "wait for the current turn to finish").await; }
+                if let Err(e) = self.ensure_client(tab).await { return self.send_error(sender, e.to_string()).await; }
+                let client = self.client(tab).expect("ensured");
+                // Bind resumed tabs before switching so their conversation is retained.
+                if let Some(id) = self.workspace.tab(tab).and_then(|tab| tab.model.session_id.clone())
+                    && let Err(e) = client.usage(Some(&id)).await { return self.send_error(sender, e.to_string()).await; }
+                match client.switch_model(model.clone()).await {
+                    Ok((id, label)) => {
+                        let tab_state = self.workspace.tab_mut(tab).expect("known tab");
+                        tab_state.model.set_session(Some(id));
+                        tab_state.model_selector = Some(model);
+                        tab_state.model_label = Some(label);
+                        if self.workspace.active_id() == tab {
+                            self.send_status(sender).await?;
+                        }
+                    }
+                    Err(e) => self.send_error(sender, e.to_string()).await?,
+                }
+            }
             // Auth is consumed by the transport before the session starts.
-            ClientMsg::Auth { .. } => {}
-            ClientMsg::Ask { tab, prompt } => {
+            ClientMsg::Auth { .. } => {}            ClientMsg::Ask { tab, prompt } => {
                 self.handle_ask(tab, prompt, sender, tab_tx).await?;
             }
             ClientMsg::Interrupt { tab } => {
@@ -916,7 +954,7 @@ impl GuiSession {
             let before = tab.model.blocks.len();
 
             match event.frame {
-                Some(Ok(ServerMessage::SessionSnapshot { session_id, messages, frames, busy, .. })) => {
+                Some(Ok(ServerMessage::SessionSnapshot { session_id, messages, frames, busy, model: snapshot_model, .. })) => {
                     let mut model = gewu_client::SessionModel::new();
                     model.set_session(Some(session_id));
                     for message in &messages { model.apply_message(message); }
@@ -927,6 +965,10 @@ impl GuiSession {
                     model.phase = if busy { Phase::Busy } else { Phase::Idle };
                     let changed = tab.model.blocks != model.blocks || tab.model.phase != model.phase;
                     tab.model = model;
+                    if let Some(selector) = snapshot_model {
+                        tab.model_selector = Some(selector.clone());
+                        tab.model_label = Some(label_for(&self.models, &selector).unwrap_or(selector));
+                    }
                     terminal = !busy;
                     update = if changed { TabUpdate::Full } else { TabUpdate::None };
                 }

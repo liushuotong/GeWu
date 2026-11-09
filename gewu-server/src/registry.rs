@@ -35,6 +35,7 @@ pub struct AgentConfig {
 /// Grouped to keep the constructor signatures manageable; consumed by
 /// [`create_agent`], [`agent_profile`], and [`build_tool_registry_and_list`].
 pub struct ProfileInputs<'a> {
+    pub model_catalog: Option<ModelCatalog>,
     pub name: &'a str,
     pub provider: Arc<dyn LlmProvider>,
     pub pool: SqlitePool,
@@ -44,6 +45,12 @@ pub struct ProfileInputs<'a> {
     pub enforcement: PathEnforcement,
     pub context_limit: Option<usize>,
     pub session_id: &'a str,
+}
+
+#[derive(Clone)]
+pub struct ModelCatalog {
+    pub entries: Arc<std::collections::BTreeMap<String, crate::bootstrap::ModelEntry>>,
+    pub default: String,
 }
 
 /// Tool registry plus the flattened tool list reported to clients.
@@ -111,6 +118,7 @@ impl ToolRegistry for ToolRegistryImpl {
 /// the task tool's [`ToolContext`]) so subagent lineage is recorded without
 /// the factory holding any session state.
 struct SqliteAgentFactory {
+    model_catalog: Option<ModelCatalog>,
     provider: Arc<dyn LlmProvider>,
     pool: SqlitePool,
     skills: Vec<SkillInfo>,
@@ -139,19 +147,31 @@ impl AgentFactory for SqliteAgentFactory {
             .into());
         }
         let session_id = resume.unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
+        let (provider, context_limit) = if let Some(catalog) = &self.model_catalog {
+            let selector = match gewu_storage::session_model(&self.pool, &session_id).await? {
+                Some(selected) => selected,
+                None => gewu_storage::session_model(&self.pool, parent_session).await?
+                    .unwrap_or_else(|| catalog.default.clone()),
+            };
+            let entry = catalog.entries.get(&selector)
+                .ok_or_else(|| format!("unknown subagent model: {selector}"))?;
+            gewu_storage::set_session_model(&self.pool, &session_id, &selector).await?;
+            (entry.provider.clone(), Some(entry.context_limit))
+        } else { (self.provider.clone(), self.context_limit) };
         gewu_storage::record_subagent_session(&self.pool, &session_id, parent_session, subagent_type).await?;
         let working_directory = std::env::current_dir()
             .map_err(|e| -> Box<dyn Error + Send + Sync> { e.to_string().into() })?;
         let (agent, _registry) = create_agent(
             ProfileInputs {
+                model_catalog: self.model_catalog.clone(),
                 name: subagent_type,
-                provider: self.provider.clone(),
+                provider,
                 pool: self.pool.clone(),
                 working_directory,
                 additional_tools: Vec::new(),
                 skills: self.skills.clone(),
                 enforcement: self.enforcement,
-                context_limit: self.context_limit,
+                context_limit,
                 session_id: &session_id,
             },
             None,
@@ -165,6 +185,7 @@ impl AgentFactory for SqliteAgentFactory {
 /// Builds the task tool wired to the CLI registry. `allowed` filters which
 /// subagent types are advertised and permitted; empty means all of them.
 fn task_tool(
+    model_catalog: Option<ModelCatalog>,
     provider: Arc<dyn LlmProvider>,
     pool: SqlitePool,
     skills: Vec<SkillInfo>,
@@ -173,6 +194,7 @@ fn task_tool(
     allowed: &[&str],
 ) -> TaskTool {
     let factory = Arc::new(SqliteAgentFactory {
+        model_catalog,
         provider,
         pool,
         skills,
@@ -203,7 +225,7 @@ fn build_tool_registry_and_list(inputs: &ProfileInputs) -> Result<RegistryBundle
         "build" => {
             let todos = Arc::new(Mutex::new(Vec::<TodoItem>::new()));
             vec![
-                Box::new(task_tool(provider.clone(), pool.clone(), skills.clone(), *enforcement, *context_limit, &[])),
+                Box::new(task_tool(inputs.model_catalog.clone(), provider.clone(), pool.clone(), skills.clone(), *enforcement, *context_limit, &[])),
                 Box::new(ReadFileTool {
                     working_directory: working_directory.clone(),
                 }),
@@ -239,7 +261,7 @@ fn build_tool_registry_and_list(inputs: &ProfileInputs) -> Result<RegistryBundle
         "plan" => {
             let todos = Arc::new(Mutex::new(Vec::<TodoItem>::new()));
             vec![
-                Box::new(task_tool(provider.clone(), pool.clone(), skills.clone(), *enforcement, *context_limit, &["explore"])),
+                Box::new(task_tool(inputs.model_catalog.clone(), provider.clone(), pool.clone(), skills.clone(), *enforcement, *context_limit, &["explore"])),
                 Box::new(ReadFileTool { working_directory: working_directory.clone() }),
                 Box::new(GlobTool { working_directory: working_directory.clone() }),
                 Box::new(GrepTool { working_directory: working_directory.clone() }),
@@ -280,7 +302,7 @@ fn build_tool_registry_and_list(inputs: &ProfileInputs) -> Result<RegistryBundle
         "general" => {
             let todos = Arc::new(Mutex::new(Vec::<TodoItem>::new()));
             vec![
-                Box::new(task_tool(provider.clone(), pool.clone(), skills.clone(), *enforcement, *context_limit, &[])),
+                Box::new(task_tool(inputs.model_catalog.clone(), provider.clone(), pool.clone(), skills.clone(), *enforcement, *context_limit, &[])),
                 Box::new(ReadFileTool {
                     working_directory: working_directory.clone(),
                 }),
@@ -356,6 +378,7 @@ pub async fn create_agent(
     log: Option<RequestLog>,
 ) -> Result<(Agent, Arc<dyn ToolRegistry>)> {
     let ProfileInputs {
+        model_catalog,
         name,
         provider,
         pool,
@@ -371,6 +394,7 @@ pub async fn create_agent(
     let memory = SqliteMemory::new(pool.clone(), session_id.to_string()).await?;
 
     let (all_tools, system_prompt, registry) = agent_profile(ProfileInputs {
+        model_catalog,
         name,
         provider: provider.clone(),
         pool: pool.clone(),
@@ -417,6 +441,7 @@ pub async fn create_agent(
 /// tool context).
 pub fn agent_profile(inputs: ProfileInputs) -> Result<ProfileBundle> {
     let ProfileInputs {
+        model_catalog,
         name,
         provider,
         pool,
@@ -428,6 +453,7 @@ pub fn agent_profile(inputs: ProfileInputs) -> Result<ProfileBundle> {
         session_id,
     } = inputs;
     let (registry, tools_arc) = build_tool_registry_and_list(&ProfileInputs {
+        model_catalog,
         name,
         provider,
         pool,
@@ -473,6 +499,28 @@ pub fn profile_reminder(previous: Option<&str>, target: &str) -> gewu_core::agen
 mod tests {
     use super::*;
 
+    #[tokio::test]
+    async fn subagent_inherits_current_model_and_resume_keeps_its_selection() {
+        let pool = sqlx::sqlite::SqlitePoolOptions::new().connect("sqlite::memory:").await.unwrap();
+        SqliteMemory::new(pool.clone(), "parent".into()).await.unwrap();
+        let provider: Arc<dyn LlmProvider> = Arc::new(DummyLlm);
+        let entries = [ ("old", 10_000), ("new", 50_000) ].into_iter().map(|(key, context_limit)| {
+            (key.into(), crate::bootstrap::ModelEntry { provider: provider.clone(), provider_name: key.into(),
+                label: key.into(), context_limit })
+        }).collect();
+        let factory = SqliteAgentFactory { model_catalog: Some(ModelCatalog { entries: Arc::new(entries), default: "old".into() }),
+            provider, pool: pool.clone(), skills: vec![], enforcement: PathEnforcement::None, context_limit: Some(10_000) };
+        gewu_storage::set_session_model(&pool, "parent", "new").await.unwrap();
+        let (child, id) = factory.create("explore", None, "parent").await.unwrap();
+        assert_eq!(child.context_limit, 50_000);
+        assert_eq!(gewu_storage::session_model(&pool, &id).await.unwrap().as_deref(), Some("new"));
+        gewu_storage::set_session_model(&pool, "parent", "old").await.unwrap();
+        let (resumed, _) = factory.create("explore", Some(id), "parent").await.unwrap();
+        assert_eq!(resumed.context_limit, 50_000);
+        gewu_storage::set_session_model(&pool, "parent", "missing").await.unwrap();
+        assert!(factory.create("explore", None, "parent").await.is_err());
+    }
+
     /// Builds `ProfileInputs` for tests; session defaults to "session".
     fn test_inputs<'a>(
         name: &'a str,
@@ -484,6 +532,7 @@ mod tests {
         session_id: &'a str,
     ) -> ProfileInputs<'a> {
         ProfileInputs {
+            model_catalog: None,
             name,
             provider,
             pool,
@@ -779,6 +828,7 @@ mod tests {
         let provider: Arc<dyn LlmProvider> = Arc::new(DummyLlm);
 
         let factory = SqliteAgentFactory {
+            model_catalog: None,
             provider: provider.clone(),
             pool: pool.clone(),
             skills: Vec::new(),

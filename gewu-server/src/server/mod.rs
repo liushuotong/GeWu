@@ -101,6 +101,8 @@ struct LiveTurn {
     bytes: usize,
     seq: u64,
     busy: bool,
+    /// The model selector the turn runs on, echoed in reconnect snapshots.
+    model: String,
     /// Notified (waiters) when `busy` flips back to false at turn
     /// finalization, so interrupts await completion without spinning.
     done: Arc<tokio::sync::Notify>,
@@ -135,6 +137,7 @@ async fn attach_subscriber(
         let snapshot = ServerMessage::SessionSnapshot {
             session_id: session_id.to_owned(), messages: live.messages.clone(),
             frames: live.frames.clone(), busy: live.busy, seq: live.seq,
+            model: Some(live.model.clone()),
         };
         subscriber.out.send(snapshot.to_line()).await
             .map_err(|_| RequestError::Failed("subscriber disconnected".into()))?;
@@ -148,9 +151,10 @@ async fn attach_subscriber(
     let messages = session.agent.lock().await.memory.messages().to_vec();
     subscriber.out.send(ServerMessage::SessionSnapshot {
         session_id: session_id.to_owned(), messages: messages.clone(), frames: vec![], busy: false, seq: 0,
+        model: Some(session.model.clone()),
     }.to_line()).await.map_err(|_| RequestError::Failed("subscriber disconnected".into()))?;
     state.turns.lock().await.insert(session_id.to_owned(), Arc::new(Mutex::new(LiveTurn {
-        request_id: String::new(), messages, frames: vec![], bytes: 0, seq: 0, busy: false,
+        request_id: String::new(), messages, frames: vec![], bytes: 0, seq: 0, busy: false, model: session.model.clone(),
         done: Arc::new(tokio::sync::Notify::new()),
         subscribers: vec![subscriber], cancel: None, terminal: None,
     })));
@@ -163,6 +167,13 @@ struct ConnectionSession {
     agent: Arc<Mutex<gewu_core::Agent>>,
     session_id: String,
     agent_name: String,
+    /// The session's model selector (`endpoint/model`) into the bootstrap
+    /// catalog; switchable at runtime via `switch_model`.
+    model: String,
+    /// The session's provider (the catalog entry for `model`).
+    provider: Arc<dyn gewu_core::traits::LlmProvider>,
+    /// Resolved context window (tokens) of the session's model.
+    context_limit: usize,
     /// Cached tool names, taken from the agent at creation. The tool set is
     /// fixed for the life of the session, so `list_tools` can be answered
     /// without locking the agent (which would block while an ask runs).
@@ -365,22 +376,43 @@ impl ServerState {
             anyhow::bail!("Unknown agent profile: {}", agent_name);
         }
 
+        // Resolve the session's model: the persisted selector when it still
+        // exists in the catalog, else the server default.
+        let model = match gewu_storage::session_model(&self.bootstrap.pool, &session_id).await? {
+            Some(stored) if self.bootstrap.models.contains_key(&stored) => stored,
+            Some(stored) => {
+                warn!(
+                    "session {} stored unknown model '{}'; using {}",
+                    session_id, stored, self.bootstrap.model_selector
+                );
+                self.bootstrap.model_selector.clone()
+            }
+            None => self.bootstrap.model_selector.clone(),
+        };
+        let entry = self
+            .bootstrap
+            .models
+            .get(&model)
+            .cloned()
+            .ok_or_else(|| anyhow::anyhow!("model '{model}' is not in the catalog"))?;
+
         let (agent, _registry) = create_agent(
             registry::ProfileInputs {
+                model_catalog: Some(registry::ModelCatalog { entries: Arc::new(self.bootstrap.models.clone()), default: self.bootstrap.model_selector.clone() }),
                 name: &agent_name,
-                provider: self.bootstrap.provider.clone(),
+                provider: entry.provider.clone(),
                 pool: self.bootstrap.pool.clone(),
                 working_directory: self.bootstrap.working_directory.clone().into(),
                 additional_tools: self.bootstrap.mcp_tools.clone(),
                 skills: self.bootstrap.skills.clone(),
                 enforcement: self.bootstrap.enforcement,
-                context_limit: self.bootstrap.context_limit,
+                context_limit: Some(entry.context_limit),
                 session_id: &session_id,
             },
             self.bootstrap.log_writer.clone(),
         )
         .await?;
-        info!("Created session {} (agent: {})", session_id, agent_name);
+        info!("Created session {} (agent: {}, model: {})", session_id, agent_name, model);
 
         let agent = Arc::new(Mutex::new(agent));
         {
@@ -395,6 +427,9 @@ impl ServerState {
             agent,
             session_id,
             agent_name,
+            model,
+            provider: entry.provider,
+            context_limit: entry.context_limit,
             tools,
         };
         *current = Some(entry.clone());
@@ -598,12 +633,14 @@ async fn handle_request(
                     let mut live = turn.lock().await;
                     live.messages = messages.clone();
                     let seq = live.seq + 1;
+                    let model = live.model.clone();
                     live.publish(ServerMessage::SessionSnapshot {
                         session_id: current.session_id.clone(),
                         messages: messages.clone(),
                         frames: vec![],
                         busy: false,
                         seq,
+                        model: Some(model),
                     });
                 }
             }
@@ -624,14 +661,15 @@ async fn handle_request(
                 return Err(RequestError::Failed("session is busy on another connection".into()));
             }
             let replacement = registry::agent_profile(registry::ProfileInputs {
+                model_catalog: Some(registry::ModelCatalog { entries: Arc::new(state.bootstrap.models.clone()), default: state.bootstrap.model_selector.clone() }),
                 name: &target,
-                provider: state.bootstrap.provider.clone(),
+                provider: current.provider.clone(),
                 pool: state.bootstrap.pool.clone(),
                 working_directory: state.bootstrap.working_directory.clone().into(),
                 additional_tools: state.bootstrap.mcp_tools.clone(),
                 skills: state.bootstrap.skills.clone(),
                 enforcement: state.bootstrap.enforcement,
-                context_limit: state.bootstrap.context_limit,
+                context_limit: Some(current.context_limit),
                 session_id: &current.session_id,
             });
             let result = match replacement {
@@ -644,7 +682,7 @@ async fn handle_request(
                             tracing::error!("failed to persist reminder state after switch: {e}");
                         }
                         let tools = agent.list_tools();
-                         *session = Some(ConnectionSession { agent: current.agent.clone(), session_id: current.session_id.clone(), agent_name: target.clone(), tools: tools.clone() });
+                         *session = Some(ConnectionSession { agent: current.agent.clone(), session_id: current.session_id.clone(), agent_name: target.clone(), model: current.model.clone(), provider: current.provider.clone(), context_limit: current.context_limit, tools: tools.clone() });
                         state.sessions.lock().await.insert(current.session_id.clone(), session.as_ref().unwrap().clone());
                         Ok(Handled::Reply(ServerMessage::AgentSwitched { id: request.id, session_id: current.session_id.clone(), agent: target, tools }))
                     }
@@ -655,6 +693,60 @@ async fn handle_request(
             state.busy_sessions.lock().await.remove(&current.session_id);
             result
         }
+        Op::SwitchModel { model: target } => {
+            if running.is_some() {
+                return Err(RequestError::Failed("cannot switch model while a turn is running".into()));
+            }
+            let current = state.get_or_create_session(session, request.session_id, None).await
+                .map_err(|e| RequestError::Failed(e.to_string()))?;
+            if !state.claim_session(&current.session_id).await {
+                return Err(RequestError::Failed("session is busy on another connection".into()));
+            }
+            let result = match state.bootstrap.models.get(&target) {
+                Some(entry) => match gewu_storage::set_session_model(&state.bootstrap.pool, &current.session_id, &target).await {
+                    Ok(()) => {
+                        {
+                            let mut agent = current.agent.lock().await;
+                            agent.set_llm(entry.provider.clone());
+                            agent.context_limit = entry.context_limit;
+                        }
+                        let replacement = ConnectionSession {
+                            agent: current.agent.clone(),
+                            session_id: current.session_id.clone(),
+                            agent_name: current.agent_name.clone(),
+                            model: target.clone(),
+                            provider: entry.provider.clone(),
+                            context_limit: entry.context_limit,
+                            tools: current.tools.clone(),
+                        };
+                        *session = Some(replacement.clone());
+                        state.sessions.lock().await.insert(current.session_id.clone(), replacement);
+                        Ok(Handled::Reply(ServerMessage::ModelSwitched {
+                            id: request.id,
+                            session_id: current.session_id.clone(),
+                            model: target,
+                            label: entry.label.clone(),
+                        }))
+                    }
+                    Err(e) => Err(RequestError::Failed(e.to_string())),
+                },
+                None => Err(RequestError::Invalid(format!("unknown model: {target}"))),
+            };
+            state.busy_sessions.lock().await.remove(&current.session_id);
+            result
+        }
+        Op::ListModels => Ok(Handled::Reply(ServerMessage::Models {
+            id: request.id,
+            models: state
+                .bootstrap
+                .models
+                .iter()
+                .map(|(selector, entry)| protocol::ModelSummary {
+                    selector: selector.clone(),
+                    label: entry.label.clone(),
+                })
+                .collect(),
+        })),
         Op::Ping => Ok(Handled::Reply(ServerMessage::Pong { id: request.id })),
 
         // Auth is normally consumed by the connection loop's auth gate; if a
@@ -1116,7 +1208,7 @@ async fn start_session_turn(
     let (cancel, mut cancelled) = tokio::sync::oneshot::channel();
     let live = Arc::new(Mutex::new(LiveTurn {
         request_id: request_id.clone(), messages, frames: vec![], bytes: 0,
-        seq: 0, busy: true,
+        seq: 0, busy: true, model: session.model.clone(),
         done: Arc::new(tokio::sync::Notify::new()),
         subscribers: vec![], cancel: Some(cancel), terminal: None,
     }));
@@ -1127,7 +1219,7 @@ async fn start_session_turn(
         let mut previous = previous.lock().await;
         let snapshot = ServerMessage::SessionSnapshot {
             session_id: session.session_id.clone(), messages: live.lock().await.messages.clone(),
-            frames: vec![], busy: true, seq: 0,
+            frames: vec![], busy: true, seq: 0, model: Some(session.model.clone()),
         }.to_line();
         for observer in previous.subscribers.drain(..).filter(|s| s.persistent) {
             if !observer.out.same_channel(&subscriber.out) && observer.send(&snapshot) {
@@ -1531,6 +1623,7 @@ mod tests {
     use super::*;
     use base64::Engine as _;
     use gewu_core::types::{ContentPart, ToolContext, ToolResult};
+    use std::collections::BTreeMap;
     use std::error::Error;
     use std::sync::atomic::{AtomicUsize, Ordering};
 
@@ -1787,8 +1880,9 @@ mod tests {
     }
 
     fn plain_session() -> ConnectionSession {
+        let llm: Arc<dyn gewu_core::traits::LlmProvider> = TestLlm::plain();
         let agent = gewu_core::Agent::builder()
-            .llm(TestLlm::plain())
+            .llm(llm.clone())
             .with_tools(vec![])
             .build()
             .unwrap();
@@ -1797,14 +1891,18 @@ mod tests {
             agent: Arc::new(Mutex::new(agent)),
             session_id: "sess-test".to_string(),
             agent_name: "build".to_string(),
+            model: "test-model".to_string(),
+            provider: llm,
+            context_limit: 256_000,
             tools,
         }
     }
 
     fn tool_session() -> ConnectionSession {
         let tool: Arc<dyn gewu_core::traits::Tool> = Arc::new(EchoTool);
+        let llm: Arc<dyn gewu_core::traits::LlmProvider> = TestLlm::tool_call();
         let agent = gewu_core::Agent::builder()
-            .llm(TestLlm::tool_call())
+            .llm(llm.clone())
             .with_tools(vec![tool])
             .build()
             .unwrap();
@@ -1813,6 +1911,9 @@ mod tests {
             agent: Arc::new(Mutex::new(agent)),
             session_id: "sess-test".to_string(),
             agent_name: "build".to_string(),
+            model: "test-model".to_string(),
+            provider: llm,
+            context_limit: 256_000,
             tools,
         }
     }
@@ -2250,7 +2351,7 @@ mod tests {
     ) -> Arc<ServerState> {
         Arc::new(ServerState {
             bootstrap: Bootstrap {
-                provider,
+                provider: provider.clone(),
                 pool: sqlx::sqlite::SqlitePoolOptions::new()
                     .connect_lazy("sqlite::memory:")
                     .unwrap(),
@@ -2262,6 +2363,16 @@ mod tests {
                 working_directory: "/tmp/gewu-test".to_string(),
                 enforcement: PathEnforcement::None,
                 context_limit: None,
+                models: BTreeMap::from([(
+                    "test-model".to_string(),
+                    crate::bootstrap::ModelEntry {
+                        provider: provider.clone(),
+                        provider_name: "test".to_string(),
+                        label: "test-model".to_string(),
+                        context_limit: 256_000,
+                    },
+                )]),
+                model_selector: "test-model".to_string(),
             },
             token: token.map(str::to_string),
             busy_sessions: Mutex::new(HashSet::new()),
@@ -2689,6 +2800,16 @@ mod tests {
                 working_directory: "/tmp/gewu-test".to_string(),
                 enforcement: PathEnforcement::None,
                 context_limit: None,
+                models: BTreeMap::from([(
+                    "test-model".to_string(),
+                    crate::bootstrap::ModelEntry {
+                        provider: TestLlm::plain(),
+                        provider_name: "test".to_string(),
+                        label: "test-model".to_string(),
+                        context_limit: 256_000,
+                    },
+                )]),
+                model_selector: "test-model".to_string(),
             },
             token: None,
             busy_sessions: Mutex::new(HashSet::new()),
@@ -3096,6 +3217,9 @@ mod tests {
             agent: Arc::new(Mutex::new(agent)),
             session_id: "sess-test".to_string(),
             agent_name: "build".to_string(),
+            model: "test-model".to_string(),
+            provider: Arc::new(ToolCallLoopLlm),
+            context_limit: 256_000,
             tools: vec!["echo".to_string()],
         };
 

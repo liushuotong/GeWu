@@ -23,6 +23,9 @@ pub struct Tab {
     pub model: SessionModel,
     /// Server model name, shown in the status line.
     pub model_label: Option<String>,
+    /// The tab's model selector (`endpoint/model`) into the server's model
+    /// catalog; `None` until a snapshot reveals it (means "server default").
+    pub model_selector: Option<String>,
     /// Context usage `(used tokens, context limit)`.
     pub context: Option<(u64, u64)>,
     /// Provider-reported token accounting accumulated across the session,
@@ -43,6 +46,7 @@ impl Tab {
             id,
             model: SessionModel::new(),
             model_label: None,
+            model_selector: None,
             context: None,
             cache: None,
             expanded_groups: HashSet::new(),

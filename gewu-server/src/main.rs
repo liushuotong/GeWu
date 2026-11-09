@@ -251,6 +251,7 @@ async fn run(cli: RunArgs) -> Result<()> {
     // Create Agent
     let (mut agent, _registry) = registry::create_agent(
         registry::ProfileInputs {
+            model_catalog: Some(registry::ModelCatalog { entries: std::sync::Arc::new(boot.models.clone()), default: boot.model_selector.clone() }),
             name: &cli.common.agent,
             provider: boot.provider,
             pool: boot.pool.clone(),

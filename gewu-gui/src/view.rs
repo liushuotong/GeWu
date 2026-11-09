@@ -7,7 +7,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::fmt::Write as _;
 
 use gewu_client::session::{Block, Phase};
-use gewu_protocol::FileEntry;
+use gewu_protocol::{FileEntry, ModelSummary};
 use math_core::{LatexToMathML, MathCoreConfig, MathDisplay};
 use pulldown_cmark::{CowStr, Event, Options, Parser, Tag, html};
 
@@ -715,8 +715,9 @@ fn format_k(tokens: u64) -> String {
 }
 
 /// The status line: a telemetry strip with phase, model, key hints,
-/// and a context gauge on the right.
-pub fn status_html(tab: &Tab) -> String {
+/// and context usage on the right. With more than one switchable model,
+/// the model entry becomes a picker.
+pub fn status_html(tab: &Tab, models: &[ModelSummary]) -> String {
     // Mode controls are rendered with status updates, including busy changes.
     let mut out = String::from("<div class=\"status-inner\">");
     for mode in ["build", "plan"] {
@@ -738,7 +739,35 @@ pub fn status_html(tab: &Tab) -> String {
             out.push_str("<span class=\"phase busy\"><i class=\"dot\"></i>thinking…</span>");
         }
     }
-    if let Some(label) = &tab.model_label {
+    if models.len() > 1 {
+        // The tab's current selection: its known selector, or the catalog
+        // entry matching the server-reported default label.
+        let selected = tab
+            .model_selector
+            .clone()
+            .or_else(|| {
+                models
+                    .iter()
+                    .find(|model| Some(&model.label) == tab.model_label.as_ref())
+                    .map(|model| model.selector.clone())
+            });
+        let _ = write!(
+            out,
+            "<label class=\"kv\"><span class=\"k\">model</span><select class=\"model-picker\" data-model-picker data-tab=\"{}\" aria-label=\"switch model\"{}>",
+            tab.id,
+            if tab.busy() { " disabled" } else { "" }
+        );
+        for model in models {
+            let _ = write!(
+                out,
+                "<option value=\"{}\"{}>{}</option>",
+                escape(&model.selector),
+                if selected.as_deref() == Some(model.selector.as_str()) { " selected" } else { "" },
+                escape(&model.label)
+            );
+        }
+        out.push_str("</select></label>");
+    } else if let Some(label) = &tab.model_label {
         let _ = write!(
             out,
             "<span class=\"kv\"><span class=\"k\">model</span><span class=\"v model\">{}</span></span>",
@@ -755,13 +784,9 @@ pub fn status_html(tab: &Tab) -> String {
     if let Some((used, limit)) = tab.context.filter(|(used, limit)| *used > 0 && *limit > 0) {
         let pct = (used * 100 / limit).min(100);
         let class = if pct >= 80 { "usage warn" } else { "usage" };
-        // The CSP forbids inline styles, so the gauge width snaps to 5% steps.
-        let step = pct / 5 * 5;
         let _ = write!(
             out,
             "<span class=\"{class}\" title=\"{used} / {limit} tokens\">\
-             <span class=\"k\">ctx</span>\
-             <span class=\"gauge\" aria-hidden=\"true\"><span class=\"gauge-fill g{step}\"></span></span>\
              <span class=\"v\">{} / {} ({}%)</span></span>",
             format_k(used),
             format_k(limit),
@@ -1105,7 +1130,7 @@ mod tests {
         let tab = ws.tab_mut(id).unwrap();
         tab.model.phase = Phase::Busy;
         tab.model.status = Some("Compacting context…".into());
-        let html = status_html(tab);
+        let html = status_html(tab, &[]);
         assert!(html.contains("COMPACTING..."), "{html}");
         assert!(!html.contains("thinking…"), "{html}");
     }
@@ -1457,14 +1482,41 @@ mod tests {
         let tab = ws.tab_mut(id).unwrap();
         tab.model_label = Some("gpt-4o".into());
         tab.context = Some((34_000, 128_000));
-        let html = status_html(ws.tab(id).unwrap());
+        let html = status_html(ws.tab(id).unwrap(), &[]);
         assert!(html.contains("gpt-4o"), "{html}");
         assert!(!html.contains("openai"), "{html}");
         assert!(!html.contains("session"), "{html}");
         assert!(!html.contains("cache"), "{html}");
         assert!(html.contains("34k / 128k (26%)"), "{html}");
-        assert!(html.contains("gauge-fill g25"), "{html}");
-        assert!(html.contains("class=\"usage\""), "{html}");
+        assert!(!html.contains("gauge"), "{html}");
+    }
+
+    #[test]
+    fn status_renders_model_picker_when_multiple_models() {
+        let models = vec![
+            ModelSummary { selector: "west/big".into(), label: "big-model".into() },
+            ModelSummary { selector: "west/small".into(), label: "small-model".into() },
+        ];
+        let (mut ws, id) = tab_with_blocks(vec![]);
+        ws.tab_mut(id).unwrap().model_selector = Some("west/small".into());
+        let html = status_html(ws.tab(id).unwrap(), &models);
+        assert!(html.contains("<select class=\"model-picker\" data-model-picker data-tab="), "{html}");
+        assert!(html.contains("<option value=\"west/big\">big-model</option>"), "{html}");
+        assert!(html.contains("<option value=\"west/small\" selected>small-model</option>"), "{html}");
+
+        // Without a selector, the default label picks the selected option.
+        let (mut ws, id) = tab_with_blocks(vec![]);
+        ws.tab_mut(id).unwrap().model_label = Some("big-model".into());
+        let html = status_html(ws.tab(id).unwrap(), &models);
+        assert!(html.contains("<option value=\"west/big\" selected>big-model</option>"), "{html}");
+
+        // A single catalog entry stays a plain label.
+        let solo = vec![ModelSummary { selector: "west/big".into(), label: "big-model".into() }];
+        let (mut ws, id) = tab_with_blocks(vec![]);
+        ws.tab_mut(id).unwrap().model_label = Some("big-model".into());
+        let html = status_html(ws.tab(id).unwrap(), &solo);
+        assert!(!html.contains("model-picker"), "{html}");
+        assert!(html.contains("class=\"v model\""), "{html}");
     }
 
     #[test]
@@ -1477,13 +1529,13 @@ mod tests {
             cached_tokens: 9_000,
             ..TokenUsage::default()
         });
-        let html = status_html(ws.tab(id).unwrap());
+        let html = status_html(ws.tab(id).unwrap(), &[]);
         assert!(html.contains("cache"), "{html}");
         assert!(html.contains(">90%</span>"), "{html}");
-        // No provider usage: hidden even when the context gauge shows.
+        // No provider usage: hidden even when the context usage shows.
         let (mut ws, id) = tab_with_blocks(vec![]);
         ws.tab_mut(id).unwrap().context = Some((34_000, 128_000));
-        let html = status_html(ws.tab(id).unwrap());
+        let html = status_html(ws.tab(id).unwrap(), &[]);
         assert!(!html.contains("cache"), "{html}");
     }
 
@@ -1491,17 +1543,16 @@ mod tests {
     fn status_usage_warns_near_limit() {
         let (mut ws, id) = tab_with_blocks(vec![]);
         ws.tab_mut(id).unwrap().context = Some((110_000, 128_000));
-        let html = status_html(ws.tab(id).unwrap());
+        let html = status_html(ws.tab(id).unwrap(), &[]);
         assert!(html.contains("class=\"usage warn\""), "{html}");
         assert!(html.contains("(85%)"), "{html}");
-        assert!(html.contains("gauge-fill g85"), "{html}");
     }
 
     #[test]
     fn busy_status_shows_interrupt_hint() {
         let (mut ws, id) = tab_with_blocks(vec![]);
         ws.tab_mut(id).unwrap().model.submit("go".into());
-        let html = status_html(ws.tab(id).unwrap());
+        let html = status_html(ws.tab(id).unwrap(), &[]);
         assert!(html.contains("thinking…"), "{html}");
         assert!(html.contains("Esc interrupt"), "{html}");
     }
