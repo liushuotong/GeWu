@@ -723,22 +723,6 @@ pub fn status_html(tab: &Tab, models: &[ModelSummary]) -> String {
     for mode in ["build", "plan"] {
         let _ = write!(out, "<button type=\"button\" class=\"mode-button\" data-mode=\"{mode}\" aria-pressed=\"{}\" {}>{mode}</button>", tab.agent == mode, if tab.busy() { "disabled" } else { "" });
     }
-    match (&tab.model.phase, tab.model.status.as_deref()) {
-        (Phase::Idle, _) => out.push_str("<span class=\"phase\"><i class=\"dot\"></i>idle</span>"),
-        // A transient status (e.g. LLM retry backoff) replaces the plain
-        // "thinking…" so a rate-limit wait is visible in the browser.
-        (Phase::Busy, Some(status)) => {
-            let label = if status == "Compacting context…" {
-                "COMPACTING...".to_string()
-            } else {
-                format!("thinking… {}", escape(status))
-            };
-            let _ = write!(out, "<span class=\"phase busy\"><i class=\"dot\"></i>{label}</span>");
-        }
-        (Phase::Busy, None) => {
-            out.push_str("<span class=\"phase busy\"><i class=\"dot\"></i>thinking…</span>");
-        }
-    }
     if models.len() > 1 {
         // The tab's current selection: its known selector, or the catalog
         // entry matching the server-reported default label.
@@ -774,12 +758,27 @@ pub fn status_html(tab: &Tab, models: &[ModelSummary]) -> String {
             escape(label)
         );
     }
-    let keys = if tab.model.phase == Phase::Busy {
-        "Esc interrupt"
-    } else {
-        "Enter send · Shift+Enter newline"
-    };
-    let _ = write!(out, "<span class=\"hint\">{keys}</span>");
+    match (&tab.model.phase, tab.model.status.as_deref()) {
+        (Phase::Idle, _) => out.push_str("<span class=\"phase\"><i class=\"dot\"></i>idle</span>"),
+        // A transient status (e.g. LLM retry backoff) replaces the plain
+        // "thinking…" so a rate-limit wait is visible in the browser.
+        (Phase::Busy, Some(status)) => {
+            let label = if status == "Compacting context…" {
+                "COMPACTING...".to_string()
+            } else {
+                format!("thinking… {}", escape(status))
+            };
+            let _ = write!(out, "<span class=\"phase busy\"><i class=\"dot\"></i>{label}</span>");
+        }
+        (Phase::Busy, None) => {
+            out.push_str("<span class=\"phase busy\"><i class=\"dot\"></i>thinking…</span>");
+        }
+    }
+    // The idle key hints live in the composer placeholder; only the busy
+    // hint needs its own spot in the status strip.
+    if tab.model.phase == Phase::Busy {
+        let _ = write!(out, "<span class=\"hint\">Esc interrupt</span>");
+    }
 
     if let Some((used, limit)) = tab.context.filter(|(used, limit)| *used > 0 && *limit > 0) {
         let pct = (used * 100 / limit).min(100);
