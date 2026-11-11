@@ -146,7 +146,9 @@ impl SessionModel {
         match event {
             AgentEvent::Compacted { summary } => {
                 self.end_thought();
-                self.blocks.push(Block::Compaction { summary: summary.clone() });
+                self.blocks.push(Block::Compaction {
+                    summary: summary.clone(),
+                });
                 Some(self.blocks.len() - 1)
             }
             AgentEvent::Status { message } => {
@@ -267,7 +269,9 @@ impl SessionModel {
     pub fn apply_message(&mut self, message: &Message) {
         match message {
             Message::System { .. } => {}
-            Message::Compaction { summary, .. } => self.blocks.push(Block::Compaction { summary: summary.clone() }),
+            Message::Compaction { summary, .. } => self.blocks.push(Block::Compaction {
+                summary: summary.clone(),
+            }),
             Message::User { content } => {
                 let text = parts_text(content);
                 if !text.is_empty() {
@@ -448,6 +452,12 @@ pub fn summarize_tool_input(tool: &str, input: &str) -> String {
             .get("url")
             .and_then(|u| u.as_str())
             .map(str::to_string),
+        // The GUI renders the workflow graph from the spec, so keep it whole.
+        "workflow_start" => value.get("spec").map(|spec| spec.to_string()),
+        "workflow_status" | "workflow_wait" | "workflow_cancel" => value
+            .get("run_id")
+            .and_then(|id| id.as_str())
+            .map(str::to_string),
         _ => None,
     };
     summary.unwrap_or_else(|| truncate(&value.to_string(), 80))
@@ -472,24 +482,48 @@ mod tests {
     #[test]
     fn compaction_live_and_reloaded_summaries_match_without_recent_context() {
         let mut live = SessionModel::default();
-        live.apply_event(&AgentEvent::Status { message: "Compacting context…".into() });
+        live.apply_event(&AgentEvent::Status {
+            message: "Compacting context…".into(),
+        });
         assert!(live.status.is_some());
-        assert_eq!(live.apply_event(&AgentEvent::Compacted { summary: "summary".into() }), Some(0));
+        assert_eq!(
+            live.apply_event(&AgentEvent::Compacted {
+                summary: "summary".into()
+            }),
+            Some(0)
+        );
         assert!(live.status.is_none());
         let mut loaded = SessionModel::default();
-        loaded.apply_message(&Message::Compaction { summary: "summary".into(), recent: "serialized context".into() });
+        loaded.apply_message(&Message::Compaction {
+            summary: "summary".into(),
+            recent: "serialized context".into(),
+        });
         assert_eq!(live.blocks, loaded.blocks);
-        assert_eq!(live.blocks, vec![Block::Compaction { summary: "summary".into() }]);
+        assert_eq!(
+            live.blocks,
+            vec![Block::Compaction {
+                summary: "summary".into()
+            }]
+        );
         assert_eq!(live.blocks[0].text(), "summary");
     }
 
     #[test]
     fn failed_compaction_clears_status_without_success_marker() {
         let mut model = SessionModel::default();
-        model.apply_event(&AgentEvent::Status { message: "Compacting context…".into() });
-        model.apply_event(&AgentEvent::Error { error: "summary failed".into() });
+        model.apply_event(&AgentEvent::Status {
+            message: "Compacting context…".into(),
+        });
+        model.apply_event(&AgentEvent::Error {
+            error: "summary failed".into(),
+        });
         assert!(model.status.is_none());
-        assert!(!model.blocks.iter().any(|block| matches!(block, Block::Compaction { .. })));
+        assert!(
+            !model
+                .blocks
+                .iter()
+                .any(|block| matches!(block, Block::Compaction { .. }))
+        );
     }
     use super::*;
     use gewu_protocol::FunctionCall;
@@ -652,7 +686,9 @@ mod tests {
         let first = m.apply_event(&AgentEvent::ReasoningDelta { delta: "hm".into() });
         assert_eq!(first, Some(1));
         match &m.blocks[1] {
-            Block::Thought { started, reasoning, .. } => {
+            Block::Thought {
+                started, reasoning, ..
+            } => {
                 assert!(started.is_some());
                 assert_eq!(reasoning, "hm");
             }
@@ -678,7 +714,9 @@ mod tests {
         m.apply_event(&AgentEvent::ReasoningDelta { delta: "hm".into() });
 
         // Content ends the thought and opens the assistant block.
-        let content_idx = m.apply_event(&AgentEvent::ContentDelta { delta: "answer".into() });
+        let content_idx = m.apply_event(&AgentEvent::ContentDelta {
+            delta: "answer".into(),
+        });
         assert_eq!(content_idx, Some(2));
         match &m.blocks[1] {
             Block::Thought { text, started, .. } => {
@@ -745,7 +783,9 @@ mod tests {
         m.submit("hi".into());
         m.apply_event(&AgentEvent::ReasoningDelta { delta: "hm".into() });
 
-        m.apply_event(&AgentEvent::ContentDelta { delta: "answer".into() });
+        m.apply_event(&AgentEvent::ContentDelta {
+            delta: "answer".into(),
+        });
         assert_eq!(m.take_collapsed(), Some(1));
     }
 
@@ -766,7 +806,9 @@ mod tests {
     fn no_reasoning_produces_no_thought_block() {
         let mut m = model();
         m.submit("hi".into());
-        m.apply_event(&AgentEvent::ContentDelta { delta: "plain".into() });
+        m.apply_event(&AgentEvent::ContentDelta {
+            delta: "plain".into(),
+        });
         assert_eq!(m.blocks.len(), 2);
         assert!(m.blocks.iter().all(|b| !matches!(b, Block::Thought { .. })));
     }
@@ -964,4 +1006,24 @@ mod tests {
             ]
         );
     }
+}
+
+#[test]
+fn workflow_tool_inputs_are_summarized_for_the_gui() {
+    let spec = r#"{"name":"demo","nodes":[{"id":"a","agent":"read","prompt":"p"}]}"#;
+    let start = summarize_tool_input("workflow_start", &format!(r#"{{"spec":{spec}}}"#));
+    // Keys are re-ordered (BTreeMap) but the spec must survive verbatim.
+    assert_eq!(
+        serde_json::from_str::<serde_json::Value>(&start).unwrap(),
+        serde_json::from_str::<serde_json::Value>(spec).unwrap()
+    );
+
+    assert_eq!(
+        summarize_tool_input("workflow_status", r#"{"run_id":"r-1"}"#),
+        "r-1"
+    );
+    assert_eq!(
+        summarize_tool_input("workflow_wait", r#"{"run_id":"r-2","wait_secs":5}"#),
+        "r-2"
+    );
 }

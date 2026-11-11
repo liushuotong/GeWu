@@ -63,7 +63,10 @@ pub(crate) fn rate_limit_error(
     body: &str,
 ) -> OpenAIError {
     let message = crate::http::rate_limit_message(body);
-    OpenAIError::RateLimit { message, retry_after }
+    OpenAIError::RateLimit {
+        message,
+        retry_after,
+    }
 }
 
 /// Configuration for the OpenAI API client.
@@ -545,12 +548,10 @@ impl FunctionObjectArgs {
     }
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[derive(Default)]
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct ChatCompletionRequestSystemMessageArgs {
     content: Option<String>,
 }
-
 
 impl ChatCompletionRequestSystemMessageArgs {
     pub fn content(mut self, content: String) -> Self {
@@ -565,12 +566,10 @@ impl ChatCompletionRequestSystemMessageArgs {
     }
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[derive(Default)]
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct ChatCompletionRequestUserMessageArgs {
     content: Option<Vec<ChatCompletionRequestUserMessageContentPart>>,
 }
-
 
 impl ChatCompletionRequestUserMessageArgs {
     pub fn content(mut self, content: Vec<ChatCompletionRequestUserMessageContentPart>) -> Self {
@@ -585,13 +584,11 @@ impl ChatCompletionRequestUserMessageArgs {
     }
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[derive(Default)]
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct ChatCompletionRequestToolMessageArgs {
     tool_call_id: Option<String>,
     content: Option<String>,
 }
-
 
 impl ChatCompletionRequestToolMessageArgs {
     pub fn tool_call_id(mut self, tool_call_id: String) -> Self {
@@ -639,10 +636,7 @@ pub struct ChatDelta {
     // Reasoning models stream their thinking under different field names:
     // Keep the native field name: alternative/custom reasoning fields are
     // retained in `extra` and detected by the provider's stream parser.
-    #[serde(
-        rename = "reasoning_content",
-        skip_serializing_if = "Option::is_none"
-    )]
+    #[serde(rename = "reasoning_content", skip_serializing_if = "Option::is_none")]
     pub reasoning_content: Option<String>,
     #[serde(flatten)]
     pub extra: std::collections::BTreeMap<String, serde_json::Value>,
@@ -716,7 +710,13 @@ mod tests {
     fn chat_delta_parses_glm_reasoning_field() {
         // GLM-style gateways stream thinking under "reasoning".
         let delta: ChatDelta = serde_json::from_str(r#"{"reasoning":"thinking..."}"#).unwrap();
-        assert_eq!(delta.extra.get("reasoning").and_then(serde_json::Value::as_str), Some("thinking..."));
+        assert_eq!(
+            delta
+                .extra
+                .get("reasoning")
+                .and_then(serde_json::Value::as_str),
+            Some("thinking...")
+        );
     }
 
     #[test]
@@ -768,7 +768,12 @@ mod tests {
         let mut reasoning = String::new();
         while let Some(ev) = stream.next().await {
             let chunk = ev.expect("chunk should parse");
-            if let Some(r) = chunk.choices[0].delta.extra.get("reasoning").and_then(serde_json::Value::as_str) {
+            if let Some(r) = chunk.choices[0]
+                .delta
+                .extra
+                .get("reasoning")
+                .and_then(serde_json::Value::as_str)
+            {
                 reasoning.push_str(r);
             }
         }

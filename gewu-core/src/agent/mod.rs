@@ -637,6 +637,16 @@ pub struct AgentTemplate {
 }
 
 impl AgentTemplate {
+    /// The tools spawned agents can call.
+    pub fn tools(&self) -> &[Arc<dyn Tool>] {
+        &self.tools
+    }
+
+    /// The system prompt spawned agents run with.
+    pub fn system_prompt(&self) -> &str {
+        &self.system_prompt
+    }
+
     /// Replaces the LLM provider used by spawned agents.
     pub fn with_llm(mut self, llm: Arc<dyn LlmProvider>) -> Self {
         self.llm = llm;
@@ -646,6 +656,12 @@ impl AgentTemplate {
     /// Replaces the tool set of spawned agents.
     pub fn with_tools(mut self, tools: Vec<Arc<dyn Tool>>) -> Self {
         self.tools = Arc::new(tools);
+        self
+    }
+
+    /// Replaces the system prompt of spawned agents.
+    pub fn with_system_prompt(mut self, system_prompt: impl Into<String>) -> Self {
+        self.system_prompt = system_prompt.into();
         self
     }
 

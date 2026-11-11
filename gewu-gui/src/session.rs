@@ -91,7 +91,8 @@ fn label_for(models: &[gewu_protocol::ModelSummary], selector: &str) -> Option<S
 }
 
 /// One browser's isolated GUI session.
-pub struct GuiSession {    endpoint: Endpoint,
+pub struct GuiSession {
+    endpoint: Endpoint,
     server_token: Option<String>,
     admin: Client,
     workspace: Workspace,
@@ -235,7 +236,12 @@ impl GuiSession {
         // tab's upstream connection.
         self.activate_active(&mut sender).await?;
 
-        let ids: Vec<_> = self.workspace.tabs.iter().filter_map(|tab| tab.model.session_id.clone().map(|s| (tab.id, s))).collect();
+        let ids: Vec<_> = self
+            .workspace
+            .tabs
+            .iter()
+            .filter_map(|tab| tab.model.session_id.clone().map(|s| (tab.id, s)))
+            .collect();
         for (id, session_id) in ids {
             // One bad stored session must not prevent the browser session
             // from starting; log and continue with the remaining tabs.
@@ -358,7 +364,12 @@ impl GuiSession {
     /// Send just a thought block's body, so toggling its reasoning does not
     /// re-render the whole transcript. Falls back to a full transcript when
     /// the block cannot be located.
-    async fn send_thought_body(&self, tab_id: u64, block: usize, sender: &mut Sender) -> Result<()> {
+    async fn send_thought_body(
+        &self,
+        tab_id: u64,
+        block: usize,
+        sender: &mut Sender,
+    ) -> Result<()> {
         if let Some(tab) = self.workspace.tab(tab_id)
             && let Some(html) = view::assistant_body_html(tab, block, false)
         {
@@ -470,7 +481,10 @@ impl GuiSession {
     }
 
     async fn observe(&mut self, tab_id: u64, session_id: String, restore: bool) -> Result<()> {
-        let observer = self.endpoint.connect_with_token(self.server_token.as_deref()).await?;
+        let observer = self
+            .endpoint
+            .connect_with_token(self.server_token.as_deref())
+            .await?;
         let mut stream = observer.watch_session(session_id).await?;
         let tx = self.tab_tx.clone().expect("running event loop");
         let task = tokio::spawn(async move {
@@ -479,16 +493,34 @@ impl GuiSession {
                 // After our own turn finishes, the local model already has
                 // every event. Do not replace it with an idle snapshot and
                 // shift block indices by discarding connection-local notes.
-                let skip = first && !restore && matches!(&frame,
-                    Ok(ServerMessage::SessionSnapshot { busy: false, .. }));
+                let skip = first
+                    && !restore
+                    && matches!(
+                        &frame,
+                        Ok(ServerMessage::SessionSnapshot { busy: false, .. })
+                    );
                 first = false;
-                if skip { continue; }
-                if tx.send(TabEvent { tab_id, frame: Some(frame) }).is_err() { return; }
+                if skip {
+                    continue;
+                }
+                if tx
+                    .send(TabEvent {
+                        tab_id,
+                        frame: Some(frame),
+                    })
+                    .is_err()
+                {
+                    return;
+                }
             }
         });
         let conn = self.conns.entry(tab_id).or_default();
-        if let Some(previous) = conn.task.replace(task) { previous.abort(); }
-        if let Some(previous) = conn.observer.replace(observer) { previous.close().await; }
+        if let Some(previous) = conn.task.replace(task) {
+            previous.abort();
+        }
+        if let Some(previous) = conn.observer.replace(observer) {
+            previous.close().await;
+        }
         conn.observing = true;
         Ok(())
     }
@@ -565,39 +597,78 @@ impl GuiSession {
     ) -> Result<()> {
         match msg {
             ClientMsg::RevertChat { tab, block, undo } => {
-                let Some(tab_state) = self.workspace.tab(tab) else { return self.send_error(sender, "unknown tab").await; };
-                if tab_state.busy() { return self.send_error(sender, "wait for the current turn to finish").await; }
+                let Some(tab_state) = self.workspace.tab(tab) else {
+                    return self.send_error(sender, "unknown tab").await;
+                };
+                if tab_state.busy() {
+                    return self
+                        .send_error(sender, "wait for the current turn to finish")
+                        .await;
+                }
                 let turn = if let Some(index) = block {
-                    if !matches!(tab_state.model.blocks.get(index), Some(Block::User(_))) { return self.send_error(sender, "not a user message").await; }
-                    Some(tab_state.model.blocks[..index].iter().filter(|b| matches!(b, Block::User(_))).count())
-                } else { None };
+                    if !matches!(tab_state.model.blocks.get(index), Some(Block::User(_))) {
+                        return self.send_error(sender, "not a user message").await;
+                    }
+                    Some(
+                        tab_state.model.blocks[..index]
+                            .iter()
+                            .filter(|b| matches!(b, Block::User(_)))
+                            .count(),
+                    )
+                } else {
+                    None
+                };
                 let session_id = tab_state.model.session_id.clone();
-                if session_id.is_none() { return self.send_error(sender, "no conversation to revert").await; }
-                if let Err(e) = self.ensure_client(tab).await { return self.send_error(sender, e.to_string()).await; }
+                if session_id.is_none() {
+                    return self.send_error(sender, "no conversation to revert").await;
+                }
+                if let Err(e) = self.ensure_client(tab).await {
+                    return self.send_error(sender, e.to_string()).await;
+                }
                 let client = self.client(tab).expect("ensured");
-                if let Err(e) = client.usage(session_id.as_deref()).await { return self.send_error(sender, e.to_string()).await; }
+                if let Err(e) = client.usage(session_id.as_deref()).await {
+                    return self.send_error(sender, e.to_string()).await;
+                }
                 match client.revert_chat(turn, undo).await {
                     Ok((id, messages)) => {
                         let tab_state = self.workspace.tab_mut(tab).expect("known");
                         tab_state.model.load_history(&messages);
                         tab_state.model.set_session(Some(id));
-                        tab_state.model.note("Conversation updated. Workspace files were NOT undone.");
+                        tab_state
+                            .model
+                            .note("Conversation updated. Workspace files were NOT undone.");
                         tab_state.expanded_groups.clear();
                         tab_state.expanded_outputs.clear();
                         tab_state.context = None;
-                        if self.workspace.active_id() == tab { self.send_active_full(sender).await?; }
+                        if self.workspace.active_id() == tab {
+                            self.send_active_full(sender).await?;
+                        }
                     }
                     Err(e) => self.send_error(sender, e.to_string()).await?,
                 }
             }
             ClientMsg::SwitchAgent { tab, agent } => {
-                if !["build", "plan"].contains(&agent.as_str()) { return self.send_error(sender, "unknown mode").await; }
-                if self.workspace.tab(tab).is_none_or(|tab| tab.busy()) { return self.send_error(sender, "wait for the current turn to finish").await; }
-                if let Err(e) = self.ensure_client(tab).await { return self.send_error(sender, e.to_string()).await; }
+                if !["build", "plan"].contains(&agent.as_str()) {
+                    return self.send_error(sender, "unknown mode").await;
+                }
+                if self.workspace.tab(tab).is_none_or(|tab| tab.busy()) {
+                    return self
+                        .send_error(sender, "wait for the current turn to finish")
+                        .await;
+                }
+                if let Err(e) = self.ensure_client(tab).await {
+                    return self.send_error(sender, e.to_string()).await;
+                }
                 let client = self.client(tab).expect("ensured");
                 // Bind resumed tabs before switching so their conversation is retained.
-                if let Some(id) = self.workspace.tab(tab).and_then(|tab| tab.model.session_id.clone())
-                    && let Err(e) = client.usage(Some(&id)).await { return self.send_error(sender, e.to_string()).await; }
+                if let Some(id) = self
+                    .workspace
+                    .tab(tab)
+                    .and_then(|tab| tab.model.session_id.clone())
+                    && let Err(e) = client.usage(Some(&id)).await
+                {
+                    return self.send_error(sender, e.to_string()).await;
+                }
                 match client.switch_agent(agent.clone()).await {
                     Ok((id, tools)) => {
                         let tab_state = self.workspace.tab_mut(tab).expect("known tab");
@@ -606,21 +677,37 @@ impl GuiSession {
                         self.tools = Ok(tools);
                         if self.workspace.active_id() == tab {
                             self.send_status(sender).await?;
-                            send_msg(sender, &ServerMsg::Tools {
-                                html: view::sidebar_tools_content_html(&self.tools),
-                            }).await?;
+                            send_msg(
+                                sender,
+                                &ServerMsg::Tools {
+                                    html: view::sidebar_tools_content_html(&self.tools),
+                                },
+                            )
+                            .await?;
                         }
                     }
                     Err(e) => self.send_error(sender, e.to_string()).await?,
                 }
             }
             ClientMsg::SwitchModel { tab, model } => {
-                if self.workspace.tab(tab).is_none_or(|tab| tab.busy()) { return self.send_error(sender, "wait for the current turn to finish").await; }
-                if let Err(e) = self.ensure_client(tab).await { return self.send_error(sender, e.to_string()).await; }
+                if self.workspace.tab(tab).is_none_or(|tab| tab.busy()) {
+                    return self
+                        .send_error(sender, "wait for the current turn to finish")
+                        .await;
+                }
+                if let Err(e) = self.ensure_client(tab).await {
+                    return self.send_error(sender, e.to_string()).await;
+                }
                 let client = self.client(tab).expect("ensured");
                 // Bind resumed tabs before switching so their conversation is retained.
-                if let Some(id) = self.workspace.tab(tab).and_then(|tab| tab.model.session_id.clone())
-                    && let Err(e) = client.usage(Some(&id)).await { return self.send_error(sender, e.to_string()).await; }
+                if let Some(id) = self
+                    .workspace
+                    .tab(tab)
+                    .and_then(|tab| tab.model.session_id.clone())
+                    && let Err(e) = client.usage(Some(&id)).await
+                {
+                    return self.send_error(sender, e.to_string()).await;
+                }
                 match client.switch_model(model.clone()).await {
                     Ok((id, label)) => {
                         let tab_state = self.workspace.tab_mut(tab).expect("known tab");
@@ -635,7 +722,8 @@ impl GuiSession {
                 }
             }
             // Auth is consumed by the transport before the session starts.
-            ClientMsg::Auth { .. } => {}            ClientMsg::Ask { tab, prompt } => {
+            ClientMsg::Auth { .. } => {}
+            ClientMsg::Ask { tab, prompt } => {
                 self.handle_ask(tab, prompt, sender, tab_tx).await?;
             }
             ClientMsg::Interrupt { tab } => {
@@ -672,7 +760,20 @@ impl GuiSession {
             }
             ClientMsg::ToggleGroup { tab, block } => {
                 if let Some(tab) = self.workspace.tab_mut(tab) {
-                    toggle(&mut tab.expanded_groups, block);
+                    // Workflow runs default to expanded, so their toggle
+                    // collapses; other runs toggle expansion as before.
+                    let run_len = tab.model.blocks.get(block..).map_or(0, |rest| {
+                        rest.iter()
+                            .take_while(|b| matches!(b, Block::Tool { .. }))
+                            .count()
+                    });
+                    let workflow = block < tab.model.blocks.len()
+                        && crate::view::is_workflow_run(&tab.model.blocks[block..block + run_len]);
+                    if workflow {
+                        toggle(&mut tab.collapsed_groups, block);
+                    } else {
+                        toggle(&mut tab.expanded_groups, block);
+                    }
                 }
                 if self.workspace.active_id() == tab {
                     self.send_tool_card(tab, block, sender).await?;
@@ -703,11 +804,8 @@ impl GuiSession {
                             }
                             Err(e) => {
                                 self.expanded_dirs.remove(&path);
-                                self.send_error(
-                                    sender,
-                                    format!("failed to list '{}': {e}", path),
-                                )
-                                .await?;
+                                self.send_error(sender, format!("failed to list '{}': {e}", path))
+                                    .await?;
                             }
                         }
                     }
@@ -746,10 +844,9 @@ impl GuiSession {
                         }
                     };
                     match self.admin.write_file(name.clone(), &bytes).await {
-                        Ok((_, bytes_written)) => uploaded.push(format!(
-                            "{name} ({} kB)",
-                            bytes_written / 1024
-                        )),
+                        Ok((_, bytes_written)) => {
+                            uploaded.push(format!("{name} ({} kB)", bytes_written / 1024))
+                        }
                         Err(e) => failures.push(format!("could not upload '{name}': {e}")),
                     }
                 }
@@ -897,13 +994,17 @@ impl GuiSession {
                 if let Some(client) = &conn.client {
                     let _ = client.interrupt().await;
                 }
-                if conn.observing { task.abort(); }
+                if conn.observing {
+                    task.abort();
+                }
                 let _ = task.await;
             }
             if let Some(client) = conn.client.take() {
                 client.close().await;
             }
-            if let Some(observer) = conn.observer.take() { observer.close().await; }
+            if let Some(observer) = conn.observer.take() {
+                observer.close().await;
+            }
         }
 
         let session_id = self
@@ -954,23 +1055,41 @@ impl GuiSession {
             let before = tab.model.blocks.len();
 
             match event.frame {
-                Some(Ok(ServerMessage::SessionSnapshot { session_id, messages, frames, busy, model: snapshot_model, .. })) => {
+                Some(Ok(ServerMessage::SessionSnapshot {
+                    session_id,
+                    messages,
+                    frames,
+                    busy,
+                    model: snapshot_model,
+                    ..
+                })) => {
                     let mut model = gewu_client::SessionModel::new();
                     model.set_session(Some(session_id));
-                    for message in &messages { model.apply_message(message); }
+                    for message in &messages {
+                        model.apply_message(message);
+                    }
                     for frame in frames {
                         if let ServerMessage::Event { event, .. } = frame
-                            && let Ok(event) = serde_json::from_value::<AgentEvent>(event) { model.apply_event(&event); }
+                            && let Ok(event) = serde_json::from_value::<AgentEvent>(event)
+                        {
+                            model.apply_event(&event);
+                        }
                     }
                     model.phase = if busy { Phase::Busy } else { Phase::Idle };
-                    let changed = tab.model.blocks != model.blocks || tab.model.phase != model.phase;
+                    let changed =
+                        tab.model.blocks != model.blocks || tab.model.phase != model.phase;
                     tab.model = model;
                     if let Some(selector) = snapshot_model {
                         tab.model_selector = Some(selector.clone());
-                        tab.model_label = Some(label_for(&self.models, &selector).unwrap_or(selector));
+                        tab.model_label =
+                            Some(label_for(&self.models, &selector).unwrap_or(selector));
                     }
                     terminal = !busy;
-                    update = if changed { TabUpdate::Full } else { TabUpdate::None };
+                    update = if changed {
+                        TabUpdate::Full
+                    } else {
+                        TabUpdate::None
+                    };
                 }
                 None => {
                     terminal = true;
@@ -1071,7 +1190,9 @@ impl GuiSession {
         }
 
         if terminal && let Some(conn) = self.conns.get_mut(&event.tab_id) {
-            if !conn.observing { conn.task = None; }
+            if !conn.observing {
+                conn.task = None;
+            }
             conn.last_stream_render = None;
         }
 
@@ -1079,9 +1200,18 @@ impl GuiSession {
         // the terminal status is rendered.
         if terminal {
             self.refresh_usage(event.tab_id).await;
-            let session_id = self.workspace.tab(event.tab_id).and_then(|tab| tab.model.session_id.clone());
-            if !self.conns.get(&event.tab_id).is_some_and(|conn| conn.observing)
-                && let Some(session_id) = session_id { self.observe(event.tab_id, session_id, false).await?; }
+            let session_id = self
+                .workspace
+                .tab(event.tab_id)
+                .and_then(|tab| tab.model.session_id.clone());
+            if !self
+                .conns
+                .get(&event.tab_id)
+                .is_some_and(|conn| conn.observing)
+                && let Some(session_id) = session_id
+            {
+                self.observe(event.tab_id, session_id, false).await?;
+            }
         }
 
         let active = active_id == event.tab_id;
@@ -1176,7 +1306,9 @@ impl GuiSession {
             if let Some(client) = conn.client.take() {
                 client.close().await;
             }
-            if let Some(observer) = conn.observer.take() { observer.close().await; }
+            if let Some(observer) = conn.observer.take() {
+                observer.close().await;
+            }
         }
         self.admin.close().await;
     }
@@ -1211,9 +1343,10 @@ fn spawn_ask_forwarder(
 ) -> JoinHandle<()> {
     tokio::spawn(async move {
         while let Some(frame) = stream.next_frame().await {
-            let terminal = frame.as_ref().is_ok_and(|message| message.is_ask_terminal().is_some()
-                || matches!(message, ServerMessage::SessionSnapshot { busy: false, .. }))
-                || frame.is_err();
+            let terminal = frame.as_ref().is_ok_and(|message| {
+                message.is_ask_terminal().is_some()
+                    || matches!(message, ServerMessage::SessionSnapshot { busy: false, .. })
+            }) || frame.is_err();
             if tx
                 .send(TabEvent {
                     tab_id,
@@ -1223,7 +1356,9 @@ fn spawn_ask_forwarder(
             {
                 return; // event loop gone
             }
-            if terminal { return; }
+            if terminal {
+                return;
+            }
         }
         let _ = tx.send(TabEvent {
             tab_id,
@@ -1265,9 +1400,15 @@ mod tests {
 
     #[test]
     fn sanitize_upload_name_strips_components_and_rejects_dots() {
-        assert_eq!(sanitize_upload_name("notes.bin").as_deref(), Some("notes.bin"));
+        assert_eq!(
+            sanitize_upload_name("notes.bin").as_deref(),
+            Some("notes.bin")
+        );
         // Only the final component survives traversal attempts.
-        assert_eq!(sanitize_upload_name("../evil.txt").as_deref(), Some("evil.txt"));
+        assert_eq!(
+            sanitize_upload_name("../evil.txt").as_deref(),
+            Some("evil.txt")
+        );
         assert_eq!(
             sanitize_upload_name("some/dir/file.md").as_deref(),
             Some("file.md")

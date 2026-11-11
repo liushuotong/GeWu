@@ -77,7 +77,9 @@ fn validate_url(url: &Url) -> Result<(), String> {
         "http" | "https" => {}
         other => return Err(format!("unsupported URL scheme: {}", other)),
     }
-    let host = url.host_str().ok_or_else(|| "URL has no host".to_string())?;
+    let host = url
+        .host_str()
+        .ok_or_else(|| "URL has no host".to_string())?;
     if is_blocked_host(host) {
         return Err(format!(
             "access to internal host '{}' is blocked (private/link-local network)",
@@ -131,10 +133,7 @@ impl Tool for WebFetchTool {
 
         // Upgrade plain http to https for public hosts; keep http for
         // loopback so local development servers keep working.
-        let loopback = parsed
-            .host_str()
-            .map(is_loopback_host)
-            .unwrap_or(false);
+        let loopback = parsed.host_str().map(is_loopback_host).unwrap_or(false);
         let url = if parsed.scheme() == "http" && !loopback {
             parsed.to_string().replacen("http://", "https://", 1)
         } else {
@@ -169,10 +168,7 @@ impl Tool for WebFetchTool {
 
         let output = match input.format.as_str() {
             "html" => html,
-            _ => {
-                
-                html2md::parse_html(&html)
-            }
+            _ => html2md::parse_html(&html),
         };
 
         Ok(ToolResult::new("webfetch", output))

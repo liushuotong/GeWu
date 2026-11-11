@@ -33,6 +33,9 @@ pub struct Tab {
     pub cache: Option<TokenUsage>,
     /// Tool runs the user expanded (keyed by the run's first block index).
     pub expanded_groups: HashSet<usize>,
+    /// Workflow tool runs the user collapsed; workflow runs default to
+    /// expanded, so collapse is the explicit state worth remembering.
+    pub collapsed_groups: HashSet<usize>,
     /// Tool calls whose full output the user expanded (block index).
     pub expanded_outputs: HashSet<usize>,
     /// Thought blocks whose reasoning text the user expanded (block index).
@@ -50,6 +53,7 @@ impl Tab {
             context: None,
             cache: None,
             expanded_groups: HashSet::new(),
+            collapsed_groups: HashSet::new(),
             expanded_outputs: HashSet::new(),
             expanded_thoughts: HashSet::new(),
         }

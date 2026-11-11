@@ -55,7 +55,10 @@ pub(crate) fn rate_limit_error(
     body: &str,
 ) -> AnthropicError {
     let message = crate::http::rate_limit_message(body);
-    AnthropicError::RateLimit { message, retry_after }
+    AnthropicError::RateLimit {
+        message,
+        retry_after,
+    }
 }
 
 /// Configuration for the Anthropic API client.
@@ -153,8 +156,13 @@ pub struct AssistantMessage {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum ContentBlock {
-    Thinking { thinking: String, signature: String },
-    RedactedThinking { data: String },
+    Thinking {
+        thinking: String,
+        signature: String,
+    },
+    RedactedThinking {
+        data: String,
+    },
     Text {
         text: String,
     },
@@ -331,7 +339,10 @@ where
             // Terminal marker events carry no data payload.
             "content_block_stop" => Some(Ok(AnthropicChunk::ContentBlockStop(()))),
             "message_stop" => Some(Ok(AnthropicChunk::MessageStop)),
-            "message_start" | "content_block_start" | "content_block_delta" | "message_delta"
+            "message_start"
+            | "content_block_start"
+            | "content_block_delta"
+            | "message_delta"
             | "error" => {
                 if data.is_empty() {
                     return None;
@@ -345,9 +356,7 @@ where
                         .map(AnthropicChunk::ContentBlockDelta),
                     "message_delta" => serde_json::from_str::<MessageDeltaChunk>(&data)
                         .map(AnthropicChunk::MessageDelta),
-                    "error" => {
-                        serde_json::from_str::<ErrorChunk>(&data).map(AnthropicChunk::Error)
-                    }
+                    "error" => serde_json::from_str::<ErrorChunk>(&data).map(AnthropicChunk::Error),
                     _ => unreachable!("event type filtered above"),
                 };
                 match parsed {
@@ -471,7 +480,9 @@ pub enum ContentBlockStart {
         thinking: String,
         signature: String,
     },
-    RedactedThinking { data: String },
+    RedactedThinking {
+        data: String,
+    },
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -486,17 +497,11 @@ pub enum ContentDelta {
     #[serde(rename = "signature_delta")]
     Signature { signature: String },
     #[serde(rename = "text_delta")]
-    Text {
-        text: String,
-    },
+    Text { text: String },
     #[serde(rename = "input_json_delta")]
-    InputJson {
-        partial_json: String,
-    },
+    InputJson { partial_json: String },
     #[serde(rename = "thinking_delta")]
-    Thinking {
-        thinking: String,
-    },
+    Thinking { thinking: String },
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -666,10 +671,7 @@ mod tests {
 
     #[tokio::test]
     async fn data_field_without_space_is_accepted() {
-        let sse = concat!(
-            "event:content_block_stop\n",
-            "event: message_stop\n",
-        );
+        let sse = concat!("event:content_block_stop\n", "event: message_stop\n",);
         let events = collect(vec![Bytes::from_static(sse.as_bytes())]).await;
         assert_eq!(events.len(), 2);
         assert!(matches!(events[0], AnthropicChunk::ContentBlockStop(())));

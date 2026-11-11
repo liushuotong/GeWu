@@ -103,10 +103,7 @@ fn truncate_line(text: &str) -> String {
 
 /// Whether the collection cap is reached, signaling the walker to quit.
 fn cap_reached(matches: &Arc<Mutex<Vec<Match>>>, limit: usize) -> bool {
-    matches
-        .lock()
-        .map(|m| m.len() > limit)
-        .unwrap_or(false)
+    matches.lock().map(|m| m.len() > limit).unwrap_or(false)
 }
 
 #[async_trait]
@@ -207,12 +204,7 @@ fn search_single_file(
 }
 
 /// Formats collected matches, grouped by file, as opencode's GrepTool does.
-fn format_matches(
-    matches_guard: &[Match],
-    total: usize,
-    truncated: bool,
-    limit: usize,
-) -> String {
+fn format_matches(matches_guard: &[Match], total: usize, truncated: bool, limit: usize) -> String {
     let mut output = format!(
         "Found {} matches{}",
         total,
@@ -274,7 +266,11 @@ fn run_search(
         } else {
             let total = sorted.len();
             let truncated = total > limit;
-            Ok((format_matches(&sorted, total, truncated, limit), total, truncated))
+            Ok((
+                format_matches(&sorted, total, truncated, limit),
+                total,
+                truncated,
+            ))
         };
     }
 
@@ -451,7 +447,11 @@ mod tests {
 
         assert!(result.truncated);
         assert_eq!(result.metadata.get("matches"), Some(&serde_json::json!(3)));
-        assert!(result.output.contains("Found 3 matches (more matches available)"));
+        assert!(
+            result
+                .output
+                .contains("Found 3 matches (more matches available)")
+        );
         assert_eq!(result.output.matches("  Line ").count(), 2);
         Ok(())
     }

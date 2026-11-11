@@ -137,9 +137,10 @@ impl Tool for ReadFileTool {
     ) -> Result<ToolResult, Box<dyn Error + Send + Sync>> {
         let input: ReadArgs = serde_json::from_value(args).map_err(into_tool_error)?;
 
-        let file_path = resolve_read_path(&self.working_directory, &input.file_path, ctx.enforcement)
-            .await
-            .map_err(into_tool_error)?;
+        let file_path =
+            resolve_read_path(&self.working_directory, &input.file_path, ctx.enforcement)
+                .await
+                .map_err(into_tool_error)?;
 
         let metadata = tokio::fs::metadata(&file_path).await;
 
@@ -259,7 +260,9 @@ impl Tool for ReadFileTool {
                     "read_file",
                     format!(
                         "Cannot read file: {} is {} bytes, which exceeds the {} byte media read cap",
-                        input.file_path, meta.len(), MAX_MEDIA_BYTES
+                        input.file_path,
+                        meta.len(),
+                        MAX_MEDIA_BYTES
                     ),
                 ));
             }
@@ -527,21 +530,20 @@ impl Tool for GlobTool {
         );
         let workdir = self.working_directory.clone();
         let contain = ctx.enforcement != gewu_core::types::PathEnforcement::None;
-        let matches =
-            tokio::task::spawn_blocking(move || {
-                let mut matches = glob_with_gitignore(&search_dir, &pattern, hidden, limit)?;
-                if contain {
-                    // The walker follows symlinks, so drop entries that
-                    // resolve (lexically) outside the working directory.
-                    matches.entries.retain(|(path, _)| {
-                        crate::fs_utils::normalize_path(path).starts_with(&workdir)
-                    });
-                }
-                Ok::<_, anyhow::Error>(matches)
-            })
-            .await
-            .map_err(into_tool_error)?
-            .map_err(into_tool_error)?;
+        let matches = tokio::task::spawn_blocking(move || {
+            let mut matches = glob_with_gitignore(&search_dir, &pattern, hidden, limit)?;
+            if contain {
+                // The walker follows symlinks, so drop entries that
+                // resolve (lexically) outside the working directory.
+                matches.entries.retain(|(path, _)| {
+                    crate::fs_utils::normalize_path(path).starts_with(&workdir)
+                });
+            }
+            Ok::<_, anyhow::Error>(matches)
+        })
+        .await
+        .map_err(into_tool_error)?
+        .map_err(into_tool_error)?;
 
         let truncated = matches.truncated;
         let count = matches.entries.len();
@@ -665,8 +667,13 @@ mod tests {
         assert!(!result.truncated);
         let lines: Vec<&str> = result.output.lines().collect();
         assert_eq!(lines.len(), 2);
-        assert!(lines[0].ends_with("a.txt"), "{}", result.output);
-        assert!(lines[1].ends_with("b.txt"), "{}", result.output);
+        // Walker order is filesystem-dependent; only membership is stable.
+        let names: Vec<&str> = lines
+            .iter()
+            .map(|line| line.rsplit('/').next().expect("non-empty path"))
+            .collect();
+        assert!(names.contains(&"a.txt"), "{}", result.output);
+        assert!(names.contains(&"b.txt"), "{}", result.output);
         Ok(())
     }
 
@@ -782,7 +789,10 @@ mod tests {
         assert_eq!(result.metadata.get("count"), Some(&serde_json::json!(1)));
 
         let result = tool
-            .execute(serde_json::json!({ "pattern": "*.txt", "hidden": true }), &ctx)
+            .execute(
+                serde_json::json!({ "pattern": "*.txt", "hidden": true }),
+                &ctx,
+            )
             .await
             .map_err(|e| anyhow::anyhow!(e.to_string()))?;
         assert!(result.output.contains(".hidden.txt"));
@@ -867,7 +877,11 @@ mod tests {
             )
             .await
             .map_err(|e| anyhow::anyhow!(e.to_string()))?;
-        assert!(result.output.contains("outside content"), "{}", result.output);
+        assert!(
+            result.output.contains("outside content"),
+            "{}",
+            result.output
+        );
 
         // With containment on, the same request is rejected.
         let ctx = ToolContext::new("test", "msg").with_enforcement(PathEnforcement::Contain);

@@ -42,7 +42,7 @@ use futures::StreamExt;
 use futures::stream::BoxStream;
 use gewu_core::traits::{LlmProvider, StatusSink, Tool};
 use gewu_core::types::{
-    Capabilities, ContentPart, Message, ProviderEvent, TokenUsage, ReasoningReplay,
+    Capabilities, ContentPart, Message, ProviderEvent, ReasoningReplay, TokenUsage,
 };
 use serde_json::Value;
 use std::error::Error;
@@ -159,7 +159,12 @@ impl OpenAIProvider {
         self.max_tokens = limit;
         self
     }
-    pub(crate) fn for_service(api_key: &str, base_url: &str, model: &str, policy: crate::services::ChatPolicy) -> Self {
+    pub(crate) fn for_service(
+        api_key: &str,
+        base_url: &str,
+        model: &str,
+        policy: crate::services::ChatPolicy,
+    ) -> Self {
         let mut provider = Self::new_with_endpoint(api_key, base_url, model);
         provider.reasoning_field = Some(policy.reasoning_field.to_string());
         provider
@@ -268,23 +273,20 @@ impl OpenAIProvider {
         part: &ContentPart,
     ) -> Option<ChatCompletionRequestUserMessageContentPart> {
         match part {
-            ContentPart::Text { text } | ContentPart::Reminder { text } => Some(
-                ChatCompletionRequestUserMessageContentPart::Text(
+            ContentPart::Text { text } | ContentPart::Reminder { text } => {
+                Some(ChatCompletionRequestUserMessageContentPart::Text(
                     ChatCompletionRequestMessageContentPartText {
                         content_type: "text".to_string(),
                         text: text.clone(),
                     },
-                ),
-            ),
+                ))
+            }
             ContentPart::Image { data, mime_type } => {
                 let url = format!("data:{};base64,{}", mime_type, data);
                 Some(ChatCompletionRequestUserMessageContentPart::ImageUrl(
                     ChatCompletionRequestMessageContentPartImage {
                         content_type: "image_url".to_string(),
-                        image_url: ImageUrl {
-                            url,
-                            detail: None,
-                        },
+                        image_url: ImageUrl { url, detail: None },
                     },
                 ))
             }
@@ -343,7 +345,8 @@ impl OpenAIProvider {
     ) -> Result<Vec<ChatCompletionRequestMessage>, Box<dyn Error + Send + Sync>> {
         match msg {
             Message::Compaction { summary, recent } => self.convert_message(
-                &gewu_core::compaction::build_checkpoint_message(summary, recent)),
+                &gewu_core::compaction::build_checkpoint_message(summary, recent),
+            ),
             Message::System { content } => {
                 let m = ChatCompletionRequestSystemMessageArgs::default()
                     .content(content.clone())
@@ -369,9 +372,13 @@ impl OpenAIProvider {
                 tool_calls,
             } => {
                 let origin = format!("chat:{}", self.base_url);
-                let compatible = replay.as_ref().filter(|r| r.origin == origin && r.model == self.model);
+                let compatible = replay
+                    .as_ref()
+                    .filter(|r| r.origin == origin && r.model == self.model);
                 let mut reasoning_fields = std::collections::BTreeMap::new();
-                let field = self.reasoning_field.as_deref()
+                let field = self
+                    .reasoning_field
+                    .as_deref()
                     .or_else(|| compatible.and_then(|r| r.field.as_deref()))
                     .unwrap_or("reasoning_content");
                 if ["role", "content", "refusal", "tool_calls"].contains(&field) {
@@ -381,9 +388,15 @@ impl OpenAIProvider {
                     reasoning_fields.insert(field.to_string(), text.clone());
                 }
                 let content = if compatible.is_none() {
-                    [reasoning.as_deref(), content.as_deref()].into_iter().flatten()
-                        .filter(|text| !text.is_empty()).collect::<Vec<_>>().join("\n\n")
-                } else { content.clone().unwrap_or_default() };
+                    [reasoning.as_deref(), content.as_deref()]
+                        .into_iter()
+                        .flatten()
+                        .filter(|text| !text.is_empty())
+                        .collect::<Vec<_>>()
+                        .join("\n\n")
+                } else {
+                    content.clone().unwrap_or_default()
+                };
                 let openai_calls = tool_calls.clone().map(|calls| {
                     calls
                         .iter()
@@ -528,10 +541,13 @@ impl OpenAIProvider {
             if matches!(msg, Message::Tool { .. }) {
                 let mut converted = self.convert_message(msg)?;
                 openai_messages.append(&mut converted);
-                if let Message::Tool { tool_name, media, .. } = msg
-                    && !media.is_empty() {
-                        pending_media.push((tool_name.clone(), media.clone()));
-                    }
+                if let Message::Tool {
+                    tool_name, media, ..
+                } = msg
+                    && !media.is_empty()
+                {
+                    pending_media.push((tool_name.clone(), media.clone()));
+                }
             } else {
                 self.flush_pending_media(&mut openai_messages, &mut pending_media);
                 let mut converted = self.convert_message(msg)?;
@@ -615,37 +631,43 @@ impl ToolCallAggregator {
         let state = &mut self.states[index];
 
         if let Some(id) = &chunk.id
-            && !id.is_empty() {
-                state.id = Some(id.clone());
-            }
+            && !id.is_empty()
+        {
+            state.id = Some(id.clone());
+        }
 
         if let Some(function) = &chunk.function {
             if let Some(name) = &function.name
-                && !name.is_empty() {
-                    state.name = Some(name.clone());
-                }
+                && !name.is_empty()
+            {
+                state.name = Some(name.clone());
+            }
 
             if let Some(args) = &function.arguments
-                && !args.is_empty() && !state.finalized {
-                    state.argument_buffer.push_str(args);
-                    Self::update_finalized_flag(state);
-                    if state.started
-                        && let Some(id) = state.id.clone() {
-                            Self::emit_pending_arguments(state, &id, &mut events);
-                        }
+                && !args.is_empty()
+                && !state.finalized
+            {
+                state.argument_buffer.push_str(args);
+                Self::update_finalized_flag(state);
+                if state.started
+                    && let Some(id) = state.id.clone()
+                {
+                    Self::emit_pending_arguments(state, &id, &mut events);
                 }
+            }
         }
 
         if !state.started
-            && let (Some(id), Some(name)) = (state.id.clone(), state.name.clone()) {
-                events.push(ProviderEvent::ToolCallStart {
-                    id: id.clone(),
-                    name,
-                });
-                state.started = true;
+            && let (Some(id), Some(name)) = (state.id.clone(), state.name.clone())
+        {
+            events.push(ProviderEvent::ToolCallStart {
+                id: id.clone(),
+                name,
+            });
+            state.started = true;
 
-                Self::emit_pending_arguments(state, &id, &mut events);
-            }
+            Self::emit_pending_arguments(state, &id, &mut events);
+        }
 
         events
     }
@@ -818,9 +840,9 @@ impl LlmProvider for OpenAIProvider {
                 // Transport-level failures retry with the backoff sequence.
                 OpenAIError::Http(_) => crate::http::RetryDecision::Yes { after: None },
                 // Rate limits honor the provider's suggested wait, capped.
-                OpenAIError::RateLimit { retry_after, .. } => {
-                    crate::http::RetryDecision::Yes { after: *retry_after }
-                }
+                OpenAIError::RateLimit { retry_after, .. } => crate::http::RetryDecision::Yes {
+                    after: *retry_after,
+                },
                 _ => crate::http::RetryDecision::No,
             },
             status_sink.as_ref(),
@@ -1070,7 +1092,8 @@ impl AnthropicProvider {
     ) -> Result<Vec<AnthropicMessage>, Box<dyn Error + Send + Sync>> {
         match msg {
             Message::Compaction { summary, recent } => self.convert_message(
-                &gewu_core::compaction::build_checkpoint_message(summary, recent)),
+                &gewu_core::compaction::build_checkpoint_message(summary, recent),
+            ),
             Message::System { content: _ } => Ok(vec![]),
             Message::User { content } => {
                 let blocks: Vec<ContentBlock> = content
@@ -1087,26 +1110,45 @@ impl AnthropicProvider {
                 replay,
                 tool_calls,
             } => {
-                let origin = format!("anthropic:{}", self.client.config.base_url.trim_end_matches('/'));
-                if let Some(replay) = replay.as_ref().filter(|r| r.origin == origin && r.model == self.model) {
-                    let blocks: Vec<ContentBlock> = replay.blocks.iter().cloned()
-                        .map(serde_json::from_value).collect::<Result<_, _>>()?;
+                let origin = format!(
+                    "anthropic:{}",
+                    self.client.config.base_url.trim_end_matches('/')
+                );
+                if let Some(replay) = replay
+                    .as_ref()
+                    .filter(|r| r.origin == origin && r.model == self.model)
+                {
+                    let blocks: Vec<ContentBlock> = replay
+                        .blocks
+                        .iter()
+                        .cloned()
+                        .map(serde_json::from_value)
+                        .collect::<Result<_, _>>()?;
                     for block in &blocks {
                         if let ContentBlock::Thinking { signature, .. } = block
-                            && signature.is_empty() {
-                                return Err("cannot replay incomplete Anthropic thinking: missing signature".into());
-                            }
+                            && signature.is_empty()
+                        {
+                            return Err(
+                                "cannot replay incomplete Anthropic thinking: missing signature"
+                                    .into(),
+                            );
+                        }
                     }
-                    return Ok(vec![AnthropicMessage::Assistant(AnthropicAssistantMessage { content: Some(blocks) })]);
+                    return Ok(vec![AnthropicMessage::Assistant(
+                        AnthropicAssistantMessage {
+                            content: Some(blocks),
+                        },
+                    )]);
                 }
                 let mut blocks: Vec<ContentBlock> = Vec::new();
                 if let Some(text) = reasoning.as_ref().filter(|text| !text.is_empty()) {
                     blocks.push(ContentBlock::Text { text: text.clone() });
                 }
                 if let Some(text) = content
-                    && !text.is_empty() {
-                        blocks.push(ContentBlock::Text { text: text.clone() });
-                    }
+                    && !text.is_empty()
+                {
+                    blocks.push(ContentBlock::Text { text: text.clone() });
+                }
                 if let Some(calls) = tool_calls {
                     for call in calls {
                         // An empty arguments string (e.g. a no-argument tool
@@ -1206,7 +1248,10 @@ impl AnthropicProvider {
         let anthropic_tools = self.convert_tools(tools)?;
 
         Ok(CreateMessageRequest {
-            output_config: self.reasoning_effort.as_ref().map(|effort| serde_json::json!({"effort": effort})),
+            output_config: self
+                .reasoning_effort
+                .as_ref()
+                .map(|effort| serde_json::json!({"effort": effort})),
             model: self.model.clone(),
             messages: anthropic_messages,
             system: if system_prompt.is_empty() {
@@ -1254,18 +1299,19 @@ impl AnthropicToolCallAggregator {
                 // no `input_json_delta` fragments afterwards. Seed the buffer
                 // so the arguments reach the agent instead of ending up empty.
                 if let Some(input) = input
-                    && input.as_object().map(|o| !o.is_empty()).unwrap_or(false) {
-                        state.argument_buffer = input.to_string();
-                        let new_len = state.argument_buffer.len();
-                        let delta = state.argument_buffer[state.sent_len..new_len].to_string();
-                        state.sent_len = new_len;
-                        if !delta.is_empty() {
-                            events.push(ProviderEvent::ToolCallDelta {
-                                id: id.clone(),
-                                delta,
-                            });
-                        }
+                    && input.as_object().map(|o| !o.is_empty()).unwrap_or(false)
+                {
+                    state.argument_buffer = input.to_string();
+                    let new_len = state.argument_buffer.len();
+                    let delta = state.argument_buffer[state.sent_len..new_len].to_string();
+                    state.sent_len = new_len;
+                    if !delta.is_empty() {
+                        events.push(ProviderEvent::ToolCallDelta {
+                            id: id.clone(),
+                            delta,
+                        });
                     }
+                }
             }
             ContentBlockStart::Thinking { thinking, .. } => {
                 if !thinking.is_empty() {
@@ -1332,7 +1378,10 @@ impl AnthropicProvider {
         stream: AnthropicStream,
     ) -> futures::stream::BoxStream<'static, Result<ProviderEvent, Box<dyn Error + Send + Sync>>>
     {
-        let origin = format!("anthropic:{}", self.client.config.base_url.trim_end_matches('/'));
+        let origin = format!(
+            "anthropic:{}",
+            self.client.config.base_url.trim_end_matches('/')
+        );
         let model = self.model.clone();
         let s = async_stream::try_stream! {
             let mut tool_aggregator = AnthropicToolCallAggregator::default();
@@ -1519,9 +1568,9 @@ impl LlmProvider for AnthropicProvider {
                 // Transport-level failures retry with the backoff sequence.
                 AnthropicError::Http(_) => crate::http::RetryDecision::Yes { after: None },
                 // Rate limits honor the provider's suggested wait, capped.
-                AnthropicError::RateLimit { retry_after, .. } => {
-                    crate::http::RetryDecision::Yes { after: *retry_after }
-                }
+                AnthropicError::RateLimit { retry_after, .. } => crate::http::RetryDecision::Yes {
+                    after: *retry_after,
+                },
                 _ => crate::http::RetryDecision::No,
             },
             status_sink.as_ref(),
@@ -1557,8 +1606,14 @@ mod tests {
             "data: {\"id\":\"1\",\"choices\":[{\"index\":0,\"delta\":{\"reasoning_text\":\"tools\"}}]}\n\n",
             "data: [DONE]\n\n"
         );
-        let addr = serve_canned(vec![http_response("HTTP/1.1 200 OK", &[("Content-Type", "text/event-stream")], body)]).await;
-        let provider = OpenAIProvider::new_with_endpoint("key", &format!("http://{addr}/v1"), "reasoner");
+        let addr = serve_canned(vec![http_response(
+            "HTTP/1.1 200 OK",
+            &[("Content-Type", "text/event-stream")],
+            body,
+        )])
+        .await;
+        let provider =
+            OpenAIProvider::new_with_endpoint("key", &format!("http://{addr}/v1"), "reasoner");
         let mut stream = provider.stream_response(&[], &[], None).await.unwrap();
         let mut text = String::new();
         let mut replay = None;
@@ -1569,16 +1624,42 @@ mod tests {
                 _ => {}
             }
         }
-        let message = Message::Assistant { content: None, reasoning: Some(text), replay, tool_calls: Some(vec![gewu_core::types::ToolCall {
-            id: "call-1".into(), r#type: "function".into(),
-            function: gewu_core::types::FunctionCall { name: "read".into(), arguments: "{}".into() },
-        }]) };
-        let restored: Message = serde_json::from_str(&serde_json::to_string(&message).unwrap()).unwrap();
+        let message = Message::Assistant {
+            content: None,
+            reasoning: Some(text),
+            replay,
+            tool_calls: Some(vec![gewu_core::types::ToolCall {
+                id: "call-1".into(),
+                r#type: "function".into(),
+                function: gewu_core::types::FunctionCall {
+                    name: "read".into(),
+                    arguments: "{}".into(),
+                },
+            }]),
+        };
+        let restored: Message =
+            serde_json::from_str(&serde_json::to_string(&message).unwrap()).unwrap();
         let wire = serde_json::to_value(provider.convert_message(&restored).unwrap()).unwrap();
         assert_eq!(wire[0]["reasoning_text"], "consider tools");
-        let request = provider.build(&[restored.clone(), Message::Tool {
-            tool_call_id: "call-1".into(), tool_name: Some("read".into()), content: "result".into(), media: vec![],
-        }, Message::User { content: vec![ContentPart::Text { text: "continue".into() }] }], &[]).unwrap();
+        let request = provider
+            .build(
+                &[
+                    restored.clone(),
+                    Message::Tool {
+                        tool_call_id: "call-1".into(),
+                        tool_name: Some("read".into()),
+                        content: "result".into(),
+                        media: vec![],
+                    },
+                    Message::User {
+                        content: vec![ContentPart::Text {
+                            text: "continue".into(),
+                        }],
+                    },
+                ],
+                &[],
+            )
+            .unwrap();
         assert_eq!(request["messages"][0]["reasoning_text"], "consider tools");
         assert_eq!(request["messages"][1]["role"], "tool");
         assert_eq!(request["messages"][2]["role"], "user");
@@ -1586,13 +1667,21 @@ mod tests {
         let wire = serde_json::to_value(other.convert_message(&restored).unwrap()).unwrap();
         assert!(wire[0].get("reasoning_text").is_none());
         let required = crate::GlmProvider::new("key", "other-model");
-        let wire = required.build(std::slice::from_ref(&restored), &[]).unwrap();
+        let wire = required
+            .build(std::slice::from_ref(&restored), &[])
+            .unwrap();
         assert!(wire["messages"][0].get("reasoning").is_none());
         drop(stream);
-        let custom = crate::DeepSeekProvider::new_with_endpoint("key", &provider.base_url, "reasoner");
+        let custom =
+            crate::DeepSeekProvider::new_with_endpoint("key", &provider.base_url, "reasoner");
         let wire = custom.build(std::slice::from_ref(&restored), &[]).unwrap();
         assert_eq!(wire["messages"][0]["reasoning_content"], "consider tools");
-        let plain = Message::Assistant { content: Some("plain".into()), reasoning: None, replay: None, tool_calls: None };
+        let plain = Message::Assistant {
+            content: Some("plain".into()),
+            reasoning: None,
+            replay: None,
+            tool_calls: None,
+        };
         let wire = custom.build(&[plain], &[]).unwrap();
         assert!(wire["messages"][0].get("reasoning_content").is_none());
     }
@@ -1610,16 +1699,33 @@ mod tests {
             serde_json::json!({"type":"content_block_start", "index":4,"content_block":{"type":"thinking","thinking":"again", "signature":"second-signature"}}),
             serde_json::json!({"type":"message_delta","delta":{"stop_reason":"tool_use"},"usage":{"output_tokens":10}}),
         ];
-        let body = events.iter().map(|e| format!("event: {}\ndata: {e}\n\n", e["type"].as_str().unwrap())).collect::<String>();
-        let addr = serve_canned(vec![http_response("HTTP/1.1 200 OK", &[("Content-Type", "text/event-stream")], &body)]).await;
-        let provider = AnthropicProvider::new_with_endpoint("key", &format!("http://{addr}"), "claude-test");
+        let body = events
+            .iter()
+            .map(|e| format!("event: {}\ndata: {e}\n\n", e["type"].as_str().unwrap()))
+            .collect::<String>();
+        let addr = serve_canned(vec![http_response(
+            "HTTP/1.1 200 OK",
+            &[("Content-Type", "text/event-stream")],
+            &body,
+        )])
+        .await;
+        let provider =
+            AnthropicProvider::new_with_endpoint("key", &format!("http://{addr}"), "claude-test");
         let mut stream = provider.stream_response(&[], &[], None).await.unwrap();
         let mut replay = None;
         while let Some(event) = stream.next().await {
-            if let ProviderEvent::ReasoningReplay { replay: state } = event.unwrap() { replay = Some(state); }
+            if let ProviderEvent::ReasoningReplay { replay: state } = event.unwrap() {
+                replay = Some(state);
+            }
         }
-        let message = Message::Assistant { content: Some("checking".into()), reasoning: Some("consider".into()), replay, tool_calls: None };
-        let restored: Message = serde_json::from_str(&serde_json::to_string(&message).unwrap()).unwrap();
+        let message = Message::Assistant {
+            content: Some("checking".into()),
+            reasoning: Some("consider".into()),
+            replay,
+            tool_calls: None,
+        };
+        let restored: Message =
+            serde_json::from_str(&serde_json::to_string(&message).unwrap()).unwrap();
         let wire = serde_json::to_value(provider.convert_message(&restored).unwrap()).unwrap();
         let blocks = &wire[0]["content"];
         assert_eq!(blocks[0]["signature"], "sig-123");
@@ -1629,13 +1735,31 @@ mod tests {
         assert_eq!(blocks[3]["input"]["path"], "a");
         assert_eq!(blocks[4]["thinking"], "again");
         assert_eq!(blocks[4]["signature"], "second-signature");
-        let request = provider.build(&[restored.clone(), Message::Tool {
-            tool_call_id: "call-1".into(), tool_name: Some("read".into()), content: "result".into(), media: vec![],
-        }], &[]).unwrap();
+        let request = provider
+            .build(
+                &[
+                    restored.clone(),
+                    Message::Tool {
+                        tool_call_id: "call-1".into(),
+                        tool_name: Some("read".into()),
+                        content: "result".into(),
+                        media: vec![],
+                    },
+                ],
+                &[],
+            )
+            .unwrap();
         assert_eq!(request["messages"][0]["content"][0]["signature"], "sig-123");
-        assert_eq!(request["messages"][1]["content"][0]["tool_use_id"], "call-1");
+        assert_eq!(
+            request["messages"][1]["content"][0]["tool_use_id"],
+            "call-1"
+        );
         let mut incomplete = restored.clone();
-        if let Message::Assistant { replay: Some(state), .. } = &mut incomplete {
+        if let Message::Assistant {
+            replay: Some(state),
+            ..
+        } = &mut incomplete
+        {
             state.blocks[0]["signature"] = serde_json::json!("");
         }
         assert!(provider.convert_message(&incomplete).is_err());
@@ -1721,7 +1845,10 @@ mod tests {
             .build_typed(&messages, &[])
             .expect("openai request builds");
         let wire = serde_json::to_string(&openai).unwrap();
-        assert!(wire.contains(reminder_text), "OpenAI wire lost the reminder");
+        assert!(
+            wire.contains(reminder_text),
+            "OpenAI wire lost the reminder"
+        );
 
         let anthropic = AnthropicProvider::new("test-key", "claude-3-5-sonnet")
             .build_typed(&messages, &[])
@@ -1729,9 +1856,11 @@ mod tests {
         let AnthropicMessage::User(UserMessage { content }) = &anthropic.messages[0] else {
             panic!("expected a user message");
         };
-        assert!(content.iter().any(
-            |block| matches!(block, ContentBlock::Text { text } if text == reminder_text)
-        ));
+        assert!(
+            content
+                .iter()
+                .any(|block| matches!(block, ContentBlock::Text { text } if text == reminder_text))
+        );
     }
 
     #[test]
@@ -2274,7 +2403,10 @@ mod tests {
         let result = provider
             .stream_response(&messages, &tools, Some(&buffer.handle()))
             .await;
-        assert!(result.is_ok(), "send should succeed against the canned server");
+        assert!(
+            result.is_ok(),
+            "send should succeed against the canned server"
+        );
 
         let entries = parse_log_entries(&buffer.contents());
         assert_eq!(entries.len(), 1);
@@ -2305,7 +2437,10 @@ mod tests {
         }];
 
         let result = provider.stream_response(&messages, &[], None).await;
-        assert!(result.is_ok(), "send should succeed against the canned server");
+        assert!(
+            result.is_ok(),
+            "send should succeed against the canned server"
+        );
     }
 
     #[test]
@@ -2408,7 +2543,9 @@ mod tests {
         let addr = listener.local_addr().unwrap();
         tokio::spawn(async move {
             for response in responses {
-                let Ok((mut socket, _)) = listener.accept().await else { break };
+                let Ok((mut socket, _)) = listener.accept().await else {
+                    break;
+                };
                 // Drain the request head and body so the reply is not reset.
                 let _ = tokio::time::timeout(std::time::Duration::from_secs(5), async {
                     let mut data = Vec::new();
@@ -2425,7 +2562,9 @@ mod tests {
                                     value.trim().parse::<usize>().ok()
                                 })
                                 .unwrap_or(0);
-                            if data.len() >= head_end + 4 + length { break; }
+                            if data.len() >= head_end + 4 + length {
+                                break;
+                            }
                         }
                         match socket.read(&mut chunk).await {
                             Ok(0) | Err(_) => break,
@@ -2454,14 +2593,21 @@ mod tests {
                 &[("Retry-After", "0")],
                 r#"{"error":{"message":"slow down","type":"new_api_error"}}"#,
             ),
-            http_response("HTTP/1.1 200 OK", &[("Content-Type", "text/event-stream")], sse),
+            http_response(
+                "HTTP/1.1 200 OK",
+                &[("Content-Type", "text/event-stream")],
+                sse,
+            ),
         ])
         .await;
-        let provider = OpenAIProvider::new_with_endpoint("test-key", &format!("http://{addr}"), "gpt-4o")
-            .with_retry_backoff(std::time::Duration::from_millis(1));
+        let provider =
+            OpenAIProvider::new_with_endpoint("test-key", &format!("http://{addr}"), "gpt-4o")
+                .with_retry_backoff(std::time::Duration::from_millis(1));
 
         let messages = vec![Message::User {
-            content: vec![ContentPart::Text { text: "hello".to_string() }],
+            content: vec![ContentPart::Text {
+                text: "hello".to_string(),
+            }],
         }];
         let events: Vec<_> = provider
             .stream_response(&messages, &[], None)
@@ -2489,17 +2635,24 @@ mod tests {
                 &[("Retry-After", "3600")],
                 NEW_API_429_BODY,
             ),
-            http_response("HTTP/1.1 200 OK", &[("Content-Type", "text/event-stream")], sse),
+            http_response(
+                "HTTP/1.1 200 OK",
+                &[("Content-Type", "text/event-stream")],
+                sse,
+            ),
         ])
         .await;
         // Tiny injected cap: the hour-long hint clamps to it instead of
         // stalling the test for minutes.
-        let provider = OpenAIProvider::new_with_endpoint("test-key", &format!("http://{addr}"), "gpt-4o")
-            .with_retry_backoff(std::time::Duration::from_millis(1))
-            .with_retry_max_wait(std::time::Duration::from_millis(1));
+        let provider =
+            OpenAIProvider::new_with_endpoint("test-key", &format!("http://{addr}"), "gpt-4o")
+                .with_retry_backoff(std::time::Duration::from_millis(1))
+                .with_retry_max_wait(std::time::Duration::from_millis(1));
 
         let messages = vec![Message::User {
-            content: vec![ContentPart::Text { text: "hello".to_string() }],
+            content: vec![ContentPart::Text {
+                text: "hello".to_string(),
+            }],
         }];
         let events: Vec<_> = provider
             .stream_response(&messages, &[], None)
@@ -2530,12 +2683,15 @@ mod tests {
             http_response("HTTP/1.1 200 OK", &[("Content-Type", "text/event-stream")], sse),
         ])
         .await;
-        let provider = AnthropicProvider::new_with_endpoint("test-key", &format!("http://{addr}"), "claude")
-            .with_retry_backoff(std::time::Duration::from_millis(1))
-            .with_retry_max_wait(std::time::Duration::from_millis(1));
+        let provider =
+            AnthropicProvider::new_with_endpoint("test-key", &format!("http://{addr}"), "claude")
+                .with_retry_backoff(std::time::Duration::from_millis(1))
+                .with_retry_max_wait(std::time::Duration::from_millis(1));
 
         let messages = vec![Message::User {
-            content: vec![ContentPart::Text { text: "hello".to_string() }],
+            content: vec![ContentPart::Text {
+                text: "hello".to_string(),
+            }],
         }];
         let events: Vec<ProviderEvent> = provider
             .stream_response(&messages, &[], None)

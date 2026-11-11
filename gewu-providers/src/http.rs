@@ -309,7 +309,9 @@ mod tests {
             },
             |e| {
                 if e.contains("rate limited") {
-                    RetryDecision::Yes { after: Some(Duration::from_millis(1)) }
+                    RetryDecision::Yes {
+                        after: Some(Duration::from_millis(1)),
+                    }
                 } else {
                     RetryDecision::No
                 }
@@ -342,7 +344,9 @@ mod tests {
             },
             |e| {
                 if e.contains("quota") {
-                    RetryDecision::Yes { after: Some(Duration::from_secs(3600)) }
+                    RetryDecision::Yes {
+                        after: Some(Duration::from_secs(3600)),
+                    }
                 } else {
                     RetryDecision::No
                 }
@@ -350,7 +354,11 @@ mod tests {
             None,
         )
         .await;
-        assert_eq!(result.unwrap(), 2, "a hint beyond the cap must clamp, not fail");
+        assert_eq!(
+            result.unwrap(),
+            2,
+            "a hint beyond the cap must clamp, not fail"
+        );
         assert_eq!(calls.load(Ordering::SeqCst), 2);
     }
 

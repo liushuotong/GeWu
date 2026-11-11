@@ -173,10 +173,16 @@ async fn test_agent_loop() {
     assert_eq!(metadata["kind"], serde_json::json!("mock"));
     assert_eq!(result, "Done: Tool output");
     drop(stream);
-    assert!(agent.memory.messages().iter().any(|message| matches!(message,
-        Message::Assistant { reasoning: Some(text), replay: Some(state), .. }
-        if text == "I should call the tool" && state == &replay
-    )));
+    assert!(
+        agent
+            .memory
+            .messages()
+            .iter()
+            .any(|message| matches!(message,
+                Message::Assistant { reasoning: Some(text), replay: Some(state), .. }
+                if text == "I should call the tool" && state == &replay
+            ))
+    );
 }
 
 #[tokio::test]
