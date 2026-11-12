@@ -36,8 +36,7 @@ pub(crate) const RETRY_BACKOFF: Duration = Duration::from_secs(1);
 /// indefinitely, but never sleep longer than this per attempt: a provider
 /// suggesting an hour-long `Retry-After` is retried every 5 minutes instead,
 /// and the backoff sequence clamps at the same ceiling. A turn stuck in this
-/// loop is still bounded from the outside by the turn runtime limit or an
-/// explicit interrupt.
+/// loop is still bounded by an explicit interrupt.
 pub(crate) const MAX_RETRY_WAIT: Duration = Duration::from_secs(300);
 
 /// Whether an error should be retried, and optionally how long to wait first.
@@ -127,8 +126,8 @@ where
 ///
 /// Waits follow the same policy as [`with_retries_capped`]: the provider's
 /// hint when present, else the exponential backoff sequence, both clamped to
-/// `max_wait`; retrying is unbounded and bounded externally by the turn
-/// runtime limit or an explicit interrupt.
+/// `max_wait`; retrying is unbounded and bounded externally by an explicit
+/// interrupt.
 pub(crate) fn retrying_stream<T, E, F, S>(
     mut make_stream: F,
     is_retryable: fn(&E) -> RetryDecision,

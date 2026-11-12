@@ -67,8 +67,10 @@ use tokio::sync::mpsc;
 use tracing::{info, trace, warn};
 use uuid::Uuid;
 
-use self::execution::{DoomLoopDetector, LlmResponseAggregator, execute_tool_call};
-use crate::agent::media::extract_media_parts;
+use self::execution::{
+    DoomLoopDetector, LlmResponseAggregator, ToolCallPlan, TurnDisposition, classify_turn,
+    execute_tool_call, normalize_tool_result, plan_tool_call, prepare_provider_messages,
+};
 
 /// Maximum number of tool calls from a single LLM turn that execute at the
 /// same time. Extra calls queue behind the semaphore until a slot frees up.
@@ -327,17 +329,7 @@ impl Agent {
                 turn += 1;
 
                 let mut aggregator = LlmResponseAggregator::new();
-                let mut messages = crate::compaction::active_context(self.memory.messages()).to_messages();
-                // Persisted history may belong to a different agent profile.
-                // Replace its base system prompt for this provider request,
-                // without rewriting conversation history.
-                if !self.system_prompt.is_empty() {
-                    if let Some(Message::System { content }) = messages.first_mut() {
-                        *content = self.system_prompt.clone();
-                    } else {
-                        messages.insert(0, Message::System { content: self.system_prompt.clone() });
-                    }
-                }
+                let messages = prepare_provider_messages(self.memory.messages(), &self.system_prompt);
                 trace!("LLM request messages: {:?}", messages);
                 let tools_clone = self.tools.clone();
 
@@ -385,7 +377,11 @@ impl Agent {
                     }
                 }
 
-                let (content, reasoning, tool_calls, replay) = aggregator.take_parts();
+                let aggregated = aggregator.take_parts();
+                let content = aggregated.content;
+                let reasoning = aggregated.reasoning;
+                let tool_calls = aggregated.tool_calls;
+                let replay = aggregated.replay;
 
                 // Reasoning models spend thinking tokens from the same
                 // `max_tokens` budget; when it runs out the turn can end with
@@ -410,11 +406,12 @@ impl Agent {
                     tool_calls: if tool_calls.is_empty() { None } else { Some(tool_calls.clone()) },
                 }).await;
 
-                if tool_calls.is_empty() {
+                let turn_disposition = classify_turn(&tool_calls, self.steering.is_pending());
+                if turn_disposition != TurnDisposition::Tools {
                     // A steer arriving while the model streams its final
                     // answer must still be answered in this run: continue
                     // instead of finishing. `max_turns` still bounds this.
-                    if self.steering.is_pending() {
+                    if turn_disposition == TurnDisposition::Steered {
                         continue;
                     }
                     // Report the running context estimate at the turn boundary
@@ -447,8 +444,9 @@ impl Agent {
                     let tool_name = call.function.name.clone();
                     let args = call.function.arguments.clone();
 
-                    if let Some(error) = doom_loop.check(&tool_name, &args) {
-                        yield AgentEvent::Error { error };
+                    let plan = plan_tool_call(call, &mut doom_loop);
+                    if let ToolCallPlan::Stop(ref error) = plan {
+                        yield AgentEvent::Error { error: error.clone() };
                         // Close out every announced call of this turn so the
                         // UI has no eternally "running" tool cards.
                         let not_executed = "Error: not executed because a doom loop was detected \
@@ -475,14 +473,9 @@ impl Agent {
                         }
                         return;
                     }
-                    doom_loop.record(tool_name.clone(), args.clone());
-
-                    if tool_name.is_empty() {
+                    if let ToolCallPlan::Reject(result) = plan {
                         yield AgentEvent::Error { error: "Tool name is empty, skipping execution".to_string() };
-                        results[index] = Some(Ok(ToolResult::new(
-                            tool_name.clone(),
-                            "Error: the tool call had an empty name and was not executed.",
-                        )));
+                        results[index] = Some(Ok(result));
                         continue;
                     }
 
@@ -536,49 +529,10 @@ impl Agent {
                 // conversation history stays deterministic regardless of
                 // completion order.
                 for (call, result) in tool_calls.iter().zip(results) {
-                    let tool_name = call.function.name.clone();
-                    let result = match result {
-                        Some(Ok(result)) => result,
-                        Some(Err(e)) => {
-                            yield AgentEvent::Error { error: e.to_string() };
-                            ToolResult::new(tool_name.clone(), format!("Error: {}", e))
-                        }
-                        // The call's task panicked or was lost; still answer
-                        // the tool_call so history stays consistent.
-                        None => ToolResult::new(
-                            tool_name.clone(),
-                            "Error: the tool call did not produce a result (execution task failed).",
-                        ),
-                    };
-
-                    yield AgentEvent::ToolFinish {
-                        tool: tool_name.clone(),
-                        title: result.title.clone(),
-                        output: result.output.clone(),
-                        metadata: result.metadata.clone(),
-                    };
-
-                    let media_parts = extract_media_parts(&result.output);
-                    // The media payload is forwarded via `media` parts; keep
-                    // only a short text reference in the tool-message content
-                    // so the base64 blob is not sent to the provider twice
-                    // (and not counted twice by the token estimator).
-                    let content = if media_parts.is_empty() {
-                        result.output
-                    } else {
-                        match media_parts.iter().find(|p| {
-                            matches!(p, ContentPart::Text { .. })
-                        }) {
-                            Some(ContentPart::Text { text }) => text.clone(),
-                            _ => "[media attached]".to_string(),
-                        }
-                    };
-                    self.memory.add_message(Message::Tool {
-                        tool_call_id: call.id.clone(),
-                        tool_name: Some(tool_name),
-                        content,
-                        media: media_parts,
-                    }).await;
+                    let normalized = normalize_tool_result(call, result);
+                    if let Some(error) = normalized.error { yield error; }
+                    yield normalized.finish;
+                    self.memory.add_message(normalized.message).await;
                 }
 
                 // Report usage AFTER the tool results are in history: the

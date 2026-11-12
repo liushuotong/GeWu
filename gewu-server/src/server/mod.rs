@@ -1492,9 +1492,6 @@ async fn start_session_turn(
         let failure = tokio::select! {
             result = &mut worker => result.err().map(|e| format!("turn task failed: {e}")),
             _ = &mut cancelled => { worker.abort(); let _ = worker.await; Some("interrupted".into()) },
-            _ = tokio::time::sleep(std::time::Duration::from_secs(3600)) => {
-                worker.abort(); let _ = worker.await; Some("turn exceeded the one-hour runtime limit".into())
-            }
         };
         {
             let mut agent = session.agent.lock().await;
