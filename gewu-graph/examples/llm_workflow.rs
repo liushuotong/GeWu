@@ -374,11 +374,9 @@ async fn main() -> Result<()> {
 
     let graph = build_graph();
 
-    let test_inputs = vec![
-        "How do I implement a binary search tree in Rust?",
+    let test_inputs = ["How do I implement a binary search tree in Rust?",
         "What is the capital of France?",
-        "Can you help me debug this code? I'm getting a segmentation fault.",
-    ];
+        "Can you help me debug this code? I'm getting a segmentation fault."];
 
     for (i, input) in test_inputs.iter().enumerate() {
         println!("========================================");

@@ -15,6 +15,86 @@ use std::{
 
 type Failure = Box<dyn Error + Send + Sync>;
 
+/// Whether a request- or stream-level failure may be retried from scratch.
+///
+/// Request-level failures arrive boxed [`crate::openai::OpenAIError`];
+/// stream-level ones carry [`crate::openai::OpenAIError::Stream`] built from
+/// the in-flight error event. Transport errors and rate limits (with their
+/// wait hints) retry; typed `Stream` errors retry only when marked
+/// transient; anything else — bad request, auth, unknown event shapes — is
+/// permanent. Raw mid-stream transport failures (boxed
+/// [`reqwest::Error`]) retry too: the retry layer only restarts while
+/// nothing was yielded, which keeps a restart duplication-free.
+fn classify_failure(error: &Failure) -> crate::http::RetryDecision {
+    if error.downcast_ref::<reqwest::Error>().is_some() {
+        return crate::http::RetryDecision::Yes { after: None };
+    }
+    match error.downcast_ref::<crate::openai::OpenAIError>() {
+        Some(crate::openai::OpenAIError::Http(_)) => crate::http::RetryDecision::Yes { after: None },
+        Some(crate::openai::OpenAIError::RateLimit { retry_after, .. }) => {
+            crate::http::RetryDecision::Yes {
+                after: *retry_after,
+            }
+        }
+        Some(crate::openai::OpenAIError::Stream {
+            transient: true,
+            retry_after,
+            ..
+        }) => crate::http::RetryDecision::Yes {
+            after: *retry_after,
+        },
+        _ => crate::http::RetryDecision::No,
+    }
+}
+
+/// Classifies an in-stream error event's payload.
+///
+/// Provider-side outages (`service_unavailable_error`, `server_error`,
+/// overloaded servers, in-stream rate limits) are marked transient so the
+/// retry layer waits out the suggested `Retry-After` — sent by gateways as
+/// embedded `retry-after` / `retry-after-ms` "headers" — and restarts the
+/// request. Everything else (invalid request, auth, context length) is
+/// permanent and surfaces to the user.
+fn stream_error(error: &Value) -> crate::openai::OpenAIError {
+    let kind = error["type"]
+        .as_str()
+        .or_else(|| error["code"].as_str())
+        .unwrap_or_default();
+    let message = error["message"].as_str().unwrap_or("unknown error");
+    let headers = &error["headers"];
+    let retry_after = headers["retry-after-ms"]
+        .as_u64()
+        .or_else(|| {
+            headers["retry-after-ms"]
+                .as_str()
+                .and_then(|value| value.trim().parse::<u64>().ok())
+        })
+        .map(Duration::from_millis)
+        .or_else(|| {
+            headers["retry-after"]
+                .as_u64()
+                .or_else(|| {
+                    headers["retry-after"]
+                        .as_str()
+                        .and_then(|value| value.trim().parse::<u64>().ok())
+                })
+                .map(Duration::from_secs)
+        });
+    let transient = matches!(
+        kind,
+        "service_unavailable_error"
+            | "server_error"
+            | "internal_server_error"
+            | "rate_limit_exceeded"
+            | "server_is_overloaded"
+    );
+    crate::openai::OpenAIError::Stream {
+        transient,
+        message: format!("{kind}: {message}"),
+        retry_after,
+    }
+}
+
 pub struct OpenAIProvider {
     client: reqwest::Client,
     api_key: String,
@@ -296,6 +376,73 @@ mod tests {
     }
 
     #[test]
+    fn stream_error_marks_provider_outages_transient_with_retry_hint() {
+        // A real-world overload payload, with the gateway's retry hint
+        // embedded as pseudo-headers inside the error event.
+        let error = json!({
+            "code": "server_is_overloaded",
+            "headers": {
+                "retry-after": "322",
+                "retry-after-ms": "322000",
+                "x-retry-metadata": "NO_MORE_RETRY"
+            },
+            "message": "Our servers are currently overloaded. Please try again later.",
+            "param": null,
+            "type": "service_unavailable_error"
+        });
+        let crate::openai::OpenAIError::Stream {
+            transient,
+            retry_after,
+            message,
+        } = &stream_error(&error)
+        else {
+            panic!("expected a typed stream error");
+        };
+        assert!(*transient);
+        assert_eq!(*retry_after, Some(Duration::from_secs(322)));
+        assert!(message.contains("service_unavailable_error"), "{message}");
+        assert!(message.contains("overloaded"), "{message}");
+    }
+
+    #[test]
+    fn stream_error_treats_request_faults_as_permanent() {
+        let error = json!({
+            "type": "invalid_request_error",
+            "code": "context_length_exceeded",
+            "message": "the context window is full"
+        });
+        let crate::openai::OpenAIError::Stream {
+            transient, retry_after, ..
+        } = &stream_error(&error)
+        else {
+            panic!("expected a typed stream error");
+        };
+        assert!(!*transient);
+        assert_eq!(*retry_after, None);
+    }
+
+    #[tokio::test]
+    async fn in_stream_error_events_surface_as_typed_failures() {
+        let source = futures::stream::iter(vec![Ok(bytes::Bytes::from_static(
+            b"data: {\"type\":\"error\",\"error\":{\"type\":\"service_unavailable_error\",\"code\":\"server_is_overloaded\",\"message\":\"overloaded\",\"headers\":{\"retry-after-ms\":322000}}}\n\n",
+        ))]);
+        let events = parse_stream(source, "origin".into(), "model".into())
+            .collect::<Vec<_>>()
+            .await;
+        let error = events.last().unwrap().as_ref().expect_err("an error event is a stream failure");
+        let crate::openai::OpenAIError::Stream {
+            transient, retry_after, ..
+        } = error
+            .downcast_ref::<crate::openai::OpenAIError>()
+            .expect("the failure carries the typed provider error")
+        else {
+            panic!("expected a typed stream error");
+        };
+        assert!(*transient);
+        assert_eq!(*retry_after, Some(Duration::from_secs(322)));
+    }
+
+    #[test]
     fn summary_defaults_and_effort_are_independent() {
         let default = OpenAIProvider::new("key", "gpt").build(&[], &[]).unwrap();
         assert_eq!(default["reasoning"], json!({"summary":"auto"}));
@@ -523,29 +670,34 @@ impl LlmProvider for OpenAIProvider {
             .lock()
             .expect("status sink lock poisoned")
             .clone();
-        let response = crate::http::with_retries_capped(
+        let origin = self.origin();
+        let model = self.model.clone();
+        // Every attempt (re)issues the whole request; stream-level failures
+        // restart too, as long as nothing has been yielded yet.
+        let request = Arc::new(request);
+        let make_stream = move || {
+            let request = Arc::clone(&request);
+            let origin = origin.clone();
+            let model = model.clone();
+            futures::stream::once(async move {
+                match self.request("/responses", Some(&request)).await {
+                    Ok(response) => parse_stream(response.bytes_stream(), origin, model),
+                    Err(error) => futures::stream::once(async move {
+                        Err(Box::new(error) as Failure)
+                    })
+                    .boxed(),
+                }
+            })
+            .flatten()
+            .boxed()
+        };
+        Ok(Box::pin(crate::http::retrying_stream(
+            make_stream,
+            classify_failure,
+            status,
             self.backoff,
             self.max_wait,
-            || self.request("/responses", Some(&request)),
-            |error| match error {
-                crate::openai::OpenAIError::Http(_) => {
-                    crate::http::RetryDecision::Yes { after: None }
-                }
-                crate::openai::OpenAIError::RateLimit { retry_after, .. } => {
-                    crate::http::RetryDecision::Yes {
-                        after: *retry_after,
-                    }
-                }
-                _ => crate::http::RetryDecision::No,
-            },
-            status.as_ref(),
-        )
-        .await?;
-        Ok(parse_stream(
-            response.bytes_stream(),
-            self.origin(),
-            self.model.clone(),
-        ))
+        )))
     }
 
     fn set_status_sink(&self, sink: Option<StatusSink>) {
@@ -788,9 +940,8 @@ impl ResponseState {
                 self.finished = true;
             }
             "error" | "response.failed" => {
-                return Err(format!(
-                    "Responses API error: {}",
-                    event.get("error").unwrap_or(&event["response"]["error"])
+                return Err(stream_error(
+                    event.get("error").unwrap_or(&event["response"]["error"]),
                 )
                 .into());
             }

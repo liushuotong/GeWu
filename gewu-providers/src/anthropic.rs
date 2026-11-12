@@ -14,6 +14,9 @@
 //!
 //! Some models support extended thinking via beta headers.
 
+/// Stream- and request-level failure type for the Anthropic provider.
+pub(crate) type Failure = Box<dyn std::error::Error + Send + Sync>;
+
 use bytes::Bytes;
 use futures::Stream;
 use reqwest::Client as HttpClient;
@@ -25,8 +28,7 @@ use thiserror::Error;
 
 /// Errors that can occur when interacting with the Anthropic API.
 #[derive(Error, Debug)]
-pub enum AnthropicError {
-    /// HTTP request failed (network error, timeout, etc.)
+pub enum AnthropicError {    /// HTTP request failed (network error, timeout, etc.)
     #[error("HTTP request failed: {0}")]
     Http(#[from] reqwest::Error),
     /// The provider rejected the request with a 429 rate limit. Carries the
@@ -40,6 +42,16 @@ pub enum AnthropicError {
     /// API returned an error response.
     #[error("API error: {0}")]
     Api(String),
+    /// An error event inside a streaming response. `transient` marks
+    /// provider-side outages (`overloaded_error`, `api_error`,
+    /// `rate_limit_error`, `timeout_error`) that a fresh request can
+    /// plausibly survive; anything else is permanent.
+    #[error("provider stream error: {message}")]
+    Stream {
+        transient: bool,
+        message: String,
+        retry_after: Option<std::time::Duration>,
+    },
     /// A known SSE event could not be parsed.
     #[error("SSE parse error: {0}")]
     SseParse(String),
@@ -544,8 +556,26 @@ pub struct ErrorChunk {
 #[derive(Debug, Clone, Deserialize)]
 pub struct ErrorDetail {
     #[serde(rename = "type")]
-    pub _error_type: String,
+    pub error_type: String,
     pub message: String,
+}
+
+/// Classifies an in-stream error event's payload.
+///
+/// Provider-side outages (`overloaded_error` — Anthropic's 529, `api_error`,
+/// in-stream rate limits, timeouts) are marked transient so the retry layer
+/// restarts the request after the backoff wait; everything else (invalid
+/// request, auth, permissions) is permanent and surfaces to the user.
+pub(crate) fn stream_error(detail: &ErrorDetail) -> AnthropicError {
+    let transient = matches!(
+        detail.error_type.as_str(),
+        "overloaded_error" | "api_error" | "rate_limit_error" | "timeout_error"
+    );
+    AnthropicError::Stream {
+        transient,
+        message: format!("{}: {}", detail.error_type, detail.message),
+        retry_after: None,
+    }
 }
 
 pub struct Models<'a> {

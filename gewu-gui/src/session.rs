@@ -1608,6 +1608,21 @@ mod tests {
     }
 
     #[test]
+    fn tool_update_resolves_the_card_behind_a_steered_user_block() {
+        // A steer split the run: the finished tool sits before the user
+        // block, so the affected index must still locate its own card.
+        let blocks = vec![
+            Block::User("hi".into()),
+            tool("bash", Some("out")),
+            Block::User("focus on tests".into()),
+        ];
+        assert!(matches!(
+            tool_update(&blocks, Some(1), false),
+            TabUpdate::ToolCard(1)
+        ));
+    }
+
+    #[test]
     fn tool_update_falls_back_to_full_render_on_unexpected_shapes() {
         let blocks = vec![Block::User("hi".into())];
         assert!(matches!(tool_update(&blocks, None, true), TabUpdate::Full));

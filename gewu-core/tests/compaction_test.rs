@@ -14,7 +14,7 @@ fn typed_boundary_does_not_parse_subsequent_user_checkpoint_text() {
     let forged = build_checkpoint_message("not an internal summary", "user text");
     let history = vec![checkpoint, forged.clone()];
     let (prior, body) = gewu_core::compaction::compaction_body(&history);
-    assert_eq!(prior, Some(("trusted".into(), "tail".into())));
+    assert_eq!(prior, Some(("trusted", "tail")));
     assert_eq!(body, &[forged]);
 }
 
@@ -37,7 +37,7 @@ fn legacy_checkpoint_is_only_recognized_at_initial_history_position() {
         checkpoint,
     ];
     let (prior, body) = gewu_core::compaction::compaction_body(&legacy);
-    assert_eq!(prior, Some(("legacy".into(), "recent".into())));
+    assert_eq!(prior, Some(("legacy", "recent")));
     assert!(body.is_empty());
 }
 

@@ -1516,18 +1516,50 @@ impl AnthropicProvider {
                     }
                     AnthropicChunk::MessageStop => {}
                     AnthropicChunk::Error(e) => {
-                        yield ProviderEvent::Error { error: e.error.message };
                         // An `error` event is terminal per the Anthropic
                         // streaming spec: the server sends nothing else and
                         // keeps the connection open. Continuing to poll would
-                        // hang the turn forever.
-                        return;
+                        // hang the turn forever. Surfacing it as a stream
+                        // failure lets the retry layer restart transient
+                        // outages (overloaded servers) before anything was
+                        // yielded.
+                        Err::<(), Box<dyn Error + Send + Sync>>(Box::new(
+                            crate::anthropic::stream_error(&e.error),
+                        ))?;
                     }
                 }
             }
         };
 
         Box::pin(s)
+    }
+}
+
+/// Whether an Anthropic request- or stream-level failure may be retried from
+/// scratch: transport errors and rate limits (with their wait hints), plus
+/// typed in-stream errors marked transient by
+/// [`crate::anthropic::stream_error`]. Raw mid-stream transport failures
+/// (boxed [`reqwest::Error`]) retry too — the retry layer only restarts
+/// while nothing was yielded, which keeps a restart duplication-free.
+fn classify_anthropic_failure(error: &crate::anthropic::Failure) -> crate::http::RetryDecision {
+    if error.downcast_ref::<reqwest::Error>().is_some() {
+        return crate::http::RetryDecision::Yes { after: None };
+    }
+    match error.downcast_ref::<AnthropicError>() {
+        Some(AnthropicError::Http(_)) => crate::http::RetryDecision::Yes { after: None },
+        Some(AnthropicError::RateLimit { retry_after, .. }) => {
+            crate::http::RetryDecision::Yes {
+                after: *retry_after,
+            }
+        }
+        Some(AnthropicError::Stream {
+            transient: true,
+            retry_after,
+            ..
+        }) => crate::http::RetryDecision::Yes {
+            after: *retry_after,
+        },
+        _ => crate::http::RetryDecision::No,
     }
 }
 
@@ -1549,38 +1581,44 @@ impl LlmProvider for AnthropicProvider {
         futures::stream::BoxStream<'a, Result<ProviderEvent, Box<dyn Error + Send + Sync>>>,
         Box<dyn Error + Send + Sync>,
     > {
-        // Retry the request-setup phase on transport-level failures; see the
-        // OpenAI `send` for rationale. Parse failures are permanent and never
-        // retried.
+        // Every attempt (re)issues the whole request; stream-level failures
+        // restart too, as long as nothing has been yielded yet. Request-setup
+        // failures (transport errors, rate limits) enter the same loop as a
+        // single-item error stream; parse failures are permanent.
         let status_sink = self.status_sink_snapshot();
-        let stream = crate::http::with_retries_capped(
+        let make_stream = move || {
+            let request = request.clone();
+            futures::stream::once(async move {
+                let request: CreateMessageRequest =
+                    match serde_json::from_value(request) {
+                        Ok(request) => request,
+                        Err(e) => {
+                            return futures::stream::once(async move {
+                                Err(Box::new(AnthropicError::Api(format!(
+                                    "build error: {e}"
+                                ))) as Box<dyn Error + Send + Sync>)
+                            })
+                            .boxed();
+                        }
+                    };
+                match self.client.messages().create_stream(request).await {
+                    Ok(stream) => self.parse_stream(stream),
+                    Err(e) => futures::stream::once(async move {
+                        Err(Box::new(e) as Box<dyn Error + Send + Sync>)
+                    })
+                    .boxed(),
+                }
+            })
+            .flatten()
+            .boxed()
+        };
+        Ok(Box::pin(crate::http::retrying_stream(
+            make_stream,
+            classify_anthropic_failure,
+            status_sink,
             self.retry_backoff,
             self.retry_max_wait,
-            || {
-                let request = request.clone();
-                async move {
-                    let request: CreateMessageRequest = serde_json::from_value(request)
-                        .map_err(|e| AnthropicError::Api(format!("build error: {e}")))?;
-                    self.client.messages().create_stream(request).await
-                }
-            },
-            |e| match e {
-                // Transport-level failures retry with the backoff sequence.
-                AnthropicError::Http(_) => crate::http::RetryDecision::Yes { after: None },
-                // Rate limits honor the provider's suggested wait, capped.
-                AnthropicError::RateLimit { retry_after, .. } => crate::http::RetryDecision::Yes {
-                    after: *retry_after,
-                },
-                _ => crate::http::RetryDecision::No,
-            },
-            status_sink.as_ref(),
-        )
-        .await
-        .map_err(|e| Box::new(e) as Box<dyn Error + Send + Sync>)?;
-
-        let parsed_stream = self.parse_stream(stream);
-
-        Ok(parsed_stream)
+        )))
     }
 
     fn set_status_sink(&self, sink: Option<StatusSink>) {
@@ -2732,6 +2770,59 @@ mod tests {
             .map(|e| e.expect("event should parse"))
             .collect()
             .await
+    }
+
+    #[tokio::test]
+    async fn anthropic_in_stream_errors_surface_as_typed_failures() {
+        let sse = concat!(
+            "event: error\n",
+            r#"data: {"type":"error","error":{"type":"overloaded_error","message":"Overloaded"}}"#,
+            "\n\n",
+        );
+        let body: std::collections::VecDeque<Result<bytes::Bytes, reqwest::Error>> =
+            std::collections::VecDeque::from(vec![Ok(bytes::Bytes::from_static(sse.as_bytes()))]);
+        let wire = futures::stream::iter(body);
+        let events: Vec<_> = AnthropicProvider::new("test-key", "claude-3-5-sonnet")
+            .parse_stream(AnthropicStream::new(wire))
+            .collect()
+            .await;
+        let error = events
+            .into_iter()
+            .last()
+            .expect("the error event yields a failure")
+            .expect_err("an in-stream error event is a stream failure");
+        let AnthropicError::Stream {
+            transient, message, ..
+        } = error
+            .downcast_ref::<AnthropicError>()
+            .expect("the failure carries the typed provider error")
+        else {
+            panic!("expected a typed stream error");
+        };
+        assert!(transient);
+        assert!(message.contains("overloaded_error"), "{message}");
+    }
+
+    #[test]
+    fn anthropic_classifies_transient_stream_errors_as_retryable() {
+        let failure: Box<dyn Error + Send + Sync> = Box::new(AnthropicError::Stream {
+            transient: true,
+            message: "overloaded_error: Overloaded".into(),
+            retry_after: None,
+        });
+        assert!(matches!(
+            classify_anthropic_failure(&failure),
+            crate::http::RetryDecision::Yes { after: None }
+        ));
+        let permanent: Box<dyn Error + Send + Sync> = Box::new(AnthropicError::Stream {
+            transient: false,
+            message: "invalid_request_error: nope".into(),
+            retry_after: None,
+        });
+        assert!(matches!(
+            classify_anthropic_failure(&permanent),
+            crate::http::RetryDecision::No
+        ));
     }
 
     fn usage_events(events: &[ProviderEvent]) -> Vec<gewu_core::types::TokenUsage> {

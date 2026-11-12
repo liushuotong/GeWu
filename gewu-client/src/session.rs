@@ -174,33 +174,15 @@ impl SessionModel {
                 Some(self.blocks.len() - 1)
             }
             AgentEvent::ToolFinish { tool, output, .. } => {
-                if !self.fill_open_tool(Some(tool), output) {
-                    self.blocks.push(Block::Tool {
-                        tool: tool.clone(),
-                        input: String::new(),
-                        output: Some(tool_output(output)),
-                    });
-                    return Some(self.blocks.len() - 1);
+                if let Some(index) = self.fill_open_tool(Some(tool), output) {
+                    return Some(index);
                 }
-                // `fill_open_tool` filled a block inside the trailing run; a
-                // run renders as one card, so any index inside it identifies
-                // the same card.
-                let start = self
-                    .blocks
-                    .iter()
-                    .rposition(|b| !matches!(b, Block::Tool { .. }))
-                    .map_or(0, |i| i + 1);
-                (start..self.blocks.len())
-                    .find(|&i| {
-                        matches!(
-                            &self.blocks[i],
-                            Block::Tool {
-                                output: Some(_),
-                                ..
-                            }
-                        )
-                    })
-                    .or(Some(self.blocks.len() - 1))
+                self.blocks.push(Block::Tool {
+                    tool: tool.clone(),
+                    input: String::new(),
+                    output: Some(tool_output(output)),
+                });
+                Some(self.blocks.len() - 1)
             }
             AgentEvent::Finish { response: _ } => {
                 self.end_thought();
@@ -325,7 +307,7 @@ impl SessionModel {
                     }
                     output.push_str(&media_text);
                 }
-                if !self.fill_open_tool(tool_name.as_deref(), &output) {
+                if self.fill_open_tool(tool_name.as_deref(), &output).is_none() {
                     self.blocks.push(Block::Tool {
                         tool: tool_name.clone().unwrap_or_else(|| "tool".to_string()),
                         input: String::new(),
@@ -347,16 +329,18 @@ impl SessionModel {
         }
     }
 
-    /// Fill the first still-open tool block (within the trailing run of tool
-    /// blocks) so historical tool results line up with their calls.
-    fn fill_open_tool(&mut self, tool_name: Option<&str>, output: &str) -> bool {
-        let start = self
-            .blocks
-            .iter()
-            .rposition(|b| !matches!(b, Block::Tool { .. }))
-            .map_or(0, |i| i + 1);
+    /// Fill the first still-open tool block matching the name (FIFO, with
+    /// an any-name fallback) so tool results line up with their calls.
+    ///
+    /// The search spans the whole transcript, not just the trailing run of
+    /// tool blocks: a steered user message can be inserted while a tool is
+    /// still running, splitting the run — the finish must still land in the
+    /// original block instead of duplicating it below the message. Safe
+    /// because completed tools are skipped and results arrive in start
+    /// order. Returns the filled block's index.
+    fn fill_open_tool(&mut self, tool_name: Option<&str>, output: &str) -> Option<usize> {
         let mut fallback = None;
-        for i in start..self.blocks.len() {
+        for i in 0..self.blocks.len() {
             if let Block::Tool {
                 tool, output: out, ..
             } = &mut self.blocks[i]
@@ -369,17 +353,18 @@ impl SessionModel {
                 }
                 if tool_name.is_none_or(|name| name == tool) {
                     *out = Some(tool_output(output));
-                    return true;
+                    return Some(i);
                 }
             }
         }
-        if let Some(i) = fallback
-            && let Block::Tool { output: out, .. } = &mut self.blocks[i]
-        {
-            *out = Some(tool_output(output));
-            return true;
-        }
-        false
+        fallback.and_then(|i| {
+            if let Block::Tool { output: out, .. } = &mut self.blocks[i] {
+                *out = Some(tool_output(output));
+                Some(i)
+            } else {
+                None
+            }
+        })
     }
 
     // -- lifecycle ----------------------------------------------------------
@@ -596,6 +581,82 @@ mod tests {
                 output: Some("file.rs".into()),
             }]
         );
+    }
+
+    #[test]
+    fn tool_finish_fills_across_a_steered_user_block() {
+        // The steer inserts a user block after the still-running tool, so
+        // the tool being finished is no longer in the trailing run. Its
+        // output must land in the original block, not in a duplicate.
+        let mut m = model();
+        let _ = m.apply_event(&AgentEvent::ToolStart {
+            tool: "bash".into(),
+            input: r#"{"command":"ls"}"#.into(),
+        });
+        let _ = m.apply_event(&AgentEvent::Steered {
+            text: "focus on tests".into(),
+        });
+        let affected = m.apply_event(&AgentEvent::ToolFinish {
+            tool: "bash".into(),
+            title: String::new(),
+            output: "file.rs".into(),
+            metadata: Default::default(),
+        });
+        // The filled block is the original tool block, right below the
+        // steered message; nothing else was appended.
+        assert_eq!(affected, Some(0));
+        assert_eq!(m.blocks.len(), 2);
+        assert_eq!(
+            m.blocks[0],
+            Block::Tool {
+                tool: "bash".into(),
+                input: "ls".into(),
+                output: Some("file.rs".into()),
+            }
+        );
+        assert!(matches!(m.blocks[1], Block::User(_)));
+    }
+
+    #[test]
+    fn parallel_tool_finishes_fill_in_order_across_a_steer() {
+        let mut m = model();
+        for _ in 0..2 {
+            let _ = m.apply_event(&AgentEvent::ToolStart {
+                tool: "bash".into(),
+                input: "{}".into(),
+            });
+        }
+        let _ = m.apply_event(&AgentEvent::Steered { text: "go".into() });
+        assert_eq!(
+            m.apply_event(&AgentEvent::ToolFinish {
+                tool: "bash".into(),
+                title: String::new(),
+                output: "first".into(),
+                metadata: Default::default(),
+            }),
+            Some(0)
+        );
+        assert_eq!(
+            m.apply_event(&AgentEvent::ToolFinish {
+                tool: "bash".into(),
+                title: String::new(),
+                output: "second".into(),
+                metadata: Default::default(),
+            }),
+            Some(1)
+        );
+        // Exactly the two original tool blocks carry the outputs.
+        let outputs: Vec<Option<String>> = m
+            .blocks
+            .iter()
+            .filter_map(|b| match b {
+                Block::Tool { output, .. } => Some(output.clone()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(outputs.len(), 2);
+        assert_eq!(outputs[0].as_deref(), Some("first"));
+        assert_eq!(outputs[1].as_deref(), Some("second"));
     }
 
     #[test]

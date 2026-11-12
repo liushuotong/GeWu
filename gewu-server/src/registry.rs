@@ -470,8 +470,8 @@ fn build_tool_registry_and_list(inputs: &ProfileInputs) -> Result<RegistryBundle
                 }),
                 Box::new(CodeSearchTool),
                 Box::new(WebSearchTool),
-                Box::new(TodoWriteTool::default()),
-                Box::new(TodoReadTool::default()),
+                Box::new(TodoWriteTool),
+                Box::new(TodoReadTool),
             ]
         }
         "plan" => {
@@ -507,8 +507,8 @@ fn build_tool_registry_and_list(inputs: &ProfileInputs) -> Result<RegistryBundle
                 }),
                 Box::new(WebFetchTool),
                 Box::new(WebSearchTool),
-                Box::new(TodoWriteTool::default()),
-                Box::new(TodoReadTool::default()),
+                Box::new(TodoWriteTool),
+                Box::new(TodoReadTool),
             ]
         }
         "explore" => {
@@ -579,8 +579,8 @@ fn build_tool_registry_and_list(inputs: &ProfileInputs) -> Result<RegistryBundle
                 }),
                 Box::new(CodeSearchTool),
                 Box::new(WebSearchTool),
-                Box::new(TodoWriteTool::default()),
-                Box::new(TodoReadTool::default()),
+                Box::new(TodoWriteTool),
+                Box::new(TodoReadTool),
             ]
         }
         _ => {

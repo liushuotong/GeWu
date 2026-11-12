@@ -45,6 +45,16 @@ pub enum OpenAIError {
         message: String,
         retry_after: Option<std::time::Duration>,
     },
+    /// An error event inside a streaming response (e.g. the Responses API's
+    /// `error` / `response.failed`). `transient` marks provider-side outages
+    /// that a fresh request can plausibly survive; `retry_after` carries the
+    /// wait hint from the event's embedded headers when one was sent.
+    #[error("provider stream error: {message}")]
+    Stream {
+        transient: bool,
+        message: String,
+        retry_after: Option<std::time::Duration>,
+    },
     /// API returned an error response.
     #[error("API error: {0}")]
     Api(String),
