@@ -14,6 +14,7 @@
 pub mod engine;
 pub mod graph_state;
 pub mod manager;
+mod planning;
 pub mod spec;
 pub mod template;
 #[cfg(test)]

@@ -49,6 +49,51 @@ fn default_timeout() -> u64 {
     120000
 }
 
+fn safe_mode_error(command: &str) -> Option<String> {
+    let trimmed = command.trim();
+    let first_word = trimmed.split_whitespace().next().unwrap_or("");
+    let allowed = [
+        "ls", "cat", "grep", "rg", "find", "pwd", "echo", "wc", "head", "tail", "whoami", "date",
+        "git", "printf", "sort", "uniq", "diff",
+    ];
+
+    if !allowed.contains(&first_word) {
+        return Some(format!(
+            "Command '{}' is not allowed in safe mode. Allowed commands: {:?}",
+            first_word, allowed
+        ));
+    }
+    if trimmed.contains('\n') || trimmed.contains('\r') {
+        return Some(
+            "Complex command chaining (;, &&, ||, |, &, newlines) is not allowed in safe mode."
+                .to_string(),
+        );
+    }
+    if trimmed.contains(';') || trimmed.contains('|') || trimmed.contains('&') {
+        return Some(
+            "Complex command chaining (;, &&, ||, |, &, newlines) is not allowed in safe mode."
+                .to_string(),
+        );
+    }
+    if trimmed.contains('>') || trimmed.contains('<') {
+        return Some("Output redirection (>, >>, <<) is not allowed in safe mode.".to_string());
+    }
+    if trimmed.contains("$(") || trimmed.contains('`') {
+        return Some(
+            "Command substitution ($(...), backticks) is not allowed in safe mode.".to_string(),
+        );
+    }
+    if trimmed
+        .split_whitespace()
+        .any(|t| matches!(t, "-exec" | "-execdir" | "-ok" | "-okdir"))
+    {
+        return Some(
+            "Command execution via find (-exec/-ok) is not allowed in safe mode.".to_string(),
+        );
+    }
+    None
+}
+
 pub struct BashTool {
     pub working_directory: PathBuf,
     pub safe_mode: bool,
@@ -75,76 +120,10 @@ impl Tool for BashTool {
     ) -> Result<ToolResult, Box<dyn Error + Send + Sync>> {
         let input: BashArgs = serde_json::from_value(args).map_err(|e| anyhow::anyhow!(e))?;
 
-        if self.safe_mode {
-            let trimmed = input.command.trim();
-            let first_word = trimmed.split_whitespace().next().unwrap_or("");
-            let allowed = [
-                "ls", "cat", "grep", "rg", "find", "pwd", "echo", "wc", "head", "tail", "whoami",
-                "date", "git", "printf", "sort", "uniq", "diff",
-            ];
-
-            if !allowed.contains(&first_word) {
-                return Ok(ToolResult::new(
-                    "bash",
-                    format!(
-                        "Command '{}' is not allowed in safe mode. Allowed commands: {:?}",
-                        first_word, allowed
-                    ),
-                ));
-            }
-
-            // Newlines are valid bash separators: without this check,
-            // `echo hi\nrm -rf ~/data` would pass the first-word allowlist
-            // and execute both lines.
-            if trimmed.contains('\n') || trimmed.contains('\r') {
-                return Ok(ToolResult::new(
-                    "bash",
-                    "Complex command chaining (;, &&, ||, |, &, newlines) is not allowed in safe mode."
-                        .to_string(),
-                ));
-            }
-
-            // `|` and any `&` are also separators/pipelining constructs; a
-            // pipe lets a whitelisted read-only command feed an arbitrary
-            // second command (e.g. `cat x | tee /etc/cron.d/evil`).
-            if trimmed.contains(';') || trimmed.contains('|') || trimmed.contains('&') {
-                return Ok(ToolResult::new(
-                    "bash",
-                    "Complex command chaining (;, &&, ||, |, &, newlines) is not allowed in safe mode."
-                        .to_string(),
-                ));
-            }
-
-            // Any redirection character, including space-less forms
-            // (`echo pwned>/tmp/x`, `2>`, `&>`) and heredocs/herestrings.
-            if trimmed.contains('>') || trimmed.contains('<') {
-                return Ok(ToolResult::new(
-                    "bash",
-                    "Output redirection (>, >>, <<) is not allowed in safe mode.".to_string(),
-                ));
-            }
-
-            if trimmed.contains("$(") || trimmed.contains('`') {
-                return Ok(ToolResult::new(
-                    "bash",
-                    "Command substitution ($(...), backticks) is not allowed in safe mode."
-                        .to_string(),
-                ));
-            }
-
-            // `find -exec`/`-ok` run arbitrary commands on every matched
-            // file, turning the read-only allowlist into a write/delete
-            // primitive (`find . -name '*' -exec rm -rf {} +`).
-            if trimmed
-                .split_whitespace()
-                .any(|t| matches!(t, "-exec" | "-execdir" | "-ok" | "-okdir"))
-            {
-                return Ok(ToolResult::new(
-                    "bash",
-                    "Command execution via find (-exec/-ok) is not allowed in safe mode."
-                        .to_string(),
-                ));
-            }
+        if self.safe_mode
+            && let Some(error) = safe_mode_error(&input.command)
+        {
+            return Ok(ToolResult::new("bash", error));
         }
 
         let work_dir = if let Some(wd) = &input.workdir {
@@ -307,6 +286,96 @@ mod tests {
     use anyhow::Result;
     use tempfile::tempdir;
     use tokio::fs;
+
+    #[test]
+    fn safe_mode_characterization() {
+        for command in [
+            "ls", "cat", "grep", "rg", "find", "pwd", "echo", "wc", "head", "tail", "whoami",
+            "date", "git", "printf", "sort", "uniq", "diff",
+        ] {
+            assert_eq!(safe_mode_error(command), None);
+        }
+        for command in [
+            "\n echo hello\r\n",
+            "git status",
+            "echo '-exec'",
+            "find . -execx",
+            "echo $HOME",
+            "echo ",
+        ] {
+            assert_eq!(safe_mode_error(command), None, "{command:?}");
+        }
+        let allowed = "[\"ls\", \"cat\", \"grep\", \"rg\", \"find\", \"pwd\", \"echo\", \"wc\", \"head\", \"tail\", \"whoami\", \"date\", \"git\", \"printf\", \"sort\", \"uniq\", \"diff\"]";
+        for (command, first) in [
+            ("", ""),
+            (" \n ", ""),
+            ("rm x; echo hi", "rm"),
+            ("/bin/ls", "/bin/ls"),
+            ("LS", "LS"),
+        ] {
+            assert_eq!(
+                safe_mode_error(command),
+                Some(format!(
+                    "Command '{}' is not allowed in safe mode. Allowed commands: {}",
+                    first, allowed
+                ))
+            );
+        }
+        for command in [
+            "echo a\nb",
+            "echo a\rb",
+            "echo a;b",
+            "echo a&&b",
+            "echo a||b",
+            "echo a|b",
+            "echo a&b",
+            "echo '&'",
+            "echo &>x",
+        ] {
+            assert_eq!(
+                safe_mode_error(command).as_deref(),
+                Some(
+                    "Complex command chaining (;, &&, ||, |, &, newlines) is not allowed in safe mode."
+                )
+            );
+        }
+        for command in [
+            "echo a>x",
+            "ls 2>x",
+            "cat <x",
+            "cat <<<x",
+            "echo '>'",
+            "echo >$(pwd)",
+        ] {
+            assert_eq!(
+                safe_mode_error(command).as_deref(),
+                Some("Output redirection (>, >>, <<) is not allowed in safe mode.")
+            );
+        }
+        for command in [
+            "echo $(pwd)",
+            "echo `pwd`",
+            "echo '$(pwd)'",
+            "find $(pwd) -exec",
+        ] {
+            assert_eq!(
+                safe_mode_error(command).as_deref(),
+                Some("Command substitution ($(...), backticks) is not allowed in safe mode.")
+            );
+        }
+        for command in [
+            "find . -exec",
+            "find . -execdir",
+            "find . -ok",
+            "find . -okdir",
+            "echo -exec",
+        ] {
+            assert_eq!(
+                safe_mode_error(command).as_deref(),
+                Some("Command execution via find (-exec/-ok) is not allowed in safe mode.")
+            );
+        }
+    }
 
     #[tokio::test]
     async fn test_bash_tool_echo() -> Result<()> {

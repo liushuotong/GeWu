@@ -9,14 +9,12 @@
 
 use crate::task::{AgentFactory, AgentOverrides};
 use crate::workflow::graph_state::{NodeOutcome, TaskFailure, WorkflowState};
-use crate::workflow::spec::{
-    ForEach, MAX_TASKS_PER_RUN, NodeSpec, ROUTE_DEFAULT, ROUTE_END, ReviewSpec, WorkflowSpec,
-};
-use crate::workflow::template::{NodeTemplateData, TemplateVars, render};
+use crate::workflow::planning::{PlannedEdge, plan_graph, plan_items};
+use crate::workflow::spec::{MAX_TASKS_PER_RUN, NodeSpec, ReviewSpec, WorkflowSpec};
+use crate::workflow::template::{TemplateVars, render};
 use gewu_core::types::AgentEvent;
-use gewu_graph::graph::constants::END;
 use gewu_graph::{CompiledGraph, NodeResult, StateGraph};
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -95,6 +93,7 @@ fn compile(
     cancel: Arc<AtomicBool>,
     state: Arc<Mutex<RunState>>,
 ) -> CompiledGraph<WorkflowState> {
+    let plan = plan_graph(spec);
     let mut graph: StateGraph<WorkflowState> = StateGraph::new();
 
     for node in &spec.nodes {
@@ -146,68 +145,29 @@ fn compile(
         });
     }
 
-    // Plain edges. Routers replace their plain outgoing edges; explicit
-    // "END" targets are dropped. Targets fed by several sources become a
-    // join barrier (the node waits for all of them).
-    let routers: HashSet<&str> = spec.conditional_edges.keys().map(String::as_str).collect();
-    let mut by_target: BTreeMap<String, Vec<String>> = BTreeMap::new();
-    for (from, to) in spec.resolved_edges() {
-        if to == ROUTE_END || routers.contains(from.as_str()) {
-            continue;
-        }
-        by_target.entry(to).or_default().push(from);
-    }
-    for (target, mut sources) in by_target {
-        sources.sort();
-        sources.dedup();
-        if sources.len() == 1 {
-            graph.add_edge(&sources[0], &target);
-        } else {
-            graph.add_waiting_edge(sources, &target);
+    for edge in plan.edges {
+        match edge {
+            PlannedEdge::Direct { source, target } => {
+                graph.add_edge(&source, &target);
+            }
+            PlannedEdge::Join { sources, target } => {
+                graph.add_waiting_edge(sources, &target);
+            }
         }
     }
 
-    for (source, route) in &spec.conditional_edges {
-        let path = route.path.clone();
-        let map = route.map.clone();
+    for route in plan.routes {
+        let source = route.source.clone();
         graph.add_conditional_edges(
-            source,
-            move |state: &WorkflowState| route_target(&path, &map, state),
+            &source,
+            move |state: &WorkflowState| route.target(state),
             HashMap::new(),
         );
     }
 
-    graph.set_entry_point(spec.entry_node());
-    graph.set_max_steps(spec.steps());
+    graph.set_entry_point(&plan.entry);
+    graph.set_max_steps(plan.max_steps);
     graph.compile()
-}
-
-/// Evaluates one routing decision: renders the route's path template
-/// against the graph state and maps the key to a target. Unlisted keys
-/// fall back to `"*"`, then end the run; a path that cannot be rendered
-/// (its node has not run) also ends the run.
-fn route_target(path: &str, map: &BTreeMap<String, String>, state: &WorkflowState) -> String {
-    let vars = TemplateVars {
-        nodes: state
-            .nodes
-            .iter()
-            .map(|(id, outcome)| (id.clone(), outcome.template_data()))
-            .collect(),
-        ..Default::default()
-    };
-    let Ok(key) = render(path, &vars) else {
-        return END.to_string();
-    };
-    map.get(&key)
-        .or_else(|| map.get(ROUTE_DEFAULT))
-        .map(|target| {
-            if target == ROUTE_END {
-                END.to_string()
-            } else {
-                target.clone()
-            }
-        })
-        .unwrap_or_else(|| END.to_string())
 }
 
 /// Runs the spec to completion (or cancel/timeout), updating `state` as it
@@ -276,40 +236,14 @@ async fn run_node(
     cancel: Arc<AtomicBool>,
     state: Arc<Mutex<RunState>>,
 ) -> NodeOutcome {
-    let items: Vec<Option<serde_json::Value>> = match &node.for_each {
-        None => vec![None],
-        Some(ForEach::Items(list)) => list.iter().cloned().map(Some).collect(),
-        Some(ForEach::From { from }) => graph_state
-            .nodes
-            .get(from)
-            .map(|outcome| {
-                outcome
-                    .outputs
-                    .iter()
-                    .map(|output| Some(serde_json::Value::String(output.clone())))
-                    .collect()
-            })
-            .unwrap_or_default(),
-    };
-
-    let template_nodes: BTreeMap<String, NodeTemplateData> = graph_state
-        .nodes
-        .iter()
-        .map(|(id, outcome)| (id.clone(), outcome.template_data()))
-        .collect();
+    let items = plan_items(node, &graph_state);
 
     let semaphore = Arc::new(Semaphore::new(spec.concurrency()));
     let mut join_set: JoinSet<(usize, TaskOutcome)> = JoinSet::new();
 
     for (index, item) in items.iter().enumerate() {
-        let vars = TemplateVars {
-            item: item.as_ref().map(render_item),
-            index: node.for_each.is_some().then_some(index),
-            output: None,
-            nodes: template_nodes.clone(),
-        };
         let (base, overrides) = resolve_agent(&node.agent, spec);
-        match render(&node.prompt, &vars) {
+        match item.prompt.clone() {
             Ok(prompt) => join_set.spawn(run_task(
                 factory.clone(),
                 parent_session.clone(),
@@ -324,8 +258,7 @@ async fn run_node(
                 semaphore.clone(),
                 index,
             )),
-            Err(error) => join_set
-                .spawn(async move { (index, Err((format!("template error: {error}"), None))) }),
+            Err(error) => join_set.spawn(async move { (index, Err((error, None))) }),
         };
     }
 
@@ -341,7 +274,7 @@ async fn run_node(
         let Some(result) = slot else {
             outcome.failed.push(TaskFailure {
                 index,
-                item: items[index].clone().unwrap_or(serde_json::Value::Null),
+                item: items[index].item.clone().unwrap_or(serde_json::Value::Null),
                 error: "the task did not produce a result (execution task lost)".to_string(),
             });
             outcome.sessions.push(String::new());
@@ -352,21 +285,12 @@ async fn run_node(
             Ok((output, _)) => outcome.outputs.push(output),
             Err((error, _)) => outcome.failed.push(TaskFailure {
                 index,
-                item: items[index].clone().unwrap_or(serde_json::Value::Null),
+                item: items[index].item.clone().unwrap_or(serde_json::Value::Null),
                 error,
             }),
         }
     }
     outcome
-}
-
-/// Renders a `for_each` item for `{{item}}`: strings verbatim, other JSON
-/// compact.
-fn render_item(item: &serde_json::Value) -> String {
-    match item {
-        serde_json::Value::String(text) => text.clone(),
-        other => other.to_string(),
-    }
 }
 
 /// One task's outcome plus the subagent session id it ran in (the session

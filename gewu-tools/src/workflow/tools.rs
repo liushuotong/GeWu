@@ -23,6 +23,15 @@ fn tool_error(message: impl Display) -> Box<dyn Error + Send + Sync> {
     anyhow!("{message}").into()
 }
 
+fn normalize_start_args(mut args: serde_json::Value) -> serde_json::Value {
+    if let Some(serde_json::Value::String(encoded)) = args.get("spec").cloned()
+        && let Ok(inner) = serde_json::from_str::<serde_json::Value>(&encoded)
+    {
+        args["spec"] = inner;
+    }
+    args
+}
+
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
 pub struct WorkflowStartArgs {
     /// The workflow specification, written as JSON. The schema below
@@ -87,13 +96,7 @@ impl Tool for WorkflowStartTool {
     ) -> Result<ToolResult, Box<dyn Error + Send + Sync>> {
         // Models sometimes wrap the spec as a JSON string; unwrap it once so
         // the call succeeds instead of costing an error-and-retry round trip.
-        let mut args = args;
-        if let Some(serde_json::Value::String(encoded)) = args.get("spec").cloned()
-            && let Ok(inner) = serde_json::from_str::<serde_json::Value>(&encoded)
-        {
-            args["spec"] = inner;
-        }
-        let input: WorkflowStartArgs = serde_json::from_value(args)
+        let input: WorkflowStartArgs = serde_json::from_value(normalize_start_args(args))
             .map_err(|e| tool_error(format!("invalid workflow spec: {e}")))?;
         let spec_value = serde_json::to_value(&input.spec)
             .map_err(|e| tool_error(format!("invalid workflow spec: {e}")))?;
@@ -308,6 +311,33 @@ fn snapshot_text(snapshot: &RunSnapshot) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn start_args_normalization_unwraps_only_once() {
+        use serde_json::json;
+        let spec = json!({"nodes": []});
+        assert_eq!(
+            normalize_start_args(json!({"spec": spec.to_string(), "extra": 1})),
+            json!({"spec": spec, "extra": 1})
+        );
+        for args in [
+            json!({"spec": spec}),
+            json!({"spec": "invalid json"}),
+            json!({"other": 1}),
+            json!(null),
+            json!([]),
+        ] {
+            assert_eq!(normalize_start_args(args.clone()), args);
+        }
+        assert_eq!(
+            normalize_start_args(json!({"spec": "null"})),
+            json!({"spec": null})
+        );
+        assert_eq!(
+            normalize_start_args(json!({"spec": "\"{}\""})),
+            json!({"spec": "{}"})
+        );
+    }
     use crate::workflow::testutil::{OWNER, ScriptedFactory};
     use std::time::Duration;
 
