@@ -217,6 +217,13 @@ impl SessionModel {
                 self.blocks.push(Block::Error(error.clone()));
                 Some(self.blocks.len() - 1)
             }
+            AgentEvent::Steered { text } => {
+                // A user message injected mid-run renders like any other
+                // user turn, at the point of the transcript where it landed.
+                self.end_thought();
+                self.blocks.push(Block::User(text.clone()));
+                Some(self.blocks.len() - 1)
+            }
         }
     }
 

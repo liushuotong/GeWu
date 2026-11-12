@@ -253,6 +253,14 @@ pub enum AgentEvent {
     /// Not part of the transcript: frontends render it in their busy
     /// indicator and replace or clear it with the next event.
     Status { message: String },
+    /// A steering message was appended to the running conversation.
+    ///
+    /// Emitted when a message sent through the agent's
+    /// [`Steering`](crate::agent::Steering) handle is injected into history
+    /// (while the agent was idle, between tool rounds, or during the final
+    /// response). Part of the transcript: frontends render it as a user
+    /// message at this point of the stream.
+    Steered { text: String },
     /// A compaction checkpoint was durably stored; recent context stays internal.
     Compacted {
         #[serde(default)]

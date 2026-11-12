@@ -812,7 +812,7 @@ pub fn status_html(tab: &Tab, models: &[ModelSummary]) -> String {
     // The idle key hints live in the composer placeholder; only the busy
     // hint needs its own spot in the status strip.
     if tab.model.phase == Phase::Busy {
-        let _ = write!(out, "<span class=\"hint\">Esc interrupt</span>");
+        let _ = write!(out, "<span class=\"hint\">Enter steer · Esc interrupt</span>");
     }
 
     if let Some((used, limit)) = tab.context.filter(|(used, limit)| *used > 0 && *limit > 0) {

@@ -82,6 +82,91 @@ fn tool_update(blocks: &[Block], affected: Option<usize>, appended: bool) -> Tab
     }
 }
 
+/// Whether pending steer entries form a contiguous run of blocks that ends
+/// at the transcript's tail — i.e. each rendered block already sits where
+/// the agent ingested it, so the confirming `steered` event needs no move.
+fn steers_in_place(group: &[(String, usize)], block_count: usize) -> bool {
+    let Some((_, index)) = group.first() else {
+        return true;
+    };
+    let mut expected = *index;
+    for (_, index) in &group[1..] {
+        expected += 1;
+        if *index != expected {
+            return false;
+        }
+    }
+    expected + 1 == block_count
+}
+
+/// Reconcile a live `steered` event against the steers this session already
+/// displayed at submit time, returning the targeted transcript update plus
+/// any thought block the event settled.
+fn confirm_steered(
+    model: &mut gewu_client::SessionModel,
+    pending: &mut Vec<(String, usize)>,
+    text: String,
+) -> (TabUpdate, Option<usize>) {
+    let Some(pos) = pending.iter().position(|(t, _)| *t == text) else {
+        // Not rendered here (another connection steered, or a snapshot
+        // rebuilt the transcript): append at the event's position as usual.
+        let affected = model.apply_event(&AgentEvent::Steered { text });
+        let collapsed = model.take_collapsed();
+        return (
+            affected.map_or(TabUpdate::Full, TabUpdate::BlockAppend),
+            collapsed,
+        );
+    };
+    if steers_in_place(&pending[pos..], model.blocks.len()) {
+        // Only later pending steers follow the block: it already sits at
+        // the position where the agent injected it.
+        pending.remove(pos);
+        return (TabUpdate::None, None);
+    }
+    // Blocks landed between the submit and the ingestion (the steer raced
+    // ahead of the ask's first events): re-anchor the unconfirmed group at
+    // the transcript's end, where the agent actually injected them,
+    // preserving submit order.
+    let mut group = pending.split_off(pos);
+    group.sort_by_key(|(_, index)| *index);
+    let intact = group.iter().all(|(pending, index)| {
+        matches!(
+            model.blocks.get(*index),
+            Some(Block::User(rendered)) if rendered == pending
+        )
+    });
+    if !intact {
+        // The transcript no longer matches the record; stop tracking and
+        // let the event append as usual.
+        pending.clear();
+        let affected = model.apply_event(&AgentEvent::Steered { text });
+        let collapsed = model.take_collapsed();
+        return (
+            affected.map_or(TabUpdate::Full, TabUpdate::BlockAppend),
+            collapsed,
+        );
+    }
+    // Remove highest index first so the stored positions stay valid.
+    for (_, index) in group.iter().rev() {
+        model.blocks.remove(*index);
+    }
+    let mut kept = Vec::new();
+    for (k, (pending, _)) in group.iter().enumerate() {
+        let appended = model
+            .apply_event(&AgentEvent::Steered {
+                text: pending.clone(),
+            })
+            .unwrap_or_else(|| model.blocks.len().saturating_sub(1));
+        if k > 0 {
+            // The first entry is the one being confirmed here.
+            kept.push((pending.clone(), appended));
+        }
+    }
+    let collapsed = model.take_collapsed();
+    pending.extend(kept);
+    (TabUpdate::Full, collapsed)
+}
+
 /// The display label for a model selector within the catalog.
 fn label_for(models: &[gewu_protocol::ModelSummary], selector: &str) -> Option<String> {
     models
@@ -895,13 +980,47 @@ impl GuiSession {
                 .send_error(sender, format!("unknown tab {tab_id}"))
                 .await;
         };
+        // While a turn runs, a submit steers the running agent instead of
+        // starting a new ask: the message is injected at the agent's next
+        // round boundary. It is rendered immediately at the transcript's
+        // end — the position where it will be ingested, since every event
+        // the running turn can still emit (deltas, tool results) updates
+        // existing blocks in place. The pending entry lets the later
+        // `steered` event confirm the block instead of duplicating it.
         if tab.model.phase != Phase::Idle {
-            return self
-                .send_error(
-                    sender,
-                    "wait for the current reply to finish or interrupt it",
-                )
-                .await;
+            if let Err(e) = self.ensure_client(tab_id).await {
+                return self.send_error(sender, format!("could not connect: {e}")).await;
+            }
+            let client = self.client(tab_id).expect("just ensured");
+            return match client.steer(prompt.clone()).await {
+                Ok(()) => {
+                    let (index, collapsed) = {
+                        let tab = self.workspace.tab_mut(tab_id).expect("tab exists");
+                        let index = tab
+                            .model
+                            .apply_event(&AgentEvent::Steered { text: prompt.clone() })
+                            .expect("a steered event appends a user block");
+                        tab.pending_steers.push((prompt, index));
+                        (index, tab.model.take_collapsed())
+                    };
+                    if self.workspace.active_id() == tab_id {
+                        if let Some(collapsed) = collapsed {
+                            self.send_thought_body(tab_id, collapsed, sender).await?;
+                        }
+                        let html = self
+                            .workspace
+                            .tab(tab_id)
+                            .and_then(|tab| view::block_html(tab, index))
+                            .expect("the appended block renders");
+                        send_msg(sender, &ServerMsg::BlockAppend { index, html }).await?;
+                    }
+                    Ok(())
+                }
+                Err(e) => {
+                    self.send_error(sender, format!("could not steer: {e}"))
+                        .await
+                }
+            };
         }
 
         if let Err(e) = self.ensure_client(tab_id).await {
@@ -1079,6 +1198,10 @@ impl GuiSession {
                     let changed =
                         tab.model.blocks != model.blocks || tab.model.phase != model.phase;
                     tab.model = model;
+                    // The snapshot is authoritative: an ingested steer is
+                    // already in its frames/messages, and one still queued
+                    // upstream re-arrives as a live `steered` event.
+                    tab.pending_steers.clear();
                     if let Some(selector) = snapshot_model {
                         tab.model_selector = Some(selector.clone());
                         tab.model_label =
@@ -1148,6 +1271,15 @@ impl GuiSession {
                             collapsed = tab.model.take_collapsed();
                             update = affected.map_or(TabUpdate::Full, TabUpdate::BlockAppend);
                         }
+                        Ok(AgentEvent::Steered { text }) => {
+                            // The message was already rendered when its
+                            // submit was routed to `steer`; this event only
+                            // confirms the agent ingested it.
+                            let (steer_update, steer_collapsed) =
+                                confirm_steered(&mut tab.model, &mut tab.pending_steers, text);
+                            update = steer_update;
+                            collapsed = steer_collapsed;
+                        }
                         Ok(agent_event) => {
                             // ToolStart / ToolFinish: update just the run's card.
                             let affected = tab.model.apply_event(&agent_event);
@@ -1186,6 +1318,9 @@ impl GuiSession {
 
             if terminal {
                 tab.model.finish_ask();
+                // A steer queued upstream but dropped before ingestion (turn
+                // ended first) must not suppress a future identical steer.
+                tab.pending_steers.clear();
             }
         }
 
@@ -1481,5 +1616,95 @@ mod tests {
             tool_update(&blocks, Some(0), false),
             TabUpdate::Full
         ));
+    }
+
+    #[test]
+    fn steers_in_place_requires_a_contiguous_tail() {
+        assert!(steers_in_place(&[("a".into(), 2)], 3));
+        assert!(steers_in_place(&[("a".into(), 2), ("b".into(), 3)], 4));
+        assert!(steers_in_place(&[], 3));
+        // A non-steer block after the group breaks the tail.
+        assert!(!steers_in_place(&[("a".into(), 2)], 4));
+        // A gap between steers breaks contiguity.
+        assert!(!steers_in_place(&[("a".into(), 2), ("b".into(), 4)], 5));
+    }
+
+    fn user_texts(model: &gewu_client::SessionModel) -> Vec<String> {
+        model
+            .blocks
+            .iter()
+            .filter_map(|b| match b {
+                Block::User(text) => Some(text.clone()),
+                _ => None,
+            })
+            .collect()
+    }
+
+    #[test]
+    fn confirm_steered_drops_pending_when_already_in_place() {
+        let mut model = gewu_client::SessionModel::new();
+        model.submit("hi".into());
+        model.apply_event(&AgentEvent::ContentDelta {
+            delta: "working".into(),
+        });
+        let index = model
+            .apply_event(&AgentEvent::Steered {
+                text: "focus".into(),
+            })
+            .expect("steered appends a block");
+        let mut pending = vec![("focus".to_string(), index)];
+
+        let (update, collapsed) =
+            confirm_steered(&mut model, &mut pending, "focus".into());
+
+        assert!(matches!(update, TabUpdate::None));
+        assert_eq!(collapsed, None);
+        assert!(pending.is_empty());
+        assert_eq!(user_texts(&model), ["hi", "focus"]);
+        assert_eq!(model.blocks.len(), 3);
+    }
+
+    #[test]
+    fn confirm_steered_relocates_group_after_race_blocks() {
+        // The steers were displayed before the ask's first block arrived.
+        let mut model = gewu_client::SessionModel::new();
+        model.submit("hi".into());
+        let a = model
+            .apply_event(&AgentEvent::Steered {
+                text: "a".into(),
+            })
+            .expect("steered appends a block");
+        let b = model
+            .apply_event(&AgentEvent::Steered { text: "b".into() })
+            .expect("steered appends a block");
+        model.apply_event(&AgentEvent::ContentDelta {
+            delta: "working".into(),
+        });
+        let mut pending = vec![("a".to_string(), a), ("b".to_string(), b)];
+
+        let (update, _) = confirm_steered(&mut model, &mut pending, "a".into());
+
+        // The group moved below the late assistant block; `b` stays pending
+        // at its new index.
+        assert!(matches!(update, TabUpdate::Full));
+        assert_eq!(pending, vec![("b".to_string(), 3)]);
+
+        let (update, _) = confirm_steered(&mut model, &mut pending, "b".into());
+        assert!(matches!(update, TabUpdate::None));
+        assert_eq!(user_texts(&model), ["hi", "a", "b"]);
+        assert!(matches!(model.blocks[1], Block::Assistant(_)));
+    }
+
+    #[test]
+    fn confirm_steered_appends_when_not_tracked_locally() {
+        let mut model = gewu_client::SessionModel::new();
+        model.submit("hi".into());
+        let mut pending = Vec::new();
+
+        let (update, _) =
+            confirm_steered(&mut model, &mut pending, "from elsewhere".into());
+
+        assert!(matches!(update, TabUpdate::BlockAppend(1)));
+        assert_eq!(user_texts(&model), ["hi", "from elsewhere"]);
     }
 }

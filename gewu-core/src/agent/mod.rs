@@ -43,10 +43,12 @@ pub use reminder::Reminder;
 mod execution;
 mod experiences;
 mod media;
+mod steering;
 mod tools;
 
 pub use compaction::CompactionError;
 pub use experiences::SearchExperiencesTool;
+pub use steering::Steering;
 pub use tools::execute_tool_with_panic_recovery;
 
 use crate::middleware::TruncationService;
@@ -109,6 +111,8 @@ pub struct Agent {
     reminder: Reminder,
     /// Per-session key/value state shared with tools on every [`ToolContext`].
     session_state: SessionState,
+    /// Buffer for steering messages injected while the agent runs.
+    steering: Steering,
 }
 
 /// Builder for constructing `Agent` instances.
@@ -263,6 +267,12 @@ impl Agent {
                 self.memory.add_message(Message::System { content: self.system_prompt.clone() }).await;
             }
 
+            // Messages steered while the agent was idle join the transcript
+            // ahead of this run's own prompt, preserving send order.
+            for text in self.ingest_steered().await {
+                yield AgentEvent::Steered { text };
+            }
+
             self.memory.add_message(Message::User { content: vec![ContentPart::Text { text: user_message.to_string() }] }).await;
             self.reminder.on_user_turn();
             // Due mode reminders become part of conversation history, so
@@ -282,6 +292,15 @@ impl Agent {
             })));
 
             loop {
+                // Inject messages steered mid-run before the context
+                // estimate so they count toward compaction. This point is
+                // the only safe spot: all tool results of the previous
+                // round are in history, so a user message never lands
+                // between an assistant turn and its tool results.
+                for text in self.ingest_steered().await {
+                    yield AgentEvent::Steered { text };
+                }
+
                 let context_tokens = crate::compaction::active_context(self.memory.messages())
                     .estimate_tokens();
                 let compacting = crate::compaction::is_overflow(context_tokens, self.context_limit);
@@ -392,6 +411,12 @@ impl Agent {
                 }).await;
 
                 if tool_calls.is_empty() {
+                    // A steer arriving while the model streams its final
+                    // answer must still be answered in this run: continue
+                    // instead of finishing. `max_turns` still bounds this.
+                    if self.steering.is_pending() {
+                        continue;
+                    }
                     // Report the running context estimate at the turn boundary
                     // (frontends update the usage gauge from these events).
                     yield self.usage_event();
@@ -588,6 +613,34 @@ impl Agent {
         &self.session_state
     }
 
+    /// Handle for queuing steering messages into this agent's runs.
+    ///
+    /// Clone it before calling [`ask`](Agent::ask) (the ask stream borrows
+    /// the agent exclusively) and send from any task while the run is in
+    /// progress. Messages queued while the agent is idle are delivered at
+    /// the start of the next ask.
+    pub fn steering(&self) -> &Steering {
+        &self.steering
+    }
+
+    /// Drains queued steering messages into conversation history as user
+    /// messages, applying the same reminder treatment as an ordinary prompt.
+    async fn ingest_steered(&mut self) -> Vec<String> {
+        let messages = self.steering.drain();
+        for text in &messages {
+            self.memory
+                .add_message(Message::User {
+                    content: vec![ContentPart::Text { text: text.clone() }],
+                })
+                .await;
+        }
+        if !messages.is_empty() {
+            self.reminder.on_user_turn();
+            self.reminder.apply(self.memory.messages_mut());
+        }
+        messages
+    }
+
     /// The tools this agent can call.
     pub fn tools(&self) -> &[Arc<dyn Tool>] {
         &self.tools
@@ -701,6 +754,7 @@ impl AgentTemplate {
             session_state: self.session_state,
             provider_usage: TokenUsage::default(),
             reminder,
+            steering: Steering::new(),
         }
     }
 }
@@ -859,6 +913,7 @@ impl AgentBuilder {
             provider_usage: TokenUsage::default(),
             reminder: self.reminder,
             session_state: self.session_state.unwrap_or_else(SessionState::in_memory),
+            steering: Steering::new(),
         };
         Ok(agent)
     }

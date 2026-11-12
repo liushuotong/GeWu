@@ -37,6 +37,7 @@
 //! {"type": "event", "id": "1", "request_id": "c3f1...", "event": {"type": "tool_start", "tool": "bash", "input": "{...}"}}
 //! {"type": "result", "id": "1", "request_id": "c3f1...", "session_id": "s1", "response": "Done."}
 //! {"type": "interrupted", "id": "1", "request_id": "c3f1..."}
+//! {"type": "steered", "id": "7", "session_id": "s", "text": "focus on tests"}
 //! {"type": "error", "id": "1", "error": "an ask is already in progress"}
 //! {"type": "pong", "id": "5"}
 //! {"type": "tools", "id": "3", "tools": ["read_file", "bash", "..."]}
@@ -68,6 +69,12 @@ pub enum Op {
     SubscribeSession,
     /// Interrupt the currently running `ask` on this connection, if any.
     Interrupt,
+    /// Inject a user message into the currently running `ask` (steering).
+    /// The message joins the conversation at the next round boundary; it
+    /// fails when no ask is running on the session.
+    Steer {
+        text: String,
+    },
     /// List the tool names available to the agent.
     ListTools,
     /// Explicitly change the active profile without replacing the conversation.
@@ -154,6 +161,7 @@ impl Serialize for ClientRequest {
                 self.op,
                 Op::Ask { .. }
                     | Op::Auth { .. }
+                    | Op::Steer { .. }
                     | Op::ListFiles { .. }
                     | Op::ReadFile { .. }
                     | Op::WriteFile { .. }
@@ -199,6 +207,10 @@ impl Serialize for ClientRequest {
                 map.serialize_entry("content_base64", content_base64)?;
             }
             Op::Interrupt => map.serialize_entry("op", "interrupt")?,
+            Op::Steer { text } => {
+                map.serialize_entry("op", "steer")?;
+                map.serialize_entry("text", text)?;
+            }
             Op::SubscribeSession => map.serialize_entry("op", "subscribe_session")?,
             Op::ListTools => map.serialize_entry("op", "list_tools")?,
             Op::ListAgents => map.serialize_entry("op", "list_agents")?,
@@ -270,6 +282,11 @@ impl ClientRequest {
     /// Build an `interrupt` request.
     pub fn interrupt(id: impl Into<Value>) -> Self {
         Self::simple(id, Op::Interrupt)
+    }
+
+    /// Build a `steer` request: inject `text` into the running ask.
+    pub fn steer(id: impl Into<Value>, text: impl Into<String>) -> Self {
+        Self::simple(id, Op::Steer { text: text.into() })
     }
 
     pub fn subscribe_session(id: impl Into<Value>, session_id: impl Into<String>) -> Self {
@@ -476,6 +493,15 @@ pub fn parse_request(line: &str) -> Result<ClientRequest, RequestError> {
             Op::Ask { prompt }
         }
         "interrupt" => Op::Interrupt,
+        "steer" => Op::Steer {
+            text: obj
+                .get("text")
+                .and_then(Value::as_str)
+                .ok_or_else(|| {
+                    RequestError::Invalid("op 'steer' requires a 'text' string".to_string())
+                })?
+                .to_string(),
+        },
         "list_tools" => Op::ListTools,
         "list_files" | "read_file" => {
             let path = obj
@@ -694,6 +720,17 @@ pub enum ServerMessage {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         request_id: Option<String>,
     },
+    /// Reply to a `steer` request: the message was queued into the
+    /// running ask. The steered message itself also arrives as a `steered`
+    /// agent event on the ask's stream.
+    Steered {
+        /// Echo of the client request id.
+        id: Value,
+        /// Session the message was injected into.
+        session_id: String,
+        /// The injected text.
+        text: String,
+    },
     /// An error occurred while handling the request.
     Error {
         /// Echo of the client request id, when known.
@@ -835,6 +872,7 @@ impl ServerMessage {
             ServerMessage::Event { .. } => "event",
             ServerMessage::Result { .. } => "result",
             ServerMessage::Interrupted { .. } => "interrupted",
+            ServerMessage::Steered { .. } => "steered",
             ServerMessage::Error { .. } => "error",
             ServerMessage::Pong { .. } => "pong",
             ServerMessage::Info { .. } => "info",
@@ -875,6 +913,7 @@ impl ServerMessage {
             | ServerMessage::Session { id, .. }
             | ServerMessage::Deleted { id, .. } => Some(id),
             ServerMessage::Interrupted { id, .. } | ServerMessage::Error { id, .. } => id.as_ref(),
+            ServerMessage::Steered { id, .. } => Some(id),
             ServerMessage::Event { .. }
             | ServerMessage::Result { .. }
             | ServerMessage::SessionSnapshot { .. } => None,
@@ -908,6 +947,26 @@ mod tests {
             assert_eq!(parse_request(&request.to_line()).unwrap(), request);
         }
         assert!(parse_request(r#"{"id":1,"op":"revert_chat","turn":-1}"#).is_err());
+    }
+
+    #[test]
+    fn steer_request_and_reply_round_trip() {
+        let request = ClientRequest::steer(9, "focus on tests").with_session("s");
+        assert_eq!(parse_request(&request.to_line()).unwrap(), request);
+        assert!(parse_request(r#"{"id":1,"op":"steer"}"#).is_err());
+
+        let reply = ServerMessage::Steered {
+            id: 9.into(),
+            session_id: "s".into(),
+            text: "focus on tests".into(),
+        };
+        let decoded: ServerMessage =
+            serde_json::from_str(&reply.to_line()).unwrap();
+        assert_eq!(decoded, reply);
+        assert_eq!(reply.kind(), "steered");
+        assert_eq!(reply.correlation_id(), Some(&9.into()));
+        // Steering never terminates the ask it injects into.
+        assert_eq!(reply.is_ask_terminal(), None);
     }
 
     #[test]

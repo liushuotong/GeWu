@@ -212,6 +212,10 @@ struct ConnectionSession {
     /// fixed for the life of the session, so `list_tools` can be answered
     /// without locking the agent (which would block while an ask runs).
     tools: Vec<String>,
+    /// The running turn's steering handle, published by `execute_ask` while
+    /// the agent lock is held so `steer` requests can inject messages
+    /// without touching the agent. `None` while idle.
+    steering: Arc<Mutex<Option<gewu_core::Steering>>>,
 }
 
 /// A currently running ask on a connection.
@@ -475,6 +479,7 @@ impl ServerState {
             provider: entry.provider,
             context_limit: entry.context_limit,
             tools,
+            steering: Arc::new(Mutex::new(None)),
         };
         *current = Some(entry.clone());
         sessions.insert(entry.session_id.clone(), entry.clone());
@@ -814,6 +819,7 @@ async fn handle_request(
                             provider: current.provider.clone(),
                             context_limit: current.context_limit,
                             tools: tools.clone(),
+                            steering: current.steering.clone(),
                         });
                         state.sessions.lock().await.insert(
                             current.session_id.clone(),
@@ -870,6 +876,7 @@ async fn handle_request(
                             provider: entry.provider.clone(),
                             context_limit: entry.context_limit,
                             tools: current.tools.clone(),
+                            steering: current.steering.clone(),
                         };
                         *session = Some(replacement.clone());
                         state
@@ -1225,6 +1232,42 @@ async fn handle_request(
             }))
         }
 
+        Op::Steer { text } => {
+            let target = request
+                .session_id
+                .or_else(|| session.as_ref().map(|s| s.session_id.clone()));
+            let Some(target) = target else {
+                return Err(RequestError::Failed(
+                    "no session: send 'ask' before steering".to_string(),
+                ));
+            };
+            let slot = state
+                .sessions
+                .lock()
+                .await
+                .get(&target)
+                .map(|entry| entry.steering.clone());
+            let Some(slot) = slot else {
+                return Err(RequestError::Failed(format!("unknown session '{target}'")));
+            };
+            let handle = slot.lock().await.clone();
+            match handle {
+                Some(steering) => {
+                    steering.send(text.clone()).map_err(|e| {
+                        RequestError::Failed(format!("steering failed: {e}"))
+                    })?;
+                    Ok(Handled::Reply(ServerMessage::Steered {
+                        id: request.id,
+                        session_id: target,
+                        text,
+                    }))
+                }
+                None => Err(RequestError::Failed(
+                    "no ask is in progress on this session".to_string(),
+                )),
+            }
+        }
+
         Op::Ask { prompt } => {
             if running.is_some() {
                 return Err(RequestError::Failed(
@@ -1299,6 +1342,10 @@ async fn execute_ask<E, Fut>(
     // Repair any history left inconsistent by a previous interrupt.
     patch_dangling_tool_calls(&mut agent).await;
 
+    // Publish the steering handle for `steer` requests while this turn
+    // holds the agent lock; cleared again when the turn ends or aborts.
+    *session.steering.lock().await = Some(agent.steering().clone());
+
     let mut client_gone = false;
     let mut terminal_sent = false;
     {
@@ -1342,6 +1389,7 @@ async fn execute_ask<E, Fut>(
     if let Err(e) = gewu_storage::set_reminder(pool, &session.session_id, agent.reminder()).await {
         tracing::error!("failed to persist reminder state after turn: {e}");
     }
+    *session.steering.lock().await = None;
     drop(agent);
     if client_gone {
         return;
@@ -1451,6 +1499,7 @@ async fn start_session_turn(
         {
             let mut agent = session.agent.lock().await;
             patch_dangling_tool_calls(&mut agent).await;
+            *session.steering.lock().await = None;
             if failure.is_some() {
                 drop_dangling_prompt(&mut agent).await;
             }
@@ -2113,6 +2162,7 @@ mod tests {
             provider: llm,
             context_limit: 256_000,
             tools,
+            steering: Arc::new(Mutex::new(None)),
         }
     }
 
@@ -2133,6 +2183,7 @@ mod tests {
             provider: llm,
             context_limit: 256_000,
             tools,
+            steering: Arc::new(Mutex::new(None)),
         }
     }
 
@@ -3648,6 +3699,106 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn connection_steer_injects_message_into_running_ask() {
+        // The slow LLM delays before its first response, so the steer lands
+        // while the turn is mid-flight. RecordingLlm records the user
+        // prompts it is asked with, proving the steered text reached the
+        // model as a user message on the follow-up request.
+        let llm = RecordingLlm::slow();
+        let state = server_state_with(llm.clone());
+        let (in_tx, mut out_rx, handle) = spawn_connection(state).await;
+
+        in_tx
+            .send(r#"{"id": 1, "op": "ask", "prompt": "go"}"#.to_string())
+            .await
+            .unwrap();
+        let ready = recv_json(&mut out_rx).await;
+        assert_eq!(ready["type"], "ready");
+        let session_id = ready["session_id"].as_str().unwrap().to_string();
+
+        in_tx
+            .send(
+                r#"{"id": 2, "op": "steer", "text": "focus on tests"}"#.to_string(),
+            )
+            .await
+            .unwrap();
+
+        // The steer ack may interleave with streamed events; wait for it.
+        loop {
+            let msg = recv_json(&mut out_rx).await;
+            match msg["type"].as_str() {
+                Some("steered") => {
+                    assert_eq!(msg["id"], 2);
+                    assert_eq!(msg["text"], "focus on tests");
+                    assert_eq!(msg["session_id"], session_id.as_str());
+                    break;
+                }
+                Some("result") => panic!("steer ack must arrive before the ask completes"),
+                _ => continue,
+            }
+        }
+
+        // The steered message extends the run; wait for the final result.
+        loop {
+            if recv_json(&mut out_rx).await["type"] == "result" {
+                break;
+            }
+        }
+
+        // The agent streamed the steered message as an event...
+        let prompts = llm.prompts();
+        assert!(
+            prompts.iter().any(|p| p.contains("focus on tests")),
+            "steered text never reached the model: {prompts:?}"
+        );
+        assert_eq!(prompts.len(), 2, "steer must trigger a follow-up request");
+
+        drop(in_tx);
+        handle.await.unwrap().unwrap();
+    }
+
+    #[tokio::test]
+    async fn steer_without_running_ask_is_rejected() {
+        let state = server_state_with(TestLlm::plain());
+        let (in_tx, mut out_rx, handle) = spawn_connection(state).await;
+
+        // No session exists yet.
+        in_tx
+            .send(r#"{"id": 1, "op": "steer", "text": "hello"}"#.to_string())
+            .await
+            .unwrap();
+        let msg = recv_json(&mut out_rx).await;
+        assert_eq!(msg["type"], "error");
+        assert!(msg["error"].as_str().unwrap().contains("no session"));
+
+        // Run one ask to idle, then steer again: the session exists but no
+        // turn is running, so the request must fail rather than queue.
+        in_tx
+            .send(r#"{"id": 2, "op": "ask", "prompt": "go"}"#.to_string())
+            .await
+            .unwrap();
+        loop {
+            if recv_json(&mut out_rx).await["type"] == "result" {
+                break;
+            }
+        }
+        in_tx
+            .send(r#"{"id": 3, "op": "steer", "text": "late"}"#.to_string())
+            .await
+            .unwrap();
+        let msg = recv_json(&mut out_rx).await;
+        assert_eq!(msg["type"], "error");
+        assert!(
+            msg["error"].as_str().unwrap().contains("no ask is in progress"),
+            "unexpected error: {}",
+            msg["error"]
+        );
+
+        drop(in_tx);
+        handle.await.unwrap().unwrap();
+    }
+
+    #[tokio::test]
     async fn connection_interrrupt_aborts_running_ask_and_repairs_history() {
         let state = server_state_with(TestLlm::slow_tool_call());
         let (in_tx, mut out_rx, handle) = spawn_connection(state).await;
@@ -3783,6 +3934,7 @@ mod tests {
             provider: Arc::new(ToolCallLoopLlm),
             context_limit: 256_000,
             tools: vec!["echo".to_string()],
+            steering: Arc::new(Mutex::new(None)),
         };
 
         let (tx, mut rx) = mpsc::channel::<String>(256);

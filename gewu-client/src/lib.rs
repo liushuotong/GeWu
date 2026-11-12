@@ -281,6 +281,19 @@ impl Client {
         self.request(request).await.map(|_| ())
     }
 
+    /// Inject a steering message into this connection's running ask.
+    ///
+    /// The message joins the conversation at the agent's next round
+    /// boundary and also arrives as a `steered` agent event on the ask's
+    /// stream. Fails when no ask is running.
+    pub async fn steer(&self, text: impl Into<String>) -> Result<()> {
+        let request = ClientRequest::steer(self.next_correlation_id(), text);
+        match self.request(request).await? {
+            ServerMessage::Steered { .. } => Ok(()),
+            other => Err(unexpected(other, "steered")),
+        }
+    }
+
     /// List the tool names available to this connection's agent.
     pub async fn list_tools(&self) -> Result<Vec<String>> {
         let request = ClientRequest::list_tools(self.next_correlation_id());
