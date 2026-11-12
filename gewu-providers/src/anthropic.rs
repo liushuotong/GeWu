@@ -28,7 +28,8 @@ use thiserror::Error;
 
 /// Errors that can occur when interacting with the Anthropic API.
 #[derive(Error, Debug)]
-pub enum AnthropicError {    /// HTTP request failed (network error, timeout, etc.)
+pub enum AnthropicError {
+    /// HTTP request failed (network error, timeout, etc.)
     #[error("HTTP request failed: {0}")]
     Http(#[from] reqwest::Error),
     /// The provider rejected the request with a 429 rate limit. Carries the

@@ -1,35 +1,46 @@
-//! Steering: user messages sent to the agent while it is running.
-//!
-//! The ask stream borrows the agent exclusively, so callers clone a
-//! [`Steering`] handle out of the agent before starting a run and send
-//! messages through it from anywhere (another task, an input loop).
-//! The agent loop drains the buffer at safe points — after the current
-//! round's tool results are recorded, before the next LLM request — and
-//! appends them to the conversation as ordinary user messages.
-//!
-//! Injection never lands between an assistant turn and its tool results
-//! (strict providers reject that history shape), mirroring opencode's
-//! steering behavior: the in-flight provider stream is not aborted; the
-//! agent adapts at the next round boundary.
-
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::collections::VecDeque;
 use std::sync::{Arc, Mutex};
-use tokio::sync::mpsc;
+use tokio::sync::{Notify, mpsc};
 
-/// Handle for queuing user messages into a running agent conversation.
-///
-/// Cloneable; every clone feeds the same agent. Sending never blocks and
-/// succeeds even while the agent is idle — messages queued between runs
-/// are delivered at the start of the next `ask`.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct BackgroundNotification {
+    pub source: String,
+    pub id: String,
+    pub status: String,
+    pub output: String,
+}
+
+impl BackgroundNotification {
+    pub fn text(&self) -> String {
+        format!(
+            "Background {} {}: {}\n{}",
+            self.source, self.id, self.status, self.output
+        )
+    }
+}
+
+#[derive(Clone, Debug)]
+pub enum InboxMessage {
+    User(String),
+    Background(BackgroundNotification),
+}
+
 #[derive(Clone)]
 pub struct Steering {
     inner: Arc<Inner>,
 }
 
+#[derive(Default)]
+struct Queue {
+    users: VecDeque<String>,
+    background: VecDeque<BackgroundNotification>,
+    paused: bool,
+}
+
 struct Inner {
-    tx: mpsc::UnboundedSender<String>,
-    rx: Mutex<mpsc::UnboundedReceiver<String>>,
-    queued: AtomicUsize,
+    queue: Mutex<Queue>,
+    wake: Notify,
+    watched: std::sync::atomic::AtomicBool,
 }
 
 impl std::fmt::Debug for Steering {
@@ -47,44 +58,103 @@ impl Default for Steering {
 }
 
 impl Steering {
-    /// Creates an empty steering buffer.
     pub fn new() -> Self {
-        let (tx, rx) = mpsc::unbounded_channel();
         Self {
             inner: Arc::new(Inner {
-                tx,
-                rx: Mutex::new(rx),
-                queued: AtomicUsize::new(0),
+                queue: Mutex::new(Queue::default()),
+                wake: Notify::new(),
+                watched: std::sync::atomic::AtomicBool::new(false),
             }),
         }
     }
 
-    /// Queues a message for injection into the conversation.
-    ///
-    /// The send only fails when the owning agent has been dropped.
     pub fn send(&self, message: impl Into<String>) -> Result<(), mpsc::error::SendError<String>> {
-        let message = message.into();
-        self.inner.tx.send(message).inspect(|_| {
-            self.inner.queued.fetch_add(1, Ordering::Relaxed);
-        })
+        let mut queue = self.inner.queue.lock().unwrap();
+        queue.users.push_back(message.into());
+        queue.paused = false;
+        self.wake();
+        Ok(())
     }
 
-    /// Takes all queued messages, oldest first.
-    pub fn drain(&self) -> Vec<String> {
-        let mut rx = self.inner.rx.lock().unwrap();
-        let mut messages = Vec::new();
-        while let Ok(message) = rx.try_recv() {
-            messages.push(message);
+    pub fn notify(&self, mut notification: BackgroundNotification) {
+        const MAX_OUTPUT: usize = 16 * 1024;
+        if notification.output.len() > MAX_OUTPUT {
+            let mut end = MAX_OUTPUT;
+            while !notification.output.is_char_boundary(end) {
+                end -= 1;
+            }
+            notification.output.truncate(end);
+            notification
+                .output
+                .push_str("\n[truncated; use workflow_status for full details]");
         }
-        self.inner
-            .queued
-            .fetch_sub(messages.len(), Ordering::Relaxed);
+        let mut queue = self.inner.queue.lock().unwrap();
+        if let Some(existing) = queue
+            .background
+            .iter_mut()
+            .find(|entry| entry.source == notification.source && entry.id == notification.id)
+        {
+            *existing = notification;
+            self.wake();
+            return;
+        }
+        if queue.background.len() >= 32 {
+            queue.background.pop_front();
+        }
+        queue.background.push_back(notification);
+        self.wake();
+    }
+
+    pub fn drain_messages(&self) -> Vec<InboxMessage> {
+        let mut queue = self.inner.queue.lock().unwrap();
+        let mut messages: Vec<_> = queue.users.drain(..).map(InboxMessage::User).collect();
+        messages.extend(queue.background.drain(..).map(InboxMessage::Background));
         messages
     }
 
-    /// Whether at least one message is queued.
+    pub fn drain(&self) -> Vec<String> {
+        self.drain_messages()
+            .into_iter()
+            .map(|message| match message {
+                InboxMessage::User(text) => text,
+                InboxMessage::Background(notification) => notification.text(),
+            })
+            .collect()
+    }
+
     pub fn is_pending(&self) -> bool {
-        self.inner.queued.load(Ordering::Relaxed) > 0
+        let queue = self.inner.queue.lock().unwrap();
+        !queue.users.is_empty() || !queue.background.is_empty()
+    }
+
+    pub fn should_resume(&self) -> bool {
+        let queue = self.inner.queue.lock().unwrap();
+        !queue.paused && (!queue.users.is_empty() || !queue.background.is_empty())
+    }
+
+    pub fn pause(&self) {
+        let mut queue = self.inner.queue.lock().unwrap();
+        queue.users.clear();
+        queue.paused = true;
+    }
+
+    pub fn unpause(&self) {
+        self.inner.queue.lock().unwrap().paused = false;
+    }
+
+    pub fn wake(&self) {
+        self.inner.wake.notify_one();
+    }
+
+    pub async fn notified(&self) {
+        self.inner.wake.notified().await;
+    }
+
+    pub fn claim_watcher(&self) -> bool {
+        !self
+            .inner
+            .watched
+            .swap(true, std::sync::atomic::Ordering::AcqRel)
     }
 }
 
@@ -112,10 +182,47 @@ mod tests {
     }
 
     #[test]
-    fn debug_shows_pending_state() {
-        let steering = Steering::new();
-        assert!(format!("{steering:?}").contains("pending: false"));
-        steering.send("x").unwrap();
-        assert!(format!("{steering:?}").contains("pending: true"));
+    fn background_is_separate_bounded_and_session_local() {
+        let inbox = Steering::new();
+        let other = Steering::new();
+        inbox.notify(BackgroundNotification {
+            source: "workflow".into(),
+            id: "run".into(),
+            status: "completed".into(),
+            output: "界".repeat(10000),
+        });
+        inbox.send("user").unwrap();
+        let messages = inbox.drain_messages();
+        assert!(matches!(&messages[0], InboxMessage::User(text) if text == "user"));
+        assert!(
+            matches!(&messages[1], InboxMessage::Background(n) if n.output.len() < 17000 && n.output.contains("truncated"))
+        );
+        assert!(!other.is_pending());
+    }
+
+    #[tokio::test]
+    async fn wakes_coalesce_and_pause_retains_background() {
+        let inbox = Steering::new();
+        inbox.send("one").unwrap();
+        inbox.send("two").unwrap();
+        inbox.notified().await;
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(10), inbox.notified())
+                .await
+                .is_err()
+        );
+        inbox.pause();
+        inbox.notify(BackgroundNotification {
+            source: "workflow".into(),
+            id: "paused".into(),
+            status: "completed".into(),
+            output: "done".into(),
+        });
+        assert!(!inbox.should_resume());
+        assert!(inbox.is_pending());
+        assert_eq!(inbox.drain_messages().len(), 1);
+        inbox.send("three").unwrap();
+        assert!(inbox.should_resume());
+        assert_eq!(inbox.drain(), vec!["three"]);
     }
 }

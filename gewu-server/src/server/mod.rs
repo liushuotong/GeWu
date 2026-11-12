@@ -462,6 +462,7 @@ impl ServerState {
             session_id, agent_name, model
         );
 
+        let steering = agent.steering().clone();
         let agent = Arc::new(Mutex::new(agent));
         {
             let mut agent = agent.lock().await;
@@ -479,7 +480,7 @@ impl ServerState {
             provider: entry.provider,
             context_limit: entry.context_limit,
             tools,
-            steering: Arc::new(Mutex::new(None)),
+            steering: Arc::new(Mutex::new(Some(steering))),
         };
         *current = Some(entry.clone());
         sessions.insert(entry.session_id.clone(), entry.clone());
@@ -502,6 +503,11 @@ impl ServerState {
     }
 
     async fn cancel_turn(&self, session_id: &str) -> Option<String> {
+        if let Some(session) = self.sessions.lock().await.get(session_id)
+            && let Some(inbox) = session.steering.lock().await.as_ref()
+        {
+            inbox.pause();
+        }
         let turn = self.turns.lock().await.get(session_id).cloned()?;
         let request_id = {
             let mut turn = turn.lock().await;
@@ -1250,12 +1256,23 @@ async fn handle_request(
             let Some(slot) = slot else {
                 return Err(RequestError::Failed(format!("unknown session '{target}'")));
             };
-            let handle = slot.lock().await.clone();
-            match handle {
+            let cached = { slot.lock().await.clone() };
+            let steering = if let Some(handle) = cached {
+                Some(handle)
+            } else {
+                state.sessions.lock().await.get(&target).and_then(|entry| {
+                    entry
+                        .agent
+                        .try_lock()
+                        .ok()
+                        .map(|agent| agent.steering().clone())
+                })
+            };
+            match steering {
                 Some(steering) => {
-                    steering.send(text.clone()).map_err(|e| {
-                        RequestError::Failed(format!("steering failed: {e}"))
-                    })?;
+                    steering
+                        .send(text.clone())
+                        .map_err(|e| RequestError::Failed(format!("steering failed: {e}")))?;
                     Ok(Handled::Reply(ServerMessage::Steered {
                         id: request.id,
                         session_id: target,
@@ -1349,7 +1366,13 @@ async fn execute_ask<E, Fut>(
     let mut client_gone = false;
     let mut terminal_sent = false;
     {
-        let mut stream = Box::pin(agent.ask(prompt));
+        let mut stream: std::pin::Pin<
+            Box<dyn futures::Stream<Item = anyhow::Result<AgentEvent>> + Send + '_>,
+        > = if prompt.is_empty() {
+            Box::pin(agent.resume())
+        } else {
+            Box::pin(agent.ask(prompt))
+        };
         // Whether a terminal frame (`result` or `error`) has been sent. Only
         // the `Finish` event and stream errors are terminal; an `AgentEvent::Error`
         // can be mid-stream (e.g. one failed tool among several).
@@ -1389,7 +1412,7 @@ async fn execute_ask<E, Fut>(
     if let Err(e) = gewu_storage::set_reminder(pool, &session.session_id, agent.reminder()).await {
         tracing::error!("failed to persist reminder state after turn: {e}");
     }
-    *session.steering.lock().await = None;
+
     drop(agent);
     if client_gone {
         return;
@@ -1415,14 +1438,17 @@ async fn start_session_turn(
     request_id: String,
     prompt: String,
     ready: ServerMessage,
-    subscriber: Subscriber,
+    subscriber: Option<Subscriber>,
+    handoff_ordinary: bool,
 ) {
     let mut messages = session.agent.lock().await.memory.messages().to_vec();
-    messages.push(Message::User {
-        content: vec![protocol::ContentPart::Text {
-            text: prompt.clone(),
-        }],
-    });
+    if !prompt.is_empty() {
+        messages.push(Message::User {
+            content: vec![protocol::ContentPart::Text {
+                text: prompt.clone(),
+            }],
+        });
+    }
     let (cancel, mut cancelled) = tokio::sync::oneshot::channel();
     let live = Arc::new(Mutex::new(LiveTurn {
         request_id: request_id.clone(),
@@ -1455,13 +1481,23 @@ async fn start_session_turn(
             model: Some(session.model.clone()),
         }
         .to_line();
-        for observer in previous.subscribers.drain(..).filter(|s| s.persistent) {
-            if !observer.out.same_channel(&subscriber.out) && observer.send(&snapshot) {
+        for observer in previous
+            .subscribers
+            .drain(..)
+            .filter(|s| s.persistent || handoff_ordinary)
+        {
+            if subscriber
+                .as_ref()
+                .is_none_or(|s| !observer.out.same_channel(&s.out))
+                && observer.send(&snapshot)
+            {
                 live.lock().await.subscribers.push(observer);
             }
         }
     }
-    if subscriber.send(&ready.to_line()) {
+    if let Some(subscriber) = subscriber
+        && subscriber.send(&ready.to_line())
+    {
         live.lock().await.subscribers.push(subscriber);
     }
     let worker_pool = state.bootstrap.pool.clone();
@@ -1496,9 +1532,10 @@ async fn start_session_turn(
         {
             let mut agent = session.agent.lock().await;
             patch_dangling_tool_calls(&mut agent).await;
-            *session.steering.lock().await = None;
+
             if failure.is_some() {
                 drop_dangling_prompt(&mut agent).await;
+                agent.steering().pause();
             }
             let mut live = live.lock().await;
             let terminal = failure
@@ -1517,8 +1554,68 @@ async fn start_session_turn(
             }
             live.frames.clear();
             live.bytes = 0;
+            let pending = agent.steering().should_resume();
             live.subscribers
-                .retain(|s| s.persistent && !s.out.is_closed());
+                .retain(|s| (s.persistent || pending) && !s.out.is_closed());
+            agent.steering().wake();
+        }
+    });
+}
+
+async fn watch_inbox(state: &Arc<ServerState>, session: &ConnectionSession) {
+    let cached = { session.steering.lock().await.clone() };
+    let inbox = match cached {
+        Some(inbox) => inbox,
+        None => session.agent.lock().await.steering().clone(),
+    };
+    *session.steering.lock().await = Some(inbox.clone());
+    if !inbox.claim_watcher() {
+        return;
+    }
+    let state = Arc::downgrade(state);
+    let session_id = session.session_id.clone();
+    tokio::spawn(async move {
+        loop {
+            let _ =
+                tokio::time::timeout(std::time::Duration::from_secs(30), inbox.notified()).await;
+            let Some(state) = state.upgrade() else { return };
+            if !inbox.should_resume() {
+                continue;
+            }
+            let _lifecycle = state.lifecycle.lock().await;
+            let Some(session) = state.sessions.lock().await.get(&session_id).cloned() else {
+                return;
+            };
+            if !state.claim_session(&session.session_id).await {
+                continue;
+            }
+            if !inbox.should_resume() {
+                state.release_session(&session.session_id).await;
+                continue;
+            }
+            if gewu_storage::commit_chat_revert(&state.bootstrap.pool, &session_id)
+                .await
+                .is_err()
+            {
+                inbox.pause();
+                state.release_session(&session_id).await;
+                continue;
+            }
+            start_session_turn(
+                state.clone(),
+                session.clone(),
+                crate::bootstrap::new_session_id(),
+                String::new(),
+                ServerMessage::Ready {
+                    id: Value::Null,
+                    request_id: String::new(),
+                    session_id: session.session_id.clone(),
+                    agent: session.agent_name.clone(),
+                },
+                None,
+                true,
+            )
+            .await;
         }
     });
 }
@@ -1617,16 +1714,31 @@ async fn drive_connection(
                         session = None;
                     }
                 }
-                match handle_request(&state, &mut session, &mut running, request).await {
+                let handled = handle_request(&state, &mut session, &mut running, request).await;
+                if let Some(session) = &session {
+                    watch_inbox(&state, session).await;
+                }
+                match handled {
                     Ok(Handled::Reply(msg)) => {
                         out.send(msg.to_line()).await?;
+                        if let ServerMessage::Steered { session_id, .. } = &msg {
+                            let turn = state.turns.lock().await.get(session_id).cloned();
+                            if let Some(turn) = turn {
+                                let mut live = turn.lock().await;
+                                if !live.busy && !live.subscribers.iter().any(|s| s.out.same_channel(&out)) {
+                                    live.subscribers.push(Subscriber {
+                                        out: out.clone(), failed: failed.clone(), persistent: false,
+                                    });
+                                }
+                            }
+                        }
                     }
                     Ok(Handled::Ask { ready, request_id, session_id, prompt }) => {
                         let session = session
                             .clone()
                             .expect("session created by handle_request");
                         start_session_turn(state.clone(), session, request_id, prompt, ready,
-                            Subscriber { out: out.clone(), failed: failed.clone(), persistent: false }).await;
+                            Some(Subscriber { out: out.clone(), failed: failed.clone(), persistent: false }), false).await;
                         running = Some(RunningAsk { session_id });
                     }
                     Ok(Handled::Subscribe { id, session: current }) => {
@@ -2418,7 +2530,10 @@ mod tests {
     }
 
     async fn recv_json(out_rx: &mut mpsc::Receiver<String>) -> Value {
-        let line = out_rx.recv().await.expect("server message");
+        let line = tokio::time::timeout(std::time::Duration::from_secs(5), out_rx.recv())
+            .await
+            .expect("server message timed out")
+            .expect("server message");
         serde_json::from_str(&line).expect("valid JSON line")
     }
 
@@ -3714,9 +3829,7 @@ mod tests {
         let session_id = ready["session_id"].as_str().unwrap().to_string();
 
         in_tx
-            .send(
-                r#"{"id": 2, "op": "steer", "text": "focus on tests"}"#.to_string(),
-            )
+            .send(r#"{"id": 2, "op": "steer", "text": "focus on tests"}"#.to_string())
             .await
             .unwrap();
 
@@ -3755,7 +3868,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn steer_without_running_ask_is_rejected() {
+    async fn idle_steer_resumes_for_the_last_request_client() {
         let state = server_state_with(TestLlm::plain());
         let (in_tx, mut out_rx, handle) = spawn_connection(state).await;
 
@@ -3768,8 +3881,7 @@ mod tests {
         assert_eq!(msg["type"], "error");
         assert!(msg["error"].as_str().unwrap().contains("no session"));
 
-        // Run one ask to idle, then steer again: the session exists but no
-        // turn is running, so the request must fail rather than queue.
+        // Run one ask to idle, then steer again: the session resumes automatically.
         in_tx
             .send(r#"{"id": 2, "op": "ask", "prompt": "go"}"#.to_string())
             .await
@@ -3783,16 +3895,60 @@ mod tests {
             .send(r#"{"id": 3, "op": "steer", "text": "late"}"#.to_string())
             .await
             .unwrap();
-        let msg = recv_json(&mut out_rx).await;
-        assert_eq!(msg["type"], "error");
-        assert!(
-            msg["error"].as_str().unwrap().contains("no ask is in progress"),
-            "unexpected error: {}",
-            msg["error"]
-        );
+        let ack = tokio::time::timeout(std::time::Duration::from_secs(5), recv_json(&mut out_rx))
+            .await
+            .expect("steer acknowledgement timed out");
+        assert_eq!(ack["type"], "steered");
+        let mut resumed_terminal = false;
+        for _ in 0..16 {
+            let msg =
+                tokio::time::timeout(std::time::Duration::from_secs(5), recv_json(&mut out_rx))
+                    .await
+                    .expect("idle resumed turn timed out");
+            if msg["type"] == "result" || msg["type"] == "error" {
+                resumed_terminal = true;
+                break;
+            }
+        }
+        assert!(resumed_terminal);
 
         drop(in_tx);
         handle.await.unwrap().unwrap();
+    }
+
+    #[tokio::test]
+    async fn idle_background_completion_reaches_persistent_subscriber() {
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            let state = server_state_with(TestLlm::plain());
+            let (in_tx, mut out_rx, handle) = spawn_connection(state.clone()).await;
+            in_tx
+                .send(r#"{"id":1,"op":"subscribe_session"}"#.into())
+                .await
+                .unwrap();
+            let ready = recv_json(&mut out_rx).await;
+            let id = ready["session_id"].as_str().unwrap();
+            assert_eq!(recv_json(&mut out_rx).await["type"], "session_snapshot");
+            let session = state.sessions.lock().await.get(id).unwrap().clone();
+            let inbox = session.steering.lock().await.clone().unwrap();
+            inbox.notify(gewu_core::agent::BackgroundNotification {
+                source: "workflow".into(),
+                id: "completed-run".into(),
+                status: "completed".into(),
+                output: "untrusted output".into(),
+            });
+            loop {
+                let message = recv_json(&mut out_rx).await;
+                if message["type"] == "result" {
+                    assert_eq!(message["response"], "Hello from test");
+                    break;
+                }
+            }
+            assert!(!inbox.is_pending());
+            drop(in_tx);
+            handle.await.unwrap().unwrap();
+        })
+        .await
+        .expect("idle background notification timed out");
     }
 
     #[tokio::test]

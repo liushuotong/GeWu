@@ -30,7 +30,9 @@ fn classify_failure(error: &Failure) -> crate::http::RetryDecision {
         return crate::http::RetryDecision::Yes { after: None };
     }
     match error.downcast_ref::<crate::openai::OpenAIError>() {
-        Some(crate::openai::OpenAIError::Http(_)) => crate::http::RetryDecision::Yes { after: None },
+        Some(crate::openai::OpenAIError::Http(_)) => {
+            crate::http::RetryDecision::Yes { after: None }
+        }
         Some(crate::openai::OpenAIError::RateLimit { retry_after, .. }) => {
             crate::http::RetryDecision::Yes {
                 after: *retry_after,
@@ -412,7 +414,9 @@ mod tests {
             "message": "the context window is full"
         });
         let crate::openai::OpenAIError::Stream {
-            transient, retry_after, ..
+            transient,
+            retry_after,
+            ..
         } = &stream_error(&error)
         else {
             panic!("expected a typed stream error");
@@ -429,9 +433,15 @@ mod tests {
         let events = parse_stream(source, "origin".into(), "model".into())
             .collect::<Vec<_>>()
             .await;
-        let error = events.last().unwrap().as_ref().expect_err("an error event is a stream failure");
+        let error = events
+            .last()
+            .unwrap()
+            .as_ref()
+            .expect_err("an error event is a stream failure");
         let crate::openai::OpenAIError::Stream {
-            transient, retry_after, ..
+            transient,
+            retry_after,
+            ..
         } = error
             .downcast_ref::<crate::openai::OpenAIError>()
             .expect("the failure carries the typed provider error")
@@ -682,10 +692,10 @@ impl LlmProvider for OpenAIProvider {
             futures::stream::once(async move {
                 match self.request("/responses", Some(&request)).await {
                     Ok(response) => parse_stream(response.bytes_stream(), origin, model),
-                    Err(error) => futures::stream::once(async move {
-                        Err(Box::new(error) as Failure)
-                    })
-                    .boxed(),
+                    Err(error) => {
+                        futures::stream::once(async move { Err(Box::new(error) as Failure) })
+                            .boxed()
+                    }
                 }
             })
             .flatten()

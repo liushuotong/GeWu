@@ -478,6 +478,7 @@ pub struct ToolContext {
     pub enforcement: PathEnforcement,
     /// Per-session key/value state tools can persist across turns.
     pub session_state: SessionState,
+    pub inbox: Option<crate::agent::Steering>,
 }
 
 impl ToolContext {
@@ -489,6 +490,7 @@ impl ToolContext {
             metadata: Default::default(),
             enforcement: PathEnforcement::default(),
             session_state: SessionState::in_memory(),
+            inbox: None,
         }
     }
 

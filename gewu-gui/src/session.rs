@@ -989,7 +989,9 @@ impl GuiSession {
         // `steered` event confirm the block instead of duplicating it.
         if tab.model.phase != Phase::Idle {
             if let Err(e) = self.ensure_client(tab_id).await {
-                return self.send_error(sender, format!("could not connect: {e}")).await;
+                return self
+                    .send_error(sender, format!("could not connect: {e}"))
+                    .await;
             }
             let client = self.client(tab_id).expect("just ensured");
             return match client.steer(prompt.clone()).await {
@@ -998,7 +1000,9 @@ impl GuiSession {
                         let tab = self.workspace.tab_mut(tab_id).expect("tab exists");
                         let index = tab
                             .model
-                            .apply_event(&AgentEvent::Steered { text: prompt.clone() })
+                            .apply_event(&AgentEvent::Steered {
+                                text: prompt.clone(),
+                            })
                             .expect("a steered event appends a user block");
                         tab.pending_steers.push((prompt, index));
                         (index, tab.model.take_collapsed())
@@ -1669,8 +1673,7 @@ mod tests {
             .expect("steered appends a block");
         let mut pending = vec![("focus".to_string(), index)];
 
-        let (update, collapsed) =
-            confirm_steered(&mut model, &mut pending, "focus".into());
+        let (update, collapsed) = confirm_steered(&mut model, &mut pending, "focus".into());
 
         assert!(matches!(update, TabUpdate::None));
         assert_eq!(collapsed, None);
@@ -1685,9 +1688,7 @@ mod tests {
         let mut model = gewu_client::SessionModel::new();
         model.submit("hi".into());
         let a = model
-            .apply_event(&AgentEvent::Steered {
-                text: "a".into(),
-            })
+            .apply_event(&AgentEvent::Steered { text: "a".into() })
             .expect("steered appends a block");
         let b = model
             .apply_event(&AgentEvent::Steered { text: "b".into() })
@@ -1716,8 +1717,7 @@ mod tests {
         model.submit("hi".into());
         let mut pending = Vec::new();
 
-        let (update, _) =
-            confirm_steered(&mut model, &mut pending, "from elsewhere".into());
+        let (update, _) = confirm_steered(&mut model, &mut pending, "from elsewhere".into());
 
         assert!(matches!(update, TabUpdate::BlockAppend(1)));
         assert_eq!(user_texts(&model), ["hi", "from elsewhere"]);

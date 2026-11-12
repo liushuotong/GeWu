@@ -102,7 +102,7 @@ impl Tool for WorkflowStartTool {
             .map_err(|e| tool_error(format!("invalid workflow spec: {e}")))?;
         let run_id = self
             .manager
-            .start(spec_value, &ctx.session_id)
+            .start_with_inbox(spec_value, &ctx.session_id, ctx.inbox.clone())
             .await
             .map_err(tool_error)?;
         Ok(ToolResult::new(

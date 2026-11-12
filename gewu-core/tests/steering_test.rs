@@ -124,6 +124,38 @@ impl Tool for SlowTool {
     }
 }
 
+#[tokio::test]
+async fn background_resume_is_user_level_data() {
+    tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        let llm = ScriptedLlm::new(vec![Message::Assistant {
+            content: Some("done".into()),
+            reasoning: None,
+            replay: None,
+            tool_calls: None,
+        }]);
+        let mut agent = AgentBuilder::default()
+            .llm(llm.clone())
+            .system_prompt("System")
+            .build()
+            .unwrap();
+        agent
+            .steering()
+            .notify(gewu_core::agent::BackgroundNotification {
+                source: "workflow".into(),
+                id: "run".into(),
+                status: "completed".into(),
+                output: "untrusted result".into(),
+            });
+        let events: Vec<_> = agent.resume().collect().await;
+        assert!(events.iter().all(Result::is_ok));
+        let requests = llm.requests();
+        assert_eq!(roles(&requests[0]), vec!["system", "user"]);
+        assert!(user_texts(&requests[0])[0].contains("untrusted result"));
+    })
+    .await
+    .expect("background resume timed out");
+}
+
 fn roles(messages: &[Message]) -> Vec<&'static str> {
     messages
         .iter()
@@ -154,6 +186,52 @@ fn user_texts(messages: &[Message]) -> Vec<String> {
             _ => None,
         })
         .collect()
+}
+
+#[tokio::test]
+async fn background_delivery_at_finish_boundary_resumes_without_user_input() {
+    let answer = || Message::Assistant {
+        content: Some("answer".into()),
+        reasoning: None,
+        replay: None,
+        tool_calls: None,
+    };
+    let llm = ScriptedLlm::new(vec![answer(), answer()]);
+    let mut agent = AgentBuilder::default()
+        .llm(llm.clone())
+        .system_prompt("System")
+        .build()
+        .unwrap();
+    let inbox = agent.steering().clone();
+    let mut stream = Box::pin(agent.ask("start"));
+    while let Some(event) = stream.next().await {
+        if matches!(event.unwrap(), AgentEvent::Finish { .. }) {
+            break;
+        }
+    }
+    inbox.notify(gewu_core::agent::BackgroundNotification {
+        source: "workflow".into(),
+        id: "run".into(),
+        status: "completed".into(),
+        output: "result".into(),
+    });
+    drop(stream);
+    let mut stream = Box::pin(agent.resume());
+    while let Some(event) = stream.next().await {
+        event.unwrap();
+    }
+    drop(stream);
+    assert_eq!(llm.requests().len(), 2);
+    assert_eq!(
+        user_texts(&llm.requests()[1]),
+        vec!["start", "Background workflow run: completed\nresult"]
+    );
+    assert!(
+        llm.requests()[1]
+            .iter()
+            .any(|m| matches!(m, Message::User { content } if content.iter().any(|part| matches!(part, ContentPart::Text { text } if text.contains("workflow run")))))
+    );
+    assert!(!inbox.is_pending());
 }
 
 fn tool_call(name: &str, arguments: Value) -> ToolCall {
@@ -294,15 +372,16 @@ async fn steer_during_final_answer_extends_the_run() {
     assert_eq!(finish.as_deref(), Some("steered answer"));
 
     let requests = llm.requests();
-    assert_eq!(requests.len(), 2, "the run continued after the first answer");
+    assert_eq!(
+        requests.len(),
+        2,
+        "the run continued after the first answer"
+    );
     assert_eq!(
         roles(&requests[1]),
         vec!["system", "user", "assistant", "user"]
     );
-    assert_eq!(
-        user_texts(&requests[1]),
-        vec!["start", "now answer this"]
-    );
+    assert_eq!(user_texts(&requests[1]), vec!["start", "now answer this"]);
 }
 
 /// Messages steered while the agent is idle are delivered at the start of

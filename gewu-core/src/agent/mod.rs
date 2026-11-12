@@ -48,7 +48,7 @@ mod tools;
 
 pub use compaction::CompactionError;
 pub use experiences::SearchExperiencesTool;
-pub use steering::Steering;
+pub use steering::{BackgroundNotification, InboxMessage, Steering};
 pub use tools::execute_tool_with_panic_recovery;
 
 use crate::middleware::TruncationService;
@@ -264,19 +264,35 @@ impl Agent {
         &'a mut self,
         user_message: &'a str,
     ) -> impl Stream<Item = Result<AgentEvent>> + 'a {
+        self.run(Some(user_message))
+    }
+
+    pub fn resume(&mut self) -> impl Stream<Item = Result<AgentEvent>> + '_ {
+        self.run(None)
+    }
+
+    fn run<'a>(
+        &'a mut self,
+        user_message: Option<&'a str>,
+    ) -> impl Stream<Item = Result<AgentEvent>> + 'a {
         async_stream::try_stream! {
+            if user_message.is_some() {
+                self.steering.unpause();
+            }
             if self.memory.messages().is_empty() && !self.system_prompt.is_empty() {
                 self.memory.add_message(Message::System { content: self.system_prompt.clone() }).await;
             }
 
             // Messages steered while the agent was idle join the transcript
             // ahead of this run's own prompt, preserving send order.
-            for text in self.ingest_steered().await {
-                yield AgentEvent::Steered { text };
+            for event in self.ingest_steered().await {
+                yield event;
             }
 
-            self.memory.add_message(Message::User { content: vec![ContentPart::Text { text: user_message.to_string() }] }).await;
-            self.reminder.on_user_turn();
+            if let Some(user_message) = user_message {
+                self.memory.add_message(Message::User { content: vec![ContentPart::Text { text: user_message.to_string() }] }).await;
+                self.reminder.on_user_turn();
+            }
             // Due mode reminders become part of conversation history, so
             // every request in this turn — and later turns — still carries
             // them instead of only the first provider call.
@@ -299,8 +315,8 @@ impl Agent {
                 // the only safe spot: all tool results of the previous
                 // round are in history, so a user message never lands
                 // between an assistant turn and its tool results.
-                for text in self.ingest_steered().await {
-                    yield AgentEvent::Steered { text };
+                for event in self.ingest_steered().await {
+                    yield event;
                 }
 
                 let context_tokens = crate::compaction::active_context(self.memory.messages())
@@ -500,12 +516,14 @@ impl Agent {
                     let enforcement = self.enforcement;
                     let truncation = self.truncation.clone();
                     let semaphore = semaphore.clone();
+                    let inbox = self.steering.clone();
                     join_set.spawn(async move {
                         let _permit = semaphore.acquire_owned().await.ok();
                         let tool_name = call.function.name.clone();
-                        let ctx = ToolContext::new(&session_id, &message_id)
+                        let mut ctx = ToolContext::new(&session_id, &message_id)
                             .with_enforcement(enforcement)
                             .with_session_state(session_state);
+                        ctx.inbox = Some(inbox);
                         let result = if let Some(t) = tool {
                             execute_tool_call(t, call, ctx, &truncation).await
                         } else {
@@ -579,20 +597,39 @@ impl Agent {
 
     /// Drains queued steering messages into conversation history as user
     /// messages, applying the same reminder treatment as an ordinary prompt.
-    async fn ingest_steered(&mut self) -> Vec<String> {
-        let messages = self.steering.drain();
-        for text in &messages {
-            self.memory
-                .add_message(Message::User {
-                    content: vec![ContentPart::Text { text: text.clone() }],
-                })
-                .await;
+    async fn ingest_steered(&mut self) -> Vec<AgentEvent> {
+        let messages = self.steering.drain_messages();
+        let mut events = Vec::new();
+        let mut user_turn = false;
+        for message in messages {
+            match message {
+                InboxMessage::User(text) => {
+                    self.memory
+                        .add_message(Message::User {
+                            content: vec![ContentPart::Text { text: text.clone() }],
+                        })
+                        .await;
+                    events.push(AgentEvent::Steered { text });
+                    user_turn = true;
+                }
+                InboxMessage::Background(notification) => {
+                    let message = notification.text();
+                    self.memory
+                        .add_message(Message::User {
+                            content: vec![ContentPart::Text {
+                                text: message.clone(),
+                            }],
+                        })
+                        .await;
+                    events.push(AgentEvent::Status { message });
+                }
+            }
         }
-        if !messages.is_empty() {
+        if user_turn {
             self.reminder.on_user_turn();
             self.reminder.apply(self.memory.messages_mut());
         }
-        messages
+        events
     }
 
     /// The tools this agent can call.

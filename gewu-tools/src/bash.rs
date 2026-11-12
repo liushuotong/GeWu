@@ -158,9 +158,9 @@ impl Tool for BashTool {
         // the timeout fires.
         let stdout_pipe = child_process.stdout.take();
         let stderr_pipe = child_process.stderr.take();
-        let stdout_reader =
+        let mut stdout_reader =
             tokio::spawn(async move { read_capped(stdout_pipe, MAX_CAPTURE_BYTES).await });
-        let stderr_reader =
+        let mut stderr_reader =
             tokio::spawn(async move { read_capped(stderr_pipe, MAX_CAPTURE_BYTES).await });
 
         let wait_result = tokio::time::timeout(
@@ -169,10 +169,29 @@ impl Tool for BashTool {
         )
         .await;
 
+        if !matches!(wait_result, Ok(Ok(_))) {
+            kill_process_tree(&mut child_process);
+            let _ =
+                tokio::time::timeout(std::time::Duration::from_secs(1), child_process.wait()).await;
+        }
+
+        let drain_deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(1);
         let (captured_stdout, stdout_truncated) =
-            stdout_reader.await.unwrap_or((Vec::new(), false));
+            match tokio::time::timeout_at(drain_deadline, &mut stdout_reader).await {
+                Ok(result) => result.unwrap_or((Vec::new(), false)),
+                Err(_) => {
+                    stdout_reader.abort();
+                    (Vec::new(), true)
+                }
+            };
         let (captured_stderr, stderr_truncated) =
-            stderr_reader.await.unwrap_or((Vec::new(), false));
+            match tokio::time::timeout_at(drain_deadline, &mut stderr_reader).await {
+                Ok(result) => result.unwrap_or((Vec::new(), false)),
+                Err(_) => {
+                    stderr_reader.abort();
+                    (Vec::new(), true)
+                }
+            };
 
         let format_captured = |stdout: &str, stderr: &str| -> String {
             let mut result = String::new();
@@ -210,12 +229,6 @@ impl Tool for BashTool {
             }
             Ok(Err(e)) => Err(anyhow::anyhow!("Failed to wait for child process: {}", e).into()),
             Err(_) => {
-                // Kill the whole process group (or at least the direct child)
-                // and reap it, then report whatever output was captured before
-                // the timeout instead of discarding it.
-                kill_process_tree(&mut child_process);
-                let _ = child_process.wait().await;
-
                 let stdout = String::from_utf8_lossy(&captured_stdout);
                 let stderr = String::from_utf8_lossy(&captured_stderr);
                 let captured = format_captured(&stdout, &stderr);
@@ -608,15 +621,63 @@ mod tests {
             "timeout": 400
         });
         let ctx = ToolContext::new("test-session", "test-msg");
-        let result = tool
-            .execute(args, &ctx)
-            .await
-            .map_err(|e| anyhow::anyhow!(e.to_string()))?;
+        let result =
+            tokio::time::timeout(std::time::Duration::from_secs(2), tool.execute(args, &ctx))
+                .await?
+                .map_err(|e| anyhow::anyhow!(e.to_string()))?;
         assert!(result.output.contains("Command timed out"));
         assert!(
             result.output.contains("before-sleep"),
             "partial output captured before the timeout should be preserved"
         );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn timeout_kills_background_processes_before_draining() -> Result<()> {
+        let dir = tempdir()?;
+        let tool = BashTool {
+            working_directory: dir.path().to_path_buf(),
+            safe_mode: false,
+        };
+        let ctx = ToolContext::new("test-session", "test-msg");
+        let result = tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            tool.execute(
+                serde_json::json!({
+                    "command": "echo stdout; echo stderr >&2; sleep 5 & wait",
+                    "timeout": 100
+                }),
+                &ctx,
+            ),
+        )
+        .await?
+        .map_err(|e| anyhow::anyhow!(e.to_string()))?;
+        assert!(result.output.contains("Command timed out"));
+        assert!(result.output.contains("stdout"));
+        assert!(result.output.contains("stderr"));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn exited_shell_does_not_wait_forever_for_inherited_pipes() -> Result<()> {
+        let dir = tempdir()?;
+        let tool = BashTool {
+            working_directory: dir.path().to_path_buf(),
+            safe_mode: false,
+        };
+        let ctx = ToolContext::new("test-session", "test-msg");
+        let result = tokio::time::timeout(
+            std::time::Duration::from_millis(2500),
+            tool.execute(
+                serde_json::json!({"command": "sleep 3 &", "timeout": 100}),
+                &ctx,
+            ),
+        )
+        .await?
+        .map_err(|e| anyhow::anyhow!(e.to_string()))?;
+        assert!(result.output.contains("output truncated"));
+        assert!(!result.output.contains("Command timed out"));
         Ok(())
     }
 

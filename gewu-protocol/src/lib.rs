@@ -960,8 +960,7 @@ mod tests {
             session_id: "s".into(),
             text: "focus on tests".into(),
         };
-        let decoded: ServerMessage =
-            serde_json::from_str(&reply.to_line()).unwrap();
+        let decoded: ServerMessage = serde_json::from_str(&reply.to_line()).unwrap();
         assert_eq!(decoded, reply);
         assert_eq!(reply.kind(), "steered");
         assert_eq!(reply.correlation_id(), Some(&9.into()));

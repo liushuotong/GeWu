@@ -112,10 +112,11 @@ async fn test_tool_not_found_error() {
 
     while let Some(event_result) = stream.next().await {
         if let Ok(AgentEvent::ToolFinish { output, .. }) = event_result
-            && output.contains("Tool not found:") {
-                tool_found_error = true;
-                break;
-            }
+            && output.contains("Tool not found:")
+        {
+            tool_found_error = true;
+            break;
+        }
     }
 
     assert!(

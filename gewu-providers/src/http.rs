@@ -197,7 +197,8 @@ where
 /// Only integral seconds are understood (the common LLM-gateway form); HTTP
 /// dates yield `None` rather than a mis-parsed delay. Call before consuming
 /// the response body.
-pub(crate) fn retry_after(response: &reqwest::Response) -> Option<Duration> {    let header = response.headers().get(reqwest::header::RETRY_AFTER)?;
+pub(crate) fn retry_after(response: &reqwest::Response) -> Option<Duration> {
+    let header = response.headers().get(reqwest::header::RETRY_AFTER)?;
     parse_retry_after(header.to_str().ok()?)
 }
 
@@ -541,8 +542,7 @@ mod tests {
 
     #[tokio::test]
     async fn retrying_stream_surfaces_permanent_failures_without_restart() {
-        let (make, calls) =
-            canned_streams(vec![vec![Err("fatal: bad request".into())]]);
+        let (make, calls) = canned_streams(vec![vec![Err("fatal: bad request".into())]]);
         let events: Vec<_> = Box::pin(retrying_stream(
             make,
             retry_on_overloaded,
@@ -582,10 +582,8 @@ mod tests {
 
     #[tokio::test]
     async fn retrying_stream_reports_the_backoff_to_the_status_sink() {
-        let (make, calls) = canned_streams(vec![
-            vec![Err("server overloaded".into())],
-            vec![Ok(7)],
-        ]);
+        let (make, calls) =
+            canned_streams(vec![vec![Err("server overloaded".into())], vec![Ok(7)]]);
         let statuses = Arc::new(std::sync::Mutex::new(Vec::new()));
         let sink_statuses = statuses.clone();
         let sink: StatusSink = Arc::new(move |message: String| {

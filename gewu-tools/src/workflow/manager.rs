@@ -86,6 +86,15 @@ impl WorkflowManager {
         spec_value: serde_json::Value,
         owner_session: &str,
     ) -> Result<String, String> {
+        self.start_with_inbox(spec_value, owner_session, None).await
+    }
+
+    pub async fn start_with_inbox(
+        &self,
+        spec_value: serde_json::Value,
+        owner_session: &str,
+        inbox: Option<gewu_core::Steering>,
+    ) -> Result<String, String> {
         let spec: WorkflowSpec = serde_json::from_value(spec_value)
             .map_err(|error| format!("invalid workflow spec: {error}"))?;
         let builtins: Vec<&str> = self.builtin_agents.iter().map(String::as_str).collect();
@@ -102,8 +111,8 @@ impl WorkflowManager {
                 .map_err(|error| format!("invalid workflow spec: {error}"))?;
         }
 
+        let mut runs = self.runs.lock().expect("workflow runs mutex poisoned");
         {
-            let runs = self.runs.lock().expect("workflow runs mutex poisoned");
             let active = runs
                 .values()
                 .filter(|run| {
@@ -122,26 +131,55 @@ impl WorkflowManager {
         let run_id = uuid::Uuid::new_v4().to_string();
         let state = Arc::new(Mutex::new(RunState::default()));
         let cancel = Arc::new(AtomicBool::new(false));
-        let handle = tokio::spawn(engine::run(
+        let run = engine::run(
             spec.clone(),
             self.factory.clone(),
             owner_session.to_string(),
             cancel.clone(),
             state.clone(),
-        ));
-        self.runs
-            .lock()
-            .expect("workflow runs mutex poisoned")
-            .insert(
-                run_id.clone(),
-                RunHandle {
-                    owner_session: owner_session.to_string(),
-                    name: spec.name.clone(),
-                    handle,
-                    cancel,
-                    state,
-                },
-            );
+        );
+        let completion_state = state.clone();
+        let completion_id = run_id.clone();
+        let handle = tokio::spawn(async move {
+            use futures_util::FutureExt;
+            let result = std::panic::AssertUnwindSafe(run).catch_unwind().await;
+            let mut state = completion_state.lock().expect("run state mutex poisoned");
+            if result.is_err() {
+                state.status = RunStatus::Failed;
+                state.error = Some("workflow task panicked".into());
+            }
+            let status = match state.status {
+                RunStatus::Running => "running",
+                RunStatus::Completed => "completed",
+                RunStatus::Canceled => "canceled",
+                RunStatus::TimedOut => "timed out",
+                RunStatus::Failed => "failed",
+            };
+            if let Some(inbox) = inbox {
+                inbox.notify(gewu_core::agent::BackgroundNotification {
+                    source: "workflow".into(),
+                    id: completion_id,
+                    status: status.to_owned(),
+                    output: format!(
+                        "{} done, {} failed\n{}\n{}",
+                        state.tasks_done,
+                        state.tasks_failed,
+                        state.error.as_deref().unwrap_or(""),
+                        state.final_output()
+                    ),
+                });
+            }
+        });
+        runs.insert(
+            run_id.clone(),
+            RunHandle {
+                owner_session: owner_session.to_string(),
+                name: spec.name.clone(),
+                handle,
+                cancel,
+                state,
+            },
+        );
         Ok(run_id)
     }
 
@@ -294,6 +332,29 @@ mod tests {
             vec!["build".to_string(), "general".to_string()],
         ));
         (manager, factory)
+    }
+
+    #[tokio::test]
+    async fn completion_notifies_only_the_supplied_session_inbox() {
+        let (manager, _) = setup(Duration::ZERO);
+        let inbox = gewu_core::Steering::new();
+        let other = gewu_core::Steering::new();
+        let run_id = manager
+            .start_with_inbox(spec_value(), OWNER, Some(inbox.clone()))
+            .await
+            .unwrap();
+        tokio::time::timeout(Duration::from_secs(5), inbox.notified())
+            .await
+            .unwrap();
+        let notifications = inbox.drain();
+        assert_eq!(notifications.len(), 1);
+        assert!(notifications[0].contains(&run_id));
+        assert!(notifications[0].contains("completed"));
+        assert!(!other.is_pending());
+        assert_eq!(
+            manager.status(&run_id, OWNER).unwrap().status,
+            RunStatus::Completed
+        );
     }
 
     fn spec_value() -> serde_json::Value {

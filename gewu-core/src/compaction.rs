@@ -363,9 +363,10 @@ impl<'a> ActiveContext<'a> {
                         return None;
                     }
                     if index == boundary
-                        && let Message::Compaction { summary, recent } = message {
-                            return Some(ContextMessage::Checkpoint(summary, recent));
-                        }
+                        && let Message::Compaction { summary, recent } = message
+                    {
+                        return Some(ContextMessage::Checkpoint(summary, recent));
+                    }
                 }
                 Some(ContextMessage::Borrowed(message))
             })

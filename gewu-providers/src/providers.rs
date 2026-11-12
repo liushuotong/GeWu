@@ -1547,11 +1547,9 @@ fn classify_anthropic_failure(error: &crate::anthropic::Failure) -> crate::http:
     }
     match error.downcast_ref::<AnthropicError>() {
         Some(AnthropicError::Http(_)) => crate::http::RetryDecision::Yes { after: None },
-        Some(AnthropicError::RateLimit { retry_after, .. }) => {
-            crate::http::RetryDecision::Yes {
-                after: *retry_after,
-            }
-        }
+        Some(AnthropicError::RateLimit { retry_after, .. }) => crate::http::RetryDecision::Yes {
+            after: *retry_after,
+        },
         Some(AnthropicError::Stream {
             transient: true,
             retry_after,
@@ -1589,18 +1587,16 @@ impl LlmProvider for AnthropicProvider {
         let make_stream = move || {
             let request = request.clone();
             futures::stream::once(async move {
-                let request: CreateMessageRequest =
-                    match serde_json::from_value(request) {
-                        Ok(request) => request,
-                        Err(e) => {
-                            return futures::stream::once(async move {
-                                Err(Box::new(AnthropicError::Api(format!(
-                                    "build error: {e}"
-                                ))) as Box<dyn Error + Send + Sync>)
-                            })
-                            .boxed();
-                        }
-                    };
+                let request: CreateMessageRequest = match serde_json::from_value(request) {
+                    Ok(request) => request,
+                    Err(e) => {
+                        return futures::stream::once(async move {
+                            Err(Box::new(AnthropicError::Api(format!("build error: {e}")))
+                                as Box<dyn Error + Send + Sync>)
+                        })
+                        .boxed();
+                    }
+                };
                 match self.client.messages().create_stream(request).await {
                     Ok(stream) => self.parse_stream(stream),
                     Err(e) => futures::stream::once(async move {
