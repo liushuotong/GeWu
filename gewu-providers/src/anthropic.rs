@@ -115,6 +115,22 @@ impl AnthropicError {
     }
 }
 
+impl gewu_core::traits::RetryClassify for AnthropicError {
+    fn retry_kind(&self) -> gewu_core::types::RetryKind {
+        match self {
+            AnthropicError::Server { status, .. } | AnthropicError::Client { status, .. } => {
+                gewu_core::types::RetryKind::Status(status.as_u16())
+            }
+            AnthropicError::RateLimit { .. } => gewu_core::types::RetryKind::RateLimit,
+            AnthropicError::Stream { .. } => gewu_core::types::RetryKind::Stream,
+            AnthropicError::Http(_) => gewu_core::types::RetryKind::Transport,
+            AnthropicError::SseParse(_) => gewu_core::types::RetryKind::Parse,
+            // Permanent; never reaches a retry notice.
+            AnthropicError::Build(_) => gewu_core::types::RetryKind::Other,
+        }
+    }
+}
+
 /// Configuration for the Anthropic API client.
 #[derive(Debug, Clone)]
 pub struct AnthropicConfig {

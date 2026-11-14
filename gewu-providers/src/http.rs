@@ -13,7 +13,7 @@ use reqwest::Client;
 use std::future::Future;
 use std::time::Duration;
 
-use gewu_core::traits::StatusSink;
+use gewu_core::traits::{RetryClassify, StatusSink};
 use serde_json::Value;
 
 /// Connect timeout for the initial TCP/TLS handshake.
@@ -75,7 +75,7 @@ pub(crate) async fn with_retries_capped<T, E, Fut, F>(
 where
     F: FnMut() -> Fut,
     Fut: Future<Output = Result<T, E>>,
-    E: std::fmt::Display,
+    E: std::fmt::Display + RetryClassify,
 {
     let mut attempt: u32 = 0;
     loop {
@@ -103,10 +103,12 @@ where
                     // Surface the backoff to frontends: without this a
                     // retry wait is indistinguishable from a silent hang.
                     if let Some(notify) = notify {
-                        notify(format!(
-                            "LLM request failed: {e}; retrying in {}s (attempt {attempt})",
-                            delay.as_secs()
-                        ));
+                        notify(gewu_core::traits::RetryNotice {
+                            kind: e.retry_kind(),
+                            message: e.to_string(),
+                            attempt,
+                            delay,
+                        });
                     }
                     tokio::time::sleep(delay).await;
                 }
@@ -138,7 +140,7 @@ pub(crate) fn retrying_stream<T, E, F, S>(
 where
     F: FnMut() -> S,
     S: futures::Stream<Item = Result<T, E>>,
-    E: std::fmt::Display,
+    E: std::fmt::Display + RetryClassify,
 {
     async_stream::try_stream! {
         let mut attempt: u32 = 0;
@@ -173,10 +175,12 @@ where
                                 "retryable LLM stream failure; restarting"
                             );
                             if let Some(notify) = &notify {
-                                notify(format!(
-                                    "LLM request failed: {error}; retrying in {}s (attempt {attempt})",
-                                    delay.as_secs()
-                                ));
+                                notify(gewu_core::traits::RetryNotice {
+                                    kind: error.retry_kind(),
+                                    message: error.to_string(),
+                                    attempt,
+                                    delay,
+                                });
                             }
                             tokio::time::sleep(delay).await;
                             restart = true;
@@ -287,10 +291,10 @@ mod tests {
     #[tokio::test]
     async fn retry_backoff_is_reported_to_the_status_sink() {
         let calls = Arc::new(AtomicUsize::new(0));
-        let statuses = Arc::new(std::sync::Mutex::new(Vec::new()));
-        let sink_statuses = statuses.clone();
-        let sink: StatusSink = Arc::new(move |message: String| {
-            sink_statuses.lock().unwrap().push(message);
+        let notices = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let sink_notices = notices.clone();
+        let sink: StatusSink = Arc::new(move |notice: gewu_core::traits::RetryNotice| {
+            sink_notices.lock().unwrap().push(notice);
         });
         let result: Result<u32, String> = with_retries_capped(
             TEST_BACKOFF,
@@ -307,11 +311,15 @@ mod tests {
         )
         .await;
         assert_eq!(result.unwrap(), 3);
-        let reported = statuses.lock().unwrap();
-        assert_eq!(reported.len(), 2, "one status per failed attempt");
-        assert!(reported[0].contains("transient 1"), "{}", reported[0]);
-        assert!(reported[0].contains("attempt 1"), "{}", reported[0]);
-        assert!(reported[1].contains("attempt 2"), "{}", reported[1]);
+        let reported = notices.lock().unwrap();
+        assert_eq!(reported.len(), 2, "one notice per failed attempt");
+        assert!(
+            reported[0].message.contains("transient 1"),
+            "{}",
+            reported[0].message
+        );
+        assert_eq!(reported[0].attempt, 1);
+        assert_eq!(reported[1].attempt, 2);
     }
 
     #[tokio::test]
@@ -581,10 +589,10 @@ mod tests {
     async fn retrying_stream_reports_the_backoff_to_the_status_sink() {
         let (make, calls) =
             canned_streams(vec![vec![Err("server overloaded".into())], vec![Ok(7)]]);
-        let statuses = Arc::new(std::sync::Mutex::new(Vec::new()));
-        let sink_statuses = statuses.clone();
-        let sink: StatusSink = Arc::new(move |message: String| {
-            sink_statuses.lock().unwrap().push(message);
+        let notices = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let sink_notices = notices.clone();
+        let sink: StatusSink = Arc::new(move |notice: gewu_core::traits::RetryNotice| {
+            sink_notices.lock().unwrap().push(notice);
         });
         let events: Vec<_> = Box::pin(retrying_stream(
             make,
@@ -596,10 +604,14 @@ mod tests {
         .collect()
         .await;
         assert!(matches!(events.as_slice(), [Ok(7)]), "{events:?}");
-        let reported = statuses.lock().unwrap();
+        let reported = notices.lock().unwrap();
         assert_eq!(reported.len(), 1);
-        assert!(reported[0].contains("overloaded"), "{}", reported[0]);
-        assert!(reported[0].contains("attempt 1"), "{}", reported[0]);
+        assert!(
+            reported[0].message.contains("overloaded"),
+            "{}",
+            reported[0].message
+        );
+        assert_eq!(reported[0].attempt, 1);
         assert_eq!(calls.load(Ordering::SeqCst), 2);
     }
 }

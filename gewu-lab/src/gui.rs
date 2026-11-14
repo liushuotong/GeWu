@@ -1,6 +1,6 @@
 use crate::cli::GuiArgs;
 use axum::{
-    Json, Router,
+    Extension, Json, Router,
     extract::{DefaultBodyLimit, Path, Request, State},
     http::{HeaderValue, Method, StatusCode, header},
     middleware::{self, Next},
@@ -11,15 +11,33 @@ use gewu_lab::{Clock, LabError, LabStore, SystemClock};
 use serde::Deserialize;
 use serde_json::{Value, json};
 use std::{
+    collections::HashMap,
     net::{IpAddr, Ipv4Addr, SocketAddr},
-    sync::Arc,
+    sync::{Arc, Mutex},
+    time::{Duration, Instant},
 };
 
+const SESSION_TTL: Duration = Duration::from_secs(8 * 60 * 60);
+const MAX_SESSIONS: usize = 1024;
+
 #[derive(Clone)]
+struct SessionCsrf(String);
+
 struct AppState {
     store: LabStore,
     authority: String,
-    token: String,
+    token: Option<String>,
+    csrf_token: String,
+    secure_cookie: bool,
+    allowed_origins: Vec<String>,
+    sessions: Mutex<HashMap<String, Session>>,
+    login_attempts: Mutex<Vec<Instant>>,
+}
+
+#[derive(Clone)]
+struct Session {
+    csrf: String,
+    expires: Instant,
 }
 
 fn bind_address(host: &str, port: u16) -> anyhow::Result<SocketAddr> {
@@ -27,14 +45,35 @@ fn bind_address(host: &str, port: u16) -> anyhow::Result<SocketAddr> {
         "localhost" => IpAddr::V4(Ipv4Addr::LOCALHOST),
         _ => host
             .parse::<IpAddr>()
-            .map_err(|_| anyhow::anyhow!("host must be a literal loopback IP or localhost"))?,
+            .map_err(|_| anyhow::anyhow!("host must be a literal IP or localhost"))?,
     };
-    anyhow::ensure!(ip.is_loopback(), "GUI is loopback-only");
     Ok(SocketAddr::new(ip, port))
 }
 
 pub async fn serve(store: LabStore, args: &GuiArgs, json_output: bool) -> anyhow::Result<()> {
-    let listener = tokio::net::TcpListener::bind(bind_address(&args.host, args.port)?).await?;
+    let address = bind_address(&args.host, args.port)?;
+    let token = match &args.token {
+        Some(token) => Some(token.clone()),
+        None => std::env::var("GEWU_LAB_GUI_TOKEN")
+            .map(Some)
+            .or_else(|error| match error {
+                std::env::VarError::NotPresent => Ok(None),
+                _ => Err(anyhow::anyhow!("GEWU_LAB_GUI_TOKEN must be valid Unicode")),
+            })?,
+    };
+    validate_token(address, token.as_deref())?;
+    for origin in &args.allowed_origins {
+        anyhow::ensure!(
+            origin_authority(origin).is_some(),
+            "allowed-origin must be an http(s) origin without path, credentials, query or fragment"
+        );
+    }
+    if !address.ip().is_loopback() && !args.secure_cookie {
+        eprintln!(
+            "warning: LAN GUI uses plain HTTP; use --secure-cookie behind HTTPS in production"
+        );
+    }
+    let listener = tokio::net::TcpListener::bind(address).await?;
     let address = listener.local_addr()?;
     let url = format!("http://{address}");
     if json_output {
@@ -57,22 +96,67 @@ pub async fn serve(store: LabStore, args: &GuiArgs, json_output: bool) -> anyhow
             eprintln!("Could not open browser: {error}");
         }
     }
-    let result = axum::serve(listener, router(store.clone(), address.to_string()))
-        .with_graceful_shutdown(async {
-            let _ = tokio::signal::ctrl_c().await;
-        })
-        .await;
+    let result = axum::serve(
+        listener,
+        router_with_options(
+            store.clone(),
+            address.to_string(),
+            token,
+            args.secure_cookie,
+            args.allowed_origins.clone(),
+        ),
+    )
+    .with_graceful_shutdown(async {
+        let _ = tokio::signal::ctrl_c().await;
+    })
+    .await;
     store.pool().close().await;
     result?;
     Ok(())
 }
 
+fn validate_token(address: SocketAddr, token: Option<&str>) -> anyhow::Result<()> {
+    anyhow::ensure!(
+        token.is_none_or(|value| !value.is_empty()),
+        "GUI token must not be empty"
+    );
+    anyhow::ensure!(
+        token.is_none_or(|value| value.len() >= 32 && !value.trim().is_empty()),
+        "GUI token must be at least 32 bytes"
+    );
+    anyhow::ensure!(
+        address.ip().is_loopback() || token.is_some(),
+        "non-loopback GUI binding requires --token or GEWU_LAB_GUI_TOKEN"
+    );
+    Ok(())
+}
+
+#[cfg(test)]
 fn router(store: LabStore, authority: String) -> Router {
+    router_with_options(store, authority, None, false, Vec::new())
+}
+
+fn router_with_options(
+    store: LabStore,
+    authority: String,
+    token: Option<String>,
+    secure_cookie: bool,
+    allowed_origins: Vec<String>,
+) -> Router {
     let state = Arc::new(AppState {
         store,
         authority,
-        token: uuid::Uuid::new_v4().to_string(),
+        token,
+        csrf_token: uuid::Uuid::new_v4().to_string(),
+        secure_cookie,
+        allowed_origins,
+        sessions: Mutex::new(HashMap::new()),
+        login_attempts: Mutex::new(Vec::new()),
     });
+    router_with_state(state)
+}
+
+fn router_with_state(state: Arc<AppState>) -> Router {
     Router::new()
         .route("/", get(|| async { Html(include_str!("gui/index.html")) }))
         .route(
@@ -112,6 +196,8 @@ fn router(store: LabStore, authority: String) -> Router {
             }),
         )
         .route("/api/config", get(config))
+        .route("/api/login", post(login))
+        .route("/api/logout", post(logout))
         .route("/api/labs", get(labs))
         .route("/api/labs/{lab}", get(dashboard))
         .route("/api/labs/{lab}/{kind}/{id}/{action}", post(mutate))
@@ -121,26 +207,68 @@ fn router(store: LabStore, authority: String) -> Router {
         .with_state(state)
 }
 
-async fn security(State(state): State<Arc<AppState>>, request: Request, next: Next) -> Response {
+async fn security(
+    State(state): State<Arc<AppState>>,
+    mut request: Request,
+    next: Next,
+) -> Response {
     let headers = request.headers().clone();
     let value = |name: &str| headers.get(name).and_then(|v| v.to_str().ok());
-    let origin = format!("http://{}", state.authority);
+    let path = request.uri().path();
+    let public = !path.starts_with("/api/") || path == "/api/login";
+    let session = value("cookie")
+        .and_then(|cookie| cookie_value(cookie, "gewu_lab_session"))
+        .and_then(|id| get_session(&state, &id));
+    if !public && state.token.is_some() && session.is_none() {
+        return security_headers(
+            ApiError(StatusCode::UNAUTHORIZED, "Authentication required".into()).into_response(),
+        );
+    }
+    let host = value("host").unwrap_or_default();
+    let origin_allowed = |candidate: &str| {
+        origin_authority(candidate).is_some_and(|authority| authority == host)
+            && (candidate == format!("http://{host}") && direct_host(&state.authority, host)
+                || state
+                    .allowed_origins
+                    .iter()
+                    .any(|allowed| allowed == candidate))
+    };
+    let host_allowed = direct_host(&state.authority, host)
+        || state
+            .allowed_origins
+            .iter()
+            .any(|origin| origin_authority(origin).is_some_and(|authority| authority == host));
     let mutation = !matches!(*request.method(), Method::GET | Method::HEAD);
-    let forbidden = value("host") != Some(state.authority.as_str())
-        || value("origin").is_some_and(|v| v != origin)
+    let forbidden = !host_allowed
+        || value("origin").is_some_and(|v| !origin_allowed(v))
         || value("sec-fetch-site").is_some_and(|v| !matches!(v, "same-origin" | "none"))
         || (mutation
-            && (value("origin") != Some(origin.as_str())
-                || value("x-gewu-lab-csrf") != Some(state.token.as_str())));
-    let mut response = if forbidden {
+            && (value("origin").is_none_or(|v| !origin_allowed(v))
+                || (path != "/api/login"
+                    && value("x-gewu-lab-csrf")
+                        != session
+                            .as_ref()
+                            .map(|item| item.csrf.as_str())
+                            .or(Some(state.csrf_token.as_str())))));
+    let response = if forbidden {
         ApiError(
             StatusCode::FORBIDDEN,
             "Same-origin request and CSRF token required".into(),
         )
         .into_response()
     } else {
+        request.extensions_mut().insert(SessionCsrf(
+            session
+                .as_ref()
+                .map(|item| item.csrf.clone())
+                .unwrap_or_else(|| state.csrf_token.clone()),
+        ));
         next.run(request).await
     };
+    security_headers(response)
+}
+
+fn security_headers(mut response: Response) -> Response {
     for (name, value) in [
         (
             "content-security-policy",
@@ -155,6 +283,68 @@ async fn security(State(state): State<Arc<AppState>>, request: Request, next: Ne
             .insert(name, HeaderValue::from_static(value));
     }
     response
+}
+
+fn cookie_value(cookie: &str, name: &str) -> Option<String> {
+    cookie.split(';').find_map(|part| {
+        let (key, value) = part.trim().split_once('=')?;
+        (key == name).then(|| value.to_string())
+    })
+}
+
+fn get_session(state: &AppState, id: &str) -> Option<Session> {
+    let mut sessions = state.sessions.lock().ok()?;
+    let item = sessions.get(id)?.clone();
+    if item.expires <= Instant::now() {
+        sessions.remove(id);
+        None
+    } else {
+        Some(item)
+    }
+}
+
+fn origin_authority(origin: &str) -> Option<String> {
+    let uri = origin.parse::<axum::http::Uri>().ok()?;
+    if !matches!(uri.scheme_str(), Some("http" | "https")) || origin.contains(['?', '#', '@']) {
+        return None;
+    }
+    let authority = uri.authority()?.as_str();
+    (origin == format!("{}://{authority}", uri.scheme_str()?)).then(|| authority.to_string())
+}
+
+fn direct_host(bound: &str, host: &str) -> bool {
+    let Ok(bound) = bound.parse::<SocketAddr>() else {
+        return false;
+    };
+    let Ok(authority) = host.parse::<axum::http::uri::Authority>() else {
+        return false;
+    };
+    if host.contains('@')
+        || !(host == authority.host()
+            || host
+                == format!(
+                    "{}:{}",
+                    authority.host(),
+                    authority.port_u16().unwrap_or(80)
+                ))
+    {
+        return false;
+    }
+    let port = authority.port_u16().unwrap_or(80);
+    if port != bound.port() {
+        return false;
+    }
+    let hostname = authority.host().trim_matches(['[', ']']);
+    if hostname == "localhost" {
+        return bound.ip().is_loopback() || bound.ip().is_unspecified();
+    }
+    hostname.parse::<IpAddr>().is_ok_and(|ip| {
+        if bound.ip().is_unspecified() {
+            !ip.is_unspecified()
+        } else {
+            ip == bound.ip()
+        }
+    })
 }
 
 struct ApiError(StatusCode, String);
@@ -186,8 +376,112 @@ fn missing() -> ApiError {
     )
 }
 
-async fn config(State(state): State<Arc<AppState>>) -> Json<Value> {
-    Json(json!({"csrf_token": state.token, "worker_started": false}))
+async fn config(
+    State(state): State<Arc<AppState>>,
+    Extension(csrf): Extension<SessionCsrf>,
+) -> Json<Value> {
+    Json(
+        json!({"csrf_token": csrf.0, "auth_required": state.token.is_some(), "worker_started": false}),
+    )
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct Login {
+    token: String,
+}
+
+fn tokens_equal(a: &str, b: &str) -> bool {
+    use subtle::ConstantTimeEq;
+    bool::from(a.as_bytes().ct_eq(b.as_bytes()))
+}
+
+async fn login(
+    State(state): State<Arc<AppState>>,
+    body: Result<Json<Login>, axum::extract::rejection::JsonRejection>,
+) -> Response {
+    let now = Instant::now();
+    {
+        let mut attempts = state
+            .login_attempts
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        attempts.retain(|time| now.duration_since(*time) < Duration::from_secs(60));
+        if attempts.len() >= 20 {
+            return ApiError(
+                StatusCode::TOO_MANY_REQUESTS,
+                "Too many login attempts".into(),
+            )
+            .into_response();
+        }
+        attempts.push(now);
+    }
+    let Ok(Json(body)) = body else {
+        return ApiError(StatusCode::BAD_REQUEST, "Invalid login JSON".into()).into_response();
+    };
+    if !state
+        .token
+        .as_deref()
+        .is_some_and(|expected| tokens_equal(&body.token, expected))
+    {
+        return ApiError(StatusCode::UNAUTHORIZED, "Invalid credentials".into()).into_response();
+    }
+    let id = uuid::Uuid::new_v4().to_string();
+    let csrf = uuid::Uuid::new_v4().to_string();
+    {
+        let mut sessions = state.sessions.lock().unwrap_or_else(|e| e.into_inner());
+        sessions.retain(|_, item| item.expires > now);
+        if sessions.len() >= MAX_SESSIONS {
+            return ApiError(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "Session capacity reached".into(),
+            )
+            .into_response();
+        }
+        sessions.insert(
+            id.clone(),
+            Session {
+                csrf,
+                expires: now + SESSION_TTL,
+            },
+        );
+    }
+    let secure = if state.secure_cookie { "; Secure" } else { "" };
+    (
+        [(
+            header::SET_COOKIE,
+            format!(
+                "gewu_lab_session={id}; HttpOnly; SameSite=Strict; Path=/; Max-Age={}{secure}",
+                SESSION_TTL.as_secs()
+            ),
+        )],
+        Json(json!({"ok": true})),
+    )
+        .into_response()
+}
+
+async fn logout(State(state): State<Arc<AppState>>, request: Request) -> Response {
+    if let Some(id) = request
+        .headers()
+        .get(header::COOKIE)
+        .and_then(|v| v.to_str().ok())
+        .and_then(|v| cookie_value(v, "gewu_lab_session"))
+    {
+        state
+            .sessions
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .remove(&id);
+    }
+    let secure = if state.secure_cookie { "; Secure" } else { "" };
+    (
+        [(
+            header::SET_COOKIE,
+            format!("gewu_lab_session=; HttpOnly; SameSite=Strict; Path=/; Max-Age=0{secure}"),
+        )],
+        Json(json!({"ok": true})),
+    )
+        .into_response()
 }
 async fn labs(State(state): State<Arc<AppState>>) -> ApiResult {
     Ok(Json(json!({"labs": state.store.labs().await?})))
@@ -323,6 +617,268 @@ mod tests {
     use axum::http::Request as HttpRequest;
     use tower::ServiceExt;
 
+    const SECRET: &str = "a-test-token-with-at-least-32-bytes";
+
+    async fn request(
+        app: &Router,
+        path: &str,
+        cookie: &str,
+        csrf: &str,
+        body: Option<Value>,
+    ) -> Response {
+        let mut builder = HttpRequest::builder()
+            .uri(path)
+            .header("host", "127.0.0.1:8440")
+            .header("cookie", cookie);
+        let body = if let Some(body) = body {
+            builder = builder
+                .method("POST")
+                .header("origin", "http://127.0.0.1:8440")
+                .header("x-gewu-lab-csrf", csrf)
+                .header("content-type", "application/json");
+            Body::from(body.to_string())
+        } else {
+            Body::empty()
+        };
+        app.clone()
+            .oneshot(builder.body(body).unwrap())
+            .await
+            .unwrap()
+    }
+
+    async fn response_json(response: Response) -> Value {
+        serde_json::from_slice(
+            &to_bytes(response.into_body(), 4 * 1024 * 1024)
+                .await
+                .unwrap(),
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn binding_token_and_authority_validation() {
+        for host in ["0.0.0.0", "::", "192.168.1.2"] {
+            let address = bind_address(host, 8440).unwrap();
+            for token in [None, Some(""), Some("short")] {
+                assert!(validate_token(address, token).is_err());
+            }
+            assert!(validate_token(address, Some(SECRET)).is_ok());
+        }
+        let address = bind_address("localhost", 0).unwrap();
+        assert!(validate_token(address, None).is_ok());
+        assert!(validate_token(address, Some("")).is_err());
+        assert!(validate_token(address, Some(SECRET)).is_ok());
+        for host in ["192.168.1.2:8440", "localhost:8440", "[::1]:8440"] {
+            assert!(direct_host("0.0.0.0:8440", host));
+        }
+        for host in [
+            "evil.test:8440",
+            "192.168.1.2:8441",
+            "127.0.0.1.evil:8440",
+            "user@127.0.0.1:8440",
+        ] {
+            assert!(!direct_host("0.0.0.0:8440", host));
+        }
+        for origin in [
+            "null",
+            "https://example.com/",
+            "https://u@example.com",
+            "https://example.com?x=y",
+        ] {
+            assert!(origin_authority(origin).is_none());
+        }
+        assert_eq!(
+            origin_authority("https://example.com"),
+            Some("example.com".into())
+        );
+        assert!(tokens_equal(SECRET, SECRET));
+        assert!(!tokens_equal(SECRET, "wrong"));
+    }
+
+    #[tokio::test]
+    async fn authenticated_sessions_csrf_expiry_logout_and_limits() {
+        let (_dir, store, _) = fixture().await;
+        let state = Arc::new(AppState {
+            store,
+            authority: "127.0.0.1:8440".into(),
+            token: Some(SECRET.into()),
+            csrf_token: "anonymous-csrf".into(),
+            secure_cookie: true,
+            allowed_origins: vec!["https://lab.example".into()],
+            sessions: Mutex::new(HashMap::new()),
+            login_attempts: Mutex::new(Vec::new()),
+        });
+        let app = router_with_state(state.clone());
+        for path in ["/api/config", "/api/labs", "/api/labs/l"] {
+            let response = request(&app, path, "", "", None).await;
+            assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+            assert_eq!(response.headers()[header::CONTENT_TYPE], "application/json");
+            assert!(!response.headers().contains_key(header::LOCATION));
+        }
+        assert_eq!(
+            request(
+                &app,
+                "/api/login",
+                "",
+                "",
+                Some(json!({"token": "invalid"}))
+            )
+            .await
+            .status(),
+            StatusCode::UNAUTHORIZED
+        );
+        let mut cookies = Vec::new();
+        let mut csrf_tokens = Vec::new();
+        for _ in 0..2 {
+            let response =
+                request(&app, "/api/login", "", "", Some(json!({"token": SECRET}))).await;
+            assert_eq!(response.status(), StatusCode::OK);
+            let cookie = response.headers()[header::SET_COOKIE]
+                .to_str()
+                .unwrap()
+                .to_string();
+            for attribute in [
+                "HttpOnly",
+                "SameSite=Strict",
+                "Path=/",
+                "Secure",
+                "Max-Age=28800",
+            ] {
+                assert!(cookie.contains(attribute));
+            }
+            assert!(!cookie.contains(SECRET));
+            let cookie = cookie.split(';').next().unwrap().to_string();
+            let config = response_json(request(&app, "/api/config", &cookie, "", None).await).await;
+            assert!(!config.to_string().contains(SECRET));
+            csrf_tokens.push(config["csrf_token"].as_str().unwrap().to_string());
+            cookies.push(cookie);
+        }
+        assert_ne!(cookies[0], cookies[1]);
+        assert_ne!(csrf_tokens[0], csrf_tokens[1]);
+        assert_eq!(
+            request(&app, "/api/labs", &cookies[0], "", None)
+                .await
+                .status(),
+            StatusCode::OK
+        );
+        let mutation = "/api/labs/l/lab/l/pause";
+        let body = json!({"actor":"human", "rationale":"reviewed"});
+        for token in [&csrf_tokens[1], &state.csrf_token, &String::new()] {
+            assert_eq!(
+                request(&app, mutation, &cookies[0], token, Some(body.clone()))
+                    .await
+                    .status(),
+                StatusCode::FORBIDDEN
+            );
+        }
+        for (host, origin) in [
+            ("127.0.0.1:8440", "https://evil.example"),
+            ("127.0.0.1:8440", "https://lab.example"),
+            ("evil.example", "https://evil.example"),
+        ] {
+            let response = app
+                .clone()
+                .oneshot(
+                    HttpRequest::builder()
+                        .method("POST")
+                        .uri(mutation)
+                        .header("host", host)
+                        .header("origin", origin)
+                        .header("cookie", &cookies[0])
+                        .header("x-gewu-lab-csrf", &csrf_tokens[0])
+                        .header("content-type", "application/json")
+                        .body(Body::from(body.to_string()))
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::FORBIDDEN);
+        }
+        let response = app
+            .clone()
+            .oneshot(
+                HttpRequest::builder()
+                    .uri("/api/config")
+                    .header("host", "lab.example")
+                    .header("origin", "https://lab.example")
+                    .header("cookie", &cookies[0])
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(
+            request(&app, mutation, &cookies[0], &csrf_tokens[0], Some(body))
+                .await
+                .status(),
+            StatusCode::OK
+        );
+        let response = request(
+            &app,
+            "/api/logout",
+            &cookies[0],
+            &csrf_tokens[0],
+            Some(json!({})),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::OK);
+        assert!(
+            response.headers()[header::SET_COOKIE]
+                .to_str()
+                .unwrap()
+                .contains("Max-Age=0")
+        );
+        assert_eq!(
+            request(&app, "/api/config", &cookies[0], "", None)
+                .await
+                .status(),
+            StatusCode::UNAUTHORIZED
+        );
+        assert_eq!(
+            request(&app, "/api/config", &cookies[1], "", None)
+                .await
+                .status(),
+            StatusCode::OK
+        );
+        let id = cookie_value(&cookies[1], "gewu_lab_session").unwrap();
+        state.sessions.lock().unwrap().get_mut(&id).unwrap().expires =
+            Instant::now() - Duration::from_secs(1);
+        assert_eq!(
+            request(&app, "/api/config", &cookies[1], "", None)
+                .await
+                .status(),
+            StatusCode::UNAUTHORIZED
+        );
+        assert!(state.sessions.lock().unwrap().is_empty());
+        for index in 0..MAX_SESSIONS {
+            state.sessions.lock().unwrap().insert(
+                index.to_string(),
+                Session {
+                    csrf: "csrf".into(),
+                    expires: Instant::now() + SESSION_TTL,
+                },
+            );
+        }
+        assert_eq!(
+            request(&app, "/api/login", "", "", Some(json!({"token": SECRET})))
+                .await
+                .status(),
+            StatusCode::SERVICE_UNAVAILABLE
+        );
+        state.sessions.lock().unwrap().clear();
+        for _ in 0..20 {
+            let _ = request(&app, "/api/login", "", "", Some(json!({"token":"wrong"}))).await;
+        }
+        assert_eq!(
+            request(&app, "/api/login", "", "", Some(json!({"token": SECRET})))
+                .await
+                .status(),
+            StatusCode::TOO_MANY_REQUESTS
+        );
+        assert!(state.login_attempts.lock().unwrap().len() <= 20);
+    }
+
     async fn fixture() -> (tempfile::TempDir, LabStore, Router) {
         let dir = tempfile::tempdir().unwrap();
         let store = LabStore::connect(&format!("sqlite://{}", dir.path().join("lab.db").display()))
@@ -413,13 +969,10 @@ mod tests {
         for host in ["127.0.0.1", "::1", "localhost"] {
             assert_eq!(bind_address(host, 0).unwrap().port(), 0);
         }
-        for host in [
-            "0.0.0.0",
-            "::",
-            "example.com",
-            "192.168.1.2",
-            "127.0.0.1.example.com",
-        ] {
+        for host in ["0.0.0.0", "::", "192.168.1.2"] {
+            assert!(bind_address(host, 8440).is_ok());
+        }
+        for host in ["example.com", "127.0.0.1.example.com"] {
             assert!(bind_address(host, 8440).is_err());
         }
     }

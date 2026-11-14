@@ -1,7 +1,7 @@
 'use strict';
 const $ = id => document.getElementById(id);
 const sections = ['projects', 'tasks', 'proposals', 'attempts', 'artifacts', 'decisions'];
-let csrf, labId, data, section = 'projects', selected, pending, generation = 0;
+let csrf, labId, data, section = 'projects', selected, pending, generation = 0, authGeneration = 0;
 function node(tag, text, className) {
   const el = document.createElement(tag);
   if (text !== undefined) el.textContent = text;
@@ -13,10 +13,13 @@ function button(text, callback, className) {
   el.type = 'button'; el.addEventListener('click', callback); return el;
 }
 async function api(path, body) {
+  const ticket = authGeneration;
   const options = {credentials: 'same-origin', headers: {}};
   if (body) { options.method = 'POST'; options.headers = {'Content-Type': 'application/json', 'X-GeWu-Lab-CSRF': csrf}; options.body = JSON.stringify(body); }
   const response = await fetch(path, options);
   const value = await response.json().catch(() => ({error: `HTTP ${response.status}`}));
+  if (ticket !== authGeneration) throw new Error('Session changed');
+  if (response.status === 401 && path !== '/api/login') showLogin();
   if (!response.ok) throw new Error(value.error || `HTTP ${response.status}`);
   return value;
 }
@@ -131,4 +134,29 @@ $('search').addEventListener('input', render);
 $('refresh').addEventListener('click', () => load().catch(notify));
 document.documentElement.dataset.theme = localStorage.getItem('lab-theme') || (matchMedia('(prefers-color-scheme: light)').matches ? 'light' : 'dark');
 $('theme').addEventListener('click', () => { const theme = document.documentElement.dataset.theme === 'dark' ? 'light' : 'dark'; document.documentElement.dataset.theme = theme; localStorage.setItem('lab-theme', theme); });
-api('/api/config').then(async config => { csrf = config.csrf_token; await load(); }).catch(notify);
+function showLogin() {
+  authGeneration++; generation++;
+  csrf = labId = data = selected = pending = undefined;
+  $('decision-dialog').close();
+  for (const id of ['labs', 'counts', 'tabs', 'records', 'detail', 'lab-actions']) $(id).replaceChildren();
+  $('title').textContent = 'Research dashboard'; $('interest').textContent = ''; $('notice').textContent = ''; $('updated').textContent = ''; $('search').value = '';
+  $('dashboard').hidden = true; $('logout').hidden = true; $('login-form').hidden = false;
+  $('login-token').value = ''; $('login-error').textContent = ''; $('login-token').focus();
+}
+async function start() {
+  const config = await api('/api/config');
+  csrf = config.csrf_token;
+  $('login-form').hidden = true; $('dashboard').hidden = false; $('logout').hidden = !config.auth_required;
+  await load();
+}
+$('login-form').addEventListener('submit', async event => {
+  event.preventDefault();
+  const token = $('login-token').value; $('login-token').value = '';
+  try { await api('/api/login', {token}); await start(); }
+  catch (error) { $('login-error').textContent = error.message; }
+});
+$('logout').addEventListener('click', async () => {
+  try { await api('/api/logout', {}); showLogin(); }
+  catch (error) { notify(error); }
+});
+start().catch(notify);

@@ -1,3 +1,5 @@
+[hidden]{display:none!important}
+#login-form{max-width:480px;margin:64px auto;padding:24px}#login-form label{display:block}#login-token{width:100%;margin:12px 0}
 @font-face{font-family:Inter;src:url('/fonts/inter.woff2') format('woff2');font-weight:100 900;font-display:swap}
 @font-face{font-family:'JetBrains Mono';src:url('/fonts/mono.woff2') format('woff2');font-display:swap}
 :root{color-scheme:dark;--bg:#07090c;--panel:#0c1015;--raised:#10151c;--line:rgba(255,255,255,.075);--strong:rgba(255,255,255,.14);--text:#d9e1ea;--dim:#8b97a6;--accent:#4fd1c5;--soft:rgba(79,209,197,.09);--error:#ff5d6c;--mono:'JetBrains Mono',ui-monospace,monospace;--sans:Inter,system-ui,sans-serif}

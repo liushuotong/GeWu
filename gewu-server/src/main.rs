@@ -105,12 +105,33 @@ async fn run_agent(agent: &mut gewu_core::Agent, prompt: &str) -> Result<()> {
                             println!("\n{DIM}── Context compacted ──{RESET}");
                             println!("{summary}");
                         }
-                        // Transient provider status (e.g. retry backoff):
-                        // shown as a dim line so a wait is visible in the CLI.
+                        // Transient provider status (context compaction):
+                        // shown as a dim line so the phase is visible.
                         AgentEvent::Status { message } => {
                             stop_spinner(&mut spinner_active, is_tty)?;
                             if is_tty {
                                 println!("{DIM}{message}{RESET}");
+                                std::io::stdout().flush()?;
+                            }
+                        }
+                        // Provider retry backoff: same dim line, one per
+                        // attempt, so a wait is visible in the CLI.
+                        AgentEvent::Retrying {
+                            ref message,
+                            attempt,
+                            delay_secs,
+                            ..
+                        } => {
+                            stop_spinner(&mut spinner_active, is_tty)?;
+                            if is_tty {
+                                println!(
+                                    "{DIM}{}{RESET}",
+                                    gewu_protocol::AgentEvent::retry_message(
+                                        message,
+                                        attempt,
+                                        delay_secs
+                                    )
+                                );
                                 std::io::stdout().flush()?;
                             }
                         }

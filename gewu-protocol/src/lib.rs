@@ -1392,17 +1392,57 @@ mod tests {
     #[test]
     fn status_event_serializes_and_round_trips() {
         let agent_event = AgentEvent::Status {
-            message: "LLM request failed: rate limited; retrying in 4s (attempt 1)".to_string(),
+            message: "Compacting context…".to_string(),
         };
         let value = agent_event_to_value(&agent_event);
         assert_eq!(value["type"], "status");
-        assert_eq!(
-            value["message"],
-            "LLM request failed: rate limited; retrying in 4s (attempt 1)"
-        );
+        assert_eq!(value["message"], "Compacting context…");
 
         let decoded: AgentEvent = serde_json::from_value(value).unwrap();
         assert_eq!(decoded, agent_event);
+    }
+
+    #[test]
+    fn retrying_event_serializes_and_round_trips() {
+        let agent_event = AgentEvent::Retrying {
+            kind: gewu_core::types::RetryKind::Status(502),
+            message: "API error: 502 Bad Gateway: <html>upstream exploded</html>".to_string(),
+            attempt: 2,
+            delay_secs: 4,
+        };
+        let value = agent_event_to_value(&agent_event);
+        assert_eq!(value["type"], "retrying");
+        // The kind serializes as a flat string tag, stable across volatile
+        // bodies; the message carries the human-readable detail.
+        assert_eq!(value["kind"], "status-502");
+        assert_eq!(
+            value["message"],
+            "API error: 502 Bad Gateway: <html>upstream exploded</html>"
+        );
+        assert_eq!(value["attempt"], 2);
+        assert_eq!(value["delay_secs"], 4);
+
+        let decoded: AgentEvent = serde_json::from_value(value).unwrap();
+        assert_eq!(decoded, agent_event);
+        assert_eq!(
+            serde_json::to_value(AgentEvent::Retrying {
+                kind: gewu_core::types::RetryKind::RateLimit,
+                message: "slow down".into(),
+                attempt: 1,
+                delay_secs: 2,
+            })
+            .unwrap()["kind"],
+            "rate-limit"
+        );
+        // One display source for every frontend: the prefix + live tail.
+        assert_eq!(
+            AgentEvent::retry_prefix("boom"),
+            "LLM request failed: boom; retrying in"
+        );
+        assert_eq!(
+            AgentEvent::retry_message("boom", 2, 4),
+            "LLM request failed: boom; retrying in 4s (attempt 2)"
+        );
     }
 
     #[test]

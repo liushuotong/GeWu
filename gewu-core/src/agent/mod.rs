@@ -302,11 +302,12 @@ impl Agent {
             let mut doom_loop = DoomLoopDetector::new(3);
 
             // Provider retry backoff is reported through this channel and
-            // surfaced as `AgentEvent::Status`, so a rate-limit wait shows
+            // surfaced as `AgentEvent::Retrying`, so a rate-limit wait shows
             // up in the UI instead of looking like a silent hang.
-            let (status_tx, mut status_rx) = mpsc::unbounded_channel::<String>();
-            self.llm.set_status_sink(Some(Arc::new(move |message| {
-                let _ = status_tx.send(message);
+            let (status_tx, mut status_rx) =
+                mpsc::unbounded_channel::<crate::traits::RetryNotice>();
+            self.llm.set_status_sink(Some(Arc::new(move |notice| {
+                let _ = status_tx.send(notice);
             })));
 
             loop {
@@ -349,10 +350,10 @@ impl Agent {
                 trace!("LLM request messages: {:?}", messages);
                 let tools_clone = self.tools.clone();
 
-                // Interleave provider status messages (retry backoff) with
-                // the awaited stream setup. The channel closes only when the
-                // sink is replaced or the ask ends; `status_open` prevents a
-                // closed channel from busy-looping the select.
+                // Interleave provider retry notices with the awaited stream
+                // setup. The channel closes only when the sink is replaced
+                // or the ask ends; `status_open` prevents a closed channel
+                // from busy-looping the select.
                 let mut status_open = true;
                 let stream_fut = self
                     .llm
@@ -361,10 +362,15 @@ impl Agent {
                 let stream_result: Option<Result<_, _>> = loop {
                     tokio::select! {
                         result = &mut stream_fut => break Some(result),
-                        status = status_rx.recv(), if status_open => {
-                            match status {
-                                Some(message) => {
-                                    yield AgentEvent::Status { message };
+                        notice = status_rx.recv(), if status_open => {
+                            match notice {
+                                Some(notice) => {
+                                    yield AgentEvent::Retrying {
+                                        kind: notice.kind,
+                                        message: notice.message,
+                                        attempt: notice.attempt,
+                                        delay_secs: notice.delay.as_secs(),
+                                    };
                                 }
                                 None => status_open = false,
                             }
@@ -379,7 +385,42 @@ impl Agent {
                 // The aggregator drops it, so it is captured here before the
                 // event is passed on.
                 let mut finish_reason: Option<String> = None;
-                while let Some(event_result) = stream.next().await {
+                // Retry backoff also fires while the stream is being polled:
+                // the Responses/Anthropic streams are lazy (the HTTP request
+                // runs on first poll), and mid-stream restarts sleep inside
+                // the stream too. Keep draining the status channel alongside
+                // the events, so a retry wait shows up in the UI instead of
+                // looking like a silent hang. The loop tracks the stream
+                // only: the channel outlives the ask (the sink is replaced
+                // by the next ask), so it never signals closure here.
+                let mut stream_open = true;
+                while stream_open {
+                    let event_result = tokio::select! {
+                        event_result = stream.next(), if stream_open => match event_result {
+                            Some(event_result) => event_result,
+                            None => {
+                                stream_open = false;
+                                continue;
+                            }
+                        },
+                        notice = status_rx.recv(), if status_open => {
+                            match notice {
+                                Some(notice) => {
+                                    yield AgentEvent::Retrying {
+                                        kind: notice.kind,
+                                        message: notice.message,
+                                        attempt: notice.attempt,
+                                        delay_secs: notice.delay.as_secs(),
+                                    };
+                                    continue;
+                                }
+                                None => {
+                                    status_open = false;
+                                    continue;
+                                }
+                            }
+                        }
+                    };
                     let event = event_result.map_err(|e| anyhow::anyhow!(e))?;
                     match &event {
                         ProviderEvent::Finish { reason } => finish_reason = reason.clone(),
@@ -984,9 +1025,13 @@ mod tests {
     struct MockProvider {
         responses: Vec<Vec<ProviderEvent>>,
         call: AtomicUsize,
-        /// When set, emitted through the registered status sink on every
-        /// `send`, simulating provider-side retry reporting.
+        /// When set, the error text reported through the registered status
+        /// sink on every `send`, simulating provider-side retry reporting.
         status_message: Option<String>,
+        /// When set, the error text reported through the registered status
+        /// sink by the returned *stream* before its first event, simulating
+        /// a lazy request or a mid-stream restart reporting a retry wait.
+        stream_status: Option<String>,
         status_sink: std::sync::Mutex<Option<crate::traits::StatusSink>>,
         /// When set, the stream yields one event then a mid-stream error.
         fail_stream: bool,
@@ -1000,6 +1045,7 @@ mod tests {
                 responses,
                 call: AtomicUsize::new(0),
                 status_message: None,
+                stream_status: None,
                 status_sink: std::sync::Mutex::new(None),
                 fail_stream: false,
                 captured_requests: std::sync::Mutex::new(Vec::new()),
@@ -1015,12 +1061,32 @@ mod tests {
             ]])
         }
 
-        /// Content response preceded by a status message sent through the
+        /// Content response preceded by a retry notice sent through the
         /// registered sink (as a retrying provider would report).
-        fn content_with_status(delta: &str, status: &str) -> Self {
+        fn content_with_status(delta: &str, error: &str) -> Self {
             let mut provider = Self::single_content(delta);
-            provider.status_message = Some(status.to_string());
+            provider.status_message = Some(error.to_string());
             provider
+        }
+
+        /// Content response whose *stream* reports a retry notice through
+        /// the registered sink before its first event — how the lazy
+        /// Responses/Anthropic streams surface a retrying request.
+        fn content_with_stream_status(delta: &str, error: &str) -> Self {
+            let mut provider = Self::single_content(delta);
+            provider.stream_status = Some(error.to_string());
+            provider
+        }
+    }
+
+    /// The retry notice a mock provider reports: first attempt, fixed 4s
+    /// wait, carrying `message` as the failure text.
+    fn mock_notice(message: &str) -> crate::traits::RetryNotice {
+        crate::traits::RetryNotice {
+            kind: crate::types::RetryKind::Status(502),
+            message: message.to_string(),
+            attempt: 1,
+            delay: std::time::Duration::from_secs(4),
         }
     }
 
@@ -1062,12 +1128,12 @@ mod tests {
             if let Some(message) = &self.status_message {
                 // Snapshot the sink (no guard across await) and report it
                 // while the send is still pending, as a real provider does
-                // during backoff waits: the status is sent, then the future
+                // during backoff waits: the notice is sent, then the future
                 // stays pending, so the agent's select observes it.
                 let sink = self.status_sink.lock().unwrap().clone();
                 if let Some(sink) = sink {
                     tokio::time::sleep(std::time::Duration::from_millis(10)).await;
-                    sink(message.clone());
+                    sink(mock_notice(message));
                     tokio::time::sleep(std::time::Duration::from_millis(10)).await;
                 }
             }
@@ -1084,7 +1150,26 @@ mod tests {
                 return Ok(Box::pin(futures::stream::iter(events)));
             }
             let events = self.responses.get(index).cloned().unwrap_or_default();
-            Ok(Box::pin(futures::stream::iter(events.into_iter().map(Ok))))
+            let mut stream = futures::stream::iter(events.into_iter().map(Ok)).boxed();
+            if let Some(message) = &self.stream_status {
+                // Report the notice from inside the stream, as a provider
+                // whose request/retry happens on first poll would: the sink
+                // fires while the consumer waits for the first event.
+                let sink = self.status_sink.lock().unwrap().clone();
+                let message = message.clone();
+                let prefix = futures::stream::once(async move {
+                    if let Some(sink) = sink {
+                        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+                        sink(mock_notice(&message));
+                        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+                    }
+                })
+                // The prefix only performs the sink call: it contributes
+                // no events.
+                .filter_map(|()| futures::future::ready(None));
+                stream = prefix.chain(stream).boxed();
+            }
+            Ok(stream)
         }
 
         async fn list_models(&self) -> Result<Vec<String>, Box<dyn Error + Send + Sync>> {
@@ -1203,37 +1288,79 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_provider_status_surfaces_as_status_event() -> Result<()> {
+    async fn test_provider_retry_surfaces_as_retrying_event() -> Result<()> {
         let mut agent = Agent::builder()
             .llm(Arc::new(MockProvider::content_with_status(
                 "hi",
-                "LLM request failed: rate limited; retrying in 4s (attempt 1)",
+                "rate limited",
             )))
             .build()?;
 
         let events = agent.ask("hello").collect::<Vec<_>>().await;
         assert!(events.iter().all(|e| e.is_ok()));
 
-        let status = events.iter().find_map(|e| match e.as_ref().unwrap() {
-            AgentEvent::Status { message } => Some(message.clone()),
+        let retrying = events.iter().find_map(|e| match e.as_ref().unwrap() {
+            AgentEvent::Retrying {
+                kind,
+                message,
+                attempt,
+                delay_secs,
+            } => Some((kind.clone(), message.clone(), *attempt, *delay_secs)),
             _ => None,
         });
         assert_eq!(
-            status.as_deref(),
-            Some("LLM request failed: rate limited; retrying in 4s (attempt 1)"),
-            "provider status must surface as an AgentEvent::Status"
+            retrying,
+            Some((
+                crate::types::RetryKind::Status(502),
+                "rate limited".to_string(),
+                1,
+                4
+            )),
+            "provider retry must surface as an AgentEvent::Retrying"
         );
-        // The status precedes the streamed content (it is emitted during
+        // The notice precedes the streamed content (it is emitted during
         // stream setup, before the response stream is consumed).
-        let status_pos = events
+        let retrying_pos = events
             .iter()
-            .position(|e| matches!(e.as_ref().unwrap(), AgentEvent::Status { .. }))
+            .position(|e| matches!(e.as_ref().unwrap(), AgentEvent::Retrying { .. }))
             .unwrap();
         let content_pos = events
             .iter()
             .position(|e| matches!(e.as_ref().unwrap(), AgentEvent::ContentDelta { .. }))
             .unwrap();
-        assert!(status_pos < content_pos);
+        assert!(retrying_pos < content_pos);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_stream_phase_retry_surfaces_as_retrying_event() -> Result<()> {
+        // The Responses/Anthropic streams are lazy: their HTTP request (and
+        // any retry wait) runs while the event stream is polled, not while
+        // `stream_response` is awaited. The notice must still surface.
+        let mut agent = Agent::builder()
+            .llm(Arc::new(MockProvider::content_with_stream_status(
+                "hi",
+                "502 Bad Gateway",
+            )))
+            .build()?;
+
+        let events = agent.ask("hello").collect::<Vec<_>>().await;
+        assert!(events.iter().all(|e| e.is_ok()));
+
+        let retrying_pos = events
+            .iter()
+            .position(|e| {
+                matches!(
+                    e.as_ref().unwrap(),
+                    AgentEvent::Retrying { message, .. } if message == "502 Bad Gateway"
+                )
+            })
+            .expect("a stream-phase retry must surface as AgentEvent::Retrying");
+        let content_pos = events
+            .iter()
+            .position(|e| matches!(e.as_ref().unwrap(), AgentEvent::ContentDelta { .. }))
+            .unwrap();
+        assert!(retrying_pos < content_pos);
         Ok(())
     }
 

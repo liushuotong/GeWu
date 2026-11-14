@@ -137,8 +137,27 @@ pub enum ServerMsg {
     StreamingBody { index: usize, html: String },
     /// Replace the status line.
     Status { html: String },
-    /// A protocol or upstream error to surface as a toast.
-    Error { message: String },
+    /// An error to surface in the floating alert box. `key` makes repeats
+    /// of the same failure update one entry in place instead of stacking;
+    /// connection-level rejections before a session exists are unkeyed.
+    Error {
+        message: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        key: Option<String>,
+    },
+    /// A provider retry wait with a live countdown. The browser renders
+    /// `{prefix} {n}s (attempt {attempt})`, ticking `n` down each second,
+    /// and dismisses the entry when it reaches zero (the request restarts).
+    RetryWait {
+        /// Stable dedup key (e.g. `retry:status-502`).
+        key: String,
+        /// Failure description + "retrying in" label (no countdown value).
+        prefix: String,
+        /// 1-based count of the attempt that just failed.
+        attempt: u32,
+        /// Initial countdown value in whole seconds.
+        delay_secs: u64,
+    },
     /// A non-error notification to surface as a toast.
     Notice { message: String },
     /// Replace the rendered file tree.
@@ -252,6 +271,35 @@ mod tests {
         let json = serde_json::to_value(&msg).unwrap();
         assert_eq!(json["type"], "block_replace");
         assert_eq!(json["index"], 2);
+
+        // Keyed errors carry their dedup key; unkeyed ones omit the field.
+        let msg = ServerMsg::Error {
+            message: "LLM request failed: 502; retrying in 2s (attempt 2)".to_string(),
+            key: Some("retry:502".to_string()),
+        };
+        let json = serde_json::to_value(&msg).unwrap();
+        assert_eq!(json["type"], "error");
+        assert_eq!(json["key"], "retry:502");
+        let msg = ServerMsg::Error {
+            message: "could not steer".to_string(),
+            key: None,
+        };
+        let json = serde_json::to_value(&msg).unwrap();
+        assert_eq!(json["type"], "error");
+        assert!(json.get("key").is_none());
+
+        let msg = ServerMsg::RetryWait {
+            key: "retry:status-502".to_string(),
+            prefix: "LLM request failed: API error: 502 Bad Gateway: <html>…</html>; retrying in"
+                .to_string(),
+            attempt: 2,
+            delay_secs: 4,
+        };
+        let json = serde_json::to_value(&msg).unwrap();
+        assert_eq!(json["type"], "retry_wait");
+        assert_eq!(json["key"], "retry:status-502");
+        assert_eq!(json["attempt"], 2);
+        assert_eq!(json["delay_secs"], 4);
 
         let msg = ServerMsg::Notice {
             message: "Uploaded notes.bin (1 kB)".to_string(),

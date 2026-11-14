@@ -10,7 +10,9 @@
 </head>
 <body>
   <header class="topbar"><div class="brand"><span class="brand-mark">格物</span><span class="brand-name">GEWU / LAB</span></div><span class="instrument">RESEARCH CONTROL</span><button id="theme" type="button">Light / dark</button></header>
-  <div class="shell">
+  <form id="login-form" hidden><h2>Sign in to GeWu Lab</h2><label>Access token<input id="login-token" type="password" required autocomplete="current-password"></label><button type="submit">Sign in</button><p id="login-error" role="alert"></p></form>
+  <button id="logout" type="button" hidden>Sign out</button>
+  <div class="shell" id="dashboard">
     <aside><div class="eyebrow">WORKSPACE</div><h2>Research labs</h2><nav id="labs" aria-label="Labs"></nav><div class="sidebar-note"><span class="signal"></span> Local dashboard<p>No worker is started here. Results require explicit human review.</p></div></aside>
     <main><div id="notice" role="status" aria-live="polite"></div><header class="page-heading"><div><div class="eyebrow">LAB INSTRUMENT / OVERVIEW</div><h1 id="title">Research dashboard</h1><p id="interest">Select a lab to inspect its research.</p></div><div id="lab-actions" class="actions"></div></header>
       <section id="counts" class="metrics" aria-label="Overview counts"></section>

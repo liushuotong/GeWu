@@ -73,6 +73,15 @@ pub struct GuiArgs {
     pub port: u16,
     #[arg(long)]
     pub open: bool,
+    #[arg(
+        long,
+        help = "GUI login secret (or GEWU_LAB_GUI_TOKEN); at least 32 bytes"
+    )]
+    pub token: Option<String>,
+    #[arg(long)]
+    pub secure_cookie: bool,
+    #[arg(long = "allowed-origin")]
+    pub allowed_origins: Vec<String>,
 }
 
 #[derive(Debug, Subcommand)]

@@ -171,6 +171,7 @@ async fn handle_socket(mut socket: WebSocket, state: AppState) {
             warn!("could not start browser session: {e:#}");
             let msg = ServerMsg::Error {
                 message: format!("{e:#}"),
+                key: None,
             };
             let _ = send_json(&mut socket, &msg).await;
             let _ = socket.send(Message::Close(None)).await;
@@ -221,6 +222,7 @@ async fn authenticate(socket: &mut WebSocket, expected: Option<&str>) -> Result<
 async fn reject(socket: &mut WebSocket, message: &str) -> Result<(), axum::Error> {
     let msg = ServerMsg::Error {
         message: message.to_string(),
+        key: None,
     };
     send_json(socket, &msg).await?;
     socket.send(Message::Close(None)).await?;

@@ -115,6 +115,22 @@ impl OpenAIError {
     }
 }
 
+impl gewu_core::traits::RetryClassify for OpenAIError {
+    fn retry_kind(&self) -> gewu_core::types::RetryKind {
+        match self {
+            OpenAIError::Server { status, .. } | OpenAIError::Client { status, .. } => {
+                gewu_core::types::RetryKind::Status(status.as_u16())
+            }
+            OpenAIError::RateLimit { .. } => gewu_core::types::RetryKind::RateLimit,
+            OpenAIError::Stream { .. } => gewu_core::types::RetryKind::Stream,
+            OpenAIError::Http(_) => gewu_core::types::RetryKind::Transport,
+            OpenAIError::SseParse(_) => gewu_core::types::RetryKind::Parse,
+            // Permanent; never reaches a retry notice.
+            OpenAIError::Build(_) => gewu_core::types::RetryKind::Other,
+        }
+    }
+}
+
 /// Configuration for the OpenAI API client.
 #[derive(Debug, Clone)]
 pub struct OpenAIConfig {

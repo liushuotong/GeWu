@@ -25,6 +25,7 @@
     prompt: document.getElementById("prompt"),
     send: document.getElementById("send"),
     toasts: document.getElementById("toasts"),
+    alerts: document.getElementById("alerts"),
     login: document.getElementById("login"),
     loginForm: document.getElementById("login-form"),
     loginError: document.getElementById("login-error"),
@@ -51,6 +52,7 @@
     reconnectAt: 0,
     refreshTimer: null,
     lastToast: { text: "", at: 0 },
+    lastAlert: { text: "", at: 0 },
   };
 
   function loadToken() {
@@ -115,7 +117,7 @@
       const config = await response.json();
       state.authRequired = Boolean(config.auth_required);
     } catch (error) {
-      toast(`Could not reach gewu-gui: ${error.message}`);
+      showAlert(`Could not reach gewu-gui: ${error.message}`);
     }
 
     if (state.authRequired && !state.token) {
@@ -158,7 +160,7 @@
       try {
         message = JSON.parse(event.data);
       } catch (error) {
-        toast("Received an invalid message from gewu-gui");
+        showAlert("Received an invalid message from gewu-gui");
         return;
       }
       handle(message);
@@ -222,7 +224,7 @@
 
   function send(message) {
     if (!state.ws || state.ws.readyState !== WebSocket.OPEN) {
-      toast("Not connected to gewu-gui");
+      showAlert("Not connected to gewu-gui");
       return false;
     }
     state.ws.send(JSON.stringify(message));
@@ -278,8 +280,11 @@
         if (isUnauthorized(message.message)) {
           handleUnauthorized();
         } else {
-          toast(message.message);
+          showAlert(message.message, "error", message.key || null);
         }
+        break;
+      case "retry_wait":
+        showRetryWait(message.key, message.prefix, message.attempt, message.delay_secs);
         break;
       case "notice":
         toast(message.message);
@@ -549,7 +554,7 @@
     const text = el.prompt.value.trim();
     if (!text) return;
     if (!state.ready) {
-      toast("Still loading the session; try again in a moment");
+      showAlert("Still loading the session; try again in a moment");
       return;
     }
     if (!send({ op: "ask", tab: state.active, prompt: text })) return;
@@ -730,7 +735,7 @@
     const files = [...fileList].filter((file) => file.size <= MAX_UPLOAD_BYTES);
     const skipped = fileList.length - files.length;
     if (skipped > 0) {
-      toast(`Skipped ${skipped} file(s) over the 50 MB upload limit`);
+      showAlert(`Skipped ${skipped} file(s) over the 50 MB upload limit`, "warning");
     }
     if (!files.length) return;
     const payloads = await Promise.all(
@@ -762,7 +767,7 @@
     if (!event.dataTransfer?.files?.length) return;
     event.preventDefault();
     if (!state.ready) {
-      toast("Still loading the session; try again in a moment");
+      showAlert("Still loading the session; try again in a moment");
       return;
     }
     uploadFiles(event.dataTransfer.files);
@@ -829,6 +834,155 @@
     }, 5000);
   }
 
+  // -- floating alert box --------------------------------------------------
+  //
+  // Errors and warnings surface in a dedicated floating box instead of
+  // vanishing toasts: errors stay until dismissed, warnings auto-expire.
+  // Keyed alerts (e.g. retries of one failure) update a single entry in
+  // place instead of stacking.
+
+  function showAlert(text, level = "error", key = null) {
+    const value = String(text || "").trim();
+    if (!value) return;
+    if (key) {
+      const existing = el.alerts.querySelector(
+        `.alert[data-alert-key="${CSS.escape(key)}"]`,
+      );
+      if (existing) {
+        const label = existing.querySelector(".alert-text");
+        if (label.textContent !== value) {
+          label.textContent = value;
+          // Re-trigger the pulse so an in-place update is noticeable.
+          existing.classList.remove("updated");
+          void existing.offsetWidth;
+          existing.classList.add("updated");
+        }
+        return;
+      }
+    } else {
+      const now = Date.now();
+      if (state.lastAlert.text === value && now - state.lastAlert.at < 8000) return;
+      state.lastAlert = { text: value, at: now };
+    }
+
+    const entry = document.createElement("div");
+    entry.className = `alert ${level}`;
+    if (key) entry.dataset.alertKey = key;
+    const label = document.createElement("span");
+    label.className = "alert-text";
+    label.textContent = value;
+    const dismiss = document.createElement("button");
+    dismiss.type = "button";
+    dismiss.className = "alert-dismiss";
+    dismiss.setAttribute("aria-label", "Dismiss");
+    dismiss.textContent = "×";
+    dismiss.addEventListener("click", () => removeAlert(entry));
+    entry.append(label, dismiss);
+    el.alerts.appendChild(entry);
+    refreshAlerts();
+
+    if (level === "warning") {
+      setTimeout(() => removeAlert(entry), 10000);
+    }
+  }
+
+  function removeAlert(entry) {
+    if (!entry.isConnected) return;
+    entry.classList.add("leaving");
+    setTimeout(() => {
+      entry.remove();
+      refreshAlerts();
+    }, 250);
+  }
+
+  function refreshAlerts() {
+    const entries = el.alerts.querySelectorAll(".alert");
+    el.alerts.hidden = entries.length === 0;
+    // With several problems at once, offer a one-click clear.
+    let head = el.alerts.querySelector(".alerts-head");
+    if (entries.length > 1 && !head) {
+      head = document.createElement("div");
+      head.className = "alerts-head";
+      const title = document.createElement("span");
+      title.className = "alerts-title";
+      title.textContent = "Problems";
+      const dismissAll = document.createElement("button");
+      dismissAll.type = "button";
+      dismissAll.className = "alerts-dismiss-all";
+      dismissAll.textContent = "Dismiss all";
+      dismissAll.addEventListener("click", () => {
+        el.alerts.querySelectorAll(".alert").forEach((entry) => removeAlert(entry));
+      });
+      head.append(title, dismissAll);
+      el.alerts.prepend(head);
+    } else if (entries.length <= 1 && head) {
+      head.remove();
+    }
+  }
+
+  // Provider retry waits: a keyed entry with a live countdown that
+  // dismisses itself when it reaches zero (the request then restarts).
+  function showRetryWait(key, prefix, attempt, delaySecs) {
+    if (delaySecs < 1) return; // nothing visible to count down
+    let entry = el.alerts.querySelector(
+      `.alert[data-alert-key="${CSS.escape(key)}"]`,
+    );
+    if (!entry) {
+      entry = document.createElement("div");
+      entry.className = "alert error";
+      entry.dataset.alertKey = key;
+      const label = document.createElement("span");
+      label.className = "alert-text";
+      const dismiss = document.createElement("button");
+      dismiss.type = "button";
+      dismiss.className = "alert-dismiss";
+      dismiss.setAttribute("aria-label", "Dismiss");
+      dismiss.textContent = "×";
+      dismiss.addEventListener("click", () => removeAlert(entry));
+      entry.append(label, dismiss);
+      el.alerts.appendChild(entry);
+    } else {
+      // Re-trigger the pulse so the fresh attempt is noticeable.
+      entry.classList.remove("updated");
+      void entry.offsetWidth;
+      entry.classList.add("updated");
+    }
+    entry.dataset.retryRemaining = String(delaySecs);
+    entry.dataset.retryAttempt = String(attempt);
+    entry.dataset.retryPrefix = prefix;
+    renderRetryWait(entry);
+    refreshAlerts();
+    startRetryTicker();
+  }
+
+  function renderRetryWait(entry) {
+    entry.querySelector(".alert-text").textContent =
+      `${entry.dataset.retryPrefix} ${entry.dataset.retryRemaining}s` +
+      ` (attempt ${entry.dataset.retryAttempt})`;
+  }
+
+  let retryTicker = null;
+  function startRetryTicker() {
+    if (retryTicker) return;
+    retryTicker = setInterval(() => {
+      for (const entry of el.alerts.querySelectorAll(".alert[data-retry-remaining]")) {
+        const remaining = Number(entry.dataset.retryRemaining) - 1;
+        if (remaining <= 0) {
+          // The wait is over and the request restarts; drop the notice.
+          removeAlert(entry);
+        } else {
+          entry.dataset.retryRemaining = String(remaining);
+          renderRetryWait(entry);
+        }
+      }
+      if (!el.alerts.querySelector(".alert[data-retry-remaining]")) {
+        clearInterval(retryTicker);
+        retryTicker = null;
+      }
+    }, 1000);
+  }
+
   setSidebarOpen(loadSidebarOpen(), false);
   boot();
 })();
+
