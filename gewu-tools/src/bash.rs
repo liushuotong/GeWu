@@ -14,6 +14,8 @@
 //! - **Working directory restriction**: Commands run in a specified directory
 //! - **Timeout**: Configurable timeout prevents hanging commands; the whole
 //!   process group is killed so detached grandchildren do not survive
+//! - **Cancellation**: Canceling the surrounding run kills the command's
+//!   process group instead of waiting for it to finish
 //! - **Output cap**: Captured stdout/stderr is capped to prevent unbounded
 //!   memory growth from commands like `cat /dev/urandom`
 //!
@@ -126,6 +128,15 @@ impl Tool for BashTool {
             return Ok(ToolResult::new("bash", error));
         }
 
+        // The turn may already be canceled when the call is dispatched;
+        // spawning a process only to kill it moments later is pointless.
+        if ctx.is_aborted() {
+            return Ok(ToolResult::new(
+                "bash",
+                "Command aborted because the surrounding run was canceled.",
+            ));
+        }
+
         let work_dir = if let Some(wd) = &input.workdir {
             crate::fs_utils::resolve_read_path(&self.working_directory, wd, ctx.enforcement)
                 .await
@@ -163,13 +174,19 @@ impl Tool for BashTool {
         let mut stderr_reader =
             tokio::spawn(async move { read_capped(stderr_pipe, MAX_CAPTURE_BYTES).await });
 
-        let wait_result = tokio::time::timeout(
-            std::time::Duration::from_millis(input.timeout),
-            child_process.wait(),
-        )
-        .await;
+        let wait_result = tokio::select! {
+            biased;
+            result = tokio::time::timeout(
+                std::time::Duration::from_millis(input.timeout),
+                child_process.wait(),
+            ) => match result {
+                Ok(result) => WaitOutcome::Done(result),
+                Err(_) => WaitOutcome::TimedOut,
+            },
+            _ = wait_for_abort(ctx) => WaitOutcome::Aborted,
+        };
 
-        if !matches!(wait_result, Ok(Ok(_))) {
+        if !matches!(wait_result, WaitOutcome::Done(Ok(_))) {
             kill_process_tree(&mut child_process);
             let _ =
                 tokio::time::timeout(std::time::Duration::from_secs(1), child_process.wait()).await;
@@ -208,7 +225,7 @@ impl Tool for BashTool {
         };
 
         match wait_result {
-            Ok(Ok(status)) => {
+            WaitOutcome::Done(Ok(status)) => {
                 let stdout = String::from_utf8_lossy(&captured_stdout);
                 let stderr = String::from_utf8_lossy(&captured_stderr);
 
@@ -227,8 +244,10 @@ impl Tool for BashTool {
                 }
                 Ok(ToolResult::new("bash", result))
             }
-            Ok(Err(e)) => Err(anyhow::anyhow!("Failed to wait for child process: {}", e).into()),
-            Err(_) => {
+            WaitOutcome::Done(Err(e)) => {
+                Err(anyhow::anyhow!("Failed to wait for child process: {}", e).into())
+            }
+            WaitOutcome::TimedOut => {
                 let stdout = String::from_utf8_lossy(&captured_stdout);
                 let stderr = String::from_utf8_lossy(&captured_stderr);
                 let captured = format_captured(&stdout, &stderr);
@@ -242,7 +261,39 @@ impl Tool for BashTool {
                 }
                 Ok(ToolResult::new("bash", result))
             }
+            WaitOutcome::Aborted => {
+                let stdout = String::from_utf8_lossy(&captured_stdout);
+                let stderr = String::from_utf8_lossy(&captured_stderr);
+                let captured = format_captured(&stdout, &stderr);
+                let mut result =
+                    String::from("Command aborted because the surrounding run was canceled.");
+                if !captured.is_empty() {
+                    result.push_str("\n--- partial output before cancellation ---\n");
+                    result.push_str(&captured);
+                }
+                Ok(ToolResult::new("bash", result))
+            }
         }
+    }
+}
+
+/// How the child wait ended: naturally, on timeout, or on cancellation of
+/// the surrounding run.
+enum WaitOutcome {
+    Done(std::io::Result<std::process::ExitStatus>),
+    TimedOut,
+    Aborted,
+}
+
+/// Resolves once the surrounding turn is canceled. Polling keeps the bash
+/// tool from waiting on a child that would otherwise run to completion
+/// long after the user pressed Ctrl-C.
+async fn wait_for_abort(ctx: &ToolContext) {
+    loop {
+        if ctx.is_aborted() {
+            return;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(25)).await;
     }
 }
 
@@ -425,11 +476,18 @@ mod tests {
         });
 
         let ctx = ToolContext::new("test-session", "test-msg");
+        let started = std::time::Instant::now();
         let result = tool
             .execute(args, &ctx)
             .await
             .map_err(|e| anyhow::anyhow!(e.to_string()))?;
         assert!(result.output.contains("Command timed out"));
+        // Pipes are drained only after the child is killed; reading first
+        // would block until the 2 s command exited on its own.
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(1),
+            "the timeout waited for the command instead of killing it"
+        );
         Ok(())
     }
 
@@ -678,6 +736,112 @@ mod tests {
         .map_err(|e| anyhow::anyhow!(e.to_string()))?;
         assert!(result.output.contains("output truncated"));
         assert!(!result.output.contains("Command timed out"));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn abort_kills_the_command_promptly() -> Result<()> {
+        let dir = tempdir()?;
+        let tool = BashTool {
+            working_directory: dir.path().to_path_buf(),
+            safe_mode: false,
+        };
+        let sentinel = dir.path().join("finished.txt");
+        let ctx = ToolContext::new("test-session", "test-msg");
+
+        let canceller = ctx.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(std::time::Duration::from_millis(150)).await;
+            canceller.abort();
+        });
+
+        let started = std::time::Instant::now();
+        let result = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            tool.execute(
+                serde_json::json!({
+                    "command": format!("echo working; sleep 10; touch {}", sentinel.display()),
+                    "timeout": 60000
+                }),
+                &ctx,
+            ),
+        )
+        .await?
+        .map_err(|e| anyhow::anyhow!(e.to_string()))?;
+
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(2),
+            "cancellation should not wait for the command: {:?}",
+            started.elapsed()
+        );
+        assert!(result.output.contains("aborted"));
+        assert!(result.output.contains("working"));
+
+        tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+        assert!(
+            !sentinel.exists(),
+            "the command kept running after cancellation"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn abort_kills_background_grandchildren() -> Result<()> {
+        let dir = tempdir()?;
+        let tool = BashTool {
+            working_directory: dir.path().to_path_buf(),
+            safe_mode: false,
+        };
+        let sentinel = dir.path().join("grandchild.txt");
+        let ctx = ToolContext::new("test-session", "test-msg");
+
+        let canceller = ctx.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(std::time::Duration::from_millis(150)).await;
+            canceller.abort();
+        });
+
+        let result = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            tool.execute(
+                serde_json::json!({
+                    "command": format!("(sleep 2; touch {}) & wait", sentinel.display()),
+                    "timeout": 60000
+                }),
+                &ctx,
+            ),
+        )
+        .await?
+        .map_err(|e| anyhow::anyhow!(e.to_string()))?;
+
+        assert!(result.output.contains("aborted"));
+        tokio::time::sleep(std::time::Duration::from_millis(2500)).await;
+        assert!(
+            !sentinel.exists(),
+            "a background grandchild survived cancellation"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn already_canceled_run_does_not_start_the_command() -> Result<()> {
+        let dir = tempdir()?;
+        let tool = BashTool {
+            working_directory: dir.path().to_path_buf(),
+            safe_mode: false,
+        };
+        let sentinel = dir.path().join("started.txt");
+        let ctx = ToolContext::new("test-session", "test-msg");
+        ctx.abort();
+        let result = tool
+            .execute(
+                serde_json::json!({ "command": format!("touch {}", sentinel.display()) }),
+                &ctx,
+            )
+            .await
+            .map_err(|e| anyhow::anyhow!(e.to_string()))?;
+        assert!(result.output.contains("aborted"));
+        assert!(!sentinel.exists());
         Ok(())
     }
 

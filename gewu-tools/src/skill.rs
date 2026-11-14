@@ -185,6 +185,10 @@ fn list_skill_files(dir: &Path) -> Vec<PathBuf> {
 
 pub struct SkillTool {
     skills: Vec<SkillInfo>,
+    /// Cached description built from the discovered skills: static text
+    /// leaves the model unaware of what exists, and it skips the tool.
+    description: String,
+    schema: RootSchema,
 }
 
 #[derive(Deserialize)]
@@ -192,11 +196,58 @@ struct SkillArgs {
     name: String,
 }
 
-fn schema() -> RootSchema {
+/// Builds the tool description from the discovered skills, so a model
+/// choosing tools sees the available names and descriptions.
+fn skill_description(skills: &[SkillInfo]) -> String {
+    let mut out = String::from(
+        "Load a specialized skill when the task at hand matches one of the skills \
+         listed below.\n\n\
+         Use this tool to inject the skill's instructions and resources into the \
+         current conversation. The output may contain detailed workflow guidance as \
+         well as references to scripts, files, etc in the same directory as the skill.\n",
+    );
+    let mut sorted: Vec<&SkillInfo> = skills.iter().collect();
+    sorted.sort_by(|a, b| a.name.cmp(&b.name));
+    out.push_str("\nAvailable skills:\n");
+    let mut listed = 0;
+    for skill in sorted {
+        let Some(summary) = skill
+            .description
+            .as_deref()
+            .filter(|value| !value.trim().is_empty())
+        else {
+            continue;
+        };
+        out.push_str(&format!("- {}: {}\n", skill.name, summary.trim()));
+        listed += 1;
+    }
+    if listed == 0 {
+        out.push_str("- (no described skills are available)\n");
+    }
+    out
+}
+
+/// The `name` argument schema: an enum of the discovered skill names when
+/// any exist, so an invalid name is rejected before execution.
+fn schema(skills: &[SkillInfo]) -> RootSchema {
+    let mut names: Vec<&str> = skills.iter().map(|s| s.name.as_str()).collect();
+    names.sort_unstable();
+    let name = if names.is_empty() {
+        serde_json::json!({
+            "type": "string",
+            "description": "Skill name from the available skills list"
+        })
+    } else {
+        serde_json::json!({
+            "type": "string",
+            "description": "Skill name from the available skills list",
+            "enum": names
+        })
+    };
     serde_json::from_value(serde_json::json!({
         "type": "object",
         "properties": {
-            "name": { "type": "string", "description": "The name of the skill from available_skills" }
+            "name": name
         },
         "required": ["name"]
     }))
@@ -205,7 +256,13 @@ fn schema() -> RootSchema {
 
 impl SkillTool {
     pub fn new(skills: Vec<SkillInfo>) -> Self {
-        Self { skills }
+        let description = skill_description(&skills);
+        let schema = schema(&skills);
+        Self {
+            skills,
+            description,
+            schema,
+        }
     }
 }
 
@@ -216,11 +273,11 @@ impl Tool for SkillTool {
     }
 
     fn description(&self) -> &str {
-        include_str!("prompts/skill.txt")
+        &self.description
     }
 
     fn schema(&self) -> RootSchema {
-        schema()
+        self.schema.clone()
     }
 
     async fn execute(
@@ -458,6 +515,60 @@ mod tests {
         assert_eq!(
             available_skills_section(&[]),
             "No skills are currently available."
+        );
+    }
+
+    #[test]
+    fn tool_description_and_schema_name_the_discovered_skills() {
+        let dir = tempdir().unwrap();
+        let root = dir.path().to_path_buf();
+        write_skill(&root, "beta", "name: beta\ndescription: Second", "b");
+        write_skill(&root, "alpha", "name: alpha\ndescription: First", "a");
+
+        let tool = SkillTool::new(discover(&[root]));
+        let description = tool.description();
+        assert!(description.contains("- alpha: First"), "{description}");
+        assert!(description.contains("- beta: Second"), "{description}");
+        // Sorted by name.
+        let alpha = description.find("- alpha").unwrap();
+        let beta = description.find("- beta").unwrap();
+        assert!(alpha < beta, "{description}");
+
+        let schema = serde_json::to_value(tool.schema()).unwrap();
+        assert_eq!(
+            schema["properties"]["name"]["enum"],
+            serde_json::json!(["alpha", "beta"])
+        );
+    }
+
+    #[test]
+    fn tool_description_without_skills_has_no_enum() {
+        let tool = SkillTool::new(Vec::new());
+        assert!(
+            tool.description()
+                .contains("(no described skills are available)")
+        );
+        let schema = serde_json::to_value(tool.schema()).unwrap();
+        assert!(schema["properties"]["name"].get("enum").is_none());
+    }
+
+    #[test]
+    fn undescribed_skills_stay_out_of_the_description_but_in_the_enum() {
+        let dir = tempdir().unwrap();
+        let root = dir.path().to_path_buf();
+        write_skill(&root, "beta", "name: beta", "b");
+        let tool = SkillTool::new(discover(&[root]));
+        assert!(
+            tool.description()
+                .contains("(no described skills are available)"),
+            "{}",
+            tool.description()
+        );
+        assert!(!tool.description().contains("- beta"));
+        let schema = serde_json::to_value(tool.schema()).unwrap();
+        assert_eq!(
+            schema["properties"]["name"]["enum"],
+            serde_json::json!(["beta"])
         );
     }
 }
