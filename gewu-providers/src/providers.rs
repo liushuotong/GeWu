@@ -836,15 +836,7 @@ impl LlmProvider for OpenAIProvider {
                     self.client.chat().create_stream(request).await
                 }
             },
-            |e| match e {
-                // Transport-level failures retry with the backoff sequence.
-                OpenAIError::Http(_) => crate::http::RetryDecision::Yes { after: None },
-                // Rate limits honor the provider's suggested wait, capped.
-                OpenAIError::RateLimit { retry_after, .. } => crate::http::RetryDecision::Yes {
-                    after: *retry_after,
-                },
-                _ => crate::http::RetryDecision::No,
-            },
+            classify_openai_failure,
             status_sink.as_ref(),
         )
         .await
@@ -1535,19 +1527,48 @@ impl AnthropicProvider {
     }
 }
 
-/// Whether an Anthropic request- or stream-level failure may be retried from
-/// scratch: transport errors and rate limits (with their wait hints), plus
-/// typed in-stream errors marked transient by
-/// [`crate::anthropic::stream_error`]. Raw mid-stream transport failures
-/// (boxed [`reqwest::Error`]) retry too — the retry layer only restarts
-/// while nothing was yielded, which keeps a restart duplication-free.
-fn classify_anthropic_failure(error: &crate::anthropic::Failure) -> crate::http::RetryDecision {
-    if error.downcast_ref::<reqwest::Error>().is_some() {
-        return crate::http::RetryDecision::Yes { after: None };
+/// Whether a chat-completions request-level failure may be retried from
+/// scratch. The default is retryable — transport errors, server outages
+/// (5xx/408 with their hints), SSE parse failures, unknown shapes — so
+/// future error modes self-heal instead of killing the ask. Only
+/// deterministic failures a re-send cannot fix are permanent: request
+/// building and 4xx client errors.
+fn classify_openai_failure(error: &OpenAIError) -> crate::http::RetryDecision {
+    match error {
+        // Deterministic failures a re-send cannot fix.
+        OpenAIError::Build(_) | OpenAIError::Client { .. } => crate::http::RetryDecision::No,
+        // Provider-suggested waits are honored, capped by the retry layer.
+        OpenAIError::RateLimit { retry_after, .. } | OpenAIError::Server { retry_after, .. } => {
+            crate::http::RetryDecision::Yes {
+                after: *retry_after,
+            }
+        }
+        // Transport errors, parse failures, unknown shapes. The retry layer
+        // only restarts while nothing was yielded, which keeps a restart
+        // duplication-free.
+        _ => crate::http::RetryDecision::Yes { after: None },
     }
+}
+
+/// Whether an Anthropic request- or stream-level failure may be retried from
+/// scratch. The default is retryable — transport errors, server outages
+/// (5xx/408 with their hints), parse failures, unknown shapes — so future
+/// error modes self-heal instead of killing the ask. Only deterministic
+/// failures a re-send cannot fix are permanent: request building and 4xx
+/// client errors, plus typed in-stream errors not marked transient by
+/// [`crate::anthropic::stream_error`].
+fn classify_anthropic_failure(error: &crate::anthropic::Failure) -> crate::http::RetryDecision {
     match error.downcast_ref::<AnthropicError>() {
-        Some(AnthropicError::Http(_)) => crate::http::RetryDecision::Yes { after: None },
-        Some(AnthropicError::RateLimit { retry_after, .. }) => crate::http::RetryDecision::Yes {
+        // Deterministic failures a re-send cannot fix.
+        Some(AnthropicError::Build(_)) | Some(AnthropicError::Client { .. }) => {
+            crate::http::RetryDecision::No
+        }
+        Some(AnthropicError::Stream {
+            transient: false, ..
+        }) => crate::http::RetryDecision::No,
+        // Provider-suggested waits are honored, capped by the retry layer.
+        Some(AnthropicError::RateLimit { retry_after, .. })
+        | Some(AnthropicError::Server { retry_after, .. }) => crate::http::RetryDecision::Yes {
             after: *retry_after,
         },
         Some(AnthropicError::Stream {
@@ -1557,7 +1578,10 @@ fn classify_anthropic_failure(error: &crate::anthropic::Failure) -> crate::http:
         }) => crate::http::RetryDecision::Yes {
             after: *retry_after,
         },
-        _ => crate::http::RetryDecision::No,
+        // Transport errors, parse failures, unknown shapes. (A boxed
+        // reqwest::Error lands here too.) The retry layer only restarts
+        // while nothing was yielded, which keeps a restart duplication-free.
+        _ => crate::http::RetryDecision::Yes { after: None },
     }
 }
 
@@ -1591,7 +1615,7 @@ impl LlmProvider for AnthropicProvider {
                     Ok(request) => request,
                     Err(e) => {
                         return futures::stream::once(async move {
-                            Err(Box::new(AnthropicError::Api(format!("build error: {e}")))
+                            Err(Box::new(AnthropicError::Build(e.to_string()))
                                 as Box<dyn Error + Send + Sync>)
                         })
                         .boxed();
@@ -2742,6 +2766,229 @@ mod tests {
         );
     }
 
+    // -- Retryable-by-default failures (gateway outages, transport drops) ---
+
+    #[tokio::test]
+    async fn openai_gateway_error_is_retried_and_recovers() {
+        let sse = "data: {\"id\":\"chatcmpl-1\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\"hi\"}}]}\n\ndata: [DONE]\n\n";
+        let addr = serve_canned(vec![
+            http_response("HTTP/1.1 502 Bad Gateway", &[], "upstream exploded"),
+            http_response(
+                "HTTP/1.1 200 OK",
+                &[("Content-Type", "text/event-stream")],
+                sse,
+            ),
+        ])
+        .await;
+        let provider =
+            OpenAIProvider::new_with_endpoint("test-key", &format!("http://{addr}"), "gpt-4o")
+                .with_retry_backoff(std::time::Duration::from_millis(1));
+
+        let messages = vec![Message::User {
+            content: vec![ContentPart::Text {
+                text: "hello".to_string(),
+            }],
+        }];
+        let events: Vec<_> = provider
+            .stream_response(&messages, &[], None)
+            .await
+            .expect("a 502 before any output should be retried")
+            .map(|event| event.expect("event should parse"))
+            .collect()
+            .await;
+        let content: String = events
+            .iter()
+            .filter_map(|event| match event {
+                ProviderEvent::ContentDelta { delta } => Some(delta.clone()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(content, "hi");
+    }
+
+    #[tokio::test]
+    async fn openai_client_error_is_not_retried() {
+        // A single canned reply: a retry would find the server gone and end
+        // with a transport error, so surfacing the typed 400 proves exactly
+        // one attempt was made.
+        let addr = serve_canned(vec![http_response(
+            "HTTP/1.1 400 Bad Request",
+            &[],
+            r#"{"error":{"message":"bad","type":"invalid_request_error"}}"#,
+        )])
+        .await;
+        let provider =
+            OpenAIProvider::new_with_endpoint("test-key", &format!("http://{addr}"), "gpt-4o")
+                .with_retry_backoff(std::time::Duration::from_millis(1));
+
+        let messages = vec![Message::User {
+            content: vec![ContentPart::Text {
+                text: "hello".to_string(),
+            }],
+        }];
+        let error = match provider.stream_response(&messages, &[], None).await {
+            Ok(_) => panic!("a 400 is permanent"),
+            Err(error) => error,
+        };
+        let OpenAIError::Client { status, .. } = error
+            .downcast_ref::<OpenAIError>()
+            .expect("typed provider error")
+        else {
+            panic!("expected a typed client error");
+        };
+        assert_eq!(*status, reqwest::StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn responses_gateway_error_is_retried_and_recovers() {
+        let done = "event: response.completed\r\ndata: {\"type\":\"response.completed\",\"response\":{\"output\":[],\"usage\":{\"input_tokens\":1,\"output_tokens\":1}}}\r\n\r\n";
+        let addr = serve_canned(vec![
+            http_response("HTTP/1.1 502 Bad Gateway", &[], "upstream exploded"),
+            http_response(
+                "HTTP/1.1 200 OK",
+                &[("Content-Type", "text/event-stream")],
+                done,
+            ),
+        ])
+        .await;
+        let provider = crate::responses::OpenAIProvider::new_with_endpoint(
+            "test-key",
+            &format!("http://{addr}/v1"),
+            "reasoner",
+        )
+        .with_retry_backoff(std::time::Duration::from_millis(1));
+
+        let messages = vec![Message::User {
+            content: vec![ContentPart::Text {
+                text: "hello".to_string(),
+            }],
+        }];
+        let events: Vec<_> = provider
+            .stream_response(&messages, &[], None)
+            .await
+            .expect("stream should start")
+            .map(|event| event.expect("a retried 502 should recover"))
+            .collect()
+            .await;
+        assert!(
+            events
+                .iter()
+                .any(|event| matches!(event, ProviderEvent::Usage { .. }))
+        );
+    }
+
+    #[tokio::test]
+    async fn responses_client_error_is_not_retried() {
+        let addr = serve_canned(vec![http_response(
+            "HTTP/1.1 400 Bad Request",
+            &[],
+            r#"{"error":{"message":"bad","type":"invalid_request_error"}}"#,
+        )])
+        .await;
+        let provider = crate::responses::OpenAIProvider::new_with_endpoint(
+            "test-key",
+            &format!("http://{addr}/v1"),
+            "reasoner",
+        )
+        .with_retry_backoff(std::time::Duration::from_millis(1));
+
+        let messages = vec![Message::User {
+            content: vec![ContentPart::Text {
+                text: "hello".to_string(),
+            }],
+        }];
+        let results: Vec<_> = provider
+            .stream_response(&messages, &[], None)
+            .await
+            .expect("stream should start")
+            .collect()
+            .await;
+        let error = results
+            .into_iter()
+            .last()
+            .expect("a terminal failure")
+            .expect_err("a 400 is permanent");
+        let crate::openai::OpenAIError::Client { status, .. } = error
+            .downcast_ref::<crate::openai::OpenAIError>()
+            .expect("typed provider error")
+        else {
+            panic!("expected a typed client error");
+        };
+        assert_eq!(*status, reqwest::StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn anthropic_gateway_error_is_retried_and_recovers() {
+        let sse = "event: message_stop\ndata: {}\n\n";
+        let addr = serve_canned(vec![
+            http_response("HTTP/1.1 502 Bad Gateway", &[], "upstream exploded"),
+            http_response(
+                "HTTP/1.1 200 OK",
+                &[("Content-Type", "text/event-stream")],
+                sse,
+            ),
+        ])
+        .await;
+        let provider =
+            AnthropicProvider::new_with_endpoint("test-key", &format!("http://{addr}"), "claude")
+                .with_retry_backoff(std::time::Duration::from_millis(1));
+
+        let messages = vec![Message::User {
+            content: vec![ContentPart::Text {
+                text: "hello".to_string(),
+            }],
+        }];
+        let events: Vec<ProviderEvent> = provider
+            .stream_response(&messages, &[], None)
+            .await
+            .expect("stream should start")
+            .map(|event| event.expect("a retried 502 should recover"))
+            .collect()
+            .await;
+        assert!(
+            !events
+                .iter()
+                .any(|e| matches!(e, ProviderEvent::Error { .. }))
+        );
+    }
+
+    #[tokio::test]
+    async fn anthropic_client_error_is_not_retried() {
+        let addr = serve_canned(vec![http_response(
+            "HTTP/1.1 400 Bad Request",
+            &[],
+            r#"{"type":"error","error":{"type":"invalid_request_error","message":"bad"}}"#,
+        )])
+        .await;
+        let provider =
+            AnthropicProvider::new_with_endpoint("test-key", &format!("http://{addr}"), "claude")
+                .with_retry_backoff(std::time::Duration::from_millis(1));
+
+        let messages = vec![Message::User {
+            content: vec![ContentPart::Text {
+                text: "hello".to_string(),
+            }],
+        }];
+        let results: Vec<_> = provider
+            .stream_response(&messages, &[], None)
+            .await
+            .expect("stream should start")
+            .collect()
+            .await;
+        let error = results
+            .into_iter()
+            .last()
+            .expect("a terminal failure")
+            .expect_err("a 400 is permanent");
+        let AnthropicError::Client { status, .. } = error
+            .downcast_ref::<AnthropicError>()
+            .expect("typed provider error")
+        else {
+            panic!("expected a typed client error");
+        };
+        assert_eq!(*status, reqwest::StatusCode::BAD_REQUEST);
+    }
+
     // -- Provider-reported usage (cache accounting) ------------------------
 
     /// Collects the parsed events from a raw OpenAI SSE body.
@@ -2800,7 +3047,7 @@ mod tests {
     }
 
     #[test]
-    fn anthropic_classifies_transient_stream_errors_as_retryable() {
+    fn anthropic_classifies_failures_by_retryability() {
         let failure: Box<dyn Error + Send + Sync> = Box::new(AnthropicError::Stream {
             transient: true,
             message: "overloaded_error: Overloaded".into(),
@@ -2818,6 +3065,86 @@ mod tests {
         assert!(matches!(
             classify_anthropic_failure(&permanent),
             crate::http::RetryDecision::No
+        ));
+        // Server outages retry, honoring the provider's wait hint.
+        let server: Box<dyn Error + Send + Sync> = Box::new(AnthropicError::Server {
+            status: reqwest::StatusCode::BAD_GATEWAY,
+            retry_after: Some(std::time::Duration::from_secs(2)),
+            message: "upstream exploded".into(),
+        });
+        assert!(matches!(
+            classify_anthropic_failure(&server),
+            crate::http::RetryDecision::Yes { after: Some(_) }
+        ));
+        // A 408 is typed as Server and retries; a 400 is permanent.
+        let timeout: Box<dyn Error + Send + Sync> = Box::new(AnthropicError::status_error(
+            reqwest::StatusCode::REQUEST_TIMEOUT,
+            None,
+            "slow",
+        ));
+        assert!(matches!(
+            classify_anthropic_failure(&timeout),
+            crate::http::RetryDecision::Yes { after: None }
+        ));
+        let client: Box<dyn Error + Send + Sync> = Box::new(AnthropicError::status_error(
+            reqwest::StatusCode::BAD_REQUEST,
+            None,
+            "bad",
+        ));
+        assert!(matches!(
+            classify_anthropic_failure(&client),
+            crate::http::RetryDecision::No
+        ));
+        let build: Box<dyn Error + Send + Sync> = Box::new(AnthropicError::Build("nope".into()));
+        assert!(matches!(
+            classify_anthropic_failure(&build),
+            crate::http::RetryDecision::No
+        ));
+        // Untyped failures (raw transport errors, parse failures, unknown
+        // shapes) default to retryable.
+        let untyped: Box<dyn Error + Send + Sync> = Box::new(std::io::Error::other("boom"));
+        assert!(matches!(
+            classify_anthropic_failure(&untyped),
+            crate::http::RetryDecision::Yes { after: None }
+        ));
+    }
+
+    #[test]
+    fn openai_classifies_failures_by_retryability() {
+        // Server outages retry, honoring the provider's wait hint.
+        assert!(matches!(
+            classify_openai_failure(&OpenAIError::Server {
+                status: reqwest::StatusCode::BAD_GATEWAY,
+                retry_after: Some(std::time::Duration::from_secs(2)),
+                message: "upstream exploded".into(),
+            }),
+            crate::http::RetryDecision::Yes { after: Some(_) }
+        ));
+        // A 408 is typed as Server and retries; a 400 is permanent.
+        assert!(matches!(
+            classify_openai_failure(&OpenAIError::status_error(
+                reqwest::StatusCode::REQUEST_TIMEOUT,
+                None,
+                "slow",
+            )),
+            crate::http::RetryDecision::Yes { after: None }
+        ));
+        assert!(matches!(
+            classify_openai_failure(&OpenAIError::status_error(
+                reqwest::StatusCode::BAD_REQUEST,
+                None,
+                "bad",
+            )),
+            crate::http::RetryDecision::No
+        ));
+        assert!(matches!(
+            classify_openai_failure(&OpenAIError::Build("nope".into())),
+            crate::http::RetryDecision::No
+        ));
+        // Transport errors and SSE parse failures retry.
+        assert!(matches!(
+            classify_openai_failure(&OpenAIError::SseParse("garbage".into())),
+            crate::http::RetryDecision::Yes { after: None }
         ));
     }
 

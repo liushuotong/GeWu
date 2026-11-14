@@ -146,6 +146,7 @@ fn spec_for_run(blocks: &[Block], run_id: &str) -> Option<WfSpec> {
             tool,
             input,
             output: Some(output),
+            ..
         } = block
         else {
             continue;

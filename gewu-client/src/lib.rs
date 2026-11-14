@@ -40,6 +40,7 @@ mod inner;
 pub mod session;
 mod stream;
 
+pub use gewu_protocol::summarize_tool_input;
 pub use session::{Block, Phase, SessionModel};
 pub use stream::AskStream;
 

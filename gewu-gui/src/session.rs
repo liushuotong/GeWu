@@ -55,6 +55,9 @@ enum TabUpdate {
     Full,
     /// Append one rendered block at the transcript's end.
     BlockAppend(usize),
+    /// Replace one rendered block in place (e.g. a steered message's
+    /// "queued" badge settling once the agent ingested it).
+    BlockReplace(usize),
     /// Replace one tool card's contents in place (`run` is the run's first
     /// block index).
     ToolCard(usize),
@@ -119,9 +122,11 @@ fn confirm_steered(
     };
     if steers_in_place(&pending[pos..], model.blocks.len()) {
         // Only later pending steers follow the block: it already sits at
-        // the position where the agent injected it.
+        // the position where the agent injected it. Re-render it so the
+        // confirming event settles its "queued" badge.
+        let (_, index) = pending[pos];
         pending.remove(pos);
-        return (TabUpdate::None, None);
+        return (TabUpdate::BlockReplace(index), None);
     }
     // Blocks landed between the submit and the ingestion (the steer raced
     // ahead of the ask's first events): re-anchor the unconfirmed group at
@@ -1386,6 +1391,18 @@ impl GuiSession {
                     None => self.send_transcript(sender).await?,
                 }
             }
+            TabUpdate::BlockReplace(index) if active => {
+                let html = self
+                    .workspace
+                    .tab(event.tab_id)
+                    .and_then(|tab| view::block_html(tab, index));
+                match html {
+                    Some(html) => {
+                        send_msg(sender, &ServerMsg::BlockReplace { index, html }).await?;
+                    }
+                    None => self.send_transcript(sender).await?,
+                }
+            }
             TabUpdate::ToolCard(run_start) if active => {
                 self.send_tool_card(event.tab_id, run_start, sender).await?;
             }
@@ -1567,6 +1584,7 @@ mod tests {
             tool: tool.into(),
             input: String::new(),
             output: output.map(str::to_string),
+            status: None,
         }
     }
 
@@ -1675,7 +1693,7 @@ mod tests {
 
         let (update, collapsed) = confirm_steered(&mut model, &mut pending, "focus".into());
 
-        assert!(matches!(update, TabUpdate::None));
+        assert!(matches!(update, TabUpdate::BlockReplace(2)));
         assert_eq!(collapsed, None);
         assert!(pending.is_empty());
         assert_eq!(user_texts(&model), ["hi", "focus"]);
@@ -1706,7 +1724,7 @@ mod tests {
         assert_eq!(pending, vec![("b".to_string(), 3)]);
 
         let (update, _) = confirm_steered(&mut model, &mut pending, "b".into());
-        assert!(matches!(update, TabUpdate::None));
+        assert!(matches!(update, TabUpdate::BlockReplace(3)));
         assert_eq!(user_texts(&model), ["hi", "a", "b"]);
         assert!(matches!(model.blocks[1], Block::Assistant(_)));
     }

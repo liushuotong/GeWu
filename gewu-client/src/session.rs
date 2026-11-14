@@ -7,7 +7,7 @@
 //! and replay conversations identically, and it stays unit-testable without
 //! any I/O.
 
-use gewu_protocol::{AgentEvent, ContentPart, Message};
+use gewu_protocol::{AgentEvent, ContentPart, Message, summarize_tool_input};
 
 /// One entry in the conversation transcript.
 #[derive(Debug, Clone, PartialEq)]
@@ -33,6 +33,9 @@ pub enum Block {
         /// Rendered input summary (e.g. the bash command).
         input: String,
         output: Option<String>,
+        /// Live status from the running tool (`ToolProgress` events);
+        /// cleared when the tool finishes. Not part of stored history.
+        status: Option<String>,
     },
     /// A non-fatal agent error or a connection error.
     Error(String),
@@ -170,10 +173,15 @@ impl SessionModel {
                     tool: tool.clone(),
                     input: summarize_tool_input(tool, input),
                     output: None,
+                    status: None,
                 });
                 Some(self.blocks.len() - 1)
             }
+            AgentEvent::ToolProgress { tool, message } => {
+                self.set_tool_status(Some(tool), Some(message.clone()))
+            }
             AgentEvent::ToolFinish { tool, output, .. } => {
+                self.set_tool_status(Some(tool), None);
                 if let Some(index) = self.fill_open_tool(Some(tool), output) {
                     return Some(index);
                 }
@@ -181,6 +189,7 @@ impl SessionModel {
                     tool: tool.clone(),
                     input: String::new(),
                     output: Some(tool_output(output)),
+                    status: None,
                 });
                 Some(self.blocks.len() - 1)
             }
@@ -290,6 +299,7 @@ impl SessionModel {
                         tool: call.function.name.clone(),
                         input: summarize_tool_input(&call.function.name, &call.function.arguments),
                         output: None,
+                        status: None,
                     });
                 }
             }
@@ -312,6 +322,7 @@ impl SessionModel {
                         tool: tool_name.clone().unwrap_or_else(|| "tool".to_string()),
                         input: String::new(),
                         output: Some(tool_output(&output)),
+                        status: None,
                     });
                 }
             }
@@ -365,6 +376,35 @@ impl SessionModel {
                 None
             }
         })
+    }
+
+    /// Set the live status on the first still-open tool block matching the
+    /// name (FIFO, same rule as [`SessionModel::fill_open_tool`]). Used for
+    /// `ToolProgress` events; `None` clears the status (a finished tool's
+    /// output takes over). Returns the affected block's index.
+    fn set_tool_status(
+        &mut self,
+        tool_name: Option<&str>,
+        status: Option<String>,
+    ) -> Option<usize> {
+        for i in 0..self.blocks.len() {
+            if let Block::Tool {
+                tool,
+                output: out,
+                status: current,
+                ..
+            } = &mut self.blocks[i]
+            {
+                if out.is_some() || *current == status {
+                    continue;
+                }
+                if tool_name.is_none_or(|name| name == tool) {
+                    *current = status;
+                    return Some(i);
+                }
+            }
+        }
+        None
     }
 
     // -- lifecycle ----------------------------------------------------------
@@ -421,52 +461,10 @@ fn parts_text(parts: &[ContentPart]) -> String {
         .join("\n")
 }
 
-/// Collapse tool input JSON to a single short line for display.
-pub fn summarize_tool_input(tool: &str, input: &str) -> String {
-    let value: serde_json::Value = match serde_json::from_str(input) {
-        Ok(v) => v,
-        Err(_) => return truncate(input, 80),
-    };
-    let summary = match tool {
-        "bash" => value
-            .get("command")
-            .and_then(|c| c.as_str())
-            .map(str::to_string),
-        "read_file" | "write_file" | "edit_file" | "apply_patch" => value
-            .get("file_path")
-            .and_then(|p| p.as_str())
-            .map(str::to_string),
-        "glob" | "list" | "grep" => value
-            .get("pattern")
-            .and_then(|p| p.as_str())
-            .map(str::to_string),
-        "webfetch" => value
-            .get("url")
-            .and_then(|u| u.as_str())
-            .map(str::to_string),
-        // The GUI renders the workflow graph from the spec, so keep it whole.
-        "workflow_start" => value.get("spec").map(|spec| spec.to_string()),
-        "workflow_status" | "workflow_wait" | "workflow_cancel" => value
-            .get("run_id")
-            .and_then(|id| id.as_str())
-            .map(str::to_string),
-        _ => None,
-    };
-    summary.unwrap_or_else(|| truncate(&value.to_string(), 80))
-}
-
 /// Tool output as received, keeping line breaks so front-ends can collapse and
 /// expand it. The server already bounds results (2000 lines / 50 KB).
 fn tool_output(text: &str) -> String {
     text.to_string()
-}
-
-fn truncate(text: &str, max_chars: usize) -> String {
-    let mut out: String = text.chars().take(max_chars).collect();
-    if text.chars().count() > max_chars {
-        out.push('…');
-    }
-    out.replace('\n', " ")
 }
 
 #[cfg(test)]
@@ -579,6 +577,7 @@ mod tests {
                 tool: "bash".into(),
                 input: "ls".into(),
                 output: Some("file.rs".into()),
+                status: None,
             }]
         );
     }
@@ -612,6 +611,7 @@ mod tests {
                 tool: "bash".into(),
                 input: "ls".into(),
                 output: Some("file.rs".into()),
+                status: None,
             }
         );
         assert!(matches!(m.blocks[1], Block::User(_)));
@@ -995,6 +995,7 @@ mod tests {
                     tool: "bash".into(),
                     input: "ls".into(),
                     output: Some("a.rs".into()),
+                    status: None,
                 },
             ]
         );
@@ -1065,14 +1066,126 @@ mod tests {
                     tool: "read_file".into(),
                     input: "{}".into(),
                     output: Some("file".into()),
+                    status: None,
                 },
                 Block::Tool {
                     tool: "bash".into(),
                     input: "{}".into(),
                     output: Some("cmd".into()),
+                    status: None,
                 },
             ]
         );
+    }
+
+    #[test]
+    fn tool_progress_updates_the_open_tool_block_in_place() {
+        let mut m = model();
+        m.apply_event(&AgentEvent::ToolStart {
+            tool: "task".into(),
+            input: r#"{"description":"explore","prompt":"p"}"#.into(),
+        });
+        assert_eq!(
+            m.apply_event(&AgentEvent::ToolProgress {
+                tool: "task".into(),
+                message: "1s — bash: ls".into(),
+            }),
+            Some(0)
+        );
+        assert_eq!(
+            m.blocks[0],
+            Block::Tool {
+                tool: "task".into(),
+                input: "explore".into(),
+                output: None,
+                status: Some("1s — bash: ls".into()),
+            }
+        );
+
+        // A later update replaces the status; no new block appears.
+        assert_eq!(
+            m.apply_event(&AgentEvent::ToolProgress {
+                tool: "task".into(),
+                message: "2s — read src/main.rs".into(),
+            }),
+            Some(0)
+        );
+        assert_eq!(m.blocks.len(), 1);
+        assert_eq!(
+            m.blocks[0],
+            Block::Tool {
+                tool: "task".into(),
+                input: "explore".into(),
+                output: None,
+                status: Some("2s — read src/main.rs".into()),
+            }
+        );
+    }
+
+    #[test]
+    fn tool_finish_clears_the_status_and_progress_after_finish_is_ignored() {
+        let mut m = model();
+        m.apply_event(&AgentEvent::ToolStart {
+            tool: "task".into(),
+            input: "{}".into(),
+        });
+        m.apply_event(&AgentEvent::ToolProgress {
+            tool: "task".into(),
+            message: "1s — bash: ls".into(),
+        });
+        assert_eq!(
+            m.apply_event(&AgentEvent::ToolFinish {
+                tool: "task".into(),
+                title: String::new(),
+                output: "done".into(),
+                metadata: Default::default(),
+            }),
+            Some(0)
+        );
+        assert!(matches!(
+            &m.blocks[0],
+            Block::Tool {
+                output: Some(_),
+                status: None,
+                ..
+            }
+        ));
+
+        // A stale progress event after the finish has no effect.
+        assert_eq!(
+            m.apply_event(&AgentEvent::ToolProgress {
+                tool: "task".into(),
+                message: "late".into(),
+            }),
+            None
+        );
+    }
+
+    #[test]
+    fn tool_progress_matches_open_tools_fifo_by_name() {
+        let mut m = model();
+        for _ in 0..2 {
+            m.apply_event(&AgentEvent::ToolStart {
+                tool: "task".into(),
+                input: "{}".into(),
+            });
+        }
+        // The first open task block gets the update.
+        assert_eq!(
+            m.apply_event(&AgentEvent::ToolProgress {
+                tool: "task".into(),
+                message: "bash: ls".into(),
+            }),
+            Some(0)
+        );
+        assert!(matches!(
+            &m.blocks[0],
+            Block::Tool {
+                status: Some(_),
+                ..
+            }
+        ));
+        assert!(matches!(&m.blocks[1], Block::Tool { status: None, .. }));
     }
 }
 

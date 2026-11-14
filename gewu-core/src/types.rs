@@ -253,6 +253,13 @@ pub enum AgentEvent {
     /// Not part of the transcript: frontends render it in their busy
     /// indicator and replace or clear it with the next event.
     Status { message: String },
+    /// A live status update from a running tool (e.g. what a subagent is
+    /// doing mid-`task`).
+    ///
+    /// Transient like [`AgentEvent::Status`], but tied to the tool's card:
+    /// frontends render it on the still-open tool block and clear it when
+    /// the tool finishes. Not part of the transcript.
+    ToolProgress { tool: String, message: String },
     /// A steering message was appended to the running conversation.
     ///
     /// Emitted when a message sent through the agent's
@@ -468,6 +475,37 @@ impl SessionStateStore for InMemorySessionStateStore {
     }
 }
 
+/// Outbound progress channel a long-running tool uses to surface live
+/// status (`AgentEvent::ToolProgress`) while it executes. The agent loop
+/// wires one per tool call, bound to the tool's name; tools report through
+/// [`ToolContext::report_progress`].
+#[derive(Clone, Debug)]
+pub struct ProgressSink {
+    tool: String,
+    sender: tokio::sync::mpsc::UnboundedSender<AgentEvent>,
+}
+
+impl ProgressSink {
+    pub fn new(
+        tool: impl Into<String>,
+        sender: tokio::sync::mpsc::UnboundedSender<AgentEvent>,
+    ) -> Self {
+        Self {
+            tool: tool.into(),
+            sender,
+        }
+    }
+
+    /// Queues a status update; a closed channel (the turn already ended)
+    /// drops the message silently.
+    pub fn send(&self, message: impl Into<String>) {
+        let _ = self.sender.send(AgentEvent::ToolProgress {
+            tool: self.tool.clone(),
+            message: message.into(),
+        });
+    }
+}
+
 #[derive(Clone, Debug)]
 pub struct ToolContext {
     pub session_id: String,
@@ -479,6 +517,9 @@ pub struct ToolContext {
     /// Per-session key/value state tools can persist across turns.
     pub session_state: SessionState,
     pub inbox: Option<crate::agent::Steering>,
+    /// Live-status sink for this tool call; `None` when the host does not
+    /// consume progress events.
+    pub progress: Option<ProgressSink>,
 }
 
 impl ToolContext {
@@ -491,6 +532,15 @@ impl ToolContext {
             enforcement: PathEnforcement::default(),
             session_state: SessionState::in_memory(),
             inbox: None,
+            progress: None,
+        }
+    }
+
+    /// Reports a transient status update for this tool call (rendered on
+    /// the tool's card by frontends). A no-op when no sink is wired.
+    pub fn report_progress(&self, message: impl Into<String>) {
+        if let Some(sink) = &self.progress {
+            sink.send(message);
         }
     }
 
@@ -520,6 +570,59 @@ pub struct TruncationResult {
     pub content: String,
     pub truncated: bool,
     pub output_path: Option<PathBuf>,
+}
+
+/// Collapse tool input JSON to a single short line for display, shared by
+/// the frontends (tool blocks) and tools that surface sub-activity (the
+/// task tool's live progress).
+pub fn summarize_tool_input(tool: &str, input: &str) -> String {
+    let value: serde_json::Value = match serde_json::from_str(input) {
+        Ok(v) => v,
+        Err(_) => return truncate_line(input, 80),
+    };
+    let summary = match tool {
+        "bash" => value
+            .get("command")
+            .and_then(|c| c.as_str())
+            .map(str::to_string),
+        "read_file" | "write_file" | "edit_file" | "apply_patch" => value
+            .get("file_path")
+            .and_then(|p| p.as_str())
+            .map(str::to_string),
+        "glob" | "list" | "grep" => value
+            .get("pattern")
+            .and_then(|p| p.as_str())
+            .map(str::to_string),
+        "webfetch" => value
+            .get("url")
+            .and_then(|u| u.as_str())
+            .map(str::to_string),
+        "websearch" => value
+            .get("query")
+            .and_then(|q| q.as_str())
+            .map(str::to_string),
+        "task" => value
+            .get("description")
+            .and_then(|d| d.as_str())
+            .map(str::to_string),
+        // The GUI renders the workflow graph from the spec, so keep it whole.
+        "workflow_start" => value.get("spec").map(|spec| spec.to_string()),
+        "workflow_status" | "workflow_wait" | "workflow_cancel" => value
+            .get("run_id")
+            .and_then(|id| id.as_str())
+            .map(str::to_string),
+        _ => None,
+    };
+    summary.unwrap_or_else(|| truncate_line(&value.to_string(), 80))
+}
+
+/// One-line truncation for tool input summaries.
+fn truncate_line(text: &str, max_chars: usize) -> String {
+    let mut out: String = text.chars().take(max_chars).collect();
+    if text.chars().count() > max_chars {
+        out.push('…');
+    }
+    out.replace('\n', " ")
 }
 
 /// Represents a stored experience.

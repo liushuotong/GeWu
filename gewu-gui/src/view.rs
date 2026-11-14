@@ -116,6 +116,25 @@ fn write_block_body(out: &mut String, tab: &Tab, block: &Block, index: usize, st
         Block::Thought { .. } => {
             out.push_str(&thought_body_html(tab, index, streaming));
         }
+        Block::User(text) => {
+            // A message submitted mid-run is queued into the running turn
+            // until the agent's `steered` event confirms it was ingested;
+            // while it sits in `pending_steers`, show that state.
+            let queued = tab
+                .pending_steers
+                .iter()
+                .any(|(pending, at)| *at == index && pending == text);
+            let _ = writeln!(
+                out,
+                "<div class=\"body plain\">{}{}</div>",
+                escape(text),
+                if queued {
+                    "<span class=\"queue-status\">queued</span>"
+                } else {
+                    ""
+                }
+            );
+        }
         _ => {
             let _ = writeln!(
                 out,
@@ -209,22 +228,28 @@ pub fn tool_card_html(tab: &Tab, first: usize) -> Option<String> {
 
 /// Render a run of consecutive tool blocks inside one card.
 fn render_tool_run(out: &mut String, tab: &Tab, run: &[Block], first: usize) {
-    let tools: Vec<(&str, &str, Option<&str>)> = run
+    let tools: Vec<(&str, &str, Option<&str>, Option<&str>)> = run
         .iter()
         .filter_map(|block| match block {
             Block::Tool {
                 tool,
                 input,
                 output,
-            } => Some((tool.as_str(), input.as_str(), output.as_deref())),
+                status,
+            } => Some((
+                tool.as_str(),
+                input.as_str(),
+                output.as_deref(),
+                status.as_deref(),
+            )),
             _ => None,
         })
         .collect();
 
     let _ = writeln!(out, "<div class=\"tool-card\" data-card=\"{first}\">");
     if tools.len() == 1 {
-        let (tool, input, output) = tools[0];
-        render_tool(out, tab, tool, input, output, first, 0);
+        let (tool, input, output, status) = tools[0];
+        render_tool(out, tab, tool, input, output, status, first, 0);
     } else {
         // Workflow runs default to expanded so their graphs stay visible,
         // but an explicit collapse (collapsed_groups) wins.
@@ -247,8 +272,8 @@ fn render_tool_run(out: &mut String, tab: &Tab, run: &[Block], first: usize) {
             escape(&group_label(run))
         );
         if expanded {
-            for (offset, (tool, input, output)) in tools.iter().enumerate() {
-                render_tool(out, tab, tool, input, *output, first + offset, 1);
+            for (offset, (tool, input, output, status)) in tools.iter().enumerate() {
+                render_tool(out, tab, tool, input, *output, *status, first + offset, 1);
             }
         }
         out.push_str("</div>\n");
@@ -271,6 +296,7 @@ fn render_tool(
     tool: &str,
     input: &str,
     output: Option<&str>,
+    status: Option<&str>,
     index: usize,
     depth: usize,
 ) {
@@ -281,7 +307,8 @@ fn render_tool(
         out,
         "<div class=\"tool{} depth-{depth}\" data-action=\"toggle_tool\" data-tab=\"{}\" data-block=\"{index}\">\
          <button class=\"tool-row\" data-action=\"toggle_tool\" data-tab=\"{}\" data-block=\"{index}\">\
-         <span class=\"tool-name\">{}</span>{} <span class=\"tool-title\">{}</span></button>",
+         <span class=\"tool-name\">{}</span>{} <span class=\"tool-title\">{}</span>\
+         {}</button>",
         if running { " running" } else { "" },
         tab.id,
         tab.id,
@@ -291,7 +318,13 @@ fn render_tool(
         } else {
             ""
         },
-        escape(&title)
+        escape(&title),
+        match (running, status) {
+            (true, Some(status)) => {
+                format!(" <span class=\"tool-status\">{}</span>", escape(status))
+            }
+            _ => String::new(),
+        }
     );
 
     // Workflow cards draw the run's graph between the row and the output.
@@ -1241,6 +1274,7 @@ mod tests {
             tool: "bash".into(),
             input: "ls".into(),
             output: Some("a.rs\nb.rs".into()),
+            status: None,
         }]);
         let html = transcript_html(ws.tab(id).unwrap());
         assert!(
@@ -1264,6 +1298,7 @@ mod tests {
                 tool: "bash".into(),
                 input: "first".into(),
                 output: Some("one".into()),
+                status: None,
             },
             Block::Assistant("between".into()),
             Block::Tool {
@@ -1275,6 +1310,7 @@ mod tests {
                         .collect::<Vec<_>>()
                         .join("\n"),
                 ),
+                status: None,
             },
         ]);
         ws.tab_mut(id).unwrap().expanded_outputs.insert(2);
@@ -1306,11 +1342,13 @@ mod tests {
                 tool: "workflow_start".into(),
                 input: spec.into(),
                 output: Some(start.into()),
+                status: None,
             },
             Block::Tool {
                 tool: "workflow_status".into(),
                 input: "r-77".into(),
                 output: Some(snapshot.into()),
+                status: None,
             },
         ]);
         let tab = ws.tab(id).unwrap();
@@ -1343,16 +1381,19 @@ mod tests {
                 input: r#"{"name":"docs","nodes":[{"id":"read","agent":"reader","prompt":"p"}]}"#
                     .into(),
                 output: Some(start.into()),
+                status: None,
             },
             Block::Tool {
                 tool: "workflow_status".into(),
                 input: "r-77".into(),
                 output: Some(snapshot.into()),
+                status: None,
             },
             Block::Tool {
                 tool: "workflow_status".into(),
                 input: "r-77".into(),
                 output: Some(snapshot.into()),
+                status: None,
             },
         ]);
         // Defaults to expanded: the graphs are visible.
@@ -1373,6 +1414,7 @@ mod tests {
             tool: "bash".into(),
             input: String::new(),
             output: None,
+            status: None,
         }]));
     }
 
@@ -1436,6 +1478,7 @@ mod tests {
             tool: "bash".into(),
             input: "seq 10".into(),
             output: Some(output),
+            status: None,
         }]);
         let html = transcript_html(ws.tab(id).unwrap());
         assert!(html.contains("line 6"), "{html}");
@@ -1455,6 +1498,7 @@ mod tests {
             tool: "bash".into(),
             input: long_command.clone(),
             output: Some("done".into()),
+            status: None,
         }]);
         // Collapsed: the command appears only in the ellipsized title row.
         let html = transcript_html(ws.tab(id).unwrap());
@@ -1476,6 +1520,7 @@ mod tests {
             tool: "bash".into(),
             input: "seq 600".into(),
             output: Some(output),
+            status: None,
         }]);
         ws.tab_mut(id).unwrap().expanded_outputs.insert(0);
         let html = transcript_html(ws.tab(id).unwrap());
@@ -1490,11 +1535,13 @@ mod tests {
                 tool: "bash".into(),
                 input: "ls".into(),
                 output: Some("a".into()),
+                status: None,
             },
             Block::Tool {
                 tool: "read_file".into(),
                 input: "src/main.rs".into(),
                 output: Some("b".into()),
+                status: None,
             },
         ]);
         let html = transcript_html(ws.tab(id).unwrap());
@@ -1519,6 +1566,7 @@ mod tests {
             tool: "bash".into(),
             input: "sleep 30".into(),
             output: None,
+            status: None,
         }]);
         let html = transcript_html(ws.tab(id).unwrap());
         assert!(html.contains("class=\"tool running depth-0\""), "{html}");
@@ -1534,11 +1582,40 @@ mod tests {
             tool: "bash".into(),
             input: "ls".into(),
             output: Some("a".into()),
+            status: None,
         }]);
         let html = transcript_html(ws.tab(id).unwrap());
         assert!(html.contains("class=\"tool depth-0\""), "{html}");
         assert!(!html.contains("tool-spinner"), "{html}");
         assert!(!html.contains("running"), "{html}");
+    }
+
+    #[test]
+    fn running_tool_shows_its_live_status() {
+        let (ws, id) = tab_with_blocks(vec![Block::Tool {
+            tool: "task".into(),
+            input: "explore".into(),
+            output: None,
+            status: Some("1m03s — bash: cargo test".into()),
+        }]);
+        let html = transcript_html(ws.tab(id).unwrap());
+        assert!(
+            html.contains("<span class=\"tool-status\">1m03s — bash: cargo test</span>"),
+            "{html}"
+        );
+        assert!(html.contains("tool-spinner"), "{html}");
+    }
+
+    #[test]
+    fn tool_status_is_hidden_once_the_tool_finishes() {
+        let (ws, id) = tab_with_blocks(vec![Block::Tool {
+            tool: "task".into(),
+            input: "explore".into(),
+            output: Some("done".into()),
+            status: Some("stale".into()),
+        }]);
+        let html = transcript_html(ws.tab(id).unwrap());
+        assert!(!html.contains("tool-status"), "{html}");
     }
 
     #[test]
@@ -1548,11 +1625,13 @@ mod tests {
                 tool: "bash".into(),
                 input: "ls".into(),
                 output: None,
+                status: None,
             },
             Block::Tool {
                 tool: "grep".into(),
                 input: "TODO".into(),
                 output: None,
+                status: None,
             },
         ]);
         let html = transcript_html(ws.tab(id).unwrap());
@@ -1567,11 +1646,13 @@ mod tests {
                 tool: "bash".into(),
                 input: "ls".into(),
                 output: Some("a".into()),
+                status: None,
             },
             Block::Tool {
                 tool: "grep".into(),
                 input: "TODO".into(),
                 output: Some("b".into()),
+                status: None,
             },
         ]);
         let html = transcript_html(ws.tab(id).unwrap());
@@ -1592,11 +1673,13 @@ mod tests {
                 tool: "bash".into(),
                 input: "ls".into(),
                 output: Some("a".into()),
+                status: None,
             },
             Block::Tool {
                 tool: "grep".into(),
                 input: "TODO".into(),
                 output: None,
+                status: None,
             },
         ]);
         ws.tab_mut(id).unwrap().expanded_groups.insert(0);
@@ -1786,6 +1869,43 @@ mod tests {
         let html = block_html(ws.tab(id).unwrap(), 2).unwrap();
         assert!(html.contains("body plain thought\""), "{html}");
         assert!(!html.contains("streaming"), "{html}");
+    }
+
+    #[test]
+    fn pending_steers_render_a_queue_badge() {
+        let (mut ws, id) = tab_with_blocks(vec![Block::User("hi".into())]);
+        {
+            let tab = ws.tab_mut(id).unwrap();
+            tab.model.apply_event(&AgentEvent::Steered {
+                text: "focus".into(),
+            });
+            tab.pending_steers.push(("focus".into(), 1));
+        }
+        let html = block_html(ws.tab(id).unwrap(), 1).expect("steered block renders");
+        assert!(
+            html.contains("<span class=\"queue-status\">queued</span>"),
+            "{html}"
+        );
+        // The settled first message carries no badge.
+        let html = block_html(ws.tab(id).unwrap(), 0).unwrap();
+        assert!(!html.contains("queue-status"), "{html}");
+
+        // Confirmation (the pending entry is consumed) settles the badge.
+        ws.tab_mut(id).unwrap().pending_steers.clear();
+        let html = block_html(ws.tab(id).unwrap(), 1).unwrap();
+        assert!(!html.contains("queue-status"), "{html}");
+    }
+
+    #[test]
+    fn queue_badge_requires_matching_text_and_index() {
+        let (mut ws, id) = tab_with_blocks(vec![Block::User("hi".into())]);
+        // A stale pending index (or different text) must not badge the block.
+        {
+            let tab = ws.tab_mut(id).unwrap();
+            tab.pending_steers.push(("other".into(), 0));
+        }
+        let html = block_html(ws.tab(id).unwrap(), 0).unwrap();
+        assert!(!html.contains("queue-status"), "{html}");
     }
 
     #[test]

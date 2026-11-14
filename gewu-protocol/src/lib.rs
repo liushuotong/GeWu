@@ -46,13 +46,15 @@
 //! ```
 //!
 //! `event` payloads are serialized [`AgentEvent`]s (tagged with `"type"`:
-//! `content_delta`, `reasoning_delta`, `tool_start`, `tool_finish`,
-//! `usage`, `finish`, `error`).
+//! `content_delta`, `reasoning_delta`, `tool_start`, `tool_progress`,
+//! `tool_finish`, `usage`, `finish`, `error`).
 
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
-pub use gewu_core::types::{AgentEvent, ContentPart, FunctionCall, Message, TokenUsage, ToolCall};
+pub use gewu_core::types::{
+    AgentEvent, ContentPart, FunctionCall, Message, TokenUsage, ToolCall, summarize_tool_input,
+};
 
 /// Operations a client can request.
 #[derive(Debug, Clone, PartialEq, Eq)]

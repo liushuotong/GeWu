@@ -130,6 +130,8 @@ pub enum ServerMsg {
     },
     /// Append one rendered block at the end of the transcript.
     BlockAppend { index: usize, html: String },
+    /// Replace one rendered block in place (whole `.block` node).
+    BlockReplace { index: usize, html: String },
     /// Replace one streaming block's rendered Markdown body in place
     /// (throttled to roughly ten updates per second).
     StreamingBody { index: usize, html: String },
@@ -241,6 +243,14 @@ mod tests {
         };
         let json = serde_json::to_value(&msg).unwrap();
         assert_eq!(json["type"], "block_append");
+        assert_eq!(json["index"], 2);
+
+        let msg = ServerMsg::BlockReplace {
+            index: 2,
+            html: "<div class=\"block\"></div>".to_string(),
+        };
+        let json = serde_json::to_value(&msg).unwrap();
+        assert_eq!(json["type"], "block_replace");
         assert_eq!(json["index"], 2);
 
         let msg = ServerMsg::Notice {

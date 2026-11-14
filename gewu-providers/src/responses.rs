@@ -19,21 +19,24 @@ type Failure = Box<dyn Error + Send + Sync>;
 ///
 /// Request-level failures arrive boxed [`crate::openai::OpenAIError`];
 /// stream-level ones carry [`crate::openai::OpenAIError::Stream`] built from
-/// the in-flight error event. Transport errors and rate limits (with their
-/// wait hints) retry; typed `Stream` errors retry only when marked
-/// transient; anything else — bad request, auth, unknown event shapes — is
-/// permanent. Raw mid-stream transport failures (boxed
-/// [`reqwest::Error`]) retry too: the retry layer only restarts while
-/// nothing was yielded, which keeps a restart duplication-free.
+/// the in-flight error event. The default is retryable — transport errors,
+/// server outages (5xx/408 with their hints), parse failures, unknown
+/// shapes — so future error modes self-heal instead of killing the ask.
+/// Only deterministic failures a re-send cannot fix are permanent: request
+/// building, status-less rejections, 4xx client errors, and typed in-stream
+/// errors not marked transient by [`stream_error`].
 fn classify_failure(error: &Failure) -> crate::http::RetryDecision {
-    if error.downcast_ref::<reqwest::Error>().is_some() {
-        return crate::http::RetryDecision::Yes { after: None };
-    }
     match error.downcast_ref::<crate::openai::OpenAIError>() {
-        Some(crate::openai::OpenAIError::Http(_)) => {
-            crate::http::RetryDecision::Yes { after: None }
+        // Deterministic failures a re-send cannot fix.
+        Some(crate::openai::OpenAIError::Build(_) | crate::openai::OpenAIError::Client { .. }) => {
+            crate::http::RetryDecision::No
         }
-        Some(crate::openai::OpenAIError::RateLimit { retry_after, .. }) => {
+        Some(crate::openai::OpenAIError::Stream {
+            transient: false, ..
+        }) => crate::http::RetryDecision::No,
+        // Provider-suggested waits are honored, capped by the retry layer.
+        Some(crate::openai::OpenAIError::RateLimit { retry_after, .. })
+        | Some(crate::openai::OpenAIError::Server { retry_after, .. }) => {
             crate::http::RetryDecision::Yes {
                 after: *retry_after,
             }
@@ -45,18 +48,23 @@ fn classify_failure(error: &Failure) -> crate::http::RetryDecision {
         }) => crate::http::RetryDecision::Yes {
             after: *retry_after,
         },
-        _ => crate::http::RetryDecision::No,
+        // Transport errors, parse failures, unknown shapes. (A boxed
+        // reqwest::Error lands here too.) The retry layer only restarts
+        // while nothing was yielded, which keeps a restart duplication-free.
+        _ => crate::http::RetryDecision::Yes { after: None },
     }
 }
 
 /// Classifies an in-stream error event's payload.
 ///
-/// Provider-side outages (`service_unavailable_error`, `server_error`,
-/// overloaded servers, in-stream rate limits) are marked transient so the
-/// retry layer waits out the suggested `Retry-After` — sent by gateways as
-/// embedded `retry-after` / `retry-after-ms` "headers" — and restarts the
-/// request. Everything else (invalid request, auth, context length) is
-/// permanent and surfaces to the user.
+/// The default is transient: provider-side outages (`service_unavailable_error`,
+/// `server_error`, overloaded servers, in-stream rate limits) and unknown
+/// error kinds from relays yet to be seen retry, so future error modes
+/// self-heal. Only known request-level failures a re-send cannot fix
+/// (invalid request, auth, quota, context length) are permanent and surface
+/// to the user. Transient errors carry the suggested `Retry-After` — sent
+/// by gateways as embedded `retry-after` / `retry-after-ms` "headers" —
+/// for the retry layer to wait out.
 fn stream_error(error: &Value) -> crate::openai::OpenAIError {
     let kind = error["type"]
         .as_str()
@@ -82,13 +90,17 @@ fn stream_error(error: &Value) -> crate::openai::OpenAIError {
                 })
                 .map(Duration::from_secs)
         });
-    let transient = matches!(
+    // Only known request-level failures are permanent; everything else —
+    // including unknown kinds — is transient so a fresh request can
+    // plausibly survive it.
+    let transient = !matches!(
         kind,
-        "service_unavailable_error"
-            | "server_error"
-            | "internal_server_error"
-            | "rate_limit_exceeded"
-            | "server_is_overloaded"
+        "invalid_request_error"
+            | "invalid_prompt"
+            | "context_length_exceeded"
+            | "invalid_api_key"
+            | "insufficient_quota"
+            | "permission_error"
     );
     crate::openai::OpenAIError::Stream {
         transient,
@@ -476,6 +488,59 @@ mod tests {
             .unwrap();
         assert_eq!(both["reasoning"], json!({"summary":"auto", "effort":"low"}));
     }
+
+    #[test]
+    fn classify_defaults_unknown_failures_to_retryable() {
+        use crate::http::RetryDecision;
+        // Untyped failures (transport errors, parse failures, unknown
+        // shapes) default to retryable so future error modes self-heal.
+        let untyped: Failure = Box::new(std::io::Error::other("boom"));
+        assert!(matches!(
+            classify_failure(&untyped),
+            RetryDecision::Yes { after: None }
+        ));
+        // Server outages retry, honoring the provider's wait hint; a 408
+        // is typed as Server too, while a 400 is permanent.
+        let server: Failure = Box::new(crate::openai::OpenAIError::Server {
+            status: reqwest::StatusCode::BAD_GATEWAY,
+            retry_after: Some(Duration::from_secs(2)),
+            message: "down".into(),
+        });
+        assert!(matches!(
+            classify_failure(&server),
+            RetryDecision::Yes { after: Some(_) }
+        ));
+        let timeout: Failure = Box::new(crate::openai::OpenAIError::status_error(
+            reqwest::StatusCode::REQUEST_TIMEOUT,
+            None,
+            "slow",
+        ));
+        assert!(matches!(
+            classify_failure(&timeout),
+            RetryDecision::Yes { after: None }
+        ));
+        let client: Failure = Box::new(crate::openai::OpenAIError::Client {
+            status: reqwest::StatusCode::BAD_REQUEST,
+            message: "bad".into(),
+        });
+        assert!(matches!(classify_failure(&client), RetryDecision::No));
+        // Typed stream errors follow their transient flag.
+        let transient: Failure = Box::new(crate::openai::OpenAIError::Stream {
+            transient: true,
+            message: "server_error: overloaded".into(),
+            retry_after: None,
+        });
+        assert!(matches!(
+            classify_failure(&transient),
+            RetryDecision::Yes { after: None }
+        ));
+        let permanent: Failure = Box::new(crate::openai::OpenAIError::Stream {
+            transient: false,
+            message: "invalid_request_error: nope".into(),
+            retry_after: None,
+        });
+        assert!(matches!(classify_failure(&permanent), RetryDecision::No));
+    }
 }
 
 impl OpenAIProvider {
@@ -550,11 +615,15 @@ impl OpenAIProvider {
         let text = response.text().await.unwrap_or_default();
         if status == reqwest::StatusCode::TOO_MANY_REQUESTS {
             return Err(crate::openai::OpenAIError::RateLimit {
-                message: crate::http::rate_limit_message(&text),
+                message: crate::http::response_message(&text),
                 retry_after,
             });
         }
-        Err(crate::openai::OpenAIError::Api(format!("{status}: {text}")))
+        Err(crate::openai::OpenAIError::status_error(
+            status,
+            retry_after,
+            &text,
+        ))
     }
 }
 

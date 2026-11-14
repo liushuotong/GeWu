@@ -268,6 +268,9 @@
       case "streaming_body":
         updateStreamingBody(message.index, message.html);
         break;
+      case "block_replace":
+        replaceBlock(message.index, message.html);
+        break;
       case "status":
         setStatus(message.html);
         break;
@@ -419,6 +422,25 @@
     }
     block.replaceChildren(body);
     if (state.stuck) scrollToBottom();
+  }
+
+  // Replace one rendered block in place (e.g. a steered message settling
+  // out of its queued state): swapping the node keeps the surrounding
+  // transcript and scroll position intact.
+  function replaceBlock(index, html) {
+    const block = el.transcript.querySelector(
+      `.block[data-block="${Number(index)}"]`,
+    );
+    if (!block) {
+      requestRefresh();
+      return;
+    }
+    const node = fromHtml(html);
+    if (!node) {
+      requestRefresh();
+      return;
+    }
+    block.replaceWith(node);
   }
 
   function setStatus(html) {

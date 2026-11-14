@@ -114,6 +114,16 @@ async fn run_agent(agent: &mut gewu_core::Agent, prompt: &str) -> Result<()> {
                                 std::io::stdout().flush()?;
                             }
                         }
+                        // Live tool progress (e.g. a subagent's activity
+                        // inside `task`): overwrite one dim line so long
+                        // waits stay visible without stacking up output.
+                        AgentEvent::ToolProgress { tool: _, message } => {
+                            stop_spinner(&mut spinner_active, is_tty)?;
+                            if is_tty {
+                                print!("\r\x1b[2K{DIM}{message}{RESET}");
+                                std::io::stdout().flush()?;
+                            }
+                        }
                         // A steering message injected mid-run; rendered like
                         // the user turn it is, so the next content starts
                         // fresh.

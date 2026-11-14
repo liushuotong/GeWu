@@ -18,11 +18,12 @@
 
 use async_trait::async_trait;
 use gewu_core::Agent;
-use gewu_core::types::{AgentEvent, ToolContext, ToolResult};
+use gewu_core::types::{AgentEvent, ToolContext, ToolResult, summarize_tool_input};
 use schemars::schema::RootSchema;
 use serde::Deserialize;
 use std::error::Error;
 use std::sync::Arc;
+use std::time::Instant;
 
 use gewu_core::traits::Tool;
 
@@ -185,6 +186,10 @@ impl Tool for TaskTool {
         use futures_util::StreamExt;
         let mut stream = Box::pin(agent.ask(&input.prompt));
         let mut result = String::new();
+        // Live status for the parent's UI: the subagent's latest activity,
+        // refreshed on every tool it starts.
+        let started_at = Instant::now();
+        let mut last_status: Option<String> = None;
 
         while let Some(event_result) = stream.next().await {
             // Stop consuming the subagent stream once the parent turn has
@@ -200,6 +205,18 @@ impl Tool for TaskTool {
                 Ok(event) => match event {
                     AgentEvent::ContentDelta { delta } => {
                         result.push_str(&delta);
+                    }
+                    AgentEvent::ToolStart { tool, input: args } => {
+                        let status = format!(
+                            "{} — {}: {}",
+                            format_elapsed(started_at.elapsed()),
+                            tool,
+                            summarize_tool_input(&tool, &args)
+                        );
+                        if last_status.as_deref() != Some(status.as_str()) {
+                            ctx.report_progress(&status);
+                            last_status = Some(status);
+                        }
                     }
                     AgentEvent::Finish { response } => {
                         result = response;
@@ -220,6 +237,16 @@ impl Tool for TaskTool {
                 session_id, result
             ),
         ))
+    }
+}
+
+/// Compact elapsed-time label for live status ("42s", "1m03s").
+fn format_elapsed(elapsed: std::time::Duration) -> String {
+    let secs = elapsed.as_secs();
+    if secs < 60 {
+        format!("{secs}s")
+    } else {
+        format!("{}m{:02}s", secs / 60, secs % 60)
     }
 }
 
@@ -456,5 +483,47 @@ mod tests {
         let description = tool.description();
         assert!(description.contains("- \"build\": Builds the project"));
         assert!(description.contains("- \"explore\": Explores the codebase"));
+    }
+
+    /// The subagent requests `bash`, which no one provides: every turn
+    /// yields ToolStart plus a "Tool not found" finish until the doom-loop
+    /// detector stops the run. The task tool must surface the subagent's
+    /// tool activity as `ToolProgress` on the context's sink, throttled to
+    /// distinct messages.
+    #[tokio::test]
+    async fn task_reports_subagent_activity_as_progress() {
+        let factory = Arc::new(MockFactory::new(vec![
+            ProviderEvent::ToolCallStart {
+                id: "c1".to_string(),
+                name: "bash".to_string(),
+            },
+            ProviderEvent::ToolCallDelta {
+                id: "c1".to_string(),
+                delta: r#"{"command":"ls"}"#.to_string(),
+            },
+            ProviderEvent::Finish {
+                reason: Some("tool_calls".to_string()),
+            },
+        ]));
+        let tool = make_tool(factory.clone());
+
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        let mut ctx = ToolContext::new("s", "m");
+        ctx.progress = Some(gewu_core::types::ProgressSink::new("task", tx));
+
+        // The run ends in a doom-loop error (the missing tool repeats);
+        // the progress events still reached the sink.
+        let _ = tool.execute(args("Watch me", "build", None), &ctx).await;
+
+        let mut statuses = Vec::new();
+        while let Ok(event) = rx.try_recv() {
+            if let AgentEvent::ToolProgress { tool, message } = event {
+                assert_eq!(tool, "task");
+                statuses.push(message);
+            }
+        }
+        assert_eq!(statuses.len(), 1, "repeats must be throttled: {statuses:?}");
+        assert!(statuses[0].contains("bash"), "{statuses:?}");
+        assert!(statuses[0].contains("ls"), "{statuses:?}");
     }
 }

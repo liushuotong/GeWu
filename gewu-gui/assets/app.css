@@ -509,6 +509,14 @@ body {
   color: var(--accent);
 }
 
+/* A user message queued into the running turn, not yet ingested. */
+.queue-status {
+  margin-left: 10px;
+  color: var(--text-dim);
+  font-size: 11px;
+  font-style: italic;
+}
+
 .block.error .body {
   position: relative;
   color: var(--error);
@@ -1057,6 +1065,18 @@ body {
   border-top-color: var(--accent);
   border-radius: 50%;
   animation: spin 0.8s linear infinite;
+}
+
+/* live status of a running tool (e.g. what a task subagent is doing) */
+.tool-status {
+  flex: 1 1 auto;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  color: var(--text-dim);
+  font-size: 11px;
+  font-style: italic;
 }
 
 @keyframes spin {

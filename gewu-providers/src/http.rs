@@ -207,10 +207,10 @@ fn parse_retry_after(value: &str) -> Option<Duration> {
     value.trim().parse::<u64>().ok().map(Duration::from_secs)
 }
 
-/// Human message for a 429 body, in preference order:
+/// Human message for an error-response body, in preference order:
 /// `error.message` (OpenAI and new-api relays), `message`, then the raw body
 /// truncated to one line so the error stays readable.
-pub(crate) fn rate_limit_message(body: &str) -> String {
+pub(crate) fn response_message(body: &str) -> String {
     let parsed: Option<serde_json::Value> = serde_json::from_str(body).ok();
     let extracted = parsed.as_ref().and_then(|value| {
         value
@@ -474,22 +474,19 @@ mod tests {
     }
 
     #[test]
-    fn rate_limit_message_prefers_structured_fields() {
+    fn response_message_prefers_structured_fields() {
         let new_api = r#"{"error":{"code":"user_rate_limit_exceeded","message":"You have reached the request limit: at most 1 requests per 60 minutes","type":"new_api_error"}}"#;
         assert_eq!(
-            rate_limit_message(new_api),
+            response_message(new_api),
             "You have reached the request limit: at most 1 requests per 60 minutes"
         );
-        assert_eq!(
-            rate_limit_message(r#"{"message":"slow down"}"#),
-            "slow down"
-        );
+        assert_eq!(response_message(r#"{"message":"slow down"}"#), "slow down");
         // Unparseable bodies are flattened and truncated, not dropped.
         let raw = format!("oops\n{}", "x".repeat(400));
-        let message = rate_limit_message(&raw);
+        let message = response_message(&raw);
         assert!(!message.contains('\n'));
         assert!(message.chars().count() <= 201);
-        assert_eq!(rate_limit_message(""), "no response body");
+        assert_eq!(response_message(""), "no response body");
     }
 
     // -- retrying_stream ----------------------------------------------------

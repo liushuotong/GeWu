@@ -40,9 +40,26 @@ pub enum AnthropicError {
         message: String,
         retry_after: Option<std::time::Duration>,
     },
-    /// API returned an error response.
-    #[error("API error: {0}")]
-    Api(String),
+    /// The server failed to serve the request (5xx, or a 408 request
+    /// timeout): a fresh request can plausibly succeed. `retry_after`
+    /// carries a provider-suggested wait when the response included one.
+    #[error("API error: {status}: {message}")]
+    Server {
+        status: reqwest::StatusCode,
+        retry_after: Option<std::time::Duration>,
+        message: String,
+    },
+    /// The request itself was rejected (4xx other than 408/429): retrying
+    /// cannot fix it, so it surfaces immediately.
+    #[error("API error: {status}: {message}")]
+    Client {
+        status: reqwest::StatusCode,
+        message: String,
+    },
+    /// Error building the request (e.g. the wire payload failed to parse).
+    /// Treated as permanent: a re-send fails the same way.
+    #[error("build error: {0}")]
+    Build(String),
     /// An error event inside a streaming response. `transient` marks
     /// provider-side outages (`overloaded_error`, `api_error`,
     /// `rate_limit_error`, `timeout_error`) that a fresh request can
@@ -67,10 +84,34 @@ pub(crate) fn rate_limit_error(
     retry_after: Option<std::time::Duration>,
     body: &str,
 ) -> AnthropicError {
-    let message = crate::http::rate_limit_message(body);
+    let message = crate::http::response_message(body);
     AnthropicError::RateLimit {
         message,
         retry_after,
+    }
+}
+
+impl AnthropicError {
+    /// Maps a non-429 failure response to its typed variant. Server-side
+    /// statuses (5xx) and request timeouts (408) become
+    /// [`AnthropicError::Server`] (retryable — a fresh request can plausibly
+    /// succeed); every other client error becomes [`AnthropicError::Client`]
+    /// (permanent).
+    pub(crate) fn status_error(
+        status: reqwest::StatusCode,
+        retry_after: Option<std::time::Duration>,
+        body: &str,
+    ) -> AnthropicError {
+        let message = crate::http::response_message(body);
+        if status.is_server_error() || status == reqwest::StatusCode::REQUEST_TIMEOUT {
+            AnthropicError::Server {
+                status,
+                retry_after,
+                message,
+            }
+        } else {
+            AnthropicError::Client { status, message }
+        }
     }
 }
 
@@ -253,7 +294,11 @@ impl<'a> Messages<'a> {
             if status == reqwest::StatusCode::TOO_MANY_REQUESTS {
                 return Err(rate_limit_error(retry_after, &error_text));
             }
-            return Err(AnthropicError::Api(format!("{}: {}", status, error_text)));
+            return Err(AnthropicError::status_error(
+                status,
+                retry_after,
+                &error_text,
+            ));
         }
 
         let stream = response.bytes_stream();
@@ -563,14 +608,23 @@ pub struct ErrorDetail {
 
 /// Classifies an in-stream error event's payload.
 ///
-/// Provider-side outages (`overloaded_error` — Anthropic's 529, `api_error`,
-/// in-stream rate limits, timeouts) are marked transient so the retry layer
-/// restarts the request after the backoff wait; everything else (invalid
-/// request, auth, permissions) is permanent and surfaces to the user.
+/// The default is transient: provider-side outages (`overloaded_error` —
+/// Anthropic's 529, `api_error`, in-stream rate limits, timeouts) and
+/// unknown error kinds retry, so future error modes self-heal instead of
+/// killing the ask. Only known request-level failures a re-send cannot fix
+/// (invalid request, auth, permissions) are permanent and surface to the
+/// user.
 pub(crate) fn stream_error(detail: &ErrorDetail) -> AnthropicError {
-    let transient = matches!(
+    // Only known request-level failures are permanent; everything else —
+    // including unknown kinds — is transient so a fresh request can
+    // plausibly survive it.
+    let transient = !matches!(
         detail.error_type.as_str(),
-        "overloaded_error" | "api_error" | "rate_limit_error" | "timeout_error"
+        "invalid_request_error"
+            | "authentication_error"
+            | "permission_error"
+            | "not_found_error"
+            | "request_too_large"
     );
     AnthropicError::Stream {
         transient,
@@ -603,7 +657,11 @@ impl<'a> Models<'a> {
             if status == reqwest::StatusCode::TOO_MANY_REQUESTS {
                 return Err(rate_limit_error(retry_after, &error_text));
             }
-            return Err(AnthropicError::Api(format!("{}: {}", status, error_text)));
+            return Err(AnthropicError::status_error(
+                status,
+                retry_after,
+                &error_text,
+            ));
         }
 
         let models: ModelsResponse = response.json().await?;

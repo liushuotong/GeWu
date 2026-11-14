@@ -55,10 +55,23 @@ pub enum OpenAIError {
         message: String,
         retry_after: Option<std::time::Duration>,
     },
-    /// API returned an error response.
-    #[error("API error: {0}")]
-    Api(String),
-    /// Error building request (missing required fields, etc.).
+    /// The server failed to serve the request (5xx, or a 408 request
+    /// timeout): a fresh request can plausibly succeed. `retry_after`
+    /// carries a provider-suggested wait when the response included one.
+    #[error("API error: {status}: {message}")]
+    Server {
+        status: reqwest::StatusCode,
+        retry_after: Option<std::time::Duration>,
+        message: String,
+    },
+    /// The request itself was rejected (4xx other than 408/429): retrying
+    /// cannot fix it, so it surfaces immediately.
+    #[error("API error: {status}: {message}")]
+    Client {
+        status: reqwest::StatusCode,
+        message: String,
+    },
+    /// Error building the request (missing required fields, etc.).
     #[error("Build error: {0}")]
     Build(String),
 }
@@ -72,10 +85,33 @@ pub(crate) fn rate_limit_error(
     retry_after: Option<std::time::Duration>,
     body: &str,
 ) -> OpenAIError {
-    let message = crate::http::rate_limit_message(body);
+    let message = crate::http::response_message(body);
     OpenAIError::RateLimit {
         message,
         retry_after,
+    }
+}
+
+impl OpenAIError {
+    /// Maps a non-429 failure response to its typed variant. Server-side
+    /// statuses (5xx) and request timeouts (408) become [`OpenAIError::Server`]
+    /// (retryable — a fresh request can plausibly succeed); every other
+    /// client error becomes [`OpenAIError::Client`] (permanent).
+    pub(crate) fn status_error(
+        status: reqwest::StatusCode,
+        retry_after: Option<std::time::Duration>,
+        body: &str,
+    ) -> OpenAIError {
+        let message = crate::http::response_message(body);
+        if status.is_server_error() || status == reqwest::StatusCode::REQUEST_TIMEOUT {
+            OpenAIError::Server {
+                status,
+                retry_after,
+                message,
+            }
+        } else {
+            OpenAIError::Client { status, message }
+        }
     }
 }
 
@@ -163,7 +199,7 @@ impl<'a> ChatCompletions<'a> {
             if status == reqwest::StatusCode::TOO_MANY_REQUESTS {
                 return Err(rate_limit_error(retry_after, &error_text));
             }
-            return Err(OpenAIError::Api(format!("{}: {}", status, error_text)));
+            return Err(OpenAIError::status_error(status, retry_after, &error_text));
         }
 
         let stream = response.bytes_stream();
@@ -326,7 +362,7 @@ impl<'a> Models<'a> {
             if status == reqwest::StatusCode::TOO_MANY_REQUESTS {
                 return Err(rate_limit_error(retry_after, &error_text));
             }
-            return Err(OpenAIError::Api(format!("{}: {}", status, error_text)));
+            return Err(OpenAIError::status_error(status, retry_after, &error_text));
         }
 
         let models: ModelsResponse = response.json().await?;

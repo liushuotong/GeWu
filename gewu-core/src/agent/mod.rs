@@ -54,8 +54,8 @@ pub use tools::execute_tool_with_panic_recovery;
 use crate::middleware::TruncationService;
 use crate::traits::{Experiences, LlmProvider, Memory, RequestLog, Tool, ToolRegistry};
 use crate::types::{
-    AgentEvent, ContentPart, Message, PathEnforcement, ProviderEvent, SessionState, TokenUsage,
-    ToolCall, ToolContext, ToolResult,
+    AgentEvent, ContentPart, Message, PathEnforcement, ProgressSink, ProviderEvent, SessionState,
+    TokenUsage, ToolCall, ToolContext, ToolResult,
 };
 use anyhow::{Context, Result};
 use async_trait::async_trait;
@@ -505,6 +505,12 @@ impl Agent {
                 // resources.
                 let semaphore = Arc::new(tokio::sync::Semaphore::new(MAX_PARALLEL_TOOL_CALLS));
                 let mut join_set = tokio::task::JoinSet::new();
+                // Long-running tools report live status on this channel;
+                // the collection loop below interleaves the events into the
+                // ask stream while the calls execute.
+                let (progress_tx, mut progress_rx) =
+                    tokio::sync::mpsc::unbounded_channel::<AgentEvent>();
+                let mut executing = 0usize;
                 for (index, call, message_id) in pending {
                     let tool = self
                         .tools
@@ -517,6 +523,8 @@ impl Agent {
                     let truncation = self.truncation.clone();
                     let semaphore = semaphore.clone();
                     let inbox = self.steering.clone();
+                    let progress_tx = progress_tx.clone();
+                    executing += 1;
                     join_set.spawn(async move {
                         let _permit = semaphore.acquire_owned().await.ok();
                         let tool_name = call.function.name.clone();
@@ -524,6 +532,7 @@ impl Agent {
                             .with_enforcement(enforcement)
                             .with_session_state(session_state);
                         ctx.inbox = Some(inbox);
+                        ctx.progress = Some(ProgressSink::new(&tool_name, progress_tx));
                         let result = if let Some(t) = tool {
                             execute_tool_call(t, call, ctx, &truncation).await
                         } else {
@@ -535,11 +544,25 @@ impl Agent {
                         (index, result)
                     });
                 }
+                drop(progress_tx);
 
-                // Collect results keyed by the original call index.
-                while let Some(joined) = join_set.join_next().await {
-                    if let Ok((index, result)) = joined {
-                        results[index] = Some(result);
+                // Collect results keyed by the original call index,
+                // interleaving live progress events from the running tools.
+                // Progress queued after the last tool completes is dropped:
+                // it is transient UI state, superseded by the ToolFinish.
+                while executing > 0 {
+                    tokio::select! {
+                        joined = join_set.join_next() => {
+                            if let Some(Ok((index, result))) = joined {
+                                results[index] = Some(result);
+                                executing -= 1;
+                            }
+                        }
+                        progress = progress_rx.recv() => {
+                            if let Some(event) = progress {
+                                yield event;
+                            }
+                        }
                     }
                 }
 
@@ -1818,6 +1841,96 @@ mod tests {
                 .await?,
             None
         );
+        Ok(())
+    }
+
+    /// A long-running tool reporting through the context's progress sink
+    /// must surface `ToolProgress` events on the ask stream, between the
+    /// call's `ToolStart` and `ToolFinish`.
+    struct ProgressProbeTool;
+
+    #[async_trait]
+    impl Tool for ProgressProbeTool {
+        fn name(&self) -> &str {
+            "progress_probe"
+        }
+
+        fn description(&self) -> &str {
+            "reports progress"
+        }
+
+        fn schema(&self) -> schemars::schema::RootSchema {
+            schemars::schema_for!(serde_json::Value)
+        }
+
+        async fn execute(
+            &self,
+            _args: Value,
+            ctx: &ToolContext,
+        ) -> Result<ToolResult, Box<dyn Error + Send + Sync>> {
+            ctx.report_progress("halfway there");
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+            ctx.report_progress("almost done");
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+            Ok(ToolResult::new("progress_probe", "ok"))
+        }
+    }
+
+    #[tokio::test]
+    async fn tool_progress_events_reach_the_ask_stream() -> Result<()> {
+        let provider = MockProvider::new(vec![
+            vec![
+                ProviderEvent::ToolCallStart {
+                    id: "call_1".to_string(),
+                    name: "progress_probe".to_string(),
+                },
+                ProviderEvent::ToolCallDelta {
+                    id: "call_1".to_string(),
+                    delta: "{}".to_string(),
+                },
+                ProviderEvent::Finish {
+                    reason: Some("tool_calls".to_string()),
+                },
+            ],
+            vec![
+                ProviderEvent::ContentDelta {
+                    delta: "done".to_string(),
+                },
+                ProviderEvent::Finish {
+                    reason: Some("end_turn".to_string()),
+                },
+            ],
+        ]);
+        let mut agent = Agent::builder()
+            .llm(Arc::new(provider))
+            .with_tools(vec![Arc::new(ProgressProbeTool)])
+            .build()?;
+
+        let events = agent.ask("probe").collect::<Vec<_>>().await;
+        let events: Vec<&AgentEvent> = events.iter().map(|e| e.as_ref().unwrap()).collect();
+
+        let start = events
+            .iter()
+            .position(
+                |e| matches!(e, AgentEvent::ToolStart { tool, .. } if tool == "progress_probe"),
+            )
+            .expect("tool must start");
+        let finish = events
+            .iter()
+            .position(
+                |e| matches!(e, AgentEvent::ToolFinish { tool, .. } if tool == "progress_probe"),
+            )
+            .expect("tool must finish");
+        let progress: Vec<&str> = events[start + 1..finish]
+            .iter()
+            .filter_map(|e| match e {
+                AgentEvent::ToolProgress { tool, message } if tool == "progress_probe" => {
+                    Some(message.as_str())
+                }
+                _ => None,
+            })
+            .collect();
+        assert_eq!(progress, vec!["halfway there", "almost done"]);
         Ok(())
     }
 }
