@@ -47,7 +47,10 @@ pub use stream::AskStream;
 use std::sync::Arc;
 use tokio::sync::{mpsc, oneshot};
 
-use gewu_protocol::{ClientRequest, FileEntry, Message, ServerMessage, SessionSummary, TokenUsage};
+use gewu_protocol::{
+    ClientRequest, DirectoryEntry, FileEntry, Message, ServerMessage, SessionSummary, TokenUsage,
+    WorkspaceSummary,
+};
 use inner::Command;
 
 /// Alias for a [`Result`](std::result::Result) with this crate's error type.
@@ -62,6 +65,8 @@ pub struct ServerInfo {
     pub provider: String,
     /// The working directory the server's agent operates in (absolute).
     pub working_directory: String,
+    pub workspaces: Vec<WorkspaceSummary>,
+    pub active_workspace: String,
 }
 
 /// The session's context usage against the agent's context window.
@@ -125,6 +130,7 @@ pub struct AskBuilder<'a> {
     prompt: String,
     session_id: Option<String>,
     agent: Option<String>,
+    workspace: Option<String>,
 }
 
 impl Client {
@@ -270,6 +276,7 @@ impl Client {
             prompt: prompt.into(),
             session_id: None,
             agent: None,
+            workspace: None,
         }
     }
 
@@ -379,21 +386,87 @@ impl Client {
         self.request(request).await.map(|_| ())
     }
 
-    /// The model, provider, and working directory the server runs with.
+    /// The model, provider, and workspace catalog the server runs with.
     pub async fn info(&self) -> Result<ServerInfo> {
         let request = ClientRequest::info(self.next_correlation_id());
+        self.info_request(request).await
+    }
+
+    /// Query server/session metadata for a particular persisted session.
+    pub async fn info_for_session(&self, session_id: &str) -> Result<ServerInfo> {
+        let request = ClientRequest::info(self.next_correlation_id()).with_session(session_id);
+        self.info_request(request).await
+    }
+
+    async fn info_request(&self, request: ClientRequest) -> Result<ServerInfo> {
         match self.request(request).await? {
             ServerMessage::Info {
                 model,
                 provider,
                 working_directory,
+                workspaces,
+                active_workspace,
                 ..
             } => Ok(ServerInfo {
                 model,
                 provider,
                 working_directory,
+                workspaces,
+                active_workspace,
             }),
             other => Err(unexpected(other, "info")),
+        }
+    }
+
+    /// Switch the active filesystem root on an idle session.
+    pub async fn switch_workspace(
+        &self,
+        workspace: impl Into<String>,
+    ) -> Result<(String, WorkspaceSummary)> {
+        let request = ClientRequest::switch_workspace(self.next_correlation_id(), workspace);
+        match self.request(request).await? {
+            ServerMessage::WorkspaceSwitched {
+                session_id,
+                workspace,
+                ..
+            } => Ok((session_id, workspace)),
+            ServerMessage::Error { error, .. } => Err(Error::Server(error)),
+            other => Err(unexpected(other, "workspace_switched")),
+        }
+    }
+
+    /// Browse direct directories on the GeWu server host.
+    pub async fn browse_workspace(
+        &self,
+        path: impl Into<String>,
+    ) -> Result<(String, Option<String>, Vec<DirectoryEntry>)> {
+        let request = ClientRequest::browse_workspace(self.next_correlation_id(), path);
+        match self.request(request).await? {
+            ServerMessage::Directories {
+                path,
+                parent,
+                entries,
+                ..
+            } => Ok((path, parent, entries)),
+            ServerMessage::Error { error, .. } => Err(Error::Server(error)),
+            other => Err(unexpected(other, "directories")),
+        }
+    }
+
+    /// Add and select a server-host directory for this session.
+    pub async fn add_workspace(
+        &self,
+        path: impl Into<String>,
+    ) -> Result<(String, WorkspaceSummary)> {
+        let request = ClientRequest::add_workspace(self.next_correlation_id(), path);
+        match self.request(request).await? {
+            ServerMessage::WorkspaceAdded {
+                session_id,
+                workspace,
+                ..
+            } => Ok((session_id, workspace)),
+            ServerMessage::Error { error, .. } => Err(Error::Server(error)),
+            other => Err(unexpected(other, "workspace_added")),
         }
     }
 
@@ -480,12 +553,19 @@ impl AskBuilder<'_> {
         self
     }
 
+    /// Use a workspace when this ask creates the connection's session.
+    pub fn workspace(mut self, workspace: impl Into<String>) -> Self {
+        self.workspace = Some(workspace.into());
+        self
+    }
+
     /// Start the ask and return its event stream.
     pub async fn send(self) -> Result<AskStream> {
         let request = ClientRequest::ask(self.client.next_correlation_id(), self.prompt);
         let request = ClientRequest {
             session_id: self.session_id,
             agent: self.agent,
+            workspace: self.workspace,
             ..request
         };
         let (tx, rx) = oneshot::channel();

@@ -5,13 +5,15 @@
 
 use serde::{Deserialize, Serialize};
 
-/// One open conversation tab, as shown in the browser's tab bar.
+/// One open conversation, as shown in the browser's sessions sidebar.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct TabInfo {
     pub id: u64,
     pub label: String,
     pub busy: bool,
     pub session_id: Option<String>,
+    #[serde(default)]
+    pub workspace: String,
 }
 
 /// Browser -> GUI commands.
@@ -32,6 +34,32 @@ pub enum ClientMsg {
         tab: u64,
         model: String,
     },
+    /// Switch the tab's active filesystem workspace root.
+    SwitchWorkspace {
+        tab: u64,
+        workspace: String,
+    },
+    /// Browse server-side directories for the runtime workspace picker.
+    BrowseWorkspace {
+        path: String,
+    },
+    /// Browse server-side directories while creating a new session.
+    BrowseNewSession {
+        path: String,
+    },
+    /// Create a local session tab with its workspace selected before the
+    /// upstream session is created on the first ask.
+    CreateTab {
+        workspace: String,
+        path: String,
+    },
+    /// Add and select a server-side directory for a tab.
+    AddWorkspace {
+        tab: u64,
+        path: String,
+    },
+    /// Close the runtime workspace picker.
+    CloseWorkspaceBrowser,
     /// First message when the GUI requires a token.
     Auth {
         token: String,
@@ -111,9 +139,12 @@ pub enum ServerMsg {
         transcript: String,
         status: String,
         sidebar: String,
+        session_sidebar: String,
     },
     /// Tab bar state changed (open/close/switch/busy marker).
     Tabs { tabs: Vec<TabInfo>, active: u64 },
+    /// Replace the workspace-grouped session sidebar.
+    SessionSidebar { html: String },
     /// Replace the active transcript with freshly rendered HTML.
     Transcript { html: String },
     /// Replace one tool card in the active transcript (`first` is its run's
@@ -162,6 +193,12 @@ pub enum ServerMsg {
     Notice { message: String },
     /// Replace the rendered file tree.
     FileTree { html: String },
+    /// Show or replace the server-side workspace browser.
+    WorkspaceBrowser { html: String },
+    /// Show the workspace picker used before creating a new session tab.
+    WorkspacePicker { html: String },
+    /// Close the server-side workspace browser/picker.
+    CloseWorkspaceBrowser,
     /// Show the requested file preview.
     FilePreview { html: String },
     /// Close the file preview overlay.
@@ -194,6 +231,23 @@ mod tests {
             serde_json::from_str::<ClientMsg>(r#"{"op":"open_tab"}"#).unwrap(),
             ClientMsg::OpenTab
         );
+        assert_eq!(
+            serde_json::from_str::<ClientMsg>(
+                r#"{"op":"create_tab","workspace":"tachyon","path":"/tmp/tachyon"}"#,
+            )
+            .unwrap(),
+            ClientMsg::CreateTab {
+                workspace: "tachyon".into(),
+                path: "/tmp/tachyon".into(),
+            }
+        );
+        assert_eq!(
+            serde_json::from_str::<ClientMsg>(r#"{"op":"browse_new_session","path":"/tmp"}"#)
+                .unwrap(),
+            ClientMsg::BrowseNewSession {
+                path: "/tmp".into()
+            }
+        );
     }
 
     #[test]
@@ -218,6 +272,7 @@ mod tests {
                 label: "new".to_string(),
                 busy: false,
                 session_id: None,
+                workspace: "cwd".into(),
             }],
             active: 1,
         };
@@ -232,10 +287,18 @@ mod tests {
             transcript: String::new(),
             status: String::new(),
             sidebar: "<section></section>".to_string(),
+            session_sidebar: "<aside></aside>".to_string(),
         };
         let json = serde_json::to_value(&msg).unwrap();
         assert_eq!(json["type"], "snapshot");
         assert_eq!(json["sidebar"], "<section></section>");
+        assert_eq!(json["session_sidebar"], "<aside></aside>");
+
+        let msg = ServerMsg::SessionSidebar {
+            html: "<aside class=\"session-sidebar\"></aside>".to_string(),
+        };
+        let json = serde_json::to_value(&msg).unwrap();
+        assert_eq!(json["type"], "session_sidebar");
 
         let msg = ServerMsg::ToolCard {
             first: 4,

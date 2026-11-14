@@ -135,6 +135,7 @@ struct SqliteAgentFactory {
     provider: Arc<dyn LlmProvider>,
     pool: SqlitePool,
     skills: Vec<SkillInfo>,
+    working_directory: std::path::PathBuf,
     enforcement: PathEnforcement,
     /// Model context window forwarded to subagent agents for compaction.
     context_limit: Option<usize>,
@@ -325,13 +326,13 @@ impl SqliteAgentFactory {
         {
             return Ok(template.clone());
         }
-        let working_directory = std::env::current_dir()?;
+        let working_directory = self.working_directory.clone();
         let (tools, system_prompt, _registry) = agent_profile(ProfileInputs {
             model_catalog: self.model_catalog.clone(),
             name: profile,
             provider: self.provider.clone(),
             pool: self.pool.clone(),
-            working_directory,
+            working_directory: working_directory.clone(),
             additional_tools: Vec::new(),
             skills: self.skills.clone(),
             enforcement: self.enforcement,
@@ -345,6 +346,7 @@ impl SqliteAgentFactory {
             .llm(self.provider.clone())
             .with_tools(tools)
             .system_prompt(&system_prompt)
+            .working_directory(working_directory)
             .with_enforcement(self.enforcement)
             .with_session_state(session_state)
             .build()?
@@ -365,6 +367,7 @@ fn agent_factory(
     provider: Arc<dyn LlmProvider>,
     pool: SqlitePool,
     skills: Vec<SkillInfo>,
+    working_directory: std::path::PathBuf,
     enforcement: PathEnforcement,
     context_limit: Option<usize>,
     agents: Arc<BTreeMap<String, AgentEntry>>,
@@ -374,6 +377,7 @@ fn agent_factory(
         provider,
         pool,
         skills,
+        working_directory,
         enforcement,
         context_limit,
         agents: agents.clone(),
@@ -431,6 +435,7 @@ fn build_tool_registry_and_list(inputs: &ProfileInputs) -> Result<RegistryBundle
                 provider.clone(),
                 pool.clone(),
                 skills.clone(),
+                working_directory.clone(),
                 *enforcement,
                 *context_limit,
                 agents.clone(),
@@ -482,6 +487,7 @@ fn build_tool_registry_and_list(inputs: &ProfileInputs) -> Result<RegistryBundle
                         provider.clone(),
                         pool.clone(),
                         skills.clone(),
+                        working_directory.clone(),
                         *enforcement,
                         *context_limit,
                         agents.clone(),
@@ -540,6 +546,7 @@ fn build_tool_registry_and_list(inputs: &ProfileInputs) -> Result<RegistryBundle
                 provider.clone(),
                 pool.clone(),
                 skills.clone(),
+                working_directory.clone(),
                 *enforcement,
                 *context_limit,
                 agents.clone(),
@@ -700,9 +707,8 @@ pub async fn create_agent(
         context_limit,
         agents,
         session_id,
-        ..
+        working_directory,
     } = inputs;
-    let working_directory = std::env::current_dir()?;
 
     let memory = SqliteMemory::new(pool.clone(), session_id.to_string()).await?;
 
@@ -711,7 +717,7 @@ pub async fn create_agent(
         name,
         provider: provider.clone(),
         pool: pool.clone(),
-        working_directory,
+        working_directory: working_directory.clone(),
         additional_tools,
         skills,
         enforcement,
@@ -724,6 +730,7 @@ pub async fn create_agent(
         .with_tools(all_tools)
         .memory(Box::new(memory))
         .system_prompt(&system_prompt)
+        .working_directory(working_directory)
         .with_enforcement(enforcement)
         // Tools observe the real conversation identity (e.g. the task tool
         // records subagent lineage against it), not a random UUID.
@@ -873,6 +880,7 @@ mod tests {
             provider,
             pool: pool.clone(),
             skills: vec![],
+            working_directory: std::env::current_dir().unwrap(),
             enforcement: PathEnforcement::None,
             context_limit: Some(10_000),
             agents: Arc::new(BTreeMap::new()),
@@ -934,6 +942,38 @@ mod tests {
             instructions: instructions.map(str::to_string),
             tools: tools.map(|list| list.iter().map(|t| t.to_string()).collect()),
         }
+    }
+
+    #[tokio::test]
+    async fn create_agent_uses_the_profile_workspace_directory() {
+        let pool = SqlitePool::connect_lazy("sqlite::memory:").unwrap();
+        let directory = tempfile::tempdir().unwrap();
+        let (agent, _) = create_agent(
+            test_inputs(
+                "build",
+                Arc::new(DummyLlm),
+                pool,
+                directory.path().to_path_buf(),
+                vec![],
+                vec![],
+                "workspace-test",
+            ),
+            None,
+        )
+        .await
+        .unwrap();
+        let result = agent
+            .execute(
+                "bash",
+                serde_json::json!({"command": "pwd"}),
+                &ToolContext::new("workspace-test", "message"),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            std::path::PathBuf::from(result.output.trim()),
+            directory.path().canonicalize().unwrap()
+        );
     }
 
     #[tokio::test]
@@ -1301,6 +1341,7 @@ mod tests {
             provider: provider.clone(),
             pool: pool.clone(),
             skills: Vec::new(),
+            working_directory: std::env::current_dir().unwrap(),
             enforcement: PathEnforcement::None,
             context_limit: None,
             agents: Arc::new(BTreeMap::new()),
@@ -1537,6 +1578,7 @@ mod tests {
             provider: provider.clone(),
             pool: pool.clone(),
             skills: Vec::new(),
+            working_directory: std::env::current_dir().unwrap(),
             enforcement: PathEnforcement::None,
             context_limit: None,
             agents: Arc::new(BTreeMap::from([(
@@ -1579,6 +1621,7 @@ mod tests {
             provider,
             pool: pool.clone(),
             skills: Vec::new(),
+            working_directory: std::env::current_dir().unwrap(),
             enforcement: PathEnforcement::None,
             context_limit: None,
             agents: Arc::new(BTreeMap::new()),
@@ -1691,6 +1734,7 @@ mod tests {
             provider,
             pool,
             Vec::new(),
+            std::env::current_dir().unwrap(),
             PathEnforcement::None,
             None,
             Arc::new(BTreeMap::new()),
@@ -1761,6 +1805,7 @@ mod tests {
             provider,
             pool,
             Vec::new(),
+            std::env::current_dir().unwrap(),
             PathEnforcement::None,
             None,
             Arc::new(BTreeMap::new()),

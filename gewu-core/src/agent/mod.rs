@@ -62,6 +62,7 @@ use async_trait::async_trait;
 use futures::{Stream, StreamExt};
 use std::any::Any;
 use std::error::Error;
+use std::path::PathBuf;
 use std::sync::Arc;
 use tokio::sync::mpsc;
 use tracing::{info, trace, warn};
@@ -115,6 +116,8 @@ pub struct Agent {
     session_state: SessionState,
     /// Buffer for steering messages injected while the agent runs.
     steering: Steering,
+    /// Session-selected filesystem root, when supplied by the host.
+    working_directory: Option<PathBuf>,
 }
 
 /// Builder for constructing `Agent` instances.
@@ -143,6 +146,8 @@ pub struct AgentBuilder {
     /// Session id surfaced to tools via [`ToolContext`]; defaults to a fresh
     /// UUID.
     session_id: Option<String>,
+    /// Filesystem root handed to path-sensitive tools.
+    working_directory: Option<PathBuf>,
 }
 
 /// Extracts a readable message from a panic payload.
@@ -184,6 +189,7 @@ impl Default for AgentBuilder {
             enforcement: PathEnforcement::default(),
             session_state: None,
             session_id: None,
+            working_directory: None,
         }
     }
 }
@@ -206,6 +212,12 @@ impl Agent {
     /// state. The caller must ensure the agent is idle.
     pub fn set_llm(&mut self, llm: Arc<dyn LlmProvider>) {
         self.llm = llm;
+    }
+
+    /// Changes the filesystem root used by subsequent tool calls.
+    /// The caller must ensure the agent is idle.
+    pub fn set_working_directory(&mut self, working_directory: impl Into<PathBuf>) {
+        self.working_directory = Some(working_directory.into());
     }
 
     /// The current mode reminder state (for persistence).
@@ -564,6 +576,7 @@ impl Agent {
                     let truncation = self.truncation.clone();
                     let semaphore = semaphore.clone();
                     let inbox = self.steering.clone();
+                    let working_directory = self.working_directory.clone();
                     let progress_tx = progress_tx.clone();
                     executing += 1;
                     join_set.spawn(async move {
@@ -574,6 +587,9 @@ impl Agent {
                             .with_session_state(session_state);
                         ctx.inbox = Some(inbox);
                         ctx.progress = Some(ProgressSink::new(&tool_name, progress_tx));
+                        if let Some(working_directory) = working_directory {
+                            ctx = ctx.with_working_directory(working_directory);
+                        }
                         let result = if let Some(t) = tool {
                             execute_tool_call(t, call, ctx, &truncation).await
                         } else {
@@ -720,6 +736,7 @@ impl Agent {
             experiences: self.experiences.clone(),
             log: self.log.clone(),
             session_state: self.session_state.clone(),
+            working_directory: self.working_directory.clone(),
         }
     }
 }
@@ -742,6 +759,7 @@ pub struct AgentTemplate {
     experiences: Option<Arc<dyn Experiences>>,
     log: Option<RequestLog>,
     session_state: SessionState,
+    working_directory: Option<PathBuf>,
 }
 
 impl AgentTemplate {
@@ -810,6 +828,7 @@ impl AgentTemplate {
             provider_usage: TokenUsage::default(),
             reminder,
             steering: Steering::new(),
+            working_directory: self.working_directory,
         }
     }
 }
@@ -937,6 +956,12 @@ impl AgentBuilder {
         self
     }
 
+    /// Sets the filesystem root handed to path-sensitive tools.
+    pub fn working_directory(mut self, working_directory: impl Into<PathBuf>) -> Self {
+        self.working_directory = Some(working_directory.into());
+        self
+    }
+
     /// Builds the `Agent` instance.
     ///
     /// # Errors
@@ -969,6 +994,7 @@ impl AgentBuilder {
             reminder: self.reminder,
             session_state: self.session_state.unwrap_or_else(SessionState::in_memory),
             steering: Steering::new(),
+            working_directory: self.working_directory,
         };
         Ok(agent)
     }

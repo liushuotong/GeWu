@@ -59,6 +59,26 @@ gewu serve --host 0.0.0.0 --token "$(openssl rand -hex 16)"
                         # required off loopback
 ```
 
+### Workspaces
+
+Sessions can start in any of several server-side directories. `cwd` is
+always available; add named roots in `config.jsonc`:
+
+```jsonc
+{
+  "workspaces": {
+    "frontend": "../frontend",
+    "wiki": "/srv/wiki"
+  }
+}
+```
+
+Relative paths resolve against the startup directory. In the web UI, pick a
+root in the FILES panel (`ROOT`), use `＋` to browse and add any directory on
+the server host at runtime, or choose a workdir when creating a session from
+the left sidebar. Each session remembers its root across restarts; switching
+is rejected while a turn is running.
+
 For one-shot and interactive use from the terminal:
 
 ```bash

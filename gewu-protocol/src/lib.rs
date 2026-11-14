@@ -106,6 +106,18 @@ pub enum Op {
     SwitchModel {
         model: String,
     },
+    /// Switch the session's active filesystem workspace root.
+    SwitchWorkspace {
+        workspace: String,
+    },
+    /// Browse direct child directories on the GeWu server host.
+    BrowseWorkspace {
+        path: String,
+    },
+    /// Add and select a server-host directory for the current session.
+    AddWorkspace {
+        path: String,
+    },
     /// List persisted conversation sessions, newest first.
     ListSessions,
     /// Load one persisted session's messages. The session id is carried in
@@ -144,6 +156,9 @@ pub struct ClientRequest {
     /// Optional agent profile name, honored when the connection session is
     /// created (defaults to `build`).
     pub agent: Option<String>,
+    /// Optional workspace id, honored only when the connection creates a new
+    /// session. Existing sessions keep their persisted workspace.
+    pub workspace: Option<String>,
 }
 
 /// Serialize in the protocol's wire format, e.g.
@@ -157,8 +172,16 @@ impl Serialize for ClientRequest {
             } else {
                 0
             }
-            + (matches!(self.op, Op::SwitchAgent { .. } | Op::SwitchModel { .. })) as usize
+            + (matches!(
+                self.op,
+                Op::SwitchAgent { .. }
+                    | Op::SwitchModel { .. }
+                    | Op::SwitchWorkspace { .. }
+                    | Op::BrowseWorkspace { .. }
+                    | Op::AddWorkspace { .. }
+            )) as usize
             + self.agent.is_some() as usize
+            + self.workspace.is_some() as usize
             + matches!(
                 self.op,
                 Op::Ask { .. }
@@ -183,6 +206,18 @@ impl Serialize for ClientRequest {
             Op::SwitchModel { model } => {
                 map.serialize_entry("op", "switch_model")?;
                 map.serialize_entry("model", model)?;
+            }
+            Op::SwitchWorkspace { workspace } => {
+                map.serialize_entry("op", "switch_workspace")?;
+                map.serialize_entry("workspace", workspace)?;
+            }
+            Op::BrowseWorkspace { path } => {
+                map.serialize_entry("op", "browse_workspace")?;
+                map.serialize_entry("path", path)?;
+            }
+            Op::AddWorkspace { path } => {
+                map.serialize_entry("op", "add_workspace")?;
+                map.serialize_entry("path", path)?;
             }
             Op::Ask { prompt } => {
                 map.serialize_entry("op", "ask")?;
@@ -230,6 +265,9 @@ impl Serialize for ClientRequest {
         if let Some(agent) = &self.agent {
             map.serialize_entry("agent", agent)?;
         }
+        if let Some(workspace) = &self.workspace {
+            map.serialize_entry("workspace", workspace)?;
+        }
         map.end()
     }
 }
@@ -255,6 +293,20 @@ impl ClientRequest {
             },
         )
     }
+    pub fn switch_workspace(id: impl Into<Value>, workspace: impl Into<String>) -> Self {
+        Self::simple(
+            id,
+            Op::SwitchWorkspace {
+                workspace: workspace.into(),
+            },
+        )
+    }
+    pub fn browse_workspace(id: impl Into<Value>, path: impl Into<String>) -> Self {
+        Self::simple(id, Op::BrowseWorkspace { path: path.into() })
+    }
+    pub fn add_workspace(id: impl Into<Value>, path: impl Into<String>) -> Self {
+        Self::simple(id, Op::AddWorkspace { path: path.into() })
+    }
     /// Build an `ask` request.
     pub fn ask(id: impl Into<Value>, prompt: impl Into<String>) -> Self {
         Self {
@@ -264,6 +316,7 @@ impl ClientRequest {
             },
             session_id: None,
             agent: None,
+            workspace: None,
         }
     }
 
@@ -278,6 +331,12 @@ impl ClientRequest {
     /// session is first created; defaults to `build`).
     pub fn with_agent(mut self, agent: impl Into<String>) -> Self {
         self.agent = Some(agent.into());
+        self
+    }
+
+    /// Attach a workspace id for creation of a new session.
+    pub fn with_workspace(mut self, workspace: impl Into<String>) -> Self {
+        self.workspace = Some(workspace.into());
         self
     }
 
@@ -306,6 +365,7 @@ impl ClientRequest {
             op: Op::ListFiles { path: path.into() },
             session_id: None,
             agent: None,
+            workspace: None,
         }
     }
 
@@ -315,6 +375,7 @@ impl ClientRequest {
             op: Op::ReadFile { path: path.into() },
             session_id: None,
             agent: None,
+            workspace: None,
         }
     }
 
@@ -334,6 +395,7 @@ impl ClientRequest {
             },
             session_id: None,
             agent: None,
+            workspace: None,
         }
     }
 
@@ -390,6 +452,7 @@ impl ClientRequest {
             },
             session_id: None,
             agent: None,
+            workspace: None,
         }
     }
 
@@ -399,6 +462,7 @@ impl ClientRequest {
             op,
             session_id: None,
             agent: None,
+            workspace: None,
         }
     }
 
@@ -482,6 +546,27 @@ pub fn parse_request(line: &str) -> Result<ClientRequest, RequestError> {
                 .get("model")
                 .and_then(Value::as_str)
                 .ok_or_else(|| RequestError::Invalid("switch_model requires model".into()))?
+                .to_string(),
+        },
+        "switch_workspace" => Op::SwitchWorkspace {
+            workspace: obj
+                .get("workspace")
+                .and_then(Value::as_str)
+                .ok_or_else(|| RequestError::Invalid("switch_workspace requires workspace".into()))?
+                .to_string(),
+        },
+        "browse_workspace" => Op::BrowseWorkspace {
+            path: obj
+                .get("path")
+                .and_then(Value::as_str)
+                .ok_or_else(|| RequestError::Invalid("browse_workspace requires path".into()))?
+                .to_string(),
+        },
+        "add_workspace" => Op::AddWorkspace {
+            path: obj
+                .get("path")
+                .and_then(Value::as_str)
+                .ok_or_else(|| RequestError::Invalid("add_workspace requires path".into()))?
                 .to_string(),
         },
         "ask" => {
@@ -584,12 +669,17 @@ pub fn parse_request(line: &str) -> Result<ClientRequest, RequestError> {
         .and_then(Value::as_str)
         .map(str::to_string);
     let agent = obj.get("agent").and_then(Value::as_str).map(str::to_string);
+    let workspace = obj
+        .get("workspace")
+        .and_then(Value::as_str)
+        .map(str::to_string);
 
     Ok(ClientRequest {
         id,
         op,
         session_id,
         agent,
+        workspace,
     })
 }
 
@@ -628,10 +718,28 @@ fn default_agent_name() -> String {
     "build".into()
 }
 
+fn default_workspace_id() -> String {
+    "cwd".into()
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct FileEntry {
     pub name: String,
     pub is_dir: bool,
+}
+
+/// One configured or runtime filesystem root visible to clients.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct WorkspaceSummary {
+    pub id: String,
+    pub path: String,
+}
+
+/// One direct child directory on the GeWu server host.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct DirectoryEntry {
+    pub name: String,
+    pub path: String,
 }
 
 /// One switchable model in the server's catalog.
@@ -676,6 +784,25 @@ pub enum ServerMessage {
         model: String,
         /// The new model's display label.
         label: String,
+    },
+    /// Reply after changing the session's active filesystem root.
+    WorkspaceSwitched {
+        id: Value,
+        session_id: String,
+        workspace: WorkspaceSummary,
+    },
+    /// Direct child directories on the GeWu server host.
+    Directories {
+        id: Value,
+        path: String,
+        parent: Option<String>,
+        entries: Vec<DirectoryEntry>,
+    },
+    /// A runtime directory was added and selected for a session.
+    WorkspaceAdded {
+        id: Value,
+        session_id: String,
+        workspace: WorkspaceSummary,
     },
     /// Sent when an `ask` begins; carries the server-assigned request id
     /// and the session handling the request.
@@ -757,6 +884,13 @@ pub enum ServerMessage {
         /// The working directory the server's agent operates in (absolute).
         #[serde(default)]
         working_directory: String,
+        /// All configured roots; empty when talking to an older server.
+        #[serde(default)]
+        workspaces: Vec<WorkspaceSummary>,
+        /// The active root for the requested session, or `cwd` when no
+        /// session has been attached.
+        #[serde(default = "default_workspace_id")]
+        active_workspace: String,
     },
     /// Reply to a `usage` request: the session's context usage.
     Usage {
@@ -870,6 +1004,9 @@ impl ServerMessage {
             ServerMessage::SessionSnapshot { .. } => "session_snapshot",
             ServerMessage::AgentSwitched { .. } => "agent_switched",
             ServerMessage::ModelSwitched { .. } => "model_switched",
+            ServerMessage::WorkspaceSwitched { .. } => "workspace_switched",
+            ServerMessage::Directories { .. } => "directories",
+            ServerMessage::WorkspaceAdded { .. } => "workspace_added",
             ServerMessage::Ready { .. } => "ready",
             ServerMessage::Event { .. } => "event",
             ServerMessage::Result { .. } => "result",
@@ -900,6 +1037,9 @@ impl ServerMessage {
         match self {
             ServerMessage::AgentSwitched { id, .. } => Some(id),
             ServerMessage::ModelSwitched { id, .. } => Some(id),
+            ServerMessage::WorkspaceSwitched { id, .. } => Some(id),
+            ServerMessage::Directories { id, .. } => Some(id),
+            ServerMessage::WorkspaceAdded { id, .. } => Some(id),
             ServerMessage::Ready { id, .. }
             | ServerMessage::Pong { id }
             | ServerMessage::Info { id, .. }
@@ -1154,6 +1294,8 @@ mod tests {
             model: "gpt-4o".into(),
             provider: "openai".into(),
             working_directory: "/tmp/proj".into(),
+            workspaces: vec![],
+            active_workspace: "cwd".into(),
         };
         assert_eq!(info.kind(), "info");
         assert!(info.correlation_id().is_some());
@@ -1522,6 +1664,116 @@ mod tests {
 
         let parsed: ServerMessage = serde_json::from_str(&line).unwrap();
         assert_eq!(parsed, msg);
+    }
+
+    #[test]
+    fn workspace_switch_request_round_trips() {
+        let req = parse_request(
+            r#"{"id":"a","op":"switch_workspace","workspace":"frontend","session_id":"s1"}"#,
+        )
+        .unwrap();
+        assert_eq!(
+            req.op,
+            Op::SwitchWorkspace {
+                workspace: "frontend".into()
+            }
+        );
+        assert_eq!(
+            ClientRequest::switch_workspace("a", "frontend")
+                .with_session("s1")
+                .to_line(),
+            r#"{"id":"a","op":"switch_workspace","workspace":"frontend","session_id":"s1"}"#
+        );
+    }
+
+    #[test]
+    fn runtime_workspace_requests_round_trip() {
+        let browse = parse_request(r#"{"id":"a","op":"browse_workspace","path":"/tmp"}"#).unwrap();
+        assert_eq!(
+            browse.op,
+            Op::BrowseWorkspace {
+                path: "/tmp".into()
+            }
+        );
+        assert_eq!(
+            ClientRequest::add_workspace("b", "/tmp/project")
+                .with_session("s1")
+                .to_line(),
+            r#"{"id":"b","op":"add_workspace","path":"/tmp/project","session_id":"s1"}"#
+        );
+    }
+
+    #[test]
+    fn workspace_info_is_backward_compatible() {
+        let legacy: ServerMessage = serde_json::from_str(
+            r#"{"type":"info","id":1,"model":"m","provider":"p","working_directory":"/tmp"}"#,
+        )
+        .unwrap();
+        match legacy {
+            ServerMessage::Info {
+                workspaces,
+                active_workspace,
+                ..
+            } => {
+                assert!(workspaces.is_empty());
+                assert_eq!(active_workspace, "cwd");
+            }
+            other => panic!("expected info, got {}", other.kind()),
+        }
+    }
+
+    #[test]
+    fn creation_workspace_round_trips_on_first_ask() {
+        let request = ClientRequest::ask("a", "pwd").with_workspace("tachyon");
+        assert_eq!(
+            request.to_line(),
+            r#"{"id":"a","op":"ask","prompt":"pwd","workspace":"tachyon"}"#
+        );
+        let parsed = parse_request(&request.to_line()).unwrap();
+        assert_eq!(parsed.workspace.as_deref(), Some("tachyon"));
+    }
+
+    #[test]
+    fn workspace_messages_have_kinds_and_ids() {
+        let switched = ServerMessage::WorkspaceSwitched {
+            id: Value::from(4),
+            session_id: "s".into(),
+            workspace: WorkspaceSummary {
+                id: "frontend".into(),
+                path: "/work/frontend".into(),
+            },
+        };
+        assert_eq!(switched.kind(), "workspace_switched");
+        assert_eq!(switched.correlation_id(), Some(&Value::from(4)));
+
+        let added = ServerMessage::WorkspaceAdded {
+            id: Value::from(5),
+            session_id: "s".into(),
+            workspace: WorkspaceSummary {
+                id: "runtime:/work/other".into(),
+                path: "/work/other".into(),
+            },
+        };
+        assert_eq!(added.kind(), "workspace_added");
+        assert_eq!(added.correlation_id(), Some(&Value::from(5)));
+        let decoded: ServerMessage =
+            serde_json::from_str(&serde_json::to_string(&added).unwrap()).unwrap();
+        assert_eq!(decoded, added);
+
+        let dirs = ServerMessage::Directories {
+            id: Value::from(6),
+            path: "/work".into(),
+            parent: Some("/".into()),
+            entries: vec![DirectoryEntry {
+                name: "project".into(),
+                path: "/work/project".into(),
+            }],
+        };
+        assert_eq!(dirs.kind(), "directories");
+        assert_eq!(dirs.correlation_id(), Some(&Value::from(6)));
+        let decoded: ServerMessage =
+            serde_json::from_str(&serde_json::to_string(&dirs).unwrap()).unwrap();
+        assert_eq!(decoded, dirs);
     }
 
     #[test]

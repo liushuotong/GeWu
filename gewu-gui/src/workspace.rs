@@ -11,13 +11,16 @@ use gewu_protocol::{Message, TokenUsage};
 
 use crate::protocol::TabInfo;
 
-/// Longest tab label before truncation.
-const MAX_LABEL: usize = 16;
+/// Safety cap for tab labels sent to the GUI. The sidebar ellipsizes labels
+/// to its actual width in CSS, so this only guards against pathologically
+/// large first prompts.
+const MAX_LABEL: usize = 200;
 
 /// One tab: a conversation plus its view state.
 #[derive(Debug)]
 pub struct Tab {
     pub agent: String,
+    pub workspace: String,
     /// Stable id, unaffected by closing other tabs.
     pub id: u64,
     pub model: SessionModel,
@@ -49,6 +52,7 @@ impl Tab {
     fn new(id: u64) -> Self {
         Self {
             agent: "build".into(),
+            workspace: "cwd".into(),
             id,
             model: SessionModel::new(),
             model_label: None,
@@ -73,6 +77,7 @@ impl Tab {
             label: tab_title(self),
             busy: self.busy(),
             session_id: self.model.session_id.clone(),
+            workspace: self.workspace.clone(),
         }
     }
 }
@@ -95,6 +100,13 @@ impl Workspace {
         let id = self.alloc_id();
         self.tabs.push(Tab::new(id));
         self.active = self.tabs.len() - 1;
+        id
+    }
+
+    /// Append an empty tab with its workspace selected and focus it.
+    pub fn open_blank_in_workspace(&mut self, workspace: impl Into<String>) -> u64 {
+        let id = self.open_blank();
+        self.tab_mut(id).expect("just added").workspace = workspace.into();
         id
     }
 
@@ -224,6 +236,14 @@ mod tests {
     }
 
     #[test]
+    fn open_blank_in_workspace_starts_a_tab_with_that_root() {
+        let mut ws = Workspace::new();
+        let id = ws.open_blank_in_workspace("tachyon");
+        assert_eq!(ws.tab(id).unwrap().workspace, "tachyon");
+        assert_eq!(ws.active_id(), id);
+    }
+
+    #[test]
     fn open_session_replays_history_and_notes() {
         let mut ws = Workspace::new();
         let id = ws.open_session("abcdef123456", &[user_message("old question")]);
@@ -289,6 +309,19 @@ mod tests {
             .blocks
             .push(Block::User("  hello   world  ".into()));
         assert_eq!(tab_title(ws.tab(id).unwrap()), "hello world");
+    }
+
+    #[test]
+    fn title_keeps_long_prompts_for_css_ellipsis() {
+        let mut ws = Workspace::new();
+        let id = ws.open_blank();
+        let prompt = "Review the workspace implementation and keep the full title";
+        ws.tab_mut(id)
+            .unwrap()
+            .model
+            .blocks
+            .push(Block::User(prompt.into()));
+        assert_eq!(tab_title(ws.tab(id).unwrap()), prompt);
     }
 
     #[test]

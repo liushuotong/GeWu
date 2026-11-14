@@ -7,10 +7,11 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::fmt::Write as _;
 
 use gewu_client::session::{Block, Phase};
-use gewu_protocol::{FileEntry, ModelSummary};
+use gewu_protocol::{DirectoryEntry, FileEntry, ModelSummary, WorkspaceSummary};
 use math_core::{LatexToMathML, MathCoreConfig, MathDisplay};
 use pulldown_cmark::{CowStr, Event, Options, Parser, Tag, html};
 
+use crate::protocol::TabInfo;
 use crate::workspace::Tab;
 
 /// Lines of tool output shown before collapsing.
@@ -908,6 +909,7 @@ pub fn sidebar_tools_content_html(tools: &Result<Vec<String>, String>) -> String
 
 /// Render the sidebar's tabbed contents. FILES is intentionally first and
 /// active by default; the browser only changes the active panel locally.
+#[allow(dead_code)]
 pub fn sidebar_tabs_html(
     tools: &Result<Vec<String>, String>,
     working_directory: Option<&str>,
@@ -915,16 +917,128 @@ pub fn sidebar_tabs_html(
     expanded: &BTreeSet<String>,
     cache: &BTreeMap<String, Vec<FileEntry>>,
 ) -> String {
-    let tools_html = sidebar_tools_content_html(tools);
-    let files_html = file_tree_html(root.or(working_directory), expanded, cache);
-
-    format!(
-        "<div class=\"sidebar-tabs\" role=\"tablist\" aria-label=\"Sidebar views\"><button type=\"button\" class=\"sidebar-tab active\" role=\"tab\" aria-selected=\"true\" aria-controls=\"sidebar-files\" data-sidebar-tab=\"files\">FILES</button><button type=\"button\" class=\"sidebar-tab\" role=\"tab\" aria-selected=\"false\" aria-controls=\"sidebar-tools\" data-sidebar-tab=\"tools\">TOOLS</button></div><div id=\"sidebar-files\" class=\"sidebar-panel active\" role=\"tabpanel\">{files_html}</div><div id=\"sidebar-tools\" class=\"sidebar-panel\" role=\"tabpanel\" hidden>{tools_html}</div>"
+    sidebar_tabs_with_workspaces_html(
+        tools,
+        root.or(working_directory),
+        &[],
+        "cwd",
+        expanded,
+        cache,
     )
 }
 
+pub fn sidebar_tabs_with_workspaces_html(
+    tools: &Result<Vec<String>, String>,
+    working_directory: Option<&str>,
+    workspaces: &[WorkspaceSummary],
+    active_workspace: &str,
+    expanded: &BTreeSet<String>,
+    cache: &BTreeMap<String, Vec<FileEntry>>,
+) -> String {
+    let tools_html = sidebar_tools_content_html(tools);
+    let files_html = file_tree_with_workspaces_html(
+        working_directory,
+        workspaces,
+        active_workspace,
+        expanded,
+        cache,
+    );
+
+    format!(
+        "<div class=\"sidebar-inner\"><div class=\"sidebar-head\"><div class=\"sidebar-tabs\" role=\"tablist\" aria-label=\"Sidebar views\"><button type=\"button\" class=\"sidebar-tab active\" role=\"tab\" aria-selected=\"true\" aria-controls=\"sidebar-files\" data-sidebar-tab=\"files\">FILES</button><button type=\"button\" class=\"sidebar-tab\" role=\"tab\" aria-selected=\"false\" aria-controls=\"sidebar-tools\" data-sidebar-tab=\"tools\">TOOLS</button></div><button type=\"button\" class=\"sidebar-collapse\" data-sidebar-collapse title=\"Hide files\" aria-label=\"Hide files\">›</button></div><div id=\"sidebar-files\" class=\"sidebar-panel active\" role=\"tabpanel\">{files_html}</div><div id=\"sidebar-tools\" class=\"sidebar-panel\" role=\"tabpanel\" hidden>{tools_html}</div></div>"
+    )
+}
+
+/// Render the left session manager: workspace groups with their sessions.
+pub fn session_sidebar_html(
+    tabs: &[TabInfo],
+    workspaces: &[WorkspaceSummary],
+    active: u64,
+) -> String {
+    let mut workspace_ids: Vec<String> = workspaces
+        .iter()
+        .map(|workspace| workspace.id.clone())
+        .collect();
+    for tab in tabs {
+        if !workspace_ids.iter().any(|id| id == &tab.workspace) {
+            workspace_ids.push(tab.workspace.clone());
+        }
+    }
+
+    let mut out = String::from(
+        "<aside class=\"session-sidebar\" aria-label=\"Sessions by workspace\"><header class=\"session-sidebar-header\"><span class=\"brand-mark session-brand\" title=\"GeWu agent\"><svg class=\"brand-icon\" viewBox=\"0 0 24 24\" fill=\"none\" stroke=\"currentColor\" stroke-width=\"1.7\" stroke-linecap=\"round\" stroke-linejoin=\"round\" aria-hidden=\"true\"><rect x=\"3.5\" y=\"3.5\" width=\"17\" height=\"17\" rx=\"3.5\"/><circle cx=\"12\" cy=\"12\" r=\"4.25\"/><path d=\"M12 3.5v4.25M12 16.25v4.25M3.5 12h4.25M16.25 12h4.25\"/></svg></span><span class=\"session-sidebar-title\">GeWu</span><button type=\"button\" class=\"session-collapse\" data-sessions-collapse title=\"Close sidebar\" aria-label=\"Close sidebar\"><svg viewBox=\"0 0 24 24\" fill=\"none\" stroke=\"currentColor\" stroke-width=\"1.8\" stroke-linecap=\"round\" stroke-linejoin=\"round\" aria-hidden=\"true\"><rect x=\"3\" y=\"4\" width=\"18\" height=\"16\" rx=\"2\"/><path d=\"M9 4v16\"/><path d=\"m16 15-3-3 3-3\"/></svg></button></header><button type=\"button\" class=\"session-new-primary\" data-session-new title=\"New session\" aria-label=\"New session\"><svg viewBox=\"0 0 24 24\" fill=\"none\" stroke=\"currentColor\" stroke-width=\"1.7\" stroke-linecap=\"round\" stroke-linejoin=\"round\" aria-hidden=\"true\"><path d=\"M4 20h4l10-10-4-4L4 16v4Z\"/><path d=\"M13 7l4 4\"/></svg><span>New session</span></button><div class=\"session-section-label\">RECENT</div><div class=\"session-workspace-groups\">",
+    );
+    for workspace_id in workspace_ids {
+        let summary = workspaces
+            .iter()
+            .find(|workspace| workspace.id == workspace_id);
+        let path = summary
+            .map(|workspace| workspace.path.clone())
+            .unwrap_or_else(|| {
+                workspace_id
+                    .strip_prefix("runtime:")
+                    .unwrap_or(&workspace_id)
+                    .to_string()
+            });
+        let label = summary
+            .map(workspace_label)
+            .unwrap_or_else(|| workspace_id.clone());
+        let _ = write!(
+            out,
+            "<section class=\"session-workspace-group\"><header class=\"session-workspace-header\"><div class=\"session-workspace-heading\"><strong>{}</strong><code title=\"{}\">{}</code></div><button type=\"button\" class=\"session-new\" data-session-new-workspace=\"{}\" data-session-new-path=\"{}\" title=\"New session in {}\" aria-label=\"New session in {}\">＋</button></header><div class=\"session-list\">",
+            escape(&label),
+            escape(&path),
+            escape(&path),
+            escape(&workspace_id),
+            escape(&path),
+            escape(&label),
+            escape(&label),
+        );
+        let group_tabs: Vec<&TabInfo> = tabs
+            .iter()
+            .filter(|tab| tab.workspace == workspace_id)
+            .collect();
+        if group_tabs.is_empty() {
+            out.push_str("<p class=\"session-empty\">No sessions</p>");
+        } else {
+            for tab in group_tabs {
+                let active_class = if tab.id == active { " active" } else { "" };
+                let busy = if tab.busy { " busy" } else { "" };
+                let _ = write!(
+                    out,
+                    "<div class=\"session-row{active_class}{busy}\"><button type=\"button\" class=\"session-select\" data-session-tab=\"{}\" title=\"{}\"><span class=\"session-label\">{}</span>{}</button><button type=\"button\" class=\"session-close\" data-session-close=\"{}\" title=\"Close session\" aria-label=\"Close {}\">×</button></div>",
+                    tab.id,
+                    escape(&tab.label),
+                    escape(&tab.label),
+                    if tab.busy {
+                        "<span class=\"session-spinner\" aria-label=\"working\"></span>"
+                    } else {
+                        ""
+                    },
+                    tab.id,
+                    escape(&tab.label),
+                );
+            }
+        }
+        out.push_str("</div></section>");
+    }
+    out.push_str("</div></aside>");
+    out
+}
+
+#[allow(dead_code)]
 pub fn file_tree_html(
     root: Option<&str>,
+    expanded: &BTreeSet<String>,
+    cache: &BTreeMap<String, Vec<FileEntry>>,
+) -> String {
+    file_tree_with_workspaces_html(root, &[], "cwd", expanded, cache)
+}
+
+pub fn file_tree_with_workspaces_html(
+    root: Option<&str>,
+    workspaces: &[WorkspaceSummary],
+    active_workspace: &str,
     expanded: &BTreeSet<String>,
     cache: &BTreeMap<String, Vec<FileEntry>>,
 ) -> String {
@@ -933,9 +1047,10 @@ pub fn file_tree_html(
         String::from("<section class=\"side-section file-tree-section\" id=\"file-tree\">");
     let _ = write!(
         out,
-        "<div class=\"tree-toolbar\"><p class=\"tree-root\" title=\"{}\">{}</p><span class=\"tree-actions\"><button class=\"tree-upload\" type=\"button\" data-tree-upload title=\"Upload files\" aria-label=\"Upload files\">⬆</button><button class=\"tree-refresh\" type=\"button\" data-tree-refresh title=\"Refresh files\" aria-label=\"Refresh files\">↻</button></span></div><ul class=\"tree-list\">",
+        "<div class=\"tree-toolbar\"><p class=\"tree-root\" title=\"{}\">{}</p>{}<span class=\"tree-actions\"><button class=\"tree-upload\" type=\"button\" data-tree-upload title=\"Upload files\" aria-label=\"Upload files\">⬆</button><button class=\"tree-refresh\" type=\"button\" data-tree-refresh title=\"Refresh files\" aria-label=\"Refresh files\">↻</button></span></div><ul class=\"tree-list\">",
         escape(root_label),
-        escape(root_label)
+        escape(root_label),
+        workspace_selector_html(root_label, workspaces, active_workspace)
     );
     if let Some(entries) = cache.get("") {
         for entry in entries {
@@ -945,6 +1060,159 @@ pub fn file_tree_html(
         out.push_str("<li class=\"tree-empty\">loading files…</li>");
     }
     out.push_str("</ul></section>");
+    out
+}
+
+fn workspace_selector_html(root: &str, workspaces: &[WorkspaceSummary], active: &str) -> String {
+    let mut out = String::from("<span class=\"workspace-controls\">");
+    if workspaces.len() > 1 {
+        out.push_str(
+            "<label class=\"workspace-picker\"><span>ROOT</span><select data-workspace-select>",
+        );
+        for workspace in workspaces {
+            let selected = if workspace.id == active {
+                " selected"
+            } else {
+                ""
+            };
+            let label = workspace_label(workspace);
+            let _ = write!(
+                out,
+                "<option value=\"{}\"{}>{}</option>",
+                escape(&workspace.id),
+                selected,
+                escape(&label)
+            );
+        }
+        out.push_str("</select></label>");
+    }
+    let _ = write!(
+        out,
+        "<button type=\"button\" class=\"workspace-add\" data-workspace-add data-workspace-browse-path=\"{}\" title=\"Add a server directory\" aria-label=\"Add a server directory\">＋</button>",
+        escape(root)
+    );
+    out.push_str("</span>");
+    out
+}
+
+fn workspace_label(workspace: &WorkspaceSummary) -> String {
+    if workspace.id.starts_with("runtime:") {
+        std::path::Path::new(&workspace.path)
+            .file_name()
+            .and_then(|name| name.to_str())
+            .unwrap_or(&workspace.id)
+            .to_string()
+    } else {
+        workspace.id.clone()
+    }
+}
+
+pub fn workspace_browser_html(
+    path: &str,
+    parent: Option<&str>,
+    entries: &[DirectoryEntry],
+) -> String {
+    let mut out = String::from(
+        "<section id=\"workspace-browser\" class=\"workspace-browser\" role=\"dialog\" aria-label=\"Choose workspace directory\"><div class=\"workspace-browser-card\"><header><strong>Choose server directory</strong><button type=\"button\" data-workspace-browser-close aria-label=\"Close\">×</button></header>",
+    );
+    let _ = write!(
+        out,
+        "<p class=\"workspace-browser-path\" title=\"{}\">{}</p><div class=\"workspace-browser-actions\">",
+        escape(path),
+        escape(path)
+    );
+    if let Some(parent) = parent {
+        let _ = write!(
+            out,
+            "<button type=\"button\" data-workspace-browse-path=\"{}\">← parent</button>",
+            escape(parent)
+        );
+    }
+    let _ = write!(
+        out,
+        "<button type=\"button\" data-workspace-add-path=\"{}\">Use this directory</button></div><ul class=\"workspace-browser-list\">",
+        escape(path)
+    );
+    for entry in entries {
+        let _ = write!(
+            out,
+            "<li><button type=\"button\" data-workspace-browse-path=\"{}\">📁 {}</button></li>",
+            escape(&entry.path),
+            escape(&entry.name)
+        );
+    }
+    if entries.is_empty() {
+        out.push_str("<li class=\"workspace-browser-empty\">No child directories</li>");
+    }
+    out.push_str("</ul></div></section>");
+    out
+}
+
+/// Render the workdir choice shown before a new session tab is created.
+pub fn session_workspace_picker_html(workspaces: &[WorkspaceSummary], browse_path: &str) -> String {
+    let mut out = String::from(
+        "<section id=\"session-workspace-picker\" class=\"workspace-browser\" role=\"dialog\" aria-label=\"Choose workspace for new session\"><div class=\"workspace-browser-card session-picker-card\"><header><strong>New session · choose workdir</strong><button type=\"button\" data-new-session-close aria-label=\"Close\">×</button></header><p class=\"workspace-picker-note\">The session will start in the selected server directory.</p><ul class=\"workspace-browser-list session-workspace-list\">",
+    );
+    for workspace in workspaces {
+        let _ = write!(
+            out,
+            "<li><button type=\"button\" class=\"session-workspace-option\" data-new-session-create data-new-session-workspace=\"{}\" data-new-session-path=\"{}\"><span class=\"session-workspace-name\">{}</span><code>{}</code></button></li>",
+            escape(&workspace.id),
+            escape(&workspace.path),
+            escape(&workspace_label(workspace)),
+            escape(&workspace.path),
+        );
+    }
+    let _ = write!(
+        out,
+        "<li><button type=\"button\" class=\"session-workspace-browse\" data-new-session-browse-path=\"{}\">＋ Browse server directories…</button></li></ul></div></section>",
+        escape(browse_path)
+    );
+    out
+}
+
+/// Render the directory browser used by the new-session picker. Its choose
+/// buttons create a tab without creating an upstream session yet.
+pub fn new_session_browser_html(
+    path: &str,
+    parent: Option<&str>,
+    entries: &[DirectoryEntry],
+) -> String {
+    let mut out = String::from(
+        "<section id=\"session-workspace-picker\" class=\"workspace-browser\" role=\"dialog\" aria-label=\"Choose workspace for new session\"><div class=\"workspace-browser-card session-picker-card\"><header><strong>New session · choose workdir</strong><button type=\"button\" data-new-session-close aria-label=\"Close\">×</button></header>",
+    );
+    let _ = write!(
+        out,
+        "<p class=\"workspace-browser-path\" title=\"{}\">{}</p><div class=\"workspace-browser-actions\">",
+        escape(path),
+        escape(path)
+    );
+    if let Some(parent) = parent {
+        let _ = write!(
+            out,
+            "<button type=\"button\" data-new-session-browse-path=\"{}\">← parent</button>",
+            escape(parent)
+        );
+    }
+    let workspace_id = format!("runtime:{path}");
+    let _ = write!(
+        out,
+        "<button type=\"button\" data-new-session-create data-new-session-workspace=\"{}\" data-new-session-path=\"{}\">Use this directory</button></div><ul class=\"workspace-browser-list\">",
+        escape(&workspace_id),
+        escape(path)
+    );
+    for entry in entries {
+        let _ = write!(
+            out,
+            "<li><button type=\"button\" data-new-session-browse-path=\"{}\">📁 {}</button></li>",
+            escape(&entry.path),
+            escape(&entry.name)
+        );
+    }
+    if entries.is_empty() {
+        out.push_str("<li class=\"workspace-browser-empty\">No child directories</li>");
+    }
+    out.push_str("</ul></div></section>");
     out
 }
 
@@ -1142,6 +1410,156 @@ mod tests {
     }
 
     #[test]
+    fn file_tree_renders_configured_workspace_selector() {
+        let html = file_tree_with_workspaces_html(
+            Some("/tmp/frontend"),
+            &[
+                WorkspaceSummary {
+                    id: "cwd".into(),
+                    path: "/tmp/project".into(),
+                },
+                WorkspaceSummary {
+                    id: "frontend".into(),
+                    path: "/tmp/frontend".into(),
+                },
+            ],
+            "frontend",
+            &BTreeSet::new(),
+            &BTreeMap::new(),
+        );
+        assert!(html.contains("data-workspace-select"), "{html}");
+        assert!(html.contains("value=\"frontend\" selected"), "{html}");
+    }
+
+    #[test]
+    fn workspace_toolbar_always_has_add_directory_action() {
+        let html = file_tree_with_workspaces_html(
+            Some("/tmp/project"),
+            &[],
+            "cwd",
+            &BTreeSet::new(),
+            &BTreeMap::new(),
+        );
+        assert!(html.contains("data-workspace-add"), "{html}");
+    }
+
+    #[test]
+    fn workspace_browser_renders_server_directory_choices() {
+        let html = workspace_browser_html(
+            "/tmp",
+            Some("/"),
+            &[DirectoryEntry {
+                name: "project".into(),
+                path: "/tmp/project".into(),
+            }],
+        );
+        assert!(
+            html.contains("data-workspace-browse-path=\"/tmp/project\""),
+            "{html}"
+        );
+        assert!(html.contains("data-workspace-add-path=\"/tmp\""), "{html}");
+    }
+
+    #[test]
+    fn new_session_picker_lists_workspaces_and_browse_action() {
+        let html = session_workspace_picker_html(
+            &[
+                WorkspaceSummary {
+                    id: "cwd".into(),
+                    path: "/data3/litian/projects/GeWu".into(),
+                },
+                WorkspaceSummary {
+                    id: "tachyon".into(),
+                    path: "/data3/litian/projects/tachyon_project".into(),
+                },
+            ],
+            "/data3/litian/projects/GeWu",
+        );
+        assert!(html.contains("id=\"session-workspace-picker\""), "{html}");
+        assert!(
+            html.contains("data-new-session-workspace=\"tachyon\""),
+            "{html}"
+        );
+        assert!(html.contains("data-new-session-browse-path"), "{html}");
+    }
+
+    #[test]
+    fn new_session_browser_selects_a_runtime_workspace() {
+        let html = new_session_browser_html(
+            "/data3/litian/projects",
+            Some("/data3/litian"),
+            &[DirectoryEntry {
+                name: "tachyon_project".into(),
+                path: "/data3/litian/projects/tachyon_project".into(),
+            }],
+        );
+        assert!(
+            html.contains("data-new-session-workspace=\"runtime:/data3/litian/projects\""),
+            "{html}"
+        );
+        assert!(html.contains("data-new-session-create"), "{html}");
+        assert!(
+            html.contains(
+                "data-new-session-browse-path=\"/data3/litian/projects/tachyon_project\""
+            ),
+            "{html}"
+        );
+    }
+
+    #[test]
+    fn session_sidebar_groups_sessions_by_workspace() {
+        let html = session_sidebar_html(
+            &[
+                TabInfo {
+                    id: 1,
+                    label: "tachyon work".into(),
+                    busy: false,
+                    session_id: Some("session-1".into()),
+                    workspace: "tachyon".into(),
+                },
+                TabInfo {
+                    id: 2,
+                    label: "wiki notes".into(),
+                    busy: true,
+                    session_id: Some("session-2".into()),
+                    workspace: "wiki".into(),
+                },
+            ],
+            &[
+                WorkspaceSummary {
+                    id: "tachyon".into(),
+                    path: "/data3/litian/projects/tachyon_project".into(),
+                },
+                WorkspaceSummary {
+                    id: "wiki".into(),
+                    path: "/data/litian/my-wiki".into(),
+                },
+            ],
+            2,
+        );
+        assert!(html.contains("class=\"session-sidebar\""), "{html}");
+        assert!(html.contains("session-brand"), "{html}");
+        assert!(html.contains("class=\"brand-icon\""), "{html}");
+        assert!(!html.contains("格物"), "{html}");
+        assert!(
+            html.contains("session-sidebar-title\">GeWu</span>"),
+            "{html}"
+        );
+        assert!(html.contains("session-new-primary"), "{html}");
+        assert!(html.contains("session-section-label"), "{html}");
+        assert!(html.contains("data-session-new"), "{html}");
+        assert!(html.contains("data-sessions-collapse"), "{html}");
+        assert!(html.contains("data-session-tab=\"1\""), "{html}");
+        assert!(html.contains("data-session-tab=\"2\""), "{html}");
+        assert!(
+            html.contains("data-session-new-workspace=\"tachyon\""),
+            "{html}"
+        );
+        assert!(html.contains("session-row active"), "{html}");
+        assert!(html.contains("data-session-close=\"2\""), "{html}");
+    }
+
+    #[test]
     fn sidebar_files_tab_is_active_by_default() {
         let mut cache = BTreeMap::new();
         cache.insert(
@@ -1174,6 +1592,8 @@ mod tests {
             html.contains("id=\"sidebar-tools\" class=\"sidebar-panel\" role=\"tabpanel\" hidden"),
             "{html}"
         );
+        assert!(html.contains("class=\"sidebar-inner\""), "{html}");
+        assert!(html.contains("data-sidebar-collapse"), "{html}");
         assert!(!html.contains("<h2 class=\"side-title\">files"), "{html}");
         assert!(!html.contains("<h2 class=\"side-title\">tools"), "{html}");
         assert!(html.contains("data-tree-refresh"), "{html}");

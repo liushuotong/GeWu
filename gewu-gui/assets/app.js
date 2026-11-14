@@ -1,6 +1,6 @@
 // GeWu web GUI client.
 //
-// The server renders all transcript HTML; this script only manages tabs,
+// The server renders all transcript HTML; this script only manages sessions,
 // applies snapshots/deltas, and forwards user actions. Model-authored text is
 // inserted with textContent, never innerHTML.
 
@@ -9,6 +9,7 @@
 
   const TOKEN_KEY = "gewu-gui-token";
   const SIDEBAR_KEY = "gewu-gui-sidebar";
+  const SESSIONS_KEY = "gewu-gui-sessions";
   const MAX_RECONNECT_MS = 60000;
 
   const el = {
@@ -16,8 +17,6 @@
     offline: document.getElementById("offline"),
     offlineText: document.getElementById("offline-text"),
     retry: document.getElementById("retry"),
-    tabs: document.getElementById("tabs"),
-    newTab: document.getElementById("new-tab"),
     interrupt: document.getElementById("interrupt"),
     transcript: document.getElementById("transcript"),
     status: document.getElementById("status"),
@@ -31,7 +30,10 @@
     loginError: document.getElementById("login-error"),
     token: document.getElementById("token"),
     sidebar: document.getElementById("sidebar"),
-    sidebarToggle: document.getElementById("sidebar-toggle"),
+    sessionSidebar: document.getElementById("session-sidebar"),
+    sessionsExpand: document.getElementById("sessions-expand"),
+    filesExpand: document.getElementById("files-expand"),
+    drawerBackdrop: document.getElementById("drawer-backdrop"),
     filePreview: document.getElementById("file-preview"),
   };
 
@@ -82,7 +84,8 @@
 
   // -- sidebar ------------------------------------------------------------
 
-  // Open by default, except on narrow screens where it covers the transcript.
+  // The files sidebar starts closed; the sessions sidebar starts open except
+  // on narrow screens where it covers the transcript.
   function loadSidebarOpen() {
     try {
       const saved = localStorage.getItem(SIDEBAR_KEY);
@@ -91,12 +94,27 @@
     } catch {
       // Fall through to the default.
     }
+    return false;
+  }
+
+  function loadSessionsOpen() {
+    try {
+      const saved = localStorage.getItem(SESSIONS_KEY);
+      if (saved === "open") return true;
+      if (saved === "closed") return false;
+    } catch {
+      // Fall through to the default.
+    }
     return !window.matchMedia("(max-width: 800px)").matches;
+  }
+
+  function narrowScreen() {
+    return window.matchMedia("(max-width: 800px)").matches;
   }
 
   function setSidebarOpen(open, remember) {
     el.app.classList.toggle("sidebar-collapsed", !open);
-    el.sidebarToggle.setAttribute("aria-expanded", String(open));
+    el.filesExpand.setAttribute("aria-expanded", String(open));
     if (!remember) return;
     try {
       localStorage.setItem(SIDEBAR_KEY, open ? "open" : "closed");
@@ -105,9 +123,52 @@
     }
   }
 
-  function toggleSidebar() {
-    setSidebarOpen(el.app.classList.contains("sidebar-collapsed"), true);
+  function setSessionsOpen(open, remember) {
+    el.app.classList.toggle("sessions-collapsed", !open);
+    el.sessionsExpand.setAttribute("aria-expanded", String(open));
+    if (!remember) return;
+    try {
+      localStorage.setItem(SESSIONS_KEY, open ? "open" : "closed");
+    } catch {
+      // The state still applies to this page.
+    }
   }
+
+  function toggleSessions() {
+    const open = el.app.classList.contains("sessions-collapsed");
+    if (open && narrowScreen()) setSidebarOpen(false, false);
+    setSessionsOpen(open, true);
+  }
+
+  function toggleSidebar() {
+    const open = el.app.classList.contains("sidebar-collapsed");
+    if (open && narrowScreen()) setSessionsOpen(false, false);
+    setSidebarOpen(open, true);
+  }
+
+  el.drawerBackdrop.addEventListener("click", () => {
+    setSessionsOpen(false, false);
+    setSidebarOpen(false, false);
+  });
+
+  document.addEventListener("keydown", (event) => {
+    if (event.key !== "Escape" || !narrowScreen()) return;
+    if (!el.app.classList.contains("sessions-collapsed")) {
+      setSessionsOpen(false, false);
+      event.preventDefault();
+      event.stopImmediatePropagation();
+    } else if (!el.app.classList.contains("sidebar-collapsed")) {
+      setSidebarOpen(false, false);
+      event.preventDefault();
+      event.stopImmediatePropagation();
+    }
+  });
+
+  window.matchMedia("(max-width: 800px)").addEventListener("change", (event) => {
+    if (!event.matches) return;
+    setSessionsOpen(false, false);
+    setSidebarOpen(false, false);
+  });
 
   // -- connection ---------------------------------------------------------
 
@@ -239,10 +300,10 @@
         state.active = message.active;
         state.ready = true;
         state.transcriptTab = message.active;
-        renderTabs(message.tabs, message.active);
         setTranscript(message.transcript, true);
         setStatus(message.status);
         el.sidebar.innerHTML = message.sidebar || "";
+        el.sessionSidebar.innerHTML = message.session_sidebar || "";
         setBusy(message.tabs.some((tab) => tab.id === message.active && tab.busy));
         break;
       case "tabs": {
@@ -251,10 +312,12 @@
         for (const id of state.scrollTops.keys()) {
           if (!alive.has(id)) state.scrollTops.delete(id);
         }
-        renderTabs(message.tabs, message.active);
         setBusy(message.tabs.some((tab) => tab.id === message.active && tab.busy));
         break;
       }
+      case "session_sidebar":
+        el.sessionSidebar.innerHTML = message.html || "";
+        break;
       case "transcript":
         setTranscript(message.html, false);
         break;
@@ -293,6 +356,19 @@
         const tree = document.getElementById("file-tree");
         if (tree) tree.outerHTML = message.html;
         break;
+      case "workspace_browser": {
+        document.getElementById("workspace-browser")?.remove();
+        if (message.html) el.app.insertAdjacentHTML("beforeend", message.html);
+        break;
+      }
+      case "workspace_picker":
+        document.getElementById("session-workspace-picker")?.remove();
+        if (message.html) el.app.insertAdjacentHTML("beforeend", message.html);
+        break;
+      case "close_workspace_browser":
+        document.getElementById("workspace-browser")?.remove();
+        document.getElementById("session-workspace-picker")?.remove();
+        break;
       case "tools": {
         const panel = document.getElementById("sidebar-tools");
         if (panel) panel.innerHTML = message.html;
@@ -321,47 +397,6 @@
     setOffline(false);
     if (state.ws) state.ws.close();
     showLogin("That token was not accepted.");
-  }
-
-  // -- tabs ---------------------------------------------------------------
-
-  function renderTabs(tabs, active) {
-    const fragment = document.createDocumentFragment();
-    for (const tab of tabs) {
-      const button = document.createElement("button");
-      button.type = "button";
-      button.className = "tab";
-      button.dataset.tab = String(tab.id);
-      if (tab.id === active) button.classList.add("active");
-      if (tab.busy) button.classList.add("busy");
-      button.title = tab.session_id
-        ? `Session ${tab.session_id}`
-        : "New session";
-
-      const label = document.createElement("span");
-      label.className = "tab-label";
-      label.textContent = tab.label;
-      button.appendChild(label);
-
-      if (tab.busy) {
-        const spinner = document.createElement("span");
-        spinner.className = "tab-spinner";
-        spinner.setAttribute("aria-label", "working");
-        button.appendChild(spinner);
-      }
-
-      const close = document.createElement("span");
-      close.className = "tab-close";
-      close.dataset.close = String(tab.id);
-      close.setAttribute("role", "button");
-      close.setAttribute("aria-label", `Close ${tab.label}`);
-      close.title = "Close and delete this session";
-      close.textContent = "×";
-      button.appendChild(close);
-
-      fragment.appendChild(button);
-    }
-    el.tabs.replaceChildren(fragment);
   }
 
   function setBusy(busy) {
@@ -599,7 +634,8 @@
     }
   });
 
-  el.sidebarToggle.addEventListener("click", toggleSidebar);
+  el.sessionsExpand.addEventListener("click", toggleSessions);
+  el.filesExpand.addEventListener("click", toggleSidebar);
   el.status.addEventListener("mousedown", (event) => {
     if (event.target.closest("[data-mode]")) event.preventDefault();
   });
@@ -613,8 +649,6 @@
     if (picker && !state.busy) send({ op: "switch_model", tab: Number(picker.dataset.tab), model: picker.value });
   });
 
-  el.newTab.addEventListener("click", () => send({ op: "open_tab" }));
-
   el.interrupt.addEventListener("click", () => {
     send({ op: "interrupt", tab: state.active });
   });
@@ -622,20 +656,6 @@
   el.retry.addEventListener("click", () => {
     clearReconnect();
     connect();
-  });
-
-  el.tabs.addEventListener("click", (event) => {
-    const close = event.target.closest("[data-close]");
-    if (close) {
-      event.stopPropagation();
-      send({ op: "close_tab", tab: Number(close.dataset.close) });
-      return;
-    }
-    const tab = event.target.closest("[data-tab]");
-    if (tab) {
-      const id = Number(tab.dataset.tab);
-      if (id !== state.active) send({ op: "switch_tab", tab: id });
-    }
   });
 
   el.transcript.addEventListener("click", (event) => {
@@ -699,6 +719,10 @@
   }, true);
 
   el.sidebar.addEventListener("click", (event) => {
+    if (event.target.closest("[data-sidebar-collapse]")) {
+      setSidebarOpen(false, true);
+      return;
+    }
     const sidebarTab = event.target.closest("[data-sidebar-tab]");
     if (sidebarTab) {
       setSidebarTab(sidebarTab.dataset.sidebarTab);
@@ -713,6 +737,82 @@
       return;
     }
     if (event.target.closest("[data-tree-refresh]")) { send({ op: "refresh_tree" }); }
+  });
+
+  el.sidebar.addEventListener("change", (event) => {
+    const workspace = event.target.closest("[data-workspace-select]");
+    if (workspace) {
+      send({ op: "switch_workspace", tab: state.active, workspace: workspace.value });
+    }
+  });
+
+  el.sessionSidebar.addEventListener("click", (event) => {
+    if (event.target.closest("[data-sessions-collapse]")) {
+      setSessionsOpen(false, true);
+      return;
+    }
+    if (event.target.closest("[data-session-new]")) {
+      send({ op: "open_tab" });
+      return;
+    }
+    const close = event.target.closest("[data-session-close]");
+    if (close) {
+      event.stopPropagation();
+      send({ op: "close_tab", tab: Number(close.dataset.sessionClose) });
+      return;
+    }
+    const create = event.target.closest("[data-session-new-workspace]");
+    if (create) {
+      send({
+        op: "create_tab",
+        workspace: create.dataset.sessionNewWorkspace,
+        path: create.dataset.sessionNewPath,
+      });
+      if (narrowScreen()) setSessionsOpen(false, false);
+      return;
+    }
+    const tab = event.target.closest("[data-session-tab]");
+    if (tab) {
+      const id = Number(tab.dataset.sessionTab);
+      if (id !== state.active) send({ op: "switch_tab", tab: id });
+      if (narrowScreen()) setSessionsOpen(false, false);
+    }
+  });
+
+  el.app.addEventListener("click", (event) => {
+    const closeNewSession = event.target.closest("[data-new-session-close]");
+    if (closeNewSession) {
+      send({ op: "close_workspace_browser" });
+      return;
+    }
+    const createTab = event.target.closest("[data-new-session-create]");
+    if (createTab) {
+      send({
+        op: "create_tab",
+        workspace: createTab.dataset.newSessionWorkspace,
+        path: createTab.dataset.newSessionPath,
+      });
+      return;
+    }
+    const browseNewSession = event.target.closest("[data-new-session-browse-path]");
+    if (browseNewSession) {
+      send({ op: "browse_new_session", path: browseNewSession.dataset.newSessionBrowsePath });
+      return;
+    }
+    const close = event.target.closest("[data-workspace-browser-close]");
+    if (close) {
+      send({ op: "close_workspace_browser" });
+      return;
+    }
+    const add = event.target.closest("[data-workspace-add-path]");
+    if (add) {
+      send({ op: "add_workspace", tab: state.active, path: add.dataset.workspaceAddPath });
+      return;
+    }
+    const browse = event.target.closest("[data-workspace-browse-path]");
+    if (browse) {
+      send({ op: "browse_workspace", path: browse.dataset.workspaceBrowsePath });
+    }
   });
 
   // -- file upload ---------------------------------------------------------
@@ -982,7 +1082,11 @@
     }, 1000);
   }
 
+  setSessionsOpen(loadSessionsOpen(), false);
   setSidebarOpen(loadSidebarOpen(), false);
+  requestAnimationFrame(() => {
+    requestAnimationFrame(() => el.app.classList.remove("preload"));
+  });
   boot();
 })();
 

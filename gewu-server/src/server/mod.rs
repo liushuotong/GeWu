@@ -32,7 +32,7 @@ use futures::{SinkExt, StreamExt};
 use gewu_core::ToolRegistry;
 use gewu_core::types::{AgentEvent, Message, PathEnforcement};
 pub use gewu_protocol as protocol;
-use gewu_protocol::FileEntry;
+use gewu_protocol::{DirectoryEntry, FileEntry, WorkspaceSummary};
 use registry::create_agent;
 use serde_json::Value;
 use std::collections::{HashMap, HashSet};
@@ -216,6 +216,8 @@ struct ConnectionSession {
     /// the agent lock is held so `steer` requests can inject messages
     /// without touching the agent. `None` while idle.
     steering: Arc<Mutex<Option<gewu_core::Steering>>>,
+    /// The session's selected filesystem root.
+    workspace: WorkspaceSummary,
 }
 
 /// A currently running ask on a connection.
@@ -360,6 +362,110 @@ async fn accept_loop(
 // ---------------------------------------------------------------------------
 
 impl ServerState {
+    fn workspace_summaries(&self) -> Vec<WorkspaceSummary> {
+        self.bootstrap
+            .workspace_roots
+            .iter()
+            .map(|(id, path)| WorkspaceSummary {
+                id: id.clone(),
+                path: path.to_string_lossy().to_string(),
+            })
+            .collect()
+    }
+
+    fn workspace(&self, id: &str) -> Result<WorkspaceSummary> {
+        if let Some(path) = self.bootstrap.workspace_roots.get(id) {
+            return Ok(WorkspaceSummary {
+                id: id.to_string(),
+                path: path.to_string_lossy().to_string(),
+            });
+        }
+        let Some(path) = id.strip_prefix("runtime:") else {
+            anyhow::bail!("unknown workspace '{id}'")
+        };
+        let path = std::fs::canonicalize(path)
+            .with_context(|| format!("cannot resolve runtime workspace '{path}'"))?;
+        anyhow::ensure!(
+            path.is_dir(),
+            "workspace is not a directory: {}",
+            path.display()
+        );
+        Ok(WorkspaceSummary {
+            id: id.to_string(),
+            path: path.to_string_lossy().to_string(),
+        })
+    }
+
+    fn workspace_for_path(&self, path: impl AsRef<std::path::Path>) -> Result<WorkspaceSummary> {
+        let path = std::fs::canonicalize(path.as_ref())
+            .with_context(|| format!("cannot resolve directory: {}", path.as_ref().display()))?;
+        anyhow::ensure!(path.is_dir(), "path is not a directory: {}", path.display());
+        if let Some((id, _)) = self
+            .bootstrap
+            .workspace_roots
+            .iter()
+            .find(|(_, root)| root.as_path() == path.as_path())
+        {
+            return self.workspace(id);
+        }
+        Ok(WorkspaceSummary {
+            id: format!("runtime:{}", path.display()),
+            path: path.to_string_lossy().to_string(),
+        })
+    }
+
+    fn browse_workspace(
+        &self,
+        requested: &str,
+    ) -> Result<(String, Option<String>, Vec<DirectoryEntry>)> {
+        let cwd = self
+            .bootstrap
+            .workspace_roots
+            .get("cwd")
+            .expect("cwd workspace is always configured");
+        let requested_path = if requested.trim().is_empty() {
+            cwd.clone()
+        } else {
+            let path = std::path::PathBuf::from(requested);
+            if path.is_absolute() {
+                path
+            } else {
+                cwd.join(path)
+            }
+        };
+        let directory = std::fs::canonicalize(&requested_path)
+            .with_context(|| format!("cannot resolve directory: {}", requested_path.display()))?;
+        anyhow::ensure!(
+            directory.is_dir(),
+            "path is not a directory: {}",
+            directory.display()
+        );
+        let mut entries = Vec::new();
+        for entry in std::fs::read_dir(&directory)
+            .with_context(|| format!("cannot list directory: {}", directory.display()))?
+        {
+            let entry = entry?;
+            let metadata = std::fs::symlink_metadata(entry.path())
+                .with_context(|| format!("cannot inspect entry: {}", entry.path().display()))?;
+            if !metadata.is_dir() {
+                continue;
+            }
+            let path = entry.path();
+            let Some(name) = entry.file_name().to_str().map(str::to_owned) else {
+                continue;
+            };
+            entries.push(DirectoryEntry {
+                name,
+                path: path.to_string_lossy().to_string(),
+            });
+        }
+        entries.sort_by_key(|a| a.name.to_lowercase());
+        let parent = directory
+            .parent()
+            .map(|path| path.to_string_lossy().to_string());
+        Ok((directory.to_string_lossy().to_string(), parent, entries))
+    }
+
     /// Get or create the per-connection session.
     ///
     /// `session_id` and `agent_name` only apply when the session is first
@@ -371,6 +477,19 @@ impl ServerState {
         current: &mut Option<ConnectionSession>,
         session_id: Option<String>,
         agent_name: Option<String>,
+    ) -> Result<ConnectionSession> {
+        self.get_or_create_session_with_workspace(current, session_id, agent_name, None)
+            .await
+    }
+
+    /// Get or create a session, optionally selecting its workspace at creation
+    /// time. The workspace hint is ignored once the session already exists.
+    async fn get_or_create_session_with_workspace(
+        &self,
+        current: &mut Option<ConnectionSession>,
+        session_id: Option<String>,
+        agent_name: Option<String>,
+        requested_workspace: Option<String>,
     ) -> Result<ConnectionSession> {
         if let Some(existing) = current {
             if let Some(requested) = &session_id
@@ -417,6 +536,27 @@ impl ServerState {
             anyhow::bail!("Unknown agent profile: {}", agent_name);
         }
 
+        let stored_id = gewu_storage::session_workspace(&self.bootstrap.pool, &session_id).await?;
+        let use_requested_workspace = requested_workspace.is_some() && stored_id.is_none();
+        let workspace_id = if use_requested_workspace {
+            requested_workspace.expect("checked above")
+        } else {
+            stored_id.clone().unwrap_or_else(|| "cwd".into())
+        };
+        let workspace = if use_requested_workspace {
+            self.workspace(&workspace_id)?
+        } else {
+            self.workspace(&workspace_id).unwrap_or_else(|error| {
+                warn!(
+                    "session {} has invalid workspace '{}': {}; using cwd",
+                    session_id, workspace_id, error
+                );
+                self.workspace("cwd")
+                    .expect("cwd workspace is always configured")
+            })
+        };
+        let workspace_path = std::path::PathBuf::from(&workspace.path);
+
         // Resolve the session's model: the persisted selector when it still
         // exists in the catalog, else the server default.
         let model = match gewu_storage::session_model(&self.bootstrap.pool, &session_id).await? {
@@ -446,7 +586,7 @@ impl ServerState {
                 name: &agent_name,
                 provider: entry.provider.clone(),
                 pool: self.bootstrap.pool.clone(),
-                working_directory: self.bootstrap.working_directory.clone().into(),
+                working_directory: workspace_path,
                 additional_tools: self.bootstrap.mcp_tools.clone(),
                 skills: self.bootstrap.skills.clone(),
                 enforcement: self.bootstrap.enforcement,
@@ -468,6 +608,10 @@ impl ServerState {
             let mut agent = agent.lock().await;
             patch_dangling_tool_calls(&mut agent).await;
         }
+        if use_requested_workspace {
+            gewu_storage::set_session_workspace(&self.bootstrap.pool, &session_id, &workspace_id)
+                .await?;
+        }
         gewu_storage::set_session_agent(&self.bootstrap.pool, &session_id, &agent_name).await?;
         // Snapshot the tool list once; it never changes for this session.
         let tools = agent.lock().await.list_tools();
@@ -481,6 +625,7 @@ impl ServerState {
             context_limit: entry.context_limit,
             tools,
             steering: Arc::new(Mutex::new(Some(steering))),
+            workspace,
         };
         *current = Some(entry.clone());
         sessions.insert(entry.session_id.clone(), entry.clone());
@@ -654,6 +799,18 @@ async fn handle_request(
     {
         *running = None;
     }
+    // File operations are session-aware too: a client may inspect a persisted
+    // session's selected workspace without first sending `usage` or `ask`.
+    if matches!(
+        &request.op,
+        Op::ListFiles { .. } | Op::ReadFile { .. } | Op::WriteFile { .. }
+    ) && (session.is_some() || request.session_id.is_some())
+    {
+        state
+            .get_or_create_session(session, request.session_id.clone(), request.agent.clone())
+            .await
+            .map_err(|e| RequestError::Failed(e.to_string()))?;
+    }
     match request.op {
         Op::SubscribeSession => {
             let current = state
@@ -786,7 +943,7 @@ async fn handle_request(
                 name: &target,
                 provider: current.provider.clone(),
                 pool: state.bootstrap.pool.clone(),
-                working_directory: state.bootstrap.working_directory.clone().into(),
+                working_directory: std::path::PathBuf::from(&current.workspace.path),
                 additional_tools: state.bootstrap.mcp_tools.clone(),
                 skills: state.bootstrap.skills.clone(),
                 enforcement: state.bootstrap.enforcement,
@@ -826,6 +983,7 @@ async fn handle_request(
                             context_limit: current.context_limit,
                             tools: tools.clone(),
                             steering: current.steering.clone(),
+                            workspace: current.workspace.clone(),
                         });
                         state.sessions.lock().await.insert(
                             current.session_id.clone(),
@@ -843,6 +1001,123 @@ async fn handle_request(
                 Err(e) => Err(RequestError::Failed(e.to_string())),
             };
             state.busy_sessions.lock().await.remove(&current.session_id);
+            result
+        }
+        Op::SwitchWorkspace { workspace: target } => {
+            if running.is_some() {
+                return Err(RequestError::Failed(
+                    "cannot switch workspace while a turn is running".into(),
+                ));
+            }
+            let current = state
+                .get_or_create_session(session, request.session_id, None)
+                .await
+                .map_err(|e| RequestError::Failed(e.to_string()))?;
+            if !state.claim_session(&current.session_id).await {
+                return Err(RequestError::Failed(
+                    "session is busy on another connection".into(),
+                ));
+            }
+            let result = match state.workspace(&target) {
+                Ok(workspace) => {
+                    if let Err(error) = gewu_storage::set_session_workspace(
+                        &state.bootstrap.pool,
+                        &current.session_id,
+                        &workspace.id,
+                    )
+                    .await
+                    {
+                        Err(RequestError::Failed(error.to_string()))
+                    } else {
+                        current
+                            .agent
+                            .lock()
+                            .await
+                            .set_working_directory(std::path::PathBuf::from(&workspace.path));
+                        let replacement = ConnectionSession {
+                            workspace: workspace.clone(),
+                            ..current.clone()
+                        };
+                        *session = Some(replacement.clone());
+                        state
+                            .sessions
+                            .lock()
+                            .await
+                            .insert(current.session_id.clone(), replacement);
+                        Ok(Handled::Reply(ServerMessage::WorkspaceSwitched {
+                            id: request.id,
+                            session_id: current.session_id.clone(),
+                            workspace,
+                        }))
+                    }
+                }
+                Err(error) => Err(RequestError::Invalid(error.to_string())),
+            };
+            state.release_session(&current.session_id).await;
+            result
+        }
+        Op::BrowseWorkspace { path } => {
+            let (path, parent, entries) = state
+                .browse_workspace(&path)
+                .map_err(|e| RequestError::Invalid(e.to_string()))?;
+            Ok(Handled::Reply(ServerMessage::Directories {
+                id: request.id,
+                path,
+                parent,
+                entries,
+            }))
+        }
+        Op::AddWorkspace { path } => {
+            if running.is_some() {
+                return Err(RequestError::Failed(
+                    "cannot add a workspace while a turn is running".into(),
+                ));
+            }
+            let current = state
+                .get_or_create_session(session, request.session_id, None)
+                .await
+                .map_err(|e| RequestError::Failed(e.to_string()))?;
+            if !state.claim_session(&current.session_id).await {
+                return Err(RequestError::Failed(
+                    "session is busy on another connection".into(),
+                ));
+            }
+            let result = match state.workspace_for_path(path) {
+                Ok(workspace) => {
+                    if let Err(error) = gewu_storage::set_session_workspace(
+                        &state.bootstrap.pool,
+                        &current.session_id,
+                        &workspace.id,
+                    )
+                    .await
+                    {
+                        Err(RequestError::Failed(error.to_string()))
+                    } else {
+                        current
+                            .agent
+                            .lock()
+                            .await
+                            .set_working_directory(std::path::PathBuf::from(&workspace.path));
+                        let replacement = ConnectionSession {
+                            workspace: workspace.clone(),
+                            ..current.clone()
+                        };
+                        *session = Some(replacement.clone());
+                        state
+                            .sessions
+                            .lock()
+                            .await
+                            .insert(current.session_id.clone(), replacement);
+                        Ok(Handled::Reply(ServerMessage::WorkspaceAdded {
+                            id: request.id,
+                            session_id: current.session_id.clone(),
+                            workspace,
+                        }))
+                    }
+                }
+                Err(error) => Err(RequestError::Invalid(error.to_string())),
+            };
+            state.release_session(&current.session_id).await;
             result
         }
         Op::SwitchModel { model: target } => {
@@ -883,6 +1158,7 @@ async fn handle_request(
                             context_limit: entry.context_limit,
                             tools: current.tools.clone(),
                             steering: current.steering.clone(),
+                            workspace: current.workspace.clone(),
                         };
                         *session = Some(replacement.clone());
                         state
@@ -925,12 +1201,31 @@ async fn handle_request(
             ok: true,
         })),
 
-        Op::Info => Ok(Handled::Reply(ServerMessage::Info {
-            id: request.id,
-            model: state.bootstrap.model.clone(),
-            provider: state.bootstrap.provider_name.clone(),
-            working_directory: state.bootstrap.working_directory.clone(),
-        })),
+        Op::Info => {
+            let active = if request.session_id.is_some() || session.is_some() {
+                state
+                    .get_or_create_session(session, request.session_id, request.agent)
+                    .await
+                    .map_err(|e| RequestError::Failed(e.to_string()))?
+                    .workspace
+            } else {
+                state
+                    .workspace("cwd")
+                    .map_err(|e| RequestError::Failed(e.to_string()))?
+            };
+            let mut workspaces = state.workspace_summaries();
+            if !workspaces.iter().any(|workspace| workspace.id == active.id) {
+                workspaces.push(active.clone());
+            }
+            Ok(Handled::Reply(ServerMessage::Info {
+                id: request.id,
+                model: state.bootstrap.model.clone(),
+                provider: state.bootstrap.provider_name.clone(),
+                working_directory: active.path.clone(),
+                workspaces,
+                active_workspace: active.id,
+            }))
+        }
 
         Op::Usage => {
             // Measure the conversation against the agent's context window —
@@ -1001,19 +1296,22 @@ async fn handle_request(
         }
 
         Op::ListFiles { path } => {
-            let root = &state.bootstrap.working_directory;
+            let root = session
+                .as_ref()
+                .map(|current| current.workspace.path.clone())
+                .unwrap_or_else(|| state.bootstrap.working_directory.clone());
             let dir = match state.bootstrap.enforcement {
                 PathEnforcement::None => {
-                    let dir = std::path::Path::new(root).join(&path);
+                    let dir = std::path::Path::new(&root).join(&path);
                     if !dir.is_dir() {
                         return Err(RequestError::Invalid("path is not a directory".into()));
                     }
                     dir
                 }
                 _ => {
-                    let dir = gewu_tools::fs_utils::resolve_safe_path(root, &path)
+                    let dir = gewu_tools::fs_utils::resolve_safe_path(&root, &path)
                         .map_err(|e| RequestError::Invalid(e.to_string()))?;
-                    let canonical_root = std::fs::canonicalize(root).map_err(|e| {
+                    let canonical_root = std::fs::canonicalize(&root).map_err(|e| {
                         RequestError::Failed(format!("cannot resolve working directory: {e}"))
                     })?;
                     let canonical_dir = std::fs::canonicalize(&dir)
@@ -1062,13 +1360,16 @@ async fn handle_request(
 
         Op::ReadFile { path } => {
             const MAX_PREVIEW_BYTES: usize = 512 * 1024;
-            let root = &state.bootstrap.working_directory;
+            let root = session
+                .as_ref()
+                .map(|current| current.workspace.path.clone())
+                .unwrap_or_else(|| state.bootstrap.working_directory.clone());
             let file = match state.bootstrap.enforcement {
-                PathEnforcement::None => std::path::Path::new(root).join(&path),
+                PathEnforcement::None => std::path::Path::new(&root).join(&path),
                 _ => {
-                    let file = gewu_tools::fs_utils::resolve_safe_path(root, &path)
+                    let file = gewu_tools::fs_utils::resolve_safe_path(&root, &path)
                         .map_err(|e| RequestError::Invalid(e.to_string()))?;
-                    let canonical_root = std::fs::canonicalize(root).map_err(|e| {
+                    let canonical_root = std::fs::canonicalize(&root).map_err(|e| {
                         RequestError::Failed(format!("cannot resolve working directory: {e}"))
                     })?;
                     let canonical_file = std::fs::canonicalize(&file)
@@ -1145,10 +1446,13 @@ async fn handle_request(
                     MAX_UPLOAD_BYTES / (1024 * 1024)
                 )));
             }
-            let canonical_root = std::fs::canonicalize(&state.bootstrap.working_directory)
-                .map_err(|e| {
-                    RequestError::Failed(format!("cannot resolve working directory: {e}"))
-                })?;
+            let root = session
+                .as_ref()
+                .map(|current| current.workspace.path.clone())
+                .unwrap_or_else(|| state.bootstrap.working_directory.clone());
+            let canonical_root = std::fs::canonicalize(&root).map_err(|e| {
+                RequestError::Failed(format!("cannot resolve working directory: {e}"))
+            })?;
             let target = canonical_root.join(name);
             if target.exists() {
                 // Follow symlinks so an existing name cannot redirect the
@@ -1292,7 +1596,12 @@ async fn handle_request(
                 ));
             }
             let session = state
-                .get_or_create_session(session, request.session_id, request.agent)
+                .get_or_create_session_with_workspace(
+                    session,
+                    request.session_id,
+                    request.agent,
+                    request.workspace,
+                )
                 .await
                 .map_err(|e| RequestError::Failed(e.to_string()))?;
             // Claim the session across connections so two connections cannot
@@ -2272,6 +2581,10 @@ mod tests {
             context_limit: 256_000,
             tools,
             steering: Arc::new(Mutex::new(None)),
+            workspace: WorkspaceSummary {
+                id: "cwd".into(),
+                path: "/tmp/gewu-test".into(),
+            },
         }
     }
 
@@ -2293,6 +2606,10 @@ mod tests {
             context_limit: 256_000,
             tools,
             steering: Arc::new(Mutex::new(None)),
+            workspace: WorkspaceSummary {
+                id: "cwd".into(),
+                path: "/tmp/gewu-test".into(),
+            },
         }
     }
 
@@ -2907,6 +3224,10 @@ mod tests {
                 model: "test-model".to_string(),
                 provider_name: "test".to_string(),
                 working_directory: "/tmp/gewu-test".to_string(),
+                workspace_roots: Arc::new(BTreeMap::from([(
+                    "cwd".to_string(),
+                    std::path::PathBuf::from("/tmp/gewu-test"),
+                )])),
                 enforcement: PathEnforcement::None,
                 context_limit: None,
                 models: BTreeMap::from([(
@@ -3135,6 +3456,176 @@ mod tests {
         )
         .await;
         assert!(result.is_err(), "expected containment rejection");
+    }
+
+    #[tokio::test]
+    async fn switching_workspace_changes_file_api_root_and_persists() {
+        let cwd = tempfile::tempdir().unwrap();
+        let frontend = tempfile::tempdir().unwrap();
+        std::fs::write(frontend.path().join("active.txt"), "frontend root").unwrap();
+        let mut state = server_state_with(TestLlm::plain());
+        let pool = sqlx::sqlite::SqlitePoolOptions::new()
+            .connect("sqlite::memory:")
+            .await
+            .unwrap();
+        {
+            let bootstrap = &mut Arc::get_mut(&mut state).unwrap().bootstrap;
+            bootstrap.pool = pool;
+            bootstrap.working_directory = cwd.path().to_string_lossy().to_string();
+            bootstrap.workspace_roots = Arc::new(BTreeMap::from([
+                ("cwd".into(), cwd.path().to_path_buf()),
+                ("frontend".into(), frontend.path().to_path_buf()),
+            ]));
+        }
+
+        let mut session = None;
+        let mut running = None;
+        let switched = handle_request(
+            &state,
+            &mut session,
+            &mut running,
+            ClientRequest::switch_workspace(1, "frontend"),
+        )
+        .await
+        .unwrap();
+        assert!(matches!(
+            switched,
+            Handled::Reply(ServerMessage::WorkspaceSwitched { ref workspace, .. })
+                if workspace.id == "frontend"
+        ));
+
+        let read = handle_request(
+            &state,
+            &mut session,
+            &mut running,
+            ClientRequest::read_file(2, "active.txt"),
+        )
+        .await
+        .unwrap();
+        match read {
+            Handled::Reply(ServerMessage::FileContent { content, .. }) => {
+                assert_eq!(content, "frontend root")
+            }
+            _ => panic!("unexpected reply"),
+        }
+        assert_eq!(
+            gewu_storage::session_workspace(
+                &state.bootstrap.pool,
+                session.as_ref().unwrap().session_id.as_str()
+            )
+            .await
+            .unwrap()
+            .as_deref(),
+            Some("frontend")
+        );
+
+        let session_id = session.as_ref().unwrap().session_id.clone();
+        let mut other_connection = None;
+        let mut other_running = None;
+        let direct = handle_request(
+            &state,
+            &mut other_connection,
+            &mut other_running,
+            ClientRequest::read_file(3, "active.txt").with_session(session_id),
+        )
+        .await
+        .unwrap();
+        assert!(matches!(
+            direct,
+            Handled::Reply(ServerMessage::FileContent { ref content, .. })
+                if content == "frontend root"
+        ));
+    }
+
+    #[tokio::test]
+    async fn adding_runtime_workspace_selects_and_persists_it() {
+        let cwd = tempfile::tempdir().unwrap();
+        let added = tempfile::tempdir().unwrap();
+        let pool = sqlx::sqlite::SqlitePoolOptions::new()
+            .connect("sqlite::memory:")
+            .await
+            .unwrap();
+        let mut state = server_state_with(TestLlm::plain());
+        {
+            let bootstrap = &mut Arc::get_mut(&mut state).unwrap().bootstrap;
+            bootstrap.pool = pool;
+            bootstrap.working_directory = cwd.path().to_string_lossy().to_string();
+            bootstrap.workspace_roots =
+                Arc::new(BTreeMap::from([("cwd".into(), cwd.path().to_path_buf())]));
+        }
+        let mut session = None;
+        let mut running = None;
+        let result = handle_request(
+            &state,
+            &mut session,
+            &mut running,
+            ClientRequest::add_workspace(1, added.path().to_string_lossy().to_string()),
+        )
+        .await
+        .unwrap();
+        let workspace = match result {
+            Handled::Reply(ServerMessage::WorkspaceAdded { workspace, .. }) => workspace,
+            _ => panic!("expected workspace_added"),
+        };
+        assert!(workspace.id.starts_with("runtime:"));
+        assert_eq!(
+            workspace.path,
+            added.path().canonicalize().unwrap().to_string_lossy()
+        );
+        assert_eq!(
+            gewu_storage::session_workspace(
+                &state.bootstrap.pool,
+                &session.as_ref().unwrap().session_id,
+            )
+            .await
+            .unwrap()
+            .as_deref(),
+            Some(workspace.id.as_str())
+        );
+    }
+
+    #[tokio::test]
+    async fn first_ask_workspace_is_used_when_creating_a_session() {
+        let cwd = tempfile::tempdir().unwrap();
+        let tachyon = tempfile::tempdir().unwrap();
+        let pool = sqlx::sqlite::SqlitePoolOptions::new()
+            .connect("sqlite::memory:")
+            .await
+            .unwrap();
+        let mut state = server_state_with(TestLlm::plain());
+        {
+            let bootstrap = &mut Arc::get_mut(&mut state).unwrap().bootstrap;
+            bootstrap.pool = pool;
+            bootstrap.working_directory = cwd.path().to_string_lossy().to_string();
+            bootstrap.workspace_roots = Arc::new(BTreeMap::from([
+                ("cwd".into(), cwd.path().to_path_buf()),
+                ("tachyon".into(), tachyon.path().to_path_buf()),
+            ]));
+        }
+        let mut session = None;
+        let mut running = None;
+        let result = handle_request(
+            &state,
+            &mut session,
+            &mut running,
+            ClientRequest::ask(1, "pwd").with_workspace("tachyon"),
+        )
+        .await
+        .unwrap();
+        assert!(matches!(result, Handled::Ask { .. }));
+        let current = session.as_ref().unwrap();
+        assert_eq!(current.workspace.id, "tachyon");
+        assert_eq!(
+            current.workspace.path,
+            tachyon.path().canonicalize().unwrap().to_string_lossy()
+        );
+        assert_eq!(
+            gewu_storage::session_workspace(&state.bootstrap.pool, &current.session_id)
+                .await
+                .unwrap()
+                .as_deref(),
+            Some("tachyon")
+        );
     }
 
     #[tokio::test]
@@ -3509,6 +4000,10 @@ mod tests {
                 model: "test-model".to_string(),
                 provider_name: "test".to_string(),
                 working_directory: "/tmp/gewu-test".to_string(),
+                workspace_roots: Arc::new(BTreeMap::from([(
+                    "cwd".to_string(),
+                    std::path::PathBuf::from("/tmp/gewu-test"),
+                )])),
                 enforcement: PathEnforcement::None,
                 context_limit: None,
                 models: BTreeMap::from([(
@@ -4088,6 +4583,10 @@ mod tests {
             context_limit: 256_000,
             tools: vec!["echo".to_string()],
             steering: Arc::new(Mutex::new(None)),
+            workspace: WorkspaceSummary {
+                id: "cwd".into(),
+                path: "/tmp/gewu-test".into(),
+            },
         };
 
         let (tx, mut rx) = mpsc::channel::<String>(256);

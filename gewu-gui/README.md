@@ -66,27 +66,35 @@ File uploads (picker or drag-and-drop) are part of the same surface: they
 write into the upstream server's working-directory root, capped at 50 MB per
 file, with traversal names sanitized and existing files overwritten.
 
-## Tabs
+## Sessions
 
 Running turns belong to the upstream server, not the browser connection.
 Closing or refreshing the browser detaches without interrupting work; opening
 the GUI again restores the saved transcript and subscribes to active turns.
-Stop explicitly cancels a turn; closing a conversation tab cancels and deletes
+Stop explicitly cancels a turn; closing a session cancels and deletes
 that session. Turns do not survive an agent-server restart.
 
 Active-turn reconnect history is limited to 16 MiB; exceeding it cancels the
 turn. Turns also have a one-hour execution limit. These are currently fixed
 server safeguards, not configurable options.
 
-On startup the GUI opens **every stored session as a tab** — oldest on the
-left, newest on the right — and focuses the newest. Titles come from the first
-user prompt, falling back to the short session id or `new`. Each tab has its
-own upstream connection, so an ask can keep streaming in a background tab while
-you work in another. `+` opens a fresh session; `×` closes the tab **and
-permanently deletes that session from the server's store**, with no
-confirmation. Subagent sessions spawned by the `task` tool are not listed:
+On startup the GUI opens **every stored session** in the left sidebar, grouped
+by workspace, and focuses the newest. Titles come from the first user prompt,
+falling back to the short session id or `new`. Each session has its own
+upstream connection, so an ask can keep streaming while you work in another.
+**New session** at the top of the left sidebar opens a fresh session; `×` next
+to a session closes it **and permanently deletes that session from the server's
+store**, with no confirmation. Subagent sessions spawned by the `task` tool are
+not listed:
 they belong to the conversation that launched them and are deleted together
 with it. Subagents cannot spawn further subagents.
+
+The left sessions sidebar and the right files sidebar collapse independently
+with an animated transition. When the sessions sidebar is collapsed, the brand
+icon floats in the top-left corner; hovering or focusing it reveals
+**Open sidebar**. The files sidebar starts hidden and its floating control
+reopens it. On narrow screens both sidebars become overlay drawers with a
+clickable scrim, and `Esc` closes an open drawer.
 
 ## Interaction
 
@@ -95,10 +103,10 @@ with it. Subagents cannot spawn further subagents.
 | `Enter` | Send the prompt |
 | `Shift+Enter` | Insert a newline |
 | `Esc` | Interrupt the running ask |
-| `Ctrl+B` | Show or hide the sidebar (available tools, working directory) |
+| `Ctrl+B` | Show or hide the files sidebar (available tools, working directory) |
 | Send / Stop | Send the composer / interrupt (buttons) |
-| Tab click | Switch sessions |
-| `×` on a tab | Close the tab and delete the session |
+| Session click | Switch sessions |
+| `×` on a session | Close the session |
 | Tool row / `… +N lines` | Expand or collapse tool output |
 | `+ Explored: …` | Expand or collapse a run of tool calls |
 | `⬆` in the file tree | Open a file picker; selected files upload into the working-directory root |
@@ -117,7 +125,7 @@ snapshot; an `unauthorized` error returns to the token prompt.
 The GUI avoids re-rendering the transcript while an ask streams. Submitting a
 prompt appends the user block; the first assistant delta appends a streaming
 block and later deltas append text in place; tool runs append their card and
-fill its output in place; only the terminal frame (and tab switches) re-render
+fill its output in place; only the terminal frame (and session switches) re-render
 the whole transcript. When a targeted update does not match the browser's DOM,
 it falls back to a full refresh.
 

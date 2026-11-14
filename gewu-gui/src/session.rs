@@ -13,7 +13,7 @@ use futures::stream::SplitSink;
 use futures::{SinkExt, StreamExt};
 use gewu_client::session::{Block, Phase};
 use gewu_client::{AskStream, Client, Error as ClientError};
-use gewu_protocol::{AgentEvent, ServerMessage};
+use gewu_protocol::{AgentEvent, ServerMessage, WorkspaceSummary};
 use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
 use tracing::{debug, warn};
@@ -195,6 +195,7 @@ pub struct GuiSession {
     tools: Result<Vec<String>, String>,
     /// Working directory the upstream server's agent operates in.
     working_directory: Option<String>,
+    workspaces: Vec<WorkspaceSummary>,
     expanded_dirs: BTreeSet<String>,
     file_cache: BTreeMap<String, Vec<gewu_protocol::FileEntry>>,
     tab_tx: Option<mpsc::UnboundedSender<TabEvent>>,
@@ -218,16 +219,17 @@ impl GuiSession {
                 )
             })?;
 
-        let (model_label, working_directory) = match admin.info().await {
+        let (model_label, working_directory, workspaces) = match admin.info().await {
             // The status bar shows the model name without the provider.
             // An empty directory means the upstream predates `info.cwd`.
             Ok(info) => (
                 Some(info.model.clone()),
                 Some(info.working_directory.clone()).filter(|dir| !dir.is_empty()),
+                info.workspaces,
             ),
             Err(e) => {
                 debug!("could not read server info: {e}");
-                (None, None)
+                (None, None, Vec::new())
             }
         };
 
@@ -301,6 +303,7 @@ impl GuiSession {
             models,
             tools,
             working_directory,
+            workspaces,
             expanded_dirs: BTreeSet::new(),
             file_cache,
             tab_tx: None,
@@ -320,12 +323,6 @@ impl GuiSession {
             Err(e) => self.fail_active(format!("server not responding: {e}")),
         }
 
-        send_msg(&mut sender, &self.snapshot()).await?;
-
-        // Refresh context usage for the focused session. This may create the
-        // tab's upstream connection.
-        self.activate_active(&mut sender).await?;
-
         let ids: Vec<_> = self
             .workspace
             .tabs
@@ -339,10 +336,30 @@ impl GuiSession {
                 warn!("failed to restore connection for tab {id}: {e}");
                 continue;
             }
+            if let Some(client) = self.client(id)
+                && let Ok(info) = client.info_for_session(&session_id).await
+            {
+                for workspace in info.workspaces {
+                    if !self.workspaces.iter().any(|root| root.id == workspace.id) {
+                        self.workspaces.push(workspace);
+                    }
+                }
+                if let Some(tab) = self.workspace.tab_mut(id) {
+                    tab.workspace = info.active_workspace;
+                }
+            }
             if let Err(e) = self.observe(id, session_id, true).await {
                 warn!("failed to restore observer for tab {id}: {e}");
             }
         }
+        // Resolve the active root and visible file cache before the first
+        // snapshot, so reconnect does not emit a second UI state sequence.
+        self.refresh_tree_cache().await?;
+        send_msg(&mut sender, &self.snapshot()).await?;
+
+        // Refresh context usage for the focused session. This may create the
+        // tab's upstream connection.
+        self.activate_active(&mut sender).await?;
 
         loop {
             let incoming = tokio::select! {
@@ -396,19 +413,38 @@ impl GuiSession {
             .workspace
             .tab(active)
             .expect("workspace is never empty");
+        let root = self.workspace_root(&tab.workspace);
         ServerMsg::Snapshot {
             tabs: self.workspace.infos(),
             active,
             transcript: view::transcript_html(tab),
             status: view::status_html(tab, &self.models),
-            sidebar: view::sidebar_tabs_html(
+            sidebar: view::sidebar_tabs_with_workspaces_html(
                 &self.tools,
-                self.working_directory.as_deref(),
-                self.working_directory.as_deref(),
+                root.map(|workspace| workspace.path.as_str())
+                    .or(self.working_directory.as_deref()),
+                &self.workspaces,
+                &tab.workspace,
                 &self.expanded_dirs,
                 &self.file_cache,
             ),
+            session_sidebar: view::session_sidebar_html(
+                &self.workspace.infos(),
+                &self.workspaces,
+                active,
+            ),
         }
+    }
+
+    fn workspace_root(&self, id: &str) -> Option<&WorkspaceSummary> {
+        self.workspaces.iter().find(|workspace| workspace.id == id)
+    }
+
+    fn active_root_path(&self) -> Option<String> {
+        let tab = self.workspace.tab(self.workspace.active_id())?;
+        self.workspace_root(&tab.workspace)
+            .map(|workspace| workspace.path.clone())
+            .or_else(|| self.working_directory.clone())
     }
 
     async fn send_tabs(&self, sender: &mut Sender) -> Result<()> {
@@ -417,6 +453,17 @@ impl GuiSession {
             &ServerMsg::Tabs {
                 tabs: self.workspace.infos(),
                 active: self.workspace.active_id(),
+            },
+        )
+        .await?;
+        send_msg(
+            sender,
+            &ServerMsg::SessionSidebar {
+                html: view::session_sidebar_html(
+                    &self.workspace.infos(),
+                    &self.workspaces,
+                    self.workspace.active_id(),
+                ),
             },
         )
         .await?;
@@ -555,19 +602,14 @@ impl GuiSession {
     /// Reload every visible tree level from the upstream and push the fresh
     /// rendering to the browser.
     async fn send_refreshed_tree(&mut self, sender: &mut Sender) -> Result<()> {
-        let paths: Vec<String> = std::iter::once(String::new())
-            .chain(self.expanded_dirs.iter().cloned())
-            .collect();
-        for path in paths {
-            if let Ok(entries) = self.admin.list_files(path.clone()).await {
-                self.file_cache.insert(path, entries);
-            }
-        }
+        self.refresh_tree_cache().await?;
         send_msg(
             sender,
             &ServerMsg::FileTree {
-                html: view::file_tree_html(
-                    self.working_directory.as_deref(),
+                html: view::file_tree_with_workspaces_html(
+                    self.active_root_path().as_deref(),
+                    &self.workspaces,
+                    &self.workspace.active_tab().workspace,
                     &self.expanded_dirs,
                     &self.file_cache,
                 ),
@@ -575,6 +617,45 @@ impl GuiSession {
         )
         .await?;
         Ok(())
+    }
+
+    async fn refresh_tree_cache(&mut self) -> Result<()> {
+        if self
+            .workspace
+            .tab(self.workspace.active_id())
+            .and_then(|tab| tab.model.session_id.as_ref())
+            .is_none()
+        {
+            self.file_cache.clear();
+            return Ok(());
+        }
+        let client = self.file_client().await?;
+        let paths: Vec<String> = std::iter::once(String::new())
+            .chain(self.expanded_dirs.iter().cloned())
+            .collect();
+        for path in paths {
+            if let Ok(entries) = client.list_files(path.clone()).await {
+                self.file_cache.insert(path, entries);
+            }
+        }
+        Ok(())
+    }
+
+    /// Use the active tab's session connection for file operations so its
+    /// selected workspace, rather than the server default, is applied.
+    async fn file_client(&mut self) -> Result<Client> {
+        let tab_id = self.workspace.active_id();
+        let session_id = self
+            .workspace
+            .tab(tab_id)
+            .and_then(|tab| tab.model.session_id.clone());
+        let Some(session_id) = session_id else {
+            return Ok(self.admin.clone());
+        };
+        self.ensure_client(tab_id).await?;
+        let client = self.client(tab_id).expect("just ensured");
+        client.usage(Some(&session_id)).await?;
+        Ok(client)
     }
 
     fn note_active(&mut self, message: impl Into<String>) {
@@ -851,6 +932,132 @@ impl GuiSession {
                     Err(e) => self.send_error(sender, e.to_string()).await?,
                 }
             }
+            ClientMsg::SwitchWorkspace { tab, workspace } => {
+                if self.workspace.tab(tab).is_none_or(|tab| tab.busy()) {
+                    return self
+                        .send_error(sender, "wait for the current turn to finish")
+                        .await;
+                }
+                if !self.workspaces.iter().any(|root| root.id == workspace) {
+                    return self.send_error(sender, "unknown workspace").await;
+                }
+                if let Err(e) = self.ensure_client(tab).await {
+                    return self.send_error(sender, e.to_string()).await;
+                }
+                let client = self.client(tab).expect("ensured");
+                if let Some(id) = self
+                    .workspace
+                    .tab(tab)
+                    .and_then(|tab| tab.model.session_id.clone())
+                    && let Err(e) = client.usage(Some(&id)).await
+                {
+                    return self.send_error(sender, e.to_string()).await;
+                }
+                match client.switch_workspace(workspace.clone()).await {
+                    Ok((session_id, workspace)) => {
+                        let tab_state = self.workspace.tab_mut(tab).expect("known tab");
+                        tab_state.workspace = workspace.id;
+                        tab_state.model.set_session(Some(session_id));
+                        if self.workspace.active_id() == tab {
+                            self.expanded_dirs.clear();
+                            self.file_cache.clear();
+                            self.send_active_full(sender).await?;
+                            self.send_refreshed_tree(sender).await?;
+                        }
+                    }
+                    Err(e) => self.send_error(sender, e.to_string()).await?,
+                }
+            }
+            ClientMsg::BrowseWorkspace { path } => match self.admin.browse_workspace(path).await {
+                Ok((path, parent, entries)) => {
+                    send_msg(
+                        sender,
+                        &ServerMsg::WorkspaceBrowser {
+                            html: view::workspace_browser_html(&path, parent.as_deref(), &entries),
+                        },
+                    )
+                    .await?;
+                }
+                Err(e) => {
+                    self.send_error(sender, format!("could not browse directory: {e}"))
+                        .await?
+                }
+            },
+            ClientMsg::BrowseNewSession { path } => match self.admin.browse_workspace(path).await {
+                Ok((path, parent, entries)) => {
+                    send_msg(
+                        sender,
+                        &ServerMsg::WorkspacePicker {
+                            html: view::new_session_browser_html(
+                                &path,
+                                parent.as_deref(),
+                                &entries,
+                            ),
+                        },
+                    )
+                    .await?;
+                }
+                Err(e) => {
+                    self.send_error(sender, format!("could not browse directory: {e}"))
+                        .await?
+                }
+            },
+            ClientMsg::CreateTab { workspace, path } => {
+                let known = self.workspaces.iter().any(|root| root.id == workspace)
+                    || workspace.starts_with("runtime:");
+                if !known || path.trim().is_empty() {
+                    return self.send_error(sender, "invalid session workspace").await;
+                }
+                if !self.workspaces.iter().any(|root| root.id == workspace) {
+                    self.workspaces.push(WorkspaceSummary {
+                        id: workspace.clone(),
+                        path,
+                    });
+                }
+                let id = self.workspace.open_blank_in_workspace(workspace);
+                self.workspace.tab_mut(id).expect("just added").model_label =
+                    self.model_label.clone();
+                self.expanded_dirs.clear();
+                self.file_cache.clear();
+                send_msg(sender, &ServerMsg::CloseWorkspaceBrowser).await?;
+                self.send_active_full(sender).await?;
+                self.send_refreshed_tree(sender).await?;
+            }
+            ClientMsg::AddWorkspace { tab, path } => {
+                if self.workspace.tab(tab).is_none_or(|tab| tab.busy()) {
+                    return self
+                        .send_error(sender, "wait for the current turn to finish")
+                        .await;
+                }
+                if let Err(e) = self.ensure_client(tab).await {
+                    return self.send_error(sender, e.to_string()).await;
+                }
+                let client = self.client(tab).expect("ensured");
+                match client.add_workspace(path).await {
+                    Ok((session_id, workspace)) => {
+                        if !self.workspaces.iter().any(|root| root.id == workspace.id) {
+                            self.workspaces.push(workspace.clone());
+                        }
+                        let tab_state = self.workspace.tab_mut(tab).expect("known tab");
+                        tab_state.workspace = workspace.id;
+                        tab_state.model.set_session(Some(session_id));
+                        if self.workspace.active_id() == tab {
+                            self.expanded_dirs.clear();
+                            self.file_cache.clear();
+                            send_msg(sender, &ServerMsg::CloseWorkspaceBrowser).await?;
+                            self.send_active_full(sender).await?;
+                            self.send_refreshed_tree(sender).await?;
+                        }
+                    }
+                    Err(e) => {
+                        self.send_error(sender, format!("could not add directory: {e}"))
+                            .await?
+                    }
+                }
+            }
+            ClientMsg::CloseWorkspaceBrowser => {
+                send_msg(sender, &ServerMsg::CloseWorkspaceBrowser).await?;
+            }
             // Auth is consumed by the transport before the session starts.
             ClientMsg::Auth { .. } => {}
             ClientMsg::Ask { tab, prompt } => {
@@ -865,10 +1072,22 @@ impl GuiSession {
                 }
             }
             ClientMsg::OpenTab => {
-                let id = self.workspace.open_blank();
-                self.workspace.tab_mut(id).expect("just added").model_label =
-                    self.model_label.clone();
-                self.send_active_full(sender).await?;
+                let browse_path = self
+                    .working_directory
+                    .clone()
+                    .or_else(|| {
+                        self.workspaces
+                            .first()
+                            .map(|workspace| workspace.path.clone())
+                    })
+                    .unwrap_or_default();
+                send_msg(
+                    sender,
+                    &ServerMsg::WorkspacePicker {
+                        html: view::session_workspace_picker_html(&self.workspaces, &browse_path),
+                    },
+                )
+                .await?;
             }
             ClientMsg::CloseTab { tab } => {
                 self.close_tab(tab).await;
@@ -876,7 +1095,10 @@ impl GuiSession {
             }
             ClientMsg::SwitchTab { tab } => {
                 if self.workspace.switch_to_id(tab) {
+                    self.expanded_dirs.clear();
+                    self.file_cache.clear();
                     self.send_active_full(sender).await?;
+                    self.send_refreshed_tree(sender).await?;
                     self.activate_active(sender).await?;
                 }
             }
@@ -921,6 +1143,7 @@ impl GuiSession {
                 self.send_active_full(sender).await?;
             }
             ClientMsg::ToggleDir { path } => {
+                let client = self.file_client().await?;
                 if self.expanded_dirs.contains(&path) {
                     self.expanded_dirs.remove(&path);
                 } else {
@@ -928,7 +1151,7 @@ impl GuiSession {
                     if !self.file_cache.contains_key(&path) {
                         // A failed listing must not tear down the whole
                         // browser session; report it and keep the tree open.
-                        match self.admin.list_files(path.clone()).await {
+                        match client.list_files(path.clone()).await {
                             Ok(entries) => {
                                 self.file_cache.insert(path.clone(), entries);
                             }
@@ -943,8 +1166,10 @@ impl GuiSession {
                 send_msg(
                     sender,
                     &ServerMsg::FileTree {
-                        html: view::file_tree_html(
-                            self.working_directory.as_deref(),
+                        html: view::file_tree_with_workspaces_html(
+                            self.active_root_path().as_deref(),
+                            &self.workspaces,
+                            &self.workspace.active_tab().workspace,
                             &self.expanded_dirs,
                             &self.file_cache,
                         ),
@@ -956,6 +1181,7 @@ impl GuiSession {
                 self.send_refreshed_tree(sender).await?;
             }
             ClientMsg::UploadFiles { files } => {
+                let client = self.file_client().await?;
                 let mut uploaded = Vec::new();
                 let mut failures = Vec::new();
                 for file in files {
@@ -973,7 +1199,7 @@ impl GuiSession {
                             continue;
                         }
                     };
-                    match self.admin.write_file(name.clone(), &bytes).await {
+                    match client.write_file(name.clone(), &bytes).await {
                         Ok((_, bytes_written)) => {
                             uploaded.push(format!("{name} ({} kB)", bytes_written / 1024))
                         }
@@ -989,21 +1215,23 @@ impl GuiSession {
                     self.send_error(sender, failures.join("; ")).await?;
                 }
             }
-            ClientMsg::ReadFile { path } => match self.admin.read_file(path.clone()).await {
-                Ok((content, truncated)) => {
-                    send_msg(
-                        sender,
-                        &ServerMsg::FilePreview {
-                            html: view::file_preview_html(&path, &content, truncated),
-                        },
-                    )
-                    .await?
-                }
-                Err(e) => {
-                    self.send_error(sender, format!("could not preview file: {e}"))
+            ClientMsg::ReadFile { path } => {
+                match self.file_client().await?.read_file(path.clone()).await {
+                    Ok((content, truncated)) => {
+                        send_msg(
+                            sender,
+                            &ServerMsg::FilePreview {
+                                html: view::file_preview_html(&path, &content, truncated),
+                            },
+                        )
                         .await?
+                    }
+                    Err(e) => {
+                        self.send_error(sender, format!("could not preview file: {e}"))
+                            .await?
+                    }
                 }
-            },
+            }
             ClientMsg::ClosePreview => send_msg(sender, &ServerMsg::ClosePreview).await?,
         }
         Ok(())
@@ -1088,9 +1316,13 @@ impl GuiSession {
             .tab(tab_id)
             .and_then(|tab| tab.model.session_id.clone());
         let client = self.client(tab_id).expect("just ensured");
+        let workspace = self.workspace.tab(tab_id).map(|tab| tab.workspace.clone());
         let mut builder = client.ask(prompt.clone());
         if let Some(session_id) = session_id {
             builder = builder.session_id(session_id);
+        }
+        if let Some(workspace) = workspace {
+            builder = builder.workspace(workspace);
         }
 
         match builder.send().await {
@@ -1454,6 +1686,9 @@ impl GuiSession {
                 && let Some(session_id) = session_id
             {
                 self.observe(event.tab_id, session_id, false).await?;
+            }
+            if active_id == event.tab_id && !self.file_cache.contains_key("") {
+                self.send_refreshed_tree(sender).await?;
             }
         }
 
