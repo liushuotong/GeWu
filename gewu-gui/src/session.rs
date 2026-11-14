@@ -491,10 +491,50 @@ impl GuiSession {
     }
 
     async fn send_error(&self, sender: &mut Sender, message: impl Into<String>) -> Result<()> {
+        // Keyed by the text: repeats of one failure update a single box
+        // entry instead of stacking.
+        let message: String = message.into();
+        let key = format!("error:{message}");
+        self.send_alert(sender, message, Some(key)).await
+    }
+
+    /// Push a message into the browser's floating alert box; `key` marks
+    /// entries that update in place (e.g. retries of one failure) instead
+    /// of stacking.
+    async fn send_alert(
+        &self,
+        sender: &mut Sender,
+        message: impl Into<String>,
+        key: Option<String>,
+    ) -> Result<()> {
         send_msg(
             sender,
             &ServerMsg::Error {
                 message: message.into(),
+                key,
+            },
+        )
+        .await?;
+        Ok(())
+    }
+
+    /// Push a provider retry wait into the floating alert box; the browser
+    /// renders a live countdown and dismisses the entry at zero.
+    async fn send_retry_wait(
+        &self,
+        sender: &mut Sender,
+        key: String,
+        prefix: String,
+        attempt: u32,
+        delay_secs: u64,
+    ) -> Result<()> {
+        send_msg(
+            sender,
+            &ServerMsg::RetryWait {
+                key,
+                prefix,
+                attempt,
+                delay_secs,
             },
         )
         .await?;
@@ -1038,6 +1078,8 @@ impl GuiSession {
                 .expect("tab exists")
                 .model
                 .fail(format!("could not connect: {e}"));
+            self.send_error(sender, format!("could not connect: {e}"))
+                .await?;
             return self.send_after_tab_change(tab_id, sender).await;
         }
 
@@ -1169,6 +1211,17 @@ impl GuiSession {
         let mut update = TabUpdate::None;
         let mut terminal = false;
         let mut usage_updated = false;
+        // A transient status (LLM retry backoff, compaction) arrived: only
+        // the status line re-renders, not the transcript.
+        let mut status_updated = false;
+        // An error to surface in the floating alert box, collected while
+        // the tab is borrowed and sent once it is released. The optional
+        // key lets the browser update an existing entry (repeats of one
+        // failure) instead of stacking.
+        let mut alert: Option<(String, Option<String>)> = None;
+        // A provider retry wait with a live countdown (key, prefix, attempt,
+        // delay), collected like the error above.
+        let mut retry_wait: Option<(String, String, u32, u64)> = None;
         // Index of a thought block that an applied event collapsed (live
         // "Thinking…" settled to "Thought Ns"); the triggering event usually
         // appends a different block, so the settled body needs its own swap.
@@ -1276,6 +1329,11 @@ impl GuiSession {
                             collapsed = tab.model.take_collapsed();
                         }
                         Ok(AgentEvent::Error { error }) => {
+                            // The transcript block is the durable record; the
+                            // floating alert box makes the failure visible,
+                            // keyed by the text so repeats of one failure
+                            // update a single entry.
+                            alert = Some((error.clone(), Some(format!("error:{error}"))));
                             let affected = tab.model.apply_event(&AgentEvent::Error { error });
                             collapsed = tab.model.take_collapsed();
                             update = affected.map_or(TabUpdate::Full, TabUpdate::BlockAppend);
@@ -1288,6 +1346,35 @@ impl GuiSession {
                                 confirm_steered(&mut tab.model, &mut tab.pending_steers, text);
                             update = steer_update;
                             collapsed = steer_collapsed;
+                        }
+                        Ok(AgentEvent::Status { message }) => {
+                            // Transient busy-indicator text (context
+                            // compaction): the transcript is unchanged, so
+                            // only the status line is pushed. Retry waits
+                            // arrive as typed `Retrying` events instead.
+                            tab.model.apply_event(&AgentEvent::Status { message });
+                            status_updated = true;
+                        }
+                        Ok(AgentEvent::Retrying {
+                            kind,
+                            message,
+                            attempt,
+                            delay_secs,
+                        }) => {
+                            // The failure surfaces in the floating alert
+                            // box, keyed by the failure's stable kind (not
+                            // the volatile body text) so retries of one
+                            // failure update a single entry instead of
+                            // stacking. The browser counts the wait down
+                            // and dismisses the entry at zero; the bottom
+                            // bar keeps its plain busy label during the
+                            // wait.
+                            retry_wait = Some((
+                                format!("retry:{kind}"),
+                                AgentEvent::retry_prefix(&message),
+                                attempt,
+                                delay_secs,
+                            ));
                         }
                         Ok(agent_event) => {
                             // ToolStart / ToolFinish: update just the run's card.
@@ -1308,6 +1395,7 @@ impl GuiSession {
                     update = TabUpdate::Full;
                 }
                 Some(Ok(ServerMessage::Error { error, .. })) => {
+                    alert = Some((error.clone(), Some(format!("error:{error}"))));
                     tab.model.fail(error);
                     terminal = true;
                     update = TabUpdate::Full;
@@ -1319,7 +1407,9 @@ impl GuiSession {
                     update = TabUpdate::Full;
                 }
                 Some(Err(e)) => {
-                    tab.model.fail(e.to_string());
+                    let text = e.to_string();
+                    alert = Some((text.clone(), Some(format!("error:{text}"))));
+                    tab.model.fail(text);
                     terminal = true;
                     update = TabUpdate::Full;
                 }
@@ -1338,6 +1428,15 @@ impl GuiSession {
                 conn.task = None;
             }
             conn.last_stream_render = None;
+        }
+
+        // Push the collected error into the floating alert box.
+        if let Some((message, key)) = alert {
+            self.send_alert(sender, message, key).await?;
+        }
+        if let Some((key, prefix, attempt, delay_secs)) = retry_wait {
+            self.send_retry_wait(sender, key, prefix, attempt, delay_secs)
+                .await?;
         }
 
         // Correct any drift with the authoritative server-side usage before
@@ -1446,9 +1545,9 @@ impl GuiSession {
             // full transcript when the tab is focused.
             _ => {}
         }
-        // A usage event leaves `update` untouched, so it needs its own
-        // status push.
-        if usage_updated && active {
+        // Usage and status events leave `update` untouched, so they need
+        // their own status push.
+        if (usage_updated || status_updated) && active {
             self.send_status(sender).await?;
         }
         Ok(())

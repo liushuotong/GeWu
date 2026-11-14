@@ -164,13 +164,51 @@ pub trait ToolRegistry: Send + Sync {
 /// can take `&self` and one handle can be shared across agents.
 pub type RequestLog = Arc<Mutex<Box<dyn Write + Send + Sync>>>;
 
-/// Callback for transient provider status updates (e.g. retry backoff).
+/// A provider-side retry wait: one request attempt failed and the request
+/// will restart after `delay`.
 ///
-/// Providers invoke it with a human-readable message whenever a request
-/// attempt fails and will be retried; the agent layer forwards these to
-/// frontends as [`crate::types::AgentEvent::Status`] so a backoff wait is
-/// visible instead of looking like a silent hang.
-pub type StatusSink = std::sync::Arc<dyn Fn(String) + Send + Sync>;
+/// Providers report these through [`StatusSink`]; the agent layer forwards
+/// them to frontends as [`crate::types::AgentEvent::Retrying`] so a backoff
+/// wait is visible instead of looking like a silent hang. Frontends collapse
+/// retries of one [`kind`](RetryKind) into a single updating surface.
+#[derive(Debug, Clone)]
+pub struct RetryNotice {
+    /// The stable failure identity, separate from [`Self::message`]: gateways
+    /// embed per-request details in error bodies, so identity must not be
+    /// derived from the text.
+    pub kind: crate::types::RetryKind,
+    /// The full human-readable failure description (the provider error's
+    /// Display form).
+    pub message: String,
+    /// 1-based count of the attempt that just failed.
+    pub attempt: u32,
+    /// How long the retry layer waits before restarting.
+    pub delay: std::time::Duration,
+}
+
+/// Extracts the stable retry identity from a provider error.
+///
+/// Implemented by the provider error enums; the defaulted method keeps the
+/// generic retry loops usable with any error type.
+pub trait RetryClassify {
+    fn retry_kind(&self) -> crate::types::RetryKind {
+        crate::types::RetryKind::Other
+    }
+}
+
+impl RetryClassify for String {}
+
+// The generic retry loops are also exercised with boxed and plain-string
+// test errors; both classify as [`crate::types::RetryKind::Other`].
+impl<T: RetryClassify + ?Sized> RetryClassify for Box<T> {}
+impl RetryClassify for dyn std::error::Error + Send + Sync {}
+
+/// Callback for transient provider status updates (retry backoff).
+///
+/// Providers invoke it whenever a request attempt fails and will be retried;
+/// the agent layer forwards these to frontends as
+/// [`crate::types::AgentEvent::Retrying`].
+pub type StatusSink = std::sync::Arc<dyn Fn(RetryNotice) + Send + Sync>;
 
 /// Timing summary of one finished LLM response, for the wire log.
 struct ResponseTiming {

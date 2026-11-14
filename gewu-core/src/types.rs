@@ -16,12 +16,12 @@
 
 use crate::traits::SessionStateStore;
 use serde::de::DeserializeOwned;
+use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use std::path::PathBuf;
 use std::sync::Arc;
 
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
-use serde::{Deserialize, Serialize};
 
 /// Represents a function call within a tool call.
 ///
@@ -248,11 +248,28 @@ pub enum AgentEvent {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         provider: Option<TokenUsage>,
     },
-    /// A transient status message for frontends (e.g. LLM retry backoff).
+    /// A transient status message for frontends (e.g. context compaction).
     ///
     /// Not part of the transcript: frontends render it in their busy
     /// indicator and replace or clear it with the next event.
     Status { message: String },
+    /// A provider-side retry wait: the attempt failed and the request
+    /// restarts after `delay_secs`.
+    ///
+    /// Transient like [`AgentEvent::Status`]. The failure's stable identity
+    /// ([`RetryKind`]) is separated from the human-readable `message`, so
+    /// frontends collapse retries of one failure into a single updating
+    /// surface even when error bodies differ per attempt.
+    Retrying {
+        /// The stable failure identity (e.g. the HTTP status).
+        kind: RetryKind,
+        /// The full human-readable failure description.
+        message: String,
+        /// 1-based count of the attempt that just failed.
+        attempt: u32,
+        /// Whole seconds the retry layer waits before restarting.
+        delay_secs: u64,
+    },
     /// A live status update from a running tool (e.g. what a subagent is
     /// doing mid-`task`).
     ///
@@ -275,6 +292,95 @@ pub enum AgentEvent {
     },
     /// An error occurred during agent execution.
     Error { error: String },
+}
+
+impl AgentEvent {
+    /// The static prefix of the retry line — the failure description and the
+    /// "retrying in" label. Browser frontends append the live countdown tail
+    /// (`"{n}s (attempt {m})"`) so the wording has one source.
+    pub fn retry_prefix(message: &str) -> String {
+        format!("LLM request failed: {message}; retrying in")
+    }
+
+    /// The human-readable line for an [`AgentEvent::Retrying`] notification,
+    /// shared by every frontend so the wording has one source.
+    pub fn retry_message(message: &str, attempt: u32, delay_secs: u64) -> String {
+        format!(
+            "{} {}s (attempt {attempt})",
+            Self::retry_prefix(message),
+            delay_secs
+        )
+    }
+}
+
+/// The stable identity of a provider-side retry, separate from the volatile
+/// human-readable message: gateways embed per-request details in error
+/// bodies, so identity must not be derived from the text.
+///
+/// Serializes as a flat string tag (`"status-502"`, `"rate-limit"`, …) so
+/// browser frontends key on a plain value.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RetryKind {
+    /// An HTTP status returned by the server (5xx, or a 408 timeout).
+    Status(u16),
+    /// The provider rejected the request as a rate limit (429).
+    RateLimit,
+    /// A failure inside the streamed response (an in-flight error event or
+    /// a dropped connection mid-stream).
+    Stream,
+    /// A transport-level failure (connect errors, read timeouts).
+    Transport,
+    /// The streamed body could not be parsed.
+    Parse,
+    /// An unclassifiable failure; no stable identity finer than this exists.
+    Other,
+}
+
+impl RetryKind {
+    fn tag(&self) -> String {
+        match self {
+            RetryKind::Status(status) => format!("status-{status}"),
+            RetryKind::RateLimit => "rate-limit".to_string(),
+            RetryKind::Stream => "stream".to_string(),
+            RetryKind::Transport => "transport".to_string(),
+            RetryKind::Parse => "parse".to_string(),
+            RetryKind::Other => "other".to_string(),
+        }
+    }
+
+    fn from_tag(tag: &str) -> Option<Self> {
+        match tag {
+            "rate-limit" => return Some(RetryKind::RateLimit),
+            "stream" => return Some(RetryKind::Stream),
+            "transport" => return Some(RetryKind::Transport),
+            "parse" => return Some(RetryKind::Parse),
+            "other" => return Some(RetryKind::Other),
+            _ => {}
+        }
+        tag.strip_prefix("status-")
+            .and_then(|code| code.parse().ok())
+            .map(RetryKind::Status)
+    }
+}
+
+impl std::fmt::Display for RetryKind {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.tag())
+    }
+}
+
+impl Serialize for RetryKind {
+    fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        serializer.serialize_str(&self.tag())
+    }
+}
+
+impl<'de> Deserialize<'de> for RetryKind {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        let tag = String::deserialize(deserializer)?;
+        Self::from_tag(&tag)
+            .ok_or_else(|| serde::de::Error::custom(format!("unknown retry kind '{tag}'")))
+    }
 }
 
 /// A message in the conversation history.

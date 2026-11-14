@@ -141,9 +141,12 @@ impl SessionModel {
     pub fn apply_event(&mut self, event: &AgentEvent) -> Option<usize> {
         self.collapsed = None;
         // A status message is transient UI state, not transcript content:
-        // any other event supersedes it. Status does not end an open
-        // thought — it can arrive mid-setup, before reasoning starts.
-        if !matches!(event, AgentEvent::Status { .. }) {
+        // any other event supersedes it. Status/Retrying do not end an open
+        // thought — they can arrive mid-setup, before reasoning starts.
+        if !matches!(
+            event,
+            AgentEvent::Status { .. } | AgentEvent::Retrying { .. }
+        ) {
             self.status = None;
         }
         match event {
@@ -156,6 +159,17 @@ impl SessionModel {
             }
             AgentEvent::Status { message } => {
                 self.status = Some(message.clone());
+                None
+            }
+            AgentEvent::Retrying {
+                message,
+                attempt,
+                delay_secs,
+                ..
+            } => {
+                // The busy indicator carries the retry display; frontends
+                // that surface retries elsewhere ignore the transient text.
+                self.status = Some(AgentEvent::retry_message(message, *attempt, *delay_secs));
                 None
             }
             AgentEvent::ReasoningDelta { delta } => self.extend_thought(delta),
