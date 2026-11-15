@@ -636,8 +636,7 @@ impl GuiSession {
         if self
             .workspace
             .tab(self.workspace.active_id())
-            .and_then(|tab| tab.model.session_id.as_ref())
-            .is_none()
+            .is_some_and(|tab| tab.model.session_id.is_none() && tab.workspace == "cwd")
         {
             self.file_cache.clear();
             return Ok(());
@@ -658,17 +657,8 @@ impl GuiSession {
     /// selected workspace, rather than the server default, is applied.
     async fn file_client(&mut self) -> Result<Client> {
         let tab_id = self.workspace.active_id();
-        let session_id = self
-            .workspace
-            .tab(tab_id)
-            .and_then(|tab| tab.model.session_id.clone());
-        let Some(session_id) = session_id else {
-            return Ok(self.admin.clone());
-        };
-        self.ensure_client(tab_id).await?;
-        let client = self.client(tab_id).expect("just ensured");
-        client.usage(Some(&session_id)).await?;
-        Ok(client)
+        self.ensure_session(tab_id).await?;
+        Ok(self.client(tab_id).expect("just ensured"))
     }
 
     fn note_active(&mut self, message: impl Into<String>) {
@@ -702,6 +692,35 @@ impl GuiSession {
             .get(&tab_id)
             .and_then(|conn| conn.client.as_ref())
             .cloned()
+    }
+
+    async fn ensure_session(&mut self, tab_id: u64) -> Result<(), ClientError> {
+        let tab = self
+            .workspace
+            .tab(tab_id)
+            .ok_or_else(|| ClientError::Protocol(format!("unknown tab {tab_id}")))?;
+        let session_id = tab.model.session_id.clone();
+        let workspace = tab.workspace.clone();
+        self.ensure_client(tab_id).await?;
+        let client = self.client(tab_id).expect("just ensured");
+        if let Some(session_id) = session_id {
+            client.usage(Some(&session_id)).await?;
+        } else {
+            let (session_id, workspace) = client.switch_workspace(workspace).await?;
+            if let Some(root) = self
+                .workspaces
+                .iter_mut()
+                .find(|root| root.id == workspace.id)
+            {
+                *root = workspace.clone();
+            } else {
+                self.workspaces.push(workspace.clone());
+            }
+            let tab = self.workspace.tab_mut(tab_id).expect("known tab");
+            tab.model.set_session(Some(session_id));
+            tab.workspace = workspace.id;
+        }
+        Ok(())
     }
 
     async fn observe(&mut self, tab_id: u64, session_id: String, restore: bool) -> Result<()> {
@@ -846,13 +865,10 @@ impl GuiSession {
                 if session_id.is_none() {
                     return self.send_error(sender, "no conversation to revert").await;
                 }
-                if let Err(e) = self.ensure_client(tab).await {
+                if let Err(e) = self.ensure_session(tab).await {
                     return self.send_error(sender, e.to_string()).await;
                 }
                 let client = self.client(tab).expect("ensured");
-                if let Err(e) = client.usage(session_id.as_deref()).await {
-                    return self.send_error(sender, e.to_string()).await;
-                }
                 match client.revert_chat(turn, undo).await {
                     Ok((id, messages)) => {
                         let tab_state = self.workspace.tab_mut(tab).expect("known");
@@ -881,19 +897,10 @@ impl GuiSession {
                         .send_error(sender, "wait for the current turn to finish")
                         .await;
                 }
-                if let Err(e) = self.ensure_client(tab).await {
+                if let Err(e) = self.ensure_session(tab).await {
                     return self.send_error(sender, e.to_string()).await;
                 }
                 let client = self.client(tab).expect("ensured");
-                // Bind resumed tabs before switching so their conversation is retained.
-                if let Some(id) = self
-                    .workspace
-                    .tab(tab)
-                    .and_then(|tab| tab.model.session_id.clone())
-                    && let Err(e) = client.usage(Some(&id)).await
-                {
-                    return self.send_error(sender, e.to_string()).await;
-                }
                 match client.switch_agent(agent.clone()).await {
                     Ok((id, tools)) => {
                         let tab_state = self.workspace.tab_mut(tab).expect("known tab");
@@ -920,19 +927,10 @@ impl GuiSession {
                         .send_error(sender, "wait for the current turn to finish")
                         .await;
                 }
-                if let Err(e) = self.ensure_client(tab).await {
+                if let Err(e) = self.ensure_session(tab).await {
                     return self.send_error(sender, e.to_string()).await;
                 }
                 let client = self.client(tab).expect("ensured");
-                // Bind resumed tabs before switching so their conversation is retained.
-                if let Some(id) = self
-                    .workspace
-                    .tab(tab)
-                    .and_then(|tab| tab.model.session_id.clone())
-                    && let Err(e) = client.usage(Some(&id)).await
-                {
-                    return self.send_error(sender, e.to_string()).await;
-                }
                 match client.switch_model(model.clone()).await {
                     Ok((id, label, reasoning_effort)) => {
                         let tab_state = self.workspace.tab_mut(tab).expect("known tab");
@@ -953,18 +951,10 @@ impl GuiSession {
                         .send_error(sender, "wait for the current turn to finish")
                         .await;
                 }
-                if let Err(e) = self.ensure_client(tab).await {
+                if let Err(e) = self.ensure_session(tab).await {
                     return self.send_error(sender, e.to_string()).await;
                 }
                 let client = self.client(tab).expect("ensured");
-                if let Some(id) = self
-                    .workspace
-                    .tab(tab)
-                    .and_then(|tab| tab.model.session_id.clone())
-                    && let Err(e) = client.usage(Some(&id)).await
-                {
-                    return self.send_error(sender, e.to_string()).await;
-                }
                 match client.switch_reasoning_effort(effort.as_deref()).await {
                     Ok((id, effort)) => {
                         let tab_state = self.workspace.tab_mut(tab).expect("known tab");
@@ -986,18 +976,10 @@ impl GuiSession {
                 if !self.workspaces.iter().any(|root| root.id == workspace) {
                     return self.send_error(sender, "unknown workspace").await;
                 }
-                if let Err(e) = self.ensure_client(tab).await {
+                if let Err(e) = self.ensure_session(tab).await {
                     return self.send_error(sender, e.to_string()).await;
                 }
                 let client = self.client(tab).expect("ensured");
-                if let Some(id) = self
-                    .workspace
-                    .tab(tab)
-                    .and_then(|tab| tab.model.session_id.clone())
-                    && let Err(e) = client.usage(Some(&id)).await
-                {
-                    return self.send_error(sender, e.to_string()).await;
-                }
                 match client.switch_workspace(workspace.clone()).await {
                     Ok((session_id, workspace)) => {
                         self.closed_workspaces.remove(&workspace.id);
@@ -1076,7 +1058,7 @@ impl GuiSession {
                         .send_error(sender, "wait for the current turn to finish")
                         .await;
                 }
-                if let Err(e) = self.ensure_client(tab).await {
+                if let Err(e) = self.ensure_session(tab).await {
                     return self.send_error(sender, e.to_string()).await;
                 }
                 let client = self.client(tab).expect("ensured");
@@ -1392,7 +1374,7 @@ impl GuiSession {
             };
         }
 
-        if let Err(e) = self.ensure_client(tab_id).await {
+        if let Err(e) = self.ensure_session(tab_id).await {
             self.workspace
                 .tab_mut(tab_id)
                 .expect("tab exists")

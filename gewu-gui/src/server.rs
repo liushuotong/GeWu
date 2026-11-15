@@ -295,7 +295,7 @@ mod tests {
                 let Ok((stream, _)) = listener.accept().await else {
                     break;
                 };
-                tokio::spawn(handle_fake_connection(stream, tx.clone()));
+                tokio::spawn(handle_fake_connection(stream, tx.clone(), None, false));
             }
         });
         (addr, rx)
@@ -304,9 +304,16 @@ mod tests {
     async fn handle_fake_connection(
         stream: tokio::net::TcpStream,
         ops: tokio::sync::mpsc::UnboundedSender<String>,
+        records: Option<tokio::sync::mpsc::UnboundedSender<Value>>,
+        saved: bool,
     ) {
         let (reader, mut writer) = stream.into_split();
         let mut lines = BufReader::new(reader).lines();
+        let mut bound = false;
+        let mut workspace = "cwd".to_string();
+        let mut agent = "build".to_string();
+        let mut model = "fake/one".to_string();
+        let mut effort = Value::Null;
         while let Ok(Some(line)) = lines.next_line().await {
             let Ok(request) = serde_json::from_str::<Value>(&line) else {
                 continue;
@@ -314,6 +321,35 @@ mod tests {
             let id = request.get("id").cloned().unwrap_or(Value::Null);
             let op = request.get("op").and_then(Value::as_str).unwrap_or("");
             let _ = ops.send(op.to_string());
+            if !bound && request["session_id"].is_string() {
+                bound = true;
+                if saved {
+                    workspace = "tfseq".into();
+                }
+            }
+            match op {
+                "switch_workspace" => {
+                    bound = true;
+                    workspace = request["workspace"].as_str().unwrap().into();
+                }
+                "switch_agent" => {
+                    bound = true;
+                    agent = request["target_agent"].as_str().unwrap().into();
+                }
+                "switch_model" => {
+                    bound = true;
+                    model = request["model"].as_str().unwrap().into();
+                }
+                "switch_reasoning_effort" => {
+                    bound = true;
+                    effort = request["effort"].clone();
+                }
+                "ask" => bound = true,
+                _ => {}
+            }
+            if let Some(records) = &records {
+                let _ = records.send(json!({"request":request,"bound":bound,"workspace":workspace,"agent":agent,"model":model,"effort":effort}));
+            }
             let replies: Vec<Value> = match op {
                 "subscribe_session" => vec![
                     json!({"type":"ready", "id":id, "request_id":"", "session_id":"sess-1", "agent":"build"}),
@@ -327,6 +363,8 @@ mod tests {
                 "info" => vec![json!({
                     "type": "info", "id": id, "model": "fake-model", "provider": "fake",
                     "working_directory": "/tmp/fake-project",
+                    "workspaces": [{"id":"cwd","path":"/tmp/fake-project"},{"id":"tfseq","path":"/canonical/TFSeq"}],
+                    "active_workspace": if saved && request["session_id"].is_string() { "tfseq" } else { &workspace },
                 })],
                 "list_models" => vec![json!({
                     "type": "models", "id": id,
@@ -340,21 +378,34 @@ mod tests {
                     "model": request.get("model").and_then(Value::as_str).unwrap_or(""),
                     "label": "fake-other",
                 })],
+                "switch_workspace" => vec![json!({
+                    "type": "workspace_switched", "id": id, "session_id": "sess-1",
+                    "workspace": {"id": request["workspace"], "path": if workspace == "cwd" { "/tmp/fake-project" } else { "/canonical/TFSeq" }},
+                })],
+                "switch_agent" => vec![json!({
+                    "type":"agent_switched", "id":id, "session_id":"sess-1", "agent":agent, "tools":[],
+                })],
                 "switch_reasoning_effort" => vec![json!({
                     "type": "reasoning_effort_switched", "id": id, "session_id": "sess-1",
                     "effort": request.get("effort").cloned().unwrap_or(Value::Null),
                 })],
                 "list_sessions" => vec![json!({
-                    "type": "sessions", "id": id, "sessions": [],
+                    "type": "sessions", "id": id, "sessions": if saved { vec![json!({"session_id":"sess-1","agent":"build","message_count":0,"updated_at":"2026-01-01"})] } else { vec![] },
                 })],
+                "get_session" => {
+                    vec![json!({"type":"session","id":id,"session_id":"sess-1","messages":[]})]
+                }
                 "list_tools" => vec![json!({
                     "type": "tools", "id": id, "tools": ["read", "grep"],
                 })],
                 "list_files" => vec![json!({
                     "type": "files", "id": id,
                     "path": request.get("path").and_then(Value::as_str).unwrap_or(""),
-                    "entries": [],
+                    "entries": if records.is_some() { vec![json!({"name":format!("{workspace}.txt"),"is_dir":false,"size":1})] } else { vec![] },
                 })],
+                "read_file" => vec![
+                    json!({"type":"file_content","id":id,"path":request["path"],"content":workspace,"truncated":false}),
+                ],
                 "write_file" => vec![json!({
                     "type": "file_written", "id": id,
                     "path": request.get("path").and_then(Value::as_str).unwrap_or(""),
@@ -507,6 +558,116 @@ mod tests {
                 return serde_json::from_str(&text).unwrap();
             }
         }
+    }
+
+    async fn check_workspace_before_first_ask(config: Option<Value>, saved: bool) {
+        tokio::time::timeout(Duration::from_secs(5), async {
+            let (records, mut requests) = tokio::sync::mpsc::unbounded_channel();
+            let (ops, _rx) = tokio::sync::mpsc::unbounded_channel();
+            let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let upstream = listener.local_addr().unwrap();
+            tokio::spawn(async move {
+                while let Ok((stream, _)) = listener.accept().await {
+                    tokio::spawn(handle_fake_connection(stream, ops.clone(), Some(records.clone()), saved));
+                }
+            });
+            let addr = spawn_gui(AppState {
+                endpoint: Endpoint::Tcp { host: "127.0.0.1".into(), port: upstream.port() },
+                token: None,
+                server_token: None,
+            }).await;
+            let (mut ws, _) = tokio_tungstenite::connect_async(format!("ws://{addr}/ws")).await.unwrap();
+            let snapshot = next_json(&mut ws).await;
+            assert_eq!(snapshot["type"], "snapshot");
+            let mut tab = snapshot["active"].as_u64().unwrap();
+            if !saved {
+                assert!(snapshot["tabs"][0]["session_id"].is_null());
+                ws.send(WsMessage::text(json!({"op":"create_tab","workspace":"tfseq","path":"/alias/TFSeq"}).to_string())).await.unwrap();
+                loop {
+                    let value = next_json(&mut ws).await;
+                    assert_ne!(value["type"], "error", "{value}");
+                    if value["type"] == "tabs" {
+                        tab = value["active"].as_u64().unwrap();
+                    }
+                    if value["type"] == "file_tree" {
+                        assert!(value["html"].as_str().unwrap().contains("tfseq.txt"), "{value}");
+                        assert!(value["html"].as_str().unwrap().contains("/canonical/TFSeq"));
+                        assert!(!value["html"].as_str().unwrap().contains("cwd.txt"));
+                        break;
+                    }
+                }
+            }
+            if let Some(mut config) = config.clone() {
+                config["tab"] = json!(tab);
+                ws.send(WsMessage::text(config.to_string())).await.unwrap();
+            }
+            for message in [json!({"op":"read_file","path":"tfseq.txt"}), json!({"op":"upload_files","files":[{"name":"upload.txt","content_base64":"eA=="}]}), json!({"op":"ask","tab":tab,"prompt":"pwd"})] {
+                ws.send(WsMessage::text(message.to_string())).await.unwrap();
+            }
+            let mut seen = Vec::new();
+            loop {
+                let record = requests.recv().await.unwrap();
+                let op = record["request"]["op"].as_str().unwrap();
+                if matches!(op, "switch_agent" | "switch_model" | "switch_reasoning_effort" | "read_file" | "write_file" | "ask") || (op == "list_files" && record["bound"] == true) {
+                    assert_eq!(record["workspace"], "tfseq", "{record}");
+                    assert_eq!(record["bound"], true, "{record}");
+                }
+                let done = op == "ask";
+                seen.push(record);
+                if done { break; }
+            }
+            let ask = seen.last().unwrap();
+            if let Some(config) = config {
+                let op = config["op"].as_str().unwrap();
+                assert!(seen.iter().any(|r| r["request"]["op"] == op));
+                for field in ["agent", "model", "effort"] {
+                    if !config[field].is_null() { assert_eq!(ask[field], config[field]); }
+                }
+            }
+            assert!(seen.iter().any(|r| r["request"]["op"] == "read_file"));
+            assert!(seen.iter().any(|r| r["request"]["op"] == "write_file"));
+            assert_eq!(seen.iter().filter(|r| r["request"]["op"] == "switch_workspace").count(), usize::from(!saved));
+            assert_eq!(ask["request"]["session_id"], "sess-1");
+            ws.close(None).await.unwrap();
+        }).await.expect("workspace initialization must complete");
+    }
+
+    #[tokio::test]
+    async fn nondefault_workspace_mode_before_first_ask() {
+        check_workspace_before_first_ask(Some(json!({"op":"switch_agent","agent":"plan"})), false)
+            .await;
+    }
+
+    #[tokio::test]
+    async fn nondefault_workspace_model_before_first_ask() {
+        check_workspace_before_first_ask(
+            Some(json!({"op":"switch_model","model":"fake/two"})),
+            false,
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn nondefault_workspace_effort_before_first_ask() {
+        check_workspace_before_first_ask(
+            Some(json!({"op":"switch_reasoning_effort","effort":"max"})),
+            false,
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn nondefault_workspace_files_before_first_ask() {
+        check_workspace_before_first_ask(None, false).await;
+    }
+
+    #[tokio::test]
+    async fn saved_workspace_is_bound_without_switching() {
+        check_workspace_before_first_ask(
+            Some(json!({"op":"switch_model","model":"fake/two"})),
+            true,
+        )
+        .await;
     }
 
     #[test]
