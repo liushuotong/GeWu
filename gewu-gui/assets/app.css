@@ -114,6 +114,7 @@ body {
   grid-template-rows: auto 1fr;
   height: 100dvh;
   min-height: 0;
+  overflow-x: clip;
 }
 
 .banner {
@@ -1841,17 +1842,20 @@ body {
   height: 100%;
   overflow: hidden;
   padding: 16px 14px;
+  transition: transform 0.2s var(--ease);
 }
 
 .app.sidebar-collapsed .sidebar {
   visibility: hidden;
   pointer-events: none;
   opacity: 0;
-  transform: translateX(10px);
   transition:
     opacity 0.2s var(--ease),
-    transform 0.2s var(--ease),
     visibility 0s linear 260ms;
+}
+
+.app.sidebar-collapsed .sidebar-inner {
+  transform: translateX(10px);
 }
 
 .session-sidebar-host {
