@@ -73,13 +73,16 @@ fn lookup<'a>(entries: &'a [(String, String)], key: &str) -> Option<&'a str> {
 /// Scans directories for `SKILL.md` files and parses their frontmatter.
 ///
 /// The `name` frontmatter key is required; files without it are skipped.
-/// Duplicate names warn and the later discovery wins.
+/// Directories are processed in the given order and entries within each
+/// directory are sorted, so duplicate names deterministically let the
+/// later path win.
 pub fn discover(directories: &[PathBuf]) -> Vec<SkillInfo> {
     let mut skills: Vec<SkillInfo> = Vec::new();
     for directory in directories {
         for entry in ignore::WalkBuilder::new(directory)
             .hidden(false)
             .follow_links(false)
+            .sort_by_file_path(|a, b| a.cmp(b))
             .build()
         {
             let Ok(entry) = entry else { continue };
@@ -166,6 +169,7 @@ fn list_skill_files(dir: &Path) -> Vec<PathBuf> {
     for entry in ignore::WalkBuilder::new(dir)
         .hidden(false)
         .follow_links(false)
+        .sort_by_file_path(|a, b| a.cmp(b))
         .build()
     {
         if files.len() >= SKILL_FILE_LIMIT {
@@ -416,6 +420,19 @@ mod tests {
         let root = dir.path().to_path_buf();
         write_skill(&root, "first", "name: dup\ndescription: first", "one");
         write_skill(&root, "second", "name: dup\ndescription: second", "two");
+
+        let skills = discover(&[root]);
+        assert_eq!(skills.len(), 1);
+        assert_eq!(skills[0].description.as_deref(), Some("second"));
+        assert!(skills[0].location.ends_with("second/SKILL.md"));
+    }
+
+    #[test]
+    fn discover_duplicate_names_does_not_depend_on_creation_order() {
+        let dir = tempdir().unwrap();
+        let root = dir.path().to_path_buf();
+        write_skill(&root, "second", "name: dup\ndescription: second", "two");
+        write_skill(&root, "first", "name: dup\ndescription: first", "one");
 
         let skills = discover(&[root]);
         assert_eq!(skills.len(), 1);
