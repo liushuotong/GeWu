@@ -14,7 +14,7 @@ use gewu_client::Client;
 /// ```
 #[derive(Parser, Debug, Clone)]
 #[command(name = "gewu-gui")]
-#[command(version = "0.1.0")]
+#[command(version)]
 #[command(about = "Web GUI for a running gewu server (start it with `gewu-server serve`)", long_about = None)]
 pub struct Cli {
     /// Host the GUI listens on. Use 0.0.0.0 to allow remote browsers.

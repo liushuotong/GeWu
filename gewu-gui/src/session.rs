@@ -1987,6 +1987,7 @@ mod tests {
             tool: tool.into(),
             input: String::new(),
             output: output.map(str::to_string),
+            images: Vec::new(),
             status: None,
         }
     }

@@ -9,9 +9,9 @@ use gewu_tools::workflow::{
     WorkflowCancelTool, WorkflowManager, WorkflowStartTool, WorkflowStatusTool, WorkflowWaitTool,
 };
 use gewu_tools::{
-    ApplyPatchTool, BashTool, CodeSearchTool, EditFileTool, GlobTool, GrepTool, ListTool,
-    ReadFileTool, SkillInfo, SkillTool, TaskTool, TodoReadTool, TodoWriteTool, WebFetchTool,
-    WebSearchTool, WriteFileTool,
+    ApplyPatchTool, BashTool, CodeSearchTool, EditFileTool, GlobTool, GrepTool, ImageLimits,
+    ListTool, ReadFileTool, SkillInfo, SkillTool, TaskTool, TodoReadTool, TodoWriteTool,
+    WebFetchTool, WebSearchTool, WriteFileTool,
 };
 use serde_json::Value;
 use sqlx::SqlitePool;
@@ -43,7 +43,7 @@ pub struct AgentConfig {
 /// Everything the profile builders need to assemble one agent.
 ///
 /// Grouped to keep the constructor signatures manageable; consumed by
-/// [`create_agent`], [`agent_profile`], and [`build_tool_registry_and_list`].
+/// [`create_agent`], [`agent_profile`], and `build_tool_registry_and_list`.
 pub struct ProfileInputs<'a> {
     pub model_catalog: Option<ModelCatalog>,
     pub name: &'a str,
@@ -53,6 +53,8 @@ pub struct ProfileInputs<'a> {
     pub additional_tools: Vec<Arc<dyn Tool>>,
     pub skills: Vec<SkillInfo>,
     pub enforcement: PathEnforcement,
+    /// Image limits applied by `read_file` before media reaches the model.
+    pub image_limits: ImageLimits,
     pub context_limit: Option<usize>,
     /// User-defined agents (from the config file) resolvable as subagent
     /// profiles alongside the built-ins.
@@ -137,6 +139,7 @@ struct SqliteAgentFactory {
     skills: Vec<SkillInfo>,
     working_directory: std::path::PathBuf,
     enforcement: PathEnforcement,
+    image_limits: ImageLimits,
     /// Model context window forwarded to subagent agents for compaction.
     context_limit: Option<usize>,
     /// User-defined agents resolvable as subagent profiles.
@@ -360,6 +363,7 @@ impl SqliteAgentFactory {
             additional_tools: Vec::new(),
             skills: self.skills.clone(),
             enforcement: self.enforcement,
+            image_limits: self.image_limits,
             context_limit: self.context_limit,
             agents: self.agents.clone(),
             session_id: "",
@@ -393,6 +397,7 @@ fn agent_factory(
     skills: Vec<SkillInfo>,
     working_directory: std::path::PathBuf,
     enforcement: PathEnforcement,
+    image_limits: ImageLimits,
     context_limit: Option<usize>,
     agents: Arc<BTreeMap<String, AgentEntry>>,
 ) -> Arc<SqliteAgentFactory> {
@@ -403,6 +408,7 @@ fn agent_factory(
         skills,
         working_directory,
         enforcement,
+        image_limits,
         context_limit,
         agents: agents.clone(),
         templates: Mutex::new(HashMap::new()),
@@ -448,6 +454,7 @@ fn build_tool_registry_and_list(inputs: &ProfileInputs) -> Result<RegistryBundle
         additional_tools,
         skills,
         enforcement,
+        image_limits,
         context_limit,
         agents,
         ..
@@ -461,6 +468,7 @@ fn build_tool_registry_and_list(inputs: &ProfileInputs) -> Result<RegistryBundle
                 skills.clone(),
                 working_directory.clone(),
                 *enforcement,
+                *image_limits,
                 *context_limit,
                 agents.clone(),
             );
@@ -473,6 +481,7 @@ fn build_tool_registry_and_list(inputs: &ProfileInputs) -> Result<RegistryBundle
                 Box::new(WorkflowCancelTool::new(workflows)),
                 Box::new(ReadFileTool {
                     working_directory: working_directory.clone(),
+                    image_limits: *image_limits,
                 }),
                 Box::new(ApplyPatchTool {
                     working_directory: working_directory.clone(),
@@ -513,6 +522,7 @@ fn build_tool_registry_and_list(inputs: &ProfileInputs) -> Result<RegistryBundle
                         skills.clone(),
                         working_directory.clone(),
                         *enforcement,
+                        *image_limits,
                         *context_limit,
                         agents.clone(),
                     ),
@@ -521,6 +531,7 @@ fn build_tool_registry_and_list(inputs: &ProfileInputs) -> Result<RegistryBundle
                 )),
                 Box::new(ReadFileTool {
                     working_directory: working_directory.clone(),
+                    image_limits: *image_limits,
                 }),
                 Box::new(GlobTool {
                     working_directory: working_directory.clone(),
@@ -545,6 +556,7 @@ fn build_tool_registry_and_list(inputs: &ProfileInputs) -> Result<RegistryBundle
             vec![
                 Box::new(ReadFileTool {
                     working_directory: working_directory.clone(),
+                    image_limits: *image_limits,
                 }),
                 Box::new(GlobTool {
                     working_directory: working_directory.clone(),
@@ -572,6 +584,7 @@ fn build_tool_registry_and_list(inputs: &ProfileInputs) -> Result<RegistryBundle
                 skills.clone(),
                 working_directory.clone(),
                 *enforcement,
+                *image_limits,
                 *context_limit,
                 agents.clone(),
             );
@@ -584,6 +597,7 @@ fn build_tool_registry_and_list(inputs: &ProfileInputs) -> Result<RegistryBundle
                 Box::new(WorkflowCancelTool::new(workflows)),
                 Box::new(ReadFileTool {
                     working_directory: working_directory.clone(),
+                    image_limits: *image_limits,
                 }),
                 Box::new(ApplyPatchTool {
                     working_directory: working_directory.clone(),
@@ -683,6 +697,7 @@ fn build_custom_agent_tools(
         additional_tools: Vec::new(),
         skills: inputs.skills.clone(),
         enforcement: inputs.enforcement,
+        image_limits: inputs.image_limits,
         context_limit: inputs.context_limit,
         agents: inputs.agents.clone(),
         session_id: inputs.session_id,
@@ -728,6 +743,7 @@ pub async fn create_agent(
         additional_tools,
         skills,
         enforcement,
+        image_limits,
         context_limit,
         agents,
         session_id,
@@ -745,6 +761,7 @@ pub async fn create_agent(
         additional_tools,
         skills,
         enforcement,
+        image_limits,
         context_limit,
         agents,
         session_id,
@@ -805,6 +822,7 @@ pub fn agent_profile(inputs: ProfileInputs) -> Result<ProfileBundle> {
         additional_tools,
         skills,
         enforcement,
+        image_limits,
         context_limit,
         agents,
         session_id,
@@ -818,6 +836,7 @@ pub fn agent_profile(inputs: ProfileInputs) -> Result<ProfileBundle> {
         additional_tools,
         skills: skills.clone(),
         enforcement,
+        image_limits,
         context_limit,
         agents: agents.clone(),
         session_id,
@@ -909,6 +928,7 @@ mod tests {
             skills: vec![],
             working_directory: std::env::current_dir().unwrap(),
             enforcement: PathEnforcement::None,
+            image_limits: ImageLimits::default(),
             context_limit: Some(10_000),
             agents: Arc::new(BTreeMap::new()),
             templates: Mutex::new(HashMap::new()),
@@ -955,6 +975,7 @@ mod tests {
             additional_tools,
             skills,
             enforcement: PathEnforcement::Contain,
+            image_limits: ImageLimits::default(),
             context_limit: None,
             agents: Arc::new(BTreeMap::new()),
             session_id,
@@ -1128,6 +1149,55 @@ mod tests {
         assert!(
             dir.path().join("plan_probe").exists(),
             "plan bash should execute commands outside the safe-mode allow-list"
+        );
+    }
+
+    #[tokio::test]
+    async fn profile_image_limits_reach_the_read_tool() {
+        use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64};
+
+        let pool = sqlx::sqlite::SqlitePoolOptions::new()
+            .connect("sqlite::memory:")
+            .await
+            .unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let photo = dir.path().join("photo.png");
+        image::RgbaImage::from_pixel(1200, 200, image::Rgba([9, 9, 9, 255]))
+            .save(&photo)
+            .unwrap();
+
+        let mut inputs = test_inputs(
+            "plan",
+            Arc::new(DummyLlm),
+            pool,
+            dir.path().to_path_buf(),
+            vec![],
+            vec![],
+            "session",
+        );
+        inputs.image_limits = ImageLimits {
+            max_width: 640,
+            ..ImageLimits::default()
+        };
+        let (_, tools) = build_tool_registry_and_list(&inputs).unwrap();
+        let read = tools
+            .iter()
+            .find(|tool| tool.name() == "read_file")
+            .expect("plan should expose read_file");
+        let result = read
+            .execute(
+                serde_json::json!({"file_path": photo.to_str().unwrap()}),
+                &ToolContext::new("session", "message"),
+            )
+            .await
+            .unwrap();
+
+        let payload: serde_json::Value = serde_json::from_str(&result.output).unwrap();
+        let data = BASE64.decode(payload["data"].as_str().unwrap()).unwrap();
+        assert_eq!(
+            image::load_from_memory(&data).unwrap().width(),
+            640,
+            "read_file should honor the profile's configured image limits"
         );
     }
     use futures::stream::BoxStream;
@@ -1370,6 +1440,7 @@ mod tests {
             skills: Vec::new(),
             working_directory: std::env::current_dir().unwrap(),
             enforcement: PathEnforcement::None,
+            image_limits: ImageLimits::default(),
             context_limit: None,
             agents: Arc::new(BTreeMap::new()),
             templates: Mutex::new(HashMap::new()),
@@ -1607,6 +1678,7 @@ mod tests {
             skills: Vec::new(),
             working_directory: std::env::current_dir().unwrap(),
             enforcement: PathEnforcement::None,
+            image_limits: ImageLimits::default(),
             context_limit: None,
             agents: Arc::new(BTreeMap::from([(
                 "reviewer".to_string(),
@@ -1650,6 +1722,7 @@ mod tests {
             skills: Vec::new(),
             working_directory: std::env::current_dir().unwrap(),
             enforcement: PathEnforcement::None,
+            image_limits: ImageLimits::default(),
             context_limit: None,
             agents: Arc::new(BTreeMap::new()),
             templates: Mutex::new(HashMap::new()),
@@ -1763,6 +1836,7 @@ mod tests {
             Vec::new(),
             std::env::current_dir().unwrap(),
             PathEnforcement::None,
+            ImageLimits::default(),
             None,
             Arc::new(BTreeMap::new()),
         );
@@ -1834,6 +1908,7 @@ mod tests {
             Vec::new(),
             std::env::current_dir().unwrap(),
             PathEnforcement::None,
+            ImageLimits::default(),
             None,
             Arc::new(BTreeMap::new()),
         );

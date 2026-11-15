@@ -109,6 +109,8 @@ pub struct Bootstrap {
     pub workspace_roots: Arc<BTreeMap<String, std::path::PathBuf>>,
     /// File-path confinement level for tools and file-tree operations.
     pub enforcement: PathEnforcement,
+    /// Image limits applied by `read_file` before media reaches the model.
+    pub image_limits: gewu_tools::ImageLimits,
     /// Model context window (tokens) forwarded to agents for compaction;
     /// `None` keeps the agent's built-in default.
     pub context_limit: Option<usize>,
@@ -559,6 +561,7 @@ pub async fn bootstrap(args: &CommonArgs) -> Result<Bootstrap> {
         working_directory: workspace_roots["cwd"].to_string_lossy().to_string(),
         workspace_roots,
         enforcement: loaded_config.config.sandbox,
+        image_limits: (&loaded_config.config.attachment.image).into(),
         context_limit,
         models,
         model_selector,

@@ -44,8 +44,12 @@ const FONTS: &[(&str, &[u8])] = &[
 ];
 
 /// Everything is same-origin; model-authored Markdown cannot run script.
+///
+/// `data:` is allowed for images only because tool cards inline `read_file`
+/// results as data URLs. Markdown cannot use it: `safe_dest` rewrites
+/// `data:` link and image destinations to `#`, and raw HTML is escaped.
 const CSP: &str = "default-src 'self'; script-src 'self'; style-src 'self'; \
-                   font-src 'self'; img-src 'self' https:; connect-src 'self' ws: wss:; \
+                   font-src 'self'; img-src 'self' https: data:; connect-src 'self' ws: wss:; \
                    base-uri 'none'; form-action 'self'; frame-ancestors 'none'";
 
 /// How long a client has to send its auth frame.
@@ -389,6 +393,22 @@ mod tests {
                             "event": {
                                 "type": "tool_finish", "tool": "bash",
                                 "title": "seq 10", "output": output,
+                            },
+                        }));
+                    }
+                    if prompt.contains("show image") {
+                        replies.push(json!({
+                            "type": "event", "id": null, "request_id": request_id,
+                            "event": {"type": "tool_start", "tool": "read_file", "input": "shot.png"},
+                        }));
+                        replies.push(json!({
+                            "type": "event", "id": null, "request_id": request_id,
+                            "event": {
+                                "type": "tool_finish", "tool": "read_file", "title": "read_file",
+                                "output": json!({
+                                    "type": "media", "mime": "image/png",
+                                    "data": "ZmFrZQ==", "message": "Image read successfully",
+                                }).to_string(),
                             },
                         }));
                     }
@@ -966,6 +986,104 @@ mod tests {
             }
         }
         panic!("expected a tool_card message");
+    }
+
+    /// `read_file` on an image must reach the card as an inline `<img>` once
+    /// the card is expanded; the collapsed transcript only carries the badge.
+    #[tokio::test]
+    async fn tool_card_inlines_image_media() {
+        let upstream = spawn_fake_upstream().await;
+        let addr = spawn_gui(AppState {
+            endpoint: Endpoint::Tcp {
+                host: "127.0.0.1".to_string(),
+                port: upstream.port(),
+            },
+            token: None,
+            server_token: None,
+        })
+        .await;
+
+        let (mut ws, _) = tokio_tungstenite::connect_async(format!("ws://{addr}/ws"))
+            .await
+            .unwrap();
+        assert_eq!(next_json(&mut ws).await["type"], "snapshot");
+
+        ws.send(WsMessage::text(
+            json!({"op": "ask", "tab": 1, "prompt": "show image"}).to_string(),
+        ))
+        .await
+        .unwrap();
+
+        let mut transcript = String::new();
+        for _ in 0..80 {
+            let value = next_json(&mut ws).await;
+            match value["type"].as_str().unwrap_or("") {
+                "transcript" => transcript = value["html"].as_str().unwrap_or("").to_string(),
+                "tabs" => {
+                    let tab = &value["tabs"][0];
+                    if tab["session_id"] == "sess-1" && tab["busy"] == false {
+                        break;
+                    }
+                }
+                _ => {}
+            }
+        }
+        assert!(transcript.contains("tool-badge\">image"), "{transcript}");
+        assert!(!transcript.contains("<img"), "{transcript}");
+        assert!(!transcript.contains("ZmFrZQ=="), "{transcript}");
+
+        while tokio::time::timeout(std::time::Duration::from_millis(150), next_json(&mut ws))
+            .await
+            .is_ok()
+        {}
+
+        // Take the block index straight from the rendered card.
+        let marker = "data-action=\"toggle_tool\"";
+        let tail = &transcript[transcript.find(marker).expect("tool card")..];
+        let start = tail.find("data-block=\"").expect("block") + "data-block=\"".len();
+        let end = start + tail[start..].find('"').expect("closing quote");
+        let block: usize = tail[start..end].parse().expect("numeric block");
+
+        ws.send(WsMessage::text(
+            json!({"op": "toggle_tool", "tab": 1, "block": block}).to_string(),
+        ))
+        .await
+        .unwrap();
+
+        for _ in 0..20 {
+            let value = next_json(&mut ws).await;
+            if value["type"] == "tool_card" {
+                let html = value["html"].as_str().unwrap();
+                assert!(
+                    html.contains(
+                        "<img class=\"tool-image\" src=\"data:image/png;base64,ZmFrZQ==\""
+                    ),
+                    "{html}"
+                );
+                assert!(html.contains("alt=\"shot.png\""), "{html}");
+                return;
+            }
+        }
+        panic!("expected a tool_card message");
+    }
+
+    /// The CSP must allow the data URLs tool cards use for images; Markdown
+    /// still cannot reach it because `safe_dest` rewrites `data:` destinations.
+    #[tokio::test]
+    async fn index_allows_data_url_images() {
+        let addr = spawn_gui(test_state(None)).await;
+        let mut stream = tokio::net::TcpStream::connect(addr).await.unwrap();
+        stream
+            .write_all(b"GET / HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n")
+            .await
+            .unwrap();
+        let mut response = String::new();
+        stream.read_to_string(&mut response).await.unwrap();
+        assert!(response.starts_with("HTTP/1.1 200"), "{response}");
+        assert!(
+            response.contains("img-src 'self' https: data:"),
+            "{response}"
+        );
     }
 
     /// A thought that ends because a second round of tool calls starts must

@@ -382,6 +382,7 @@ mod tests {
             tool: "bash".into(),
             input: String::new(),
             output: None,
+            images: Vec::new(),
             status: None,
         };
         let blocks = vec![Block::User("start".into()), tool(), tool(), tool()];

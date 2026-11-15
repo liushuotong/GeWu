@@ -30,6 +30,7 @@ pub struct EndpointConfig {
 
 use gewu_core::types::PathEnforcement;
 use gewu_tools::mcp::types::McpServerConfig;
+use gewu_tools::{DEFAULT_MAX_BASE64_BYTES, DEFAULT_MAX_DIMENSION, ImageLimits};
 
 /// Built-in agent profiles; config-defined agents derive from one of these
 /// and cannot shadow their names.
@@ -49,6 +50,71 @@ pub struct AgentEntry {
     pub instructions: Option<String>,
     /// Narrows the base profile's tool set to these names.
     pub tools: Option<Vec<String>>,
+}
+
+/// Image attachment limits for `read_file`, mirroring opencode's
+/// `attachment.image` block.
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ImageConfig {
+    /// Downscale oversized images instead of refusing them.
+    #[serde(default = "default_auto_resize")]
+    pub auto_resize: bool,
+    /// Longest allowed edge, in pixels.
+    #[serde(default = "default_max_width")]
+    pub max_width: u32,
+    /// Longest allowed edge, in pixels.
+    #[serde(default = "default_max_height")]
+    pub max_height: u32,
+    /// Cap on the base64 payload handed to the model.
+    #[serde(default = "default_max_base64_bytes")]
+    pub max_base64_bytes: usize,
+}
+
+impl Default for ImageConfig {
+    fn default() -> Self {
+        Self {
+            auto_resize: default_auto_resize(),
+            max_width: default_max_width(),
+            max_height: default_max_height(),
+            max_base64_bytes: default_max_base64_bytes(),
+        }
+    }
+}
+
+impl From<&ImageConfig> for ImageLimits {
+    fn from(config: &ImageConfig) -> Self {
+        Self {
+            auto_resize: config.auto_resize,
+            max_width: config.max_width,
+            max_height: config.max_height,
+            max_base64_bytes: config.max_base64_bytes,
+        }
+    }
+}
+
+fn default_auto_resize() -> bool {
+    true
+}
+
+fn default_max_width() -> u32 {
+    DEFAULT_MAX_DIMENSION
+}
+
+fn default_max_height() -> u32 {
+    DEFAULT_MAX_DIMENSION
+}
+
+fn default_max_base64_bytes() -> usize {
+    DEFAULT_MAX_BASE64_BYTES
+}
+
+/// Attachment handling settings (opencode's `attachment` block).
+#[derive(Debug, Deserialize, Default)]
+#[serde(deny_unknown_fields)]
+pub struct AttachmentConfig {
+    #[serde(default)]
+    pub image: ImageConfig,
 }
 
 #[derive(Debug, Deserialize, Default)]
@@ -77,6 +143,9 @@ pub struct Config {
     /// User-defined agents keyed by name; spawnable via the `task` tool.
     #[serde(default)]
     pub agents: BTreeMap<String, AgentEntry>,
+    /// Image limits for `read_file` attachments.
+    #[serde(default)]
+    pub attachment: AttachmentConfig,
 }
 
 #[derive(Debug)]
@@ -119,6 +188,15 @@ impl LoadedConfig {
 
 impl Config {
     pub fn validate(&self) -> Result<()> {
+        let image = &self.attachment.image;
+        anyhow::ensure!(
+            image.max_width > 0 && image.max_height > 0,
+            "attachment.image max_width and max_height must be positive"
+        );
+        anyhow::ensure!(
+            image.max_base64_bytes > 0,
+            "attachment.image max_base64_bytes must be positive"
+        );
         for (name, path) in &self.workspaces {
             anyhow::ensure!(
                 name != "cwd"
@@ -313,6 +391,61 @@ fn resolve_config_path(config_path: Option<&str>) -> Result<PathBuf> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn image_attachment_limits_default_and_override() {
+        let config: Config = serde_json::from_value(serde_json::json!({})).unwrap();
+        assert_eq!(
+            ImageLimits::from(&config.attachment.image),
+            ImageLimits::default()
+        );
+
+        let config: Config = serde_json::from_value(serde_json::json!({
+            "attachment": {"image": {
+                "auto_resize": false,
+                "max_width": 800,
+                "max_height": 600,
+                "max_base64_bytes": 1_048_576
+            }}
+        }))
+        .unwrap();
+        config.validate().unwrap();
+        assert_eq!(
+            ImageLimits::from(&config.attachment.image),
+            ImageLimits {
+                auto_resize: false,
+                max_width: 800,
+                max_height: 600,
+                max_base64_bytes: 1_048_576,
+            }
+        );
+
+        let partial: Config = serde_json::from_value(serde_json::json!({
+            "attachment": {"image": {"max_width": 640}}
+        }))
+        .unwrap();
+        assert_eq!(partial.attachment.image.max_width, 640);
+        assert_eq!(
+            partial.attachment.image.max_height,
+            ImageLimits::default().max_height
+        );
+        serde_json::from_value::<Config>(serde_json::json!({
+            "attachment": {"image": {"max_size": 1}}
+        }))
+        .expect_err("unknown attachment.image keys must be rejected");
+    }
+
+    #[test]
+    fn image_attachment_limits_must_be_positive() {
+        for config in [
+            serde_json::json!({"attachment": {"image": {"max_width": 0}}}),
+            serde_json::json!({"attachment": {"image": {"max_height": 0}}}),
+            serde_json::json!({"attachment": {"image": {"max_base64_bytes": 0}}}),
+        ] {
+            let config: Config = serde_json::from_value(config).unwrap();
+            assert!(config.validate().is_err(), "{config:?} should not validate");
+        }
+    }
 
     #[test]
     fn validates_model_options_and_selectors() {

@@ -171,7 +171,7 @@ async fn run_agent(agent: &mut gewu_core::Agent, prompt: &str) -> Result<()> {
 
 #[derive(Parser)]
 #[command(name = "gewu-server")]
-#[command(version = "0.1.0")]
+#[command(version)]
 #[command(about = "GeWu agent CLI and server", long_about = None)]
 struct Cli {
     #[command(subcommand)]
@@ -301,6 +301,7 @@ async fn run(cli: RunArgs) -> Result<()> {
             additional_tools: boot.mcp_tools,
             skills: boot.skills,
             enforcement: boot.enforcement,
+            image_limits: boot.image_limits,
             context_limit: boot.context_limit,
             agents: boot.agents.clone(),
             session_id: &session_id,

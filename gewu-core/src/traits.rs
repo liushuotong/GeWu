@@ -170,7 +170,7 @@ pub type RequestLog = Arc<Mutex<Box<dyn Write + Send + Sync>>>;
 /// Providers report these through [`StatusSink`]; the agent layer forwards
 /// them to frontends as [`crate::types::AgentEvent::Retrying`] so a backoff
 /// wait is visible instead of looking like a silent hang. Frontends collapse
-/// retries of one [`kind`](RetryKind) into a single updating surface.
+/// retries of one [`kind`](crate::types::RetryKind) into a single updating surface.
 #[derive(Debug, Clone)]
 pub struct RetryNotice {
     /// The stable failure identity, separate from [`Self::message`]: gateways

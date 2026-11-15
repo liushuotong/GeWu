@@ -7,7 +7,9 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::fmt::Write as _;
 
 use gewu_client::session::{Block, Phase};
-use gewu_protocol::{DirectoryEntry, FileEntry, ModelSummary, REASONING_EFFORTS, WorkspaceSummary};
+use gewu_protocol::{
+    ContentPart, DirectoryEntry, FileEntry, ModelSummary, REASONING_EFFORTS, WorkspaceSummary,
+};
 use math_core::{LatexToMathML, MathCoreConfig, MathDisplay};
 use pulldown_cmark::{CowStr, Event, Options, Parser, Tag, html};
 
@@ -22,6 +24,13 @@ const TOOL_MAX_LINES: usize = 5000;
 /// Commands longer than this (or spanning multiple lines) get a full-width
 /// block when the tool is expanded, since the inline title ellipsizes.
 const COMMAND_INLINE_LIMIT: usize = 80;
+/// MIME types drawn inline in a tool card. Raster only: an `<img>` with one
+/// of these cannot execute script, and the list matches what `read_file`
+/// emits after normalization.
+const INLINE_IMAGE_MIMES: [&str; 4] = ["image/png", "image/jpeg", "image/gif", "image/webp"];
+/// Base64 cap for inline rendering. Normalization keeps images under 5 MiB;
+/// this protects transcript snapshots when the server limit is raised.
+const MAX_INLINE_IMAGE_BYTES: usize = 4 * 1024 * 1024;
 /// Version shown in the sessions sidebar, from `gewu-gui`'s package metadata.
 const GEWU_GUI_VERSION: &str = env!("CARGO_PKG_VERSION");
 
@@ -259,28 +268,29 @@ pub fn tool_card_html(tab: &Tab, first: usize) -> Option<String> {
 
 /// Render a run of consecutive tool blocks inside one card.
 fn render_tool_run(out: &mut String, tab: &Tab, run: &[Block], first: usize) {
-    let tools: Vec<(&str, &str, Option<&str>, Option<&str>)> = run
+    let tools: Vec<ToolView> = run
         .iter()
         .filter_map(|block| match block {
             Block::Tool {
                 tool,
                 input,
                 output,
+                images,
                 status,
-            } => Some((
-                tool.as_str(),
-                input.as_str(),
-                output.as_deref(),
-                status.as_deref(),
-            )),
+            } => Some(ToolView {
+                tool,
+                input,
+                output: output.as_deref(),
+                status: status.as_deref(),
+                images,
+            }),
             _ => None,
         })
         .collect();
 
     let _ = writeln!(out, "<div class=\"tool-card\" data-card=\"{first}\">");
     if tools.len() == 1 {
-        let (tool, input, output, status) = tools[0];
-        render_tool(out, tab, tool, input, output, status, first, 0);
+        render_tool(out, tab, &tools[0], first, 0);
     } else {
         // Workflow runs default to expanded so their graphs stay visible,
         // but an explicit collapse (collapsed_groups) wins.
@@ -303,8 +313,8 @@ fn render_tool_run(out: &mut String, tab: &Tab, run: &[Block], first: usize) {
             escape(&group_label(run))
         );
         if expanded {
-            for (offset, (tool, input, output, status)) in tools.iter().enumerate() {
-                render_tool(out, tab, tool, input, *output, *status, first + offset, 1);
+            for (offset, view) in tools.iter().enumerate() {
+                render_tool(out, tab, view, first + offset, 1);
             }
         }
         out.push_str("</div>\n");
@@ -319,18 +329,25 @@ pub(crate) fn is_workflow_run(run: &[Block]) -> bool {
         .any(|block| matches!(block, Block::Tool { tool, .. } if tool.starts_with("workflow_")))
 }
 
+/// One tool row's render inputs.
+struct ToolView<'a> {
+    tool: &'a str,
+    input: &'a str,
+    output: Option<&'a str>,
+    status: Option<&'a str>,
+    images: &'a [ContentPart],
+}
+
 /// One tool row plus its output.
-#[allow(clippy::too_many_arguments)]
-fn render_tool(
-    out: &mut String,
-    tab: &Tab,
-    tool: &str,
-    input: &str,
-    output: Option<&str>,
-    status: Option<&str>,
-    index: usize,
-    depth: usize,
-) {
+fn render_tool(out: &mut String, tab: &Tab, view: &ToolView, index: usize, depth: usize) {
+    let ToolView {
+        tool,
+        input,
+        output,
+        status,
+        images,
+    } = view;
+    let (tool, input, output, status) = (*tool, *input, *output, *status);
     let (name, title) = tool_row(tool, input);
     let running = output.is_none();
     let expanded = tab.expanded_outputs.contains(&index);
@@ -338,7 +355,7 @@ fn render_tool(
         out,
         "<div class=\"tool{} depth-{depth}\" data-action=\"toggle_tool\" data-tab=\"{}\" data-block=\"{index}\">\
          <button class=\"tool-row\" data-action=\"toggle_tool\" data-tab=\"{}\" data-block=\"{index}\">\
-         <span class=\"tool-name\">{}</span>{} <span class=\"tool-title\">{}</span>\
+         <span class=\"tool-name\">{}</span>{} <span class=\"tool-title\">{}</span>{}\
          {}</button>",
         if running { " running" } else { "" },
         tab.id,
@@ -350,6 +367,11 @@ fn render_tool(
             ""
         },
         escape(&title),
+        if has_inline_image(images) {
+            " <span class=\"tool-badge\">image</span>"
+        } else {
+            ""
+        },
         match (running, status) {
             (true, Some(status)) => {
                 format!(" <span class=\"tool-status\">{}</span>", escape(status))
@@ -377,20 +399,18 @@ fn render_tool(
         );
     }
     let lines: Vec<&str> = output.trim_end().lines().collect();
-    if lines.is_empty() {
-        out.push_str("</div>\n");
-        return;
-    }
     let shown = if expanded {
         lines.len().min(TOOL_MAX_LINES)
     } else {
         lines.len().min(TOOL_PREVIEW_LINES)
     };
-    let _ = writeln!(
-        out,
-        "<pre class=\"tool-output\">{}</pre>",
-        escape(&lines[..shown].join("\n"))
-    );
+    if shown > 0 {
+        let _ = writeln!(
+            out,
+            "<pre class=\"tool-output\">{}</pre>",
+            escape(&lines[..shown].join("\n"))
+        );
+    }
     if lines.len() > shown {
         let hidden = lines.len() - shown;
         let _ = writeln!(
@@ -400,7 +420,55 @@ fn render_tool(
             if hidden == 1 { "" } else { "s" }
         );
     }
+    // Images stay collapsed with the rest of the output: the row's badge says
+    // one is attached, and expanding shows it.
+    if expanded && let Some(media) = tool_media_html(images, &title) {
+        out.push_str(&media);
+    }
     out.push_str("</div>\n");
+}
+
+/// Whether any image part is a raster format the GUI draws inline.
+fn has_inline_image(images: &[ContentPart]) -> bool {
+    images.iter().any(|part| {
+        matches!(part, ContentPart::Image { mime_type, .. }
+            if INLINE_IMAGE_MIMES.contains(&mime_type.as_str()))
+    })
+}
+
+/// Inline `<img>` markup for a tool's image parts, or `None` when nothing is
+/// renderable.
+///
+/// Only the [`INLINE_IMAGE_MIMES`] allowlist is drawn: those raster formats
+/// cannot execute script when loaded through `<img>`. Payloads over
+/// [`MAX_INLINE_IMAGE_BYTES`] fall back to a one-line note so a raised server
+/// limit cannot bloat transcript snapshots.
+fn tool_media_html(images: &[ContentPart], alt: &str) -> Option<String> {
+    let mut out = String::new();
+    for part in images {
+        let ContentPart::Image { data, mime_type } = part else {
+            continue;
+        };
+        if !INLINE_IMAGE_MIMES.contains(&mime_type.as_str()) {
+            continue;
+        }
+        if data.len() > MAX_INLINE_IMAGE_BYTES {
+            let _ = writeln!(
+                out,
+                "<p class=\"tool-media-note\">image attached ({:.1} MB) — too large to display</p>",
+                data.len() as f64 / (1024.0 * 1024.0)
+            );
+            continue;
+        }
+        let _ = writeln!(
+            out,
+            "<figure class=\"tool-media\"><img class=\"tool-image\" src=\"data:{};base64,{}\" alt=\"{}\" loading=\"lazy\" decoding=\"async\"></figure>",
+            escape(mime_type),
+            escape(data),
+            escape(alt)
+        );
+    }
+    (!out.is_empty()).then_some(out)
 }
 
 /// Readable display name for a tool.
@@ -1887,6 +1955,7 @@ mod tests {
             tool: "bash".into(),
             input: "ls".into(),
             output: Some("a.rs\nb.rs".into()),
+            images: Vec::new(),
             status: None,
         }]);
         let html = transcript_html(ws.tab(id).unwrap());
@@ -1911,6 +1980,7 @@ mod tests {
                 tool: "bash".into(),
                 input: "first".into(),
                 output: Some("one".into()),
+                images: Vec::new(),
                 status: None,
             },
             Block::Assistant("between".into()),
@@ -1923,6 +1993,7 @@ mod tests {
                         .collect::<Vec<_>>()
                         .join("\n"),
                 ),
+                images: Vec::new(),
                 status: None,
             },
         ]);
@@ -1955,12 +2026,14 @@ mod tests {
                 tool: "workflow_start".into(),
                 input: spec.into(),
                 output: Some(start.into()),
+                images: Vec::new(),
                 status: None,
             },
             Block::Tool {
                 tool: "workflow_status".into(),
                 input: "r-77".into(),
                 output: Some(snapshot.into()),
+                images: Vec::new(),
                 status: None,
             },
         ]);
@@ -1994,18 +2067,21 @@ mod tests {
                 input: r#"{"name":"docs","nodes":[{"id":"read","agent":"reader","prompt":"p"}]}"#
                     .into(),
                 output: Some(start.into()),
+                images: Vec::new(),
                 status: None,
             },
             Block::Tool {
                 tool: "workflow_status".into(),
                 input: "r-77".into(),
                 output: Some(snapshot.into()),
+                images: Vec::new(),
                 status: None,
             },
             Block::Tool {
                 tool: "workflow_status".into(),
                 input: "r-77".into(),
                 output: Some(snapshot.into()),
+                images: Vec::new(),
                 status: None,
             },
         ]);
@@ -2027,6 +2103,7 @@ mod tests {
             tool: "bash".into(),
             input: String::new(),
             output: None,
+            images: Vec::new(),
             status: None,
         }]));
     }
@@ -2091,6 +2168,7 @@ mod tests {
             tool: "bash".into(),
             input: "seq 10".into(),
             output: Some(output),
+            images: Vec::new(),
             status: None,
         }]);
         let html = transcript_html(ws.tab(id).unwrap());
@@ -2104,6 +2182,87 @@ mod tests {
         assert!(!html.contains("+4 lines"), "{html}");
     }
 
+    fn image_part(mime: &str, data: &str) -> ContentPart {
+        ContentPart::Image {
+            data: data.into(),
+            mime_type: mime.into(),
+        }
+    }
+
+    #[test]
+    fn expanded_tool_renders_image_media_inline() {
+        let (mut ws, id) = tab_with_blocks(vec![Block::Tool {
+            tool: "read_file".into(),
+            input: "shot.png".into(),
+            output: Some("Image read successfully".into()),
+            images: vec![image_part("image/png", "ZmFrZQ==")],
+            status: None,
+        }]);
+
+        // Collapsed: a badge marks the image, but no payload reaches the DOM.
+        let html = transcript_html(ws.tab(id).unwrap());
+        assert!(html.contains("class=\"tool-badge\">image"), "{html}");
+        assert!(!html.contains("<img"), "{html}");
+        assert!(!html.contains("ZmFrZQ=="), "{html}");
+
+        ws.tab_mut(id).unwrap().expanded_outputs.insert(0);
+        let html = transcript_html(ws.tab(id).unwrap());
+        assert!(
+            html.contains("<img class=\"tool-image\" src=\"data:image/png;base64,ZmFrZQ==\""),
+            "{html}"
+        );
+        assert!(html.contains("alt=\"shot.png\""), "{html}");
+        assert!(!html.contains("tool-output\">ZmFrZQ=="), "{html}");
+    }
+
+    #[test]
+    fn non_raster_media_is_never_inlined() {
+        let (mut ws, id) = tab_with_blocks(vec![Block::Tool {
+            tool: "read_file".into(),
+            input: "icon.svg".into(),
+            output: Some("Image read successfully".into()),
+            images: vec![image_part("image/svg+xml", "PHN2Zz48L3N2Zz4=")],
+            status: None,
+        }]);
+        ws.tab_mut(id).unwrap().expanded_outputs.insert(0);
+        let html = transcript_html(ws.tab(id).unwrap());
+        assert!(!html.contains("<img"), "{html}");
+        assert!(!html.contains("tool-badge"), "{html}");
+        assert!(!html.contains("PHN2Zz48L3N2Zz4="), "{html}");
+    }
+
+    #[test]
+    fn oversized_image_falls_back_to_a_note() {
+        let data = "A".repeat(MAX_INLINE_IMAGE_BYTES + 4);
+        let (mut ws, id) = tab_with_blocks(vec![Block::Tool {
+            tool: "read_file".into(),
+            input: "huge.png".into(),
+            output: Some("Image read successfully".into()),
+            images: vec![image_part("image/png", &data)],
+            status: None,
+        }]);
+        ws.tab_mut(id).unwrap().expanded_outputs.insert(0);
+        let html = transcript_html(ws.tab(id).unwrap());
+        assert!(!html.contains("<img"), "{html}");
+        assert!(html.contains("class=\"tool-media-note\""), "{html}");
+        assert!(html.contains("too large to display"), "{html}");
+    }
+
+    #[test]
+    fn image_payload_is_attribute_escaped() {
+        let (mut ws, id) = tab_with_blocks(vec![Block::Tool {
+            tool: "read_file".into(),
+            input: "shot.png".into(),
+            output: Some("Image read successfully".into()),
+            images: vec![image_part("image/png", "\"><script>alert(1)</script>")],
+            status: None,
+        }]);
+        ws.tab_mut(id).unwrap().expanded_outputs.insert(0);
+        let html = transcript_html(ws.tab(id).unwrap());
+        assert!(!html.contains("<script>"), "{html}");
+        assert!(html.contains("&lt;script&gt;"), "{html}");
+    }
+
     #[test]
     fn expanded_tool_shows_the_full_command() {
         let long_command = format!("echo {} # padded well past one line", "x".repeat(120));
@@ -2111,6 +2270,7 @@ mod tests {
             tool: "bash".into(),
             input: long_command.clone(),
             output: Some("done".into()),
+            images: Vec::new(),
             status: None,
         }]);
         // Collapsed: the command appears only in the ellipsized title row.
@@ -2133,6 +2293,7 @@ mod tests {
             tool: "bash".into(),
             input: "seq 600".into(),
             output: Some(output),
+            images: Vec::new(),
             status: None,
         }]);
         ws.tab_mut(id).unwrap().expanded_outputs.insert(0);
@@ -2148,12 +2309,14 @@ mod tests {
                 tool: "bash".into(),
                 input: "ls".into(),
                 output: Some("a".into()),
+                images: Vec::new(),
                 status: None,
             },
             Block::Tool {
                 tool: "read_file".into(),
                 input: "src/main.rs".into(),
                 output: Some("b".into()),
+                images: Vec::new(),
                 status: None,
             },
         ]);
@@ -2179,6 +2342,7 @@ mod tests {
             tool: "bash".into(),
             input: "sleep 30".into(),
             output: None,
+            images: Vec::new(),
             status: None,
         }]);
         let html = transcript_html(ws.tab(id).unwrap());
@@ -2195,6 +2359,7 @@ mod tests {
             tool: "bash".into(),
             input: "ls".into(),
             output: Some("a".into()),
+            images: Vec::new(),
             status: None,
         }]);
         let html = transcript_html(ws.tab(id).unwrap());
@@ -2209,6 +2374,7 @@ mod tests {
             tool: "task".into(),
             input: "explore".into(),
             output: None,
+            images: Vec::new(),
             status: Some("1m03s — bash: cargo test".into()),
         }]);
         let html = transcript_html(ws.tab(id).unwrap());
@@ -2225,6 +2391,7 @@ mod tests {
             tool: "task".into(),
             input: "explore".into(),
             output: Some("done".into()),
+            images: Vec::new(),
             status: Some("stale".into()),
         }]);
         let html = transcript_html(ws.tab(id).unwrap());
@@ -2238,12 +2405,14 @@ mod tests {
                 tool: "bash".into(),
                 input: "ls".into(),
                 output: None,
+                images: Vec::new(),
                 status: None,
             },
             Block::Tool {
                 tool: "grep".into(),
                 input: "TODO".into(),
                 output: None,
+                images: Vec::new(),
                 status: None,
             },
         ]);
@@ -2259,12 +2428,14 @@ mod tests {
                 tool: "bash".into(),
                 input: "ls".into(),
                 output: Some("a".into()),
+                images: Vec::new(),
                 status: None,
             },
             Block::Tool {
                 tool: "grep".into(),
                 input: "TODO".into(),
                 output: Some("b".into()),
+                images: Vec::new(),
                 status: None,
             },
         ]);
@@ -2286,12 +2457,14 @@ mod tests {
                 tool: "bash".into(),
                 input: "ls".into(),
                 output: Some("a".into()),
+                images: Vec::new(),
                 status: None,
             },
             Block::Tool {
                 tool: "grep".into(),
                 input: "TODO".into(),
                 output: None,
+                images: Vec::new(),
                 status: None,
             },
         ]);

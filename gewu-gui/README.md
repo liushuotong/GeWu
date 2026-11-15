@@ -149,6 +149,13 @@ neutralized into text, and `javascript:`, `vbscript:`, and `data:` link/image
 destinations are replaced with `#`. Streamed deltas are appended with
 `textContent`, so partial assistant output cannot inject markup either.
 
+`read_file` images are the one place the GUI emits a `data:` URL itself. Only
+the raster allowlist (`image/png`, `image/jpeg`, `image/gif`, `image/webp`)
+produced by the tool is inlined, the payload is attribute-escaped, and cards
+wider than 4 MB of base64 show a text note instead. The CSP therefore allows
+`img-src 'self' https: data:`; Markdown cannot use that allowance because its
+`data:` destinations never reach the page.
+
 Assistant Markdown supports LaTeX math: `$…$` and `\(…\)` render inline,
 `$$…$$` and `\[…\]` render as display blocks, converted server-side to MathML
 Core (`math-core`) so no JavaScript or external fonts are needed. Math inside

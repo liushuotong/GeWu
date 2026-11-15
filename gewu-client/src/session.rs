@@ -7,6 +7,7 @@
 //! and replay conversations identically, and it stays unit-testable without
 //! any I/O.
 
+use gewu_core::agent::extract_media_parts;
 use gewu_protocol::{AgentEvent, ContentPart, Message, summarize_tool_input};
 
 /// One entry in the conversation transcript.
@@ -33,6 +34,10 @@ pub enum Block {
         /// Rendered input summary (e.g. the bash command).
         input: String,
         output: Option<String>,
+        /// Images the tool returned (`read_file` media). Kept beside the
+        /// output so base64 never renders as text; front-ends that cannot
+        /// draw them simply show the output's caption.
+        images: Vec<ContentPart>,
         /// Live status from the running tool (`ToolProgress` events);
         /// cleared when the tool finishes. Not part of stored history.
         status: Option<String>,
@@ -187,6 +192,7 @@ impl SessionModel {
                     tool: tool.clone(),
                     input: summarize_tool_input(tool, input),
                     output: None,
+                    images: Vec::new(),
                     status: None,
                 });
                 Some(self.blocks.len() - 1)
@@ -196,13 +202,16 @@ impl SessionModel {
             }
             AgentEvent::ToolFinish { tool, output, .. } => {
                 self.set_tool_status(Some(tool), None);
-                if let Some(index) = self.fill_open_tool(Some(tool), output) {
-                    return Some(index);
-                }
+                let (text, images) = tool_media(output);
+                let images = match self.fill_open_tool(Some(tool), &text, images) {
+                    Ok(index) => return Some(index),
+                    Err(images) => images,
+                };
                 self.blocks.push(Block::Tool {
                     tool: tool.clone(),
                     input: String::new(),
-                    output: Some(tool_output(output)),
+                    output: Some(text),
+                    images,
                     status: None,
                 });
                 Some(self.blocks.len() - 1)
@@ -269,7 +278,7 @@ impl SessionModel {
     }
 
     /// The block index whose live "Thinking…" label collapsed during the
-    /// last [`apply_event`], if any. Reset per event.
+    /// last [`SessionModel::apply_event`], if any. Reset per event.
     pub fn take_collapsed(&mut self) -> Option<usize> {
         self.collapsed.take()
     }
@@ -313,6 +322,7 @@ impl SessionModel {
                         tool: call.function.name.clone(),
                         input: summarize_tool_input(&call.function.name, &call.function.arguments),
                         output: None,
+                        images: Vec::new(),
                         status: None,
                     });
                 }
@@ -323,19 +333,21 @@ impl SessionModel {
                 media,
                 ..
             } => {
-                let mut output = content.clone();
-                let media_text = parts_text(media);
-                if !media_text.is_empty() {
-                    if !output.is_empty() {
-                        output.push('\n');
-                    }
-                    output.push_str(&media_text);
-                }
-                if self.fill_open_tool(tool_name.as_deref(), &output).is_none() {
+                // Media may be stored beside the text (`media`) or, for
+                // sessions recorded before images were split out, still
+                // embedded in `content` as a payload.
+                let (output, images) = tool_media(content);
+                let images = if images.is_empty() {
+                    image_parts(media)
+                } else {
+                    images
+                };
+                if let Err(images) = self.fill_open_tool(tool_name.as_deref(), &output, images) {
                     self.blocks.push(Block::Tool {
                         tool: tool_name.clone().unwrap_or_else(|| "tool".to_string()),
                         input: String::new(),
-                        output: Some(tool_output(&output)),
+                        output: Some(output),
+                        images,
                         status: None,
                     });
                 }
@@ -362,34 +374,55 @@ impl SessionModel {
     /// still running, splitting the run — the finish must still land in the
     /// original block instead of duplicating it below the message. Safe
     /// because completed tools are skipped and results arrive in start
-    /// order. Returns the filled block's index.
-    fn fill_open_tool(&mut self, tool_name: Option<&str>, output: &str) -> Option<usize> {
+    /// order. Images are handed back to the caller when no block is open,
+    /// so the result can be pushed without cloning the payload.
+    fn fill_open_tool(
+        &mut self,
+        tool_name: Option<&str>,
+        output: &str,
+        images: Vec<ContentPart>,
+    ) -> Result<usize, Vec<ContentPart>> {
+        let mut pending = Some(images);
         let mut fallback = None;
         for i in 0..self.blocks.len() {
-            if let Block::Tool {
-                tool, output: out, ..
+            let Block::Tool {
+                tool,
+                output: out,
+                images: imgs,
+                ..
             } = &mut self.blocks[i]
-            {
-                if out.is_some() {
-                    continue;
-                }
-                if fallback.is_none() {
-                    fallback = Some(i);
-                }
-                if tool_name.is_none_or(|name| name == tool) {
-                    *out = Some(tool_output(output));
-                    return Some(i);
-                }
+            else {
+                continue;
+            };
+            if out.is_some() {
+                continue;
+            }
+            if fallback.is_none() {
+                fallback = Some(i);
+            }
+            if tool_name.is_none_or(|name| name == tool) {
+                *out = Some(tool_output(output));
+                *imgs = pending.take().unwrap_or_default();
+                return Ok(i);
             }
         }
-        fallback.and_then(|i| {
-            if let Block::Tool { output: out, .. } = &mut self.blocks[i] {
-                *out = Some(tool_output(output));
-                Some(i)
-            } else {
-                None
+        match fallback {
+            Some(i) => {
+                if let Block::Tool {
+                    output: out,
+                    images: imgs,
+                    ..
+                } = &mut self.blocks[i]
+                {
+                    *out = Some(tool_output(output));
+                    *imgs = pending.take().unwrap_or_default();
+                    Ok(i)
+                } else {
+                    Err(pending.unwrap_or_default())
+                }
             }
-        })
+            None => Err(pending.unwrap_or_default()),
+        }
     }
 
     /// Set the live status on the first still-open tool block matching the
@@ -479,6 +512,35 @@ fn parts_text(parts: &[ContentPart]) -> String {
 /// expand it. The server already bounds results (2000 lines / 50 KB).
 fn tool_output(text: &str) -> String {
     text.to_string()
+}
+
+/// Split a tool result into display text and the image parts it carried.
+///
+/// A media payload (`read_file` on an image) is one JSON string whose base64
+/// must never reach the transcript as text, so the payload's message becomes
+/// the block's output and its images travel separately.
+fn tool_media(output: &str) -> (String, Vec<ContentPart>) {
+    let parts = extract_media_parts(output);
+    if parts.is_empty() {
+        return (tool_output(output), Vec::new());
+    }
+    let text = parts
+        .iter()
+        .find_map(|part| match part {
+            ContentPart::Text { text } => Some(text.as_str()),
+            _ => None,
+        })
+        .unwrap_or_default();
+    (tool_output(text), image_parts(&parts))
+}
+
+/// The image parts of a message payload.
+fn image_parts(parts: &[ContentPart]) -> Vec<ContentPart> {
+    parts
+        .iter()
+        .filter(|part| matches!(part, ContentPart::Image { .. }))
+        .cloned()
+        .collect()
 }
 
 #[cfg(test)]
@@ -591,6 +653,7 @@ mod tests {
                 tool: "bash".into(),
                 input: "ls".into(),
                 output: Some("file.rs".into()),
+                images: Vec::new(),
                 status: None,
             }]
         );
@@ -625,6 +688,7 @@ mod tests {
                 tool: "bash".into(),
                 input: "ls".into(),
                 output: Some("file.rs".into()),
+                images: Vec::new(),
                 status: None,
             }
         );
@@ -1009,6 +1073,7 @@ mod tests {
                     tool: "bash".into(),
                     input: "ls".into(),
                     output: Some("a.rs".into()),
+                    images: Vec::new(),
                     status: None,
                 },
             ]
@@ -1080,16 +1145,143 @@ mod tests {
                     tool: "read_file".into(),
                     input: "{}".into(),
                     output: Some("file".into()),
+                    images: Vec::new(),
                     status: None,
                 },
                 Block::Tool {
                     tool: "bash".into(),
                     input: "{}".into(),
                     output: Some("cmd".into()),
+                    images: Vec::new(),
                     status: None,
                 },
             ]
         );
+    }
+
+    const IMAGE_PAYLOAD: &str = r#"{"type":"media","mime":"image/png","data":"ZmFrZQ==","message":"Image read successfully"}"#;
+
+    fn png_part() -> ContentPart {
+        ContentPart::Image {
+            data: "ZmFrZQ==".into(),
+            mime_type: "image/png".into(),
+        }
+    }
+
+    #[test]
+    fn tool_finish_keeps_image_media_out_of_the_output_text() {
+        let mut m = model();
+        let _ = m.apply_event(&AgentEvent::ToolStart {
+            tool: "read_file".into(),
+            input: r#"{"file_path":"shot.png"}"#.into(),
+        });
+        let _ = m.apply_event(&AgentEvent::ToolFinish {
+            tool: "read_file".into(),
+            title: "read_file".into(),
+            output: IMAGE_PAYLOAD.into(),
+            metadata: Default::default(),
+        });
+
+        assert_eq!(
+            m.blocks,
+            vec![Block::Tool {
+                tool: "read_file".into(),
+                input: "shot.png".into(),
+                output: Some("Image read successfully".into()),
+                images: vec![png_part()],
+                status: None,
+            }]
+        );
+        assert!(
+            !m.blocks[0].text().contains("ZmFrZQ=="),
+            "base64 must never reach the transcript text"
+        );
+    }
+
+    #[test]
+    fn replayed_tool_media_is_kept_for_rendering() {
+        let mut m = model();
+        m.apply_message(&Message::Assistant {
+            content: None,
+            reasoning: None,
+            replay: None,
+            tool_calls: Some(vec![gewu_protocol::ToolCall {
+                id: "c1".into(),
+                r#type: "function".into(),
+                function: FunctionCall {
+                    name: "read_file".into(),
+                    arguments: r#"{"file_path":"shot.png"}"#.into(),
+                },
+            }]),
+        });
+        m.apply_message(&Message::Tool {
+            tool_call_id: "c1".into(),
+            tool_name: Some("read_file".into()),
+            content: "Image read successfully".into(),
+            media: vec![png_part()],
+        });
+
+        assert_eq!(
+            m.blocks[0],
+            Block::Tool {
+                tool: "read_file".into(),
+                input: "shot.png".into(),
+                output: Some("Image read successfully".into()),
+                images: vec![png_part()],
+                status: None,
+            }
+        );
+    }
+
+    #[test]
+    fn replayed_media_embedded_in_content_is_still_split() {
+        let mut m = model();
+        m.apply_message(&Message::Assistant {
+            content: None,
+            reasoning: None,
+            replay: None,
+            tool_calls: Some(vec![gewu_protocol::ToolCall {
+                id: "c1".into(),
+                r#type: "function".into(),
+                function: FunctionCall {
+                    name: "read_file".into(),
+                    arguments: r#"{"file_path":"shot.png"}"#.into(),
+                },
+            }]),
+        });
+        // Sessions recorded before media was split out kept the payload here.
+        m.apply_message(&Message::Tool {
+            tool_call_id: "c1".into(),
+            tool_name: Some("read_file".into()),
+            content: IMAGE_PAYLOAD.into(),
+            media: vec![],
+        });
+
+        let Block::Tool { output, images, .. } = &m.blocks[0] else {
+            panic!("expected a tool block");
+        };
+        assert_eq!(output.as_deref(), Some("Image read successfully"));
+        assert_eq!(images, &vec![png_part()]);
+    }
+
+    #[test]
+    fn non_media_tool_output_is_unchanged() {
+        let mut m = model();
+        let _ = m.apply_event(&AgentEvent::ToolStart {
+            tool: "bash".into(),
+            input: r#"{"command":"ls"}"#.into(),
+        });
+        let _ = m.apply_event(&AgentEvent::ToolFinish {
+            tool: "bash".into(),
+            title: String::new(),
+            output: r#"{"type":"media-ish"}"#.into(),
+            metadata: Default::default(),
+        });
+        let Block::Tool { output, images, .. } = &m.blocks[0] else {
+            panic!("expected a tool block");
+        };
+        assert_eq!(output.as_deref(), Some(r#"{"type":"media-ish"}"#));
+        assert!(images.is_empty());
     }
 
     #[test]
@@ -1112,6 +1304,7 @@ mod tests {
                 tool: "task".into(),
                 input: "explore".into(),
                 output: None,
+                images: Vec::new(),
                 status: Some("1s — bash: ls".into()),
             }
         );
@@ -1131,6 +1324,7 @@ mod tests {
                 tool: "task".into(),
                 input: "explore".into(),
                 output: None,
+                images: Vec::new(),
                 status: Some("2s — read src/main.rs".into()),
             }
         );

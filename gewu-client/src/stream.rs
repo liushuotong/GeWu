@@ -12,7 +12,8 @@ use gewu_protocol::{AgentEvent, ServerMessage};
 /// the terminal frame.
 ///
 /// Use [`AskStream::final_response`] when you only care about the outcome
-/// and [`AskStream::events`] to iterate decoded [`gewu_protocol::AgentEvent`]s.
+/// and [`AskStream::decode_event`] to decode [`gewu_protocol::AgentEvent`]s
+/// from its frames.
 #[derive(Debug)]
 pub struct AskStream {
     handle: AskHandle,

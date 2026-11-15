@@ -616,6 +616,7 @@ impl ServerState {
                 additional_tools: self.bootstrap.mcp_tools.clone(),
                 skills: self.bootstrap.skills.clone(),
                 enforcement: self.bootstrap.enforcement,
+                image_limits: self.bootstrap.image_limits,
                 context_limit: Some(entry.context_limit),
                 agents: self.bootstrap.agents.clone(),
                 session_id: &session_id,
@@ -979,6 +980,7 @@ async fn handle_request(
                 additional_tools: state.bootstrap.mcp_tools.clone(),
                 skills: state.bootstrap.skills.clone(),
                 enforcement: state.bootstrap.enforcement,
+                image_limits: state.bootstrap.image_limits,
                 context_limit: Some(current.context_limit),
                 agents: state.bootstrap.agents.clone(),
                 session_id: &current.session_id,
@@ -3387,6 +3389,7 @@ mod tests {
                     std::path::PathBuf::from("/tmp/gewu-test"),
                 )])),
                 enforcement: PathEnforcement::None,
+                image_limits: gewu_tools::ImageLimits::default(),
                 context_limit: None,
                 models: BTreeMap::from([
                     (
@@ -4282,6 +4285,7 @@ mod tests {
                     std::path::PathBuf::from("/tmp/gewu-test"),
                 )])),
                 enforcement: PathEnforcement::None,
+                image_limits: gewu_tools::ImageLimits::default(),
                 context_limit: None,
                 models: BTreeMap::from([(
                     "test-model".to_string(),

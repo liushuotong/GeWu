@@ -9,3 +9,25 @@ members = ["gewu",
 ]
 exclude = ["opencode"]
 resolver = "2"
+
+# Image normalization in `read_file` decodes and re-encodes photos, and the
+# codec stack is 30-50x slower unoptimized: a 12 MP JPEG takes ~20s in a
+# debug build versus ~0.5s optimized. Optimize just those crates so `cargo
+# run` stays usable without touching optimization for the workspace itself.
+[profile.dev.package.image]
+opt-level = 3
+
+[profile.dev.package.png]
+opt-level = 3
+
+[profile.dev.package.zune-jpeg]
+opt-level = 3
+
+[profile.dev.package.image-webp]
+opt-level = 3
+
+[profile.dev.package.tiff]
+opt-level = 3
+
+[profile.dev.package.gif]
+opt-level = 3

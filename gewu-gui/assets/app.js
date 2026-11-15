@@ -831,6 +831,9 @@
       return;
     }
     if (!event.target.closest(".message-menu")) closeMessageMenus();
+    // Tool images sit inside a click-to-toggle card; clicking the picture
+    // itself should not collapse it (right-click still saves the image).
+    if (event.target.closest(".tool-image")) return;
     const button = event.target.closest("[data-action]");
     if (!button) return;
     const tab = Number(button.dataset.tab);

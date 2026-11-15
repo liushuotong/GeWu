@@ -152,7 +152,9 @@ impl WebFetchTool {
             let (host, pinned) = self.check(&current).await?;
             let mut builder = reqwest::Client::builder()
                 .timeout(Duration::from_secs(30))
-                .user_agent("opencode-cli/0.1.0")
+                // Honest attribution: identify as GeWu instead of posing as a
+                // browser. The version follows the crate so it cannot go stale.
+                .user_agent(concat!("gewu/", env!("CARGO_PKG_VERSION")))
                 .cookie_provider(jar.clone())
                 .redirect(reqwest::redirect::Policy::none());
             if let Some(addr) = pinned {
@@ -378,6 +380,7 @@ mod tests {
 
         let _m = server
             .mock("GET", "/hello")
+            .match_header("user-agent", concat!("gewu/", env!("CARGO_PKG_VERSION")))
             .with_status(200)
             .with_header("content-type", "text/html")
             .with_body("<html><body><h1>Hello, World!</h1></body></html>")

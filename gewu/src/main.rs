@@ -21,7 +21,7 @@ use gewu_server::bootstrap::CommonArgs;
 
 #[derive(Parser)]
 #[command(name = "gewu")]
-#[command(version = "0.1.0")]
+#[command(version)]
 #[command(about = "Run the GeWu agent server and web GUI with a single command", long_about = None)]
 struct Cli {
     #[command(subcommand)]

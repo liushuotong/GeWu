@@ -79,6 +79,28 @@ the server host at runtime, or choose a workdir when creating a session from
 the left sidebar. Each session remembers its root across restarts; switching
 is rejected while a turn is running.
 
+### Image attachments
+
+`read_file` downscales images before handing them to the model, so a photo
+does not consume the context window at full resolution. Defaults follow
+opencode: 2000 px per edge and 5 MiB of base64, encoded as PNG when it fits
+and JPEG otherwise. Override them in `config.jsonc`:
+
+```jsonc
+{
+  "attachment": {
+    "image": {
+      "auto_resize": true,        // false refuses oversized images instead
+      "max_width": 2000,
+      "max_height": 2000,
+      "max_base64_bytes": 5242880
+    }
+  }
+}
+```
+
+Images already within the limits pass through byte-for-byte.
+
 For one-shot and interactive use from the terminal:
 
 ```bash

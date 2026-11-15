@@ -8,25 +8,25 @@
 //!
 //! | Tool | Name | Description |
 //! |------|------|-------------|
-//! | [`BashTool`](bash::BashTool) | `bash` | Execute shell commands |
-//! | [`ApplyPatchTool`](apply_patch::ApplyPatchTool) | `apply_patch` | Apply validated multi-file patches |
-//! | [`ReadFileTool`](fs::ReadFileTool) | `read_file` | Read files and directories |
-//! | [`WriteFileTool`](fs::WriteFileTool) | `write_file` | Write/create files |
-//! | [`EditFileTool`](fs::EditFileTool) | `edit_file` | Edit files by replacing text |
-//! | [`GlobTool`](fs::GlobTool) | `glob` | Find files by glob patterns |
-//! | [`GrepTool`](grep::GrepTool) | `grep` | Search file contents |
-//! | [`ListTool`](list::ListTool) | `list` | List directory contents |
-//! | [`WebFetchTool`](web_fetch::WebFetchTool) | `webfetch` | Fetch web pages |
-//! | [`WebSearchTool`](search::WebSearchTool) | `websearch` | Search the web |
-//! | [`CodeSearchTool`](search::CodeSearchTool) | `codesearch` | Search code semantically |
-//! | [`TodoReadTool`](todo::TodoReadTool) | `todoread` | Read the task list |
-//! | [`TodoWriteTool`](todo::TodoWriteTool) | `todowrite` | Write the task list |
-//! | [`TaskTool`](task::TaskTool) | `task` | Launch sub-agents for complex tasks |
-//! | [`WorkflowStartTool`](workflow::WorkflowStartTool) | `workflow_start` | Start a background workflow run from a JSON spec |
-//! | [`WorkflowStatusTool`](workflow::WorkflowStatusTool) | `workflow_status` | Snapshot a workflow run without waiting |
-//! | [`WorkflowWaitTool`](workflow::WorkflowWaitTool) | `workflow_wait` | Wait for a workflow run to finish |
-//! | [`WorkflowCancelTool`](workflow::WorkflowCancelTool) | `workflow_cancel` | Abort a workflow run |
-//! | [`SkillTool`](skill::SkillTool) | `skill` | Load skill instructions into the conversation |
+//! | [`BashTool`] | `bash` | Execute shell commands |
+//! | [`ApplyPatchTool`] | `apply_patch` | Apply validated multi-file patches |
+//! | [`ReadFileTool`] | `read_file` | Read files and directories |
+//! | [`WriteFileTool`] | `write_file` | Write/create files |
+//! | [`EditFileTool`] | `edit_file` | Edit files by replacing text |
+//! | [`GlobTool`] | `glob` | Find files by glob patterns |
+//! | [`GrepTool`] | `grep` | Search file contents |
+//! | [`ListTool`] | `list` | List directory contents |
+//! | [`WebFetchTool`] | `webfetch` | Fetch web pages |
+//! | [`WebSearchTool`] | `websearch` | Search the web |
+//! | [`CodeSearchTool`] | `codesearch` | Search code semantically |
+//! | [`TodoReadTool`] | `todoread` | Read the task list |
+//! | [`TodoWriteTool`] | `todowrite` | Write the task list |
+//! | [`TaskTool`] | `task` | Launch sub-agents for complex tasks |
+//! | [`WorkflowStartTool`] | `workflow_start` | Start a background workflow run from a JSON spec |
+//! | [`WorkflowStatusTool`] | `workflow_status` | Snapshot a workflow run without waiting |
+//! | [`WorkflowWaitTool`] | `workflow_wait` | Wait for a workflow run to finish |
+//! | [`WorkflowCancelTool`] | `workflow_cancel` | Abort a workflow run |
+//! | [`SkillTool`] | `skill` | Load skill instructions into the conversation |
 //!
 //! # MCP Tools
 //!
@@ -65,6 +65,7 @@ pub mod fs_utils;
 pub mod grep;
 pub mod list;
 pub mod mcp;
+mod media;
 pub mod replacers;
 pub mod search;
 pub mod skill;
@@ -78,6 +79,7 @@ pub use bash::BashTool;
 pub use fs::{EditFileTool, GlobTool, ReadFileTool, WriteFileTool};
 pub use grep::GrepTool;
 pub use list::ListTool;
+pub use media::{DEFAULT_MAX_BASE64_BYTES, DEFAULT_MAX_DIMENSION, ImageLimits};
 pub use search::{CodeSearchTool, WebSearchTool};
 pub use skill::{SkillInfo, SkillTool};
 pub use task::{AgentFactory, AgentOverrides, TaskTool};

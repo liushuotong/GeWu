@@ -6,7 +6,8 @@
 //!
 //! # Security
 //!
-//! File paths are resolved according to the [`PathEnforcement`] level carried
+//! File paths are resolved according to the
+//! [`PathEnforcement`](gewu_core::types::PathEnforcement) level carried
 //! on the [`ToolContext`]. The level is server configuration (config key
 //! `sandbox`) and defaults to `None`: paths are used as provided with no
 //! containment checks. `Contain` rejects paths escaping the working directory
@@ -24,6 +25,7 @@ use crate::fs_utils::{
     glob_with_gitignore, into_tool_error, is_binary_file, mime_type, read_bytes, read_text,
     resolve_read_path, resolve_write_path, write,
 };
+use crate::media::ImageLimits;
 use crate::replacers::smart_replace;
 use anyhow::Result;
 use async_trait::async_trait;
@@ -102,6 +104,8 @@ fn default_glob_limit() -> usize {
 
 pub struct ReadFileTool {
     pub working_directory: PathBuf,
+    /// Caps applied to image attachments (see [`ImageLimits`]).
+    pub image_limits: ImageLimits,
 }
 
 pub struct WriteFileTool {
@@ -321,6 +325,32 @@ impl Tool for ReadFileTool {
                 ));
             }
             let data = read_bytes(&file_path).await.map_err(into_tool_error)?;
+            // Images are downscaled and re-encoded before they leave the tool:
+            // a phone photo is otherwise billed to the model in full. Decoding
+            // is CPU-bound, so keep it off the async executor.
+            let (data, mime) = if is_image {
+                let path_mime = mime;
+                let limits = self.image_limits;
+                match tokio::task::spawn_blocking(move || {
+                    crate::media::normalize(&data, &path_mime, limits)
+                })
+                .await
+                .map_err(into_tool_error)?
+                {
+                    Ok(normalized) => (normalized.data, normalized.mime),
+                    Err(error) => {
+                        return Ok(ToolResult::new(
+                            "read_file",
+                            format!(
+                                "Cannot read file: {} could not be attached because {error}",
+                                input.file_path
+                            ),
+                        ));
+                    }
+                }
+            } else {
+                (data, mime)
+            };
             let encoded = BASE64.encode(&data);
             let msg = if is_image { "Image" } else { "PDF" };
             let result = serde_json::json!({
@@ -663,6 +693,7 @@ mod tests {
 
         let tool = ReadFileTool {
             working_directory: working_dir,
+            image_limits: ImageLimits::default(),
         };
         let args = serde_json::json!({
             "file_path": file_path.to_str().unwrap()
@@ -686,6 +717,7 @@ mod tests {
         fs::write(selected.path().join("selected.txt"), "from selected").await?;
         let tool = ReadFileTool {
             working_directory: fallback.path().to_path_buf(),
+            image_limits: ImageLimits::default(),
         };
         let ctx = ToolContext::new("test", "message")
             .with_working_directory(selected.path().to_path_buf());
@@ -695,6 +727,65 @@ mod tests {
             .await
             .map_err(|e| anyhow::anyhow!(e.to_string()))?;
         assert!(result.output.contains("from selected"), "{}", result.output);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn read_file_downscales_oversized_images() -> Result<()> {
+        let dir = tempdir()?;
+        let file_path = dir.path().join("photo.png");
+        image::RgbaImage::from_pixel(3000, 300, image::Rgba([10, 20, 30, 255])).save(&file_path)?;
+        let tool = ReadFileTool {
+            working_directory: dir.path().to_path_buf(),
+            image_limits: ImageLimits::default(),
+        };
+        let ctx = ToolContext::new("test", "message");
+
+        let result = tool
+            .execute(
+                serde_json::json!({"file_path": file_path.to_str().unwrap()}),
+                &ctx,
+            )
+            .await
+            .map_err(|e| anyhow::anyhow!(e.to_string()))?;
+
+        let payload: serde_json::Value = serde_json::from_str(&result.output)?;
+        assert_eq!(payload["type"], "media");
+        assert_eq!(payload["mime"], "image/png");
+        assert_eq!(payload["message"], "Image read successfully");
+        let data = BASE64.decode(payload["data"].as_str().unwrap())?;
+        assert_eq!(image::load_from_memory(&data)?.width(), 2000);
+        assert_eq!(
+            result.attachments[0].mime.as_deref(),
+            Some("image/png"),
+            "attachment MIME must follow the normalized payload"
+        );
+        assert_eq!(result.attachments[0].size, data.len() as u64);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn read_file_leaves_small_images_untouched() -> Result<()> {
+        let dir = tempdir()?;
+        let file_path = dir.path().join("icon.png");
+        image::RgbaImage::from_pixel(16, 16, image::Rgba([1, 2, 3, 255])).save(&file_path)?;
+        let original = fs::read(&file_path).await?;
+        let tool = ReadFileTool {
+            working_directory: dir.path().to_path_buf(),
+            image_limits: ImageLimits::default(),
+        };
+        let ctx = ToolContext::new("test", "message");
+
+        let result = tool
+            .execute(
+                serde_json::json!({"file_path": file_path.to_str().unwrap()}),
+                &ctx,
+            )
+            .await
+            .map_err(|e| anyhow::anyhow!(e.to_string()))?;
+
+        let payload: serde_json::Value = serde_json::from_str(&result.output)?;
+        assert_eq!(BASE64.decode(payload["data"].as_str().unwrap())?, original);
         Ok(())
     }
 
@@ -956,6 +1047,7 @@ mod tests {
 
         let tool = ReadFileTool {
             working_directory: root.path().to_path_buf(),
+            image_limits: ImageLimits::default(),
         };
         let ctx = ToolContext::new("test", "msg").with_enforcement(PathEnforcement::None);
         let result = tool
