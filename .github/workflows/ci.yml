@@ -36,6 +36,9 @@ jobs:
       - name: Check formatting
         run: cargo fmt --all --check
 
+      - name: Check install script
+        run: bash -n install.sh
+
       - name: Build workspace
         run: cargo build --workspace --locked
 

@@ -12,8 +12,19 @@ Moonshot, proxies, and local models).
 
 ## Install
 
-A Rust toolchain is required (see [rustup.rs](https://rustup.rs)). From the
-repository root:
+Prebuilt binaries are published for Linux x86_64 (glibc >= 2.28) and macOS
+arm64. The installer downloads the latest release, verifies its checksum, and
+puts the binary in `~/.local/bin`:
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/regulatory-genomics/GeWu/main/install.sh | bash
+```
+
+Set `GEWU_INSTALL_DIR` to install elsewhere, or `GEWU_VERSION=v0.1.3` to pin a
+release. Add the install directory to your `PATH` if the script asks you to.
+
+On other platforms, build from source with a Rust toolchain (see
+[rustup.rs](https://rustup.rs)). From the repository root:
 
 ```bash
 cargo install --path gewu    # builds and installs the `gewu` binary
@@ -78,36 +89,5 @@ root in the FILES panel (`ROOT`), use `＋` to browse and add any directory on
 the server host at runtime, or choose a workdir when creating a session from
 the left sidebar. Each session remembers its root across restarts; switching
 is rejected while a turn is running.
-
-### Image attachments
-
-`read_file` downscales images before handing them to the model, so a photo
-does not consume the context window at full resolution. Defaults follow
-opencode: 2000 px per edge and 5 MiB of base64, encoded as PNG when it fits
-and JPEG otherwise. Override them in `config.jsonc`:
-
-```jsonc
-{
-  "attachment": {
-    "image": {
-      "auto_resize": true,        // false refuses oversized images instead
-      "max_width": 2000,
-      "max_height": 2000,
-      "max_base64_bytes": 5242880
-    }
-  }
-}
-```
-
-Images already within the limits pass through byte-for-byte.
-
-For one-shot and interactive use from the terminal:
-
-```bash
-cargo run -p gewu-server -- run "Fix the failing tests"   # one-shot (or pipe via stdin)
-cargo run -p gewu-server -- run -i                        # interactive shell
-cargo run -p gewu-server -- run --list-models
-cargo run -p gewu-server -- view                          # list persisted sessions
-```
 
 Agent state is stored in `~/.gewu/gewu.db` (override with `--db-path`).
