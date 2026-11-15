@@ -10,6 +10,7 @@
   const TOKEN_KEY = "gewu-gui-token";
   const SIDEBAR_KEY = "gewu-gui-sidebar";
   const SESSIONS_KEY = "gewu-gui-sessions";
+  const WORKSPACES_KEY = "gewu-gui-collapsed-workspaces";
   const MAX_RECONNECT_MS = 60000;
 
   const el = {
@@ -134,6 +135,56 @@
     } catch {
       // The state still applies to this page.
     }
+  }
+
+  function loadCollapsedWorkspaces() {
+    try {
+      const saved = JSON.parse(localStorage.getItem(WORKSPACES_KEY) || "[]");
+      return Array.isArray(saved)
+        ? new Set(saved.filter((id) => typeof id === "string"))
+        : new Set();
+    } catch {
+      return new Set();
+    }
+  }
+
+  const collapsedWorkspaces = loadCollapsedWorkspaces();
+
+  function saveCollapsedWorkspaces() {
+    try {
+      localStorage.setItem(WORKSPACES_KEY, JSON.stringify([...collapsedWorkspaces]));
+    } catch {
+      // The state still applies to this page.
+    }
+  }
+
+  function applyWorkspaceCollapseState() {
+    for (const group of el.sessionSidebar.querySelectorAll("[data-session-workspace-group]")) {
+      const collapsed = collapsedWorkspaces.has(group.dataset.sessionWorkspaceGroup);
+      group.classList.toggle("collapsed", collapsed);
+      const toggle = group.querySelector("[data-session-workspace-toggle]");
+      if (toggle) toggle.setAttribute("aria-expanded", String(!collapsed));
+      const list = group.querySelector(".session-list");
+      if (list) list.hidden = collapsed;
+    }
+  }
+
+  function setSessionSidebarHtml(html) {
+    el.sessionSidebar.innerHTML = html || "";
+    applyWorkspaceCollapseState();
+  }
+
+  function toggleWorkspaceGroup(id) {
+    if (collapsedWorkspaces.has(id)) collapsedWorkspaces.delete(id);
+    else collapsedWorkspaces.add(id);
+    saveCollapsedWorkspaces();
+    applyWorkspaceCollapseState();
+  }
+
+  function expandWorkspace(id) {
+    if (!collapsedWorkspaces.delete(id)) return;
+    saveCollapsedWorkspaces();
+    applyWorkspaceCollapseState();
   }
 
   function toggleSessions() {
@@ -310,7 +361,7 @@
         setTranscript(message.transcript, true);
         setStatus(message.status);
         el.sidebar.innerHTML = message.sidebar || "";
-        el.sessionSidebar.innerHTML = message.session_sidebar || "";
+        setSessionSidebarHtml(message.session_sidebar);
         setBusy(message.tabs.some((tab) => tab.id === message.active && tab.busy));
         break;
       case "tabs": {
@@ -326,7 +377,7 @@
         break;
       }
       case "session_sidebar":
-        el.sessionSidebar.innerHTML = message.html || "";
+        setSessionSidebarHtml(message.html);
         break;
       case "transcript":
         state.loadingEarlier = false;
@@ -857,8 +908,14 @@
       send({ op: "close_tab", tab: Number(close.dataset.sessionClose) });
       return;
     }
+    const workspaceToggle = event.target.closest("[data-session-workspace-toggle]");
+    if (workspaceToggle) {
+      toggleWorkspaceGroup(workspaceToggle.dataset.sessionWorkspaceToggle);
+      return;
+    }
     const create = event.target.closest("[data-session-new-workspace]");
     if (create) {
+      expandWorkspace(create.dataset.sessionNewWorkspace);
       send({
         op: "create_tab",
         workspace: create.dataset.sessionNewWorkspace,
@@ -883,6 +940,7 @@
     }
     const createTab = event.target.closest("[data-new-session-create]");
     if (createTab) {
+      expandWorkspace(createTab.dataset.newSessionWorkspace);
       send({
         op: "create_tab",
         workspace: createTab.dataset.newSessionWorkspace,

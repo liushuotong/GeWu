@@ -104,6 +104,7 @@ clickable scrim, and `Esc` closes an open drawer.
 | `Shift+Enter` | Insert a newline |
 | `Esc` | Interrupt the running ask |
 | `Ctrl+B` | Show or hide the files sidebar (available tools, working directory) |
+| Workspace header | Expand or collapse its session list |
 | Send / Stop | Send the composer / interrupt (buttons) |
 | Session click | Switch sessions |
 | `×` on a session | Close the session |
