@@ -82,10 +82,10 @@ On startup the GUI opens **every stored session** in the left sidebar, grouped
 by workspace, and focuses the newest. Titles come from the first user prompt,
 falling back to the short session id or `new`. Each session has its own
 upstream connection, so an ask can keep streaming while you work in another.
-**New session** at the top of the left sidebar opens a fresh session; `×` next
-to a session closes it **and permanently deletes that session from the server's
-store**, with no confirmation. Subagent sessions spawned by the `task` tool are
-not listed:
+**Open workspace** at the top of the left sidebar opens the workspace picker;
+choosing a directory starts a fresh session there. `×` next to a session closes
+it **and permanently deletes that session from the server's store**, with no
+confirmation. Subagent sessions spawned by the `task` tool are not listed:
 they belong to the conversation that launched them and are deleted together
 with it. Subagents cannot spawn further subagents.
 

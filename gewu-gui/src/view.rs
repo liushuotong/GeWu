@@ -1032,7 +1032,7 @@ pub fn session_sidebar_html(
     }
 
     let mut out = format!(
-        "<aside class=\"session-sidebar\" aria-label=\"Sessions by workspace\"><header class=\"session-sidebar-header\"><span class=\"brand-mark session-brand\" title=\"GeWu agent\"><svg class=\"brand-icon\" viewBox=\"0 0 24 24\" fill=\"none\" stroke=\"currentColor\" stroke-width=\"1.7\" stroke-linecap=\"round\" stroke-linejoin=\"round\" aria-hidden=\"true\"><rect x=\"3.5\" y=\"3.5\" width=\"17\" height=\"17\" rx=\"3.5\"/><circle cx=\"12\" cy=\"12\" r=\"4.25\"/><path d=\"M12 3.5v4.25M12 16.25v4.25M3.5 12h4.25M16.25 12h4.25\"/></svg></span><span class=\"session-sidebar-title\">GeWu <span class=\"session-sidebar-version\">v{}</span></span><button type=\"button\" class=\"session-collapse\" data-sessions-collapse title=\"Close sidebar\" aria-label=\"Close sidebar\"><svg viewBox=\"0 0 24 24\" fill=\"none\" stroke=\"currentColor\" stroke-width=\"1.8\" stroke-linecap=\"round\" stroke-linejoin=\"round\" aria-hidden=\"true\"><rect x=\"3\" y=\"4\" width=\"18\" height=\"16\" rx=\"2\"/><path d=\"M9 4v16\"/><path d=\"m16 15-3-3 3-3\"/></svg></button></header><button type=\"button\" class=\"session-new-primary\" data-session-new title=\"New session\" aria-label=\"New session\"><svg viewBox=\"0 0 24 24\" fill=\"none\" stroke=\"currentColor\" stroke-width=\"1.7\" stroke-linecap=\"round\" stroke-linejoin=\"round\" aria-hidden=\"true\"><path d=\"M4 20h4l10-10-4-4L4 16v4Z\"/><path d=\"M13 7l4 4\"/></svg><span>New session</span></button><div class=\"session-section-label\">WORKSPACE</div><div class=\"session-workspace-groups\">",
+        "<aside class=\"session-sidebar\" aria-label=\"Sessions by workspace\"><header class=\"session-sidebar-header\"><span class=\"brand-mark session-brand\" title=\"GeWu agent\"><svg class=\"brand-icon\" viewBox=\"0 0 24 24\" fill=\"none\" stroke=\"currentColor\" stroke-width=\"1.7\" stroke-linecap=\"round\" stroke-linejoin=\"round\" aria-hidden=\"true\"><rect x=\"3.5\" y=\"3.5\" width=\"17\" height=\"17\" rx=\"3.5\"/><circle cx=\"12\" cy=\"12\" r=\"4.25\"/><path d=\"M12 3.5v4.25M12 16.25v4.25M3.5 12h4.25M16.25 12h4.25\"/></svg></span><span class=\"session-sidebar-title\">GeWu <span class=\"session-sidebar-version\">v{}</span></span><button type=\"button\" class=\"session-collapse\" data-sessions-collapse title=\"Close sidebar\" aria-label=\"Close sidebar\"><svg viewBox=\"0 0 24 24\" fill=\"none\" stroke=\"currentColor\" stroke-width=\"1.8\" stroke-linecap=\"round\" stroke-linejoin=\"round\" aria-hidden=\"true\"><rect x=\"3\" y=\"4\" width=\"18\" height=\"16\" rx=\"2\"/><path d=\"M9 4v16\"/><path d=\"m16 15-3-3 3-3\"/></svg></button></header><button type=\"button\" class=\"session-new-primary\" data-session-new title=\"Open workspace\" aria-label=\"Open workspace\"><svg viewBox=\"0 0 24 24\" fill=\"none\" stroke=\"currentColor\" stroke-width=\"1.7\" stroke-linecap=\"round\" stroke-linejoin=\"round\" aria-hidden=\"true\"><path d=\"M3.5 6.5A1.5 1.5 0 0 1 5 5h4l2 2h8a1.5 1.5 0 0 1 1.5 1.5V10\"/><path d=\"M3.5 10.5h17l-2 8h-13l-2-8Z\"/></svg><span>Open workspace</span></button><div class=\"session-section-label\">WORKSPACE</div><div class=\"session-workspace-groups\">",
         GEWU_GUI_VERSION
     );
     for (group_index, workspace_id) in workspace_ids.into_iter().enumerate() {
@@ -1221,7 +1221,7 @@ pub fn workspace_browser_html(
 /// Render the workdir choice shown before a new session tab is created.
 pub fn session_workspace_picker_html(workspaces: &[WorkspaceSummary], browse_path: &str) -> String {
     let mut out = String::from(
-        "<section id=\"session-workspace-picker\" class=\"workspace-browser\" role=\"dialog\" aria-label=\"Choose workspace for new session\"><div class=\"workspace-browser-card session-picker-card\"><header><strong>New session · choose workdir</strong><button type=\"button\" data-new-session-close aria-label=\"Close\">×</button></header><p class=\"workspace-picker-note\">The session will start in the selected server directory.</p><ul class=\"workspace-browser-list session-workspace-list\">",
+        "<section id=\"session-workspace-picker\" class=\"workspace-browser\" role=\"dialog\" aria-label=\"Open workspace\"><div class=\"workspace-browser-card session-picker-card\"><header><strong>Open workspace · choose workdir</strong><button type=\"button\" data-new-session-close aria-label=\"Close\">×</button></header><p class=\"workspace-picker-note\">A new session will start in the selected server directory.</p><ul class=\"workspace-browser-list session-workspace-list\">",
     );
     for workspace in workspaces {
         let _ = write!(
@@ -1249,7 +1249,7 @@ pub fn new_session_browser_html(
     entries: &[DirectoryEntry],
 ) -> String {
     let mut out = String::from(
-        "<section id=\"session-workspace-picker\" class=\"workspace-browser\" role=\"dialog\" aria-label=\"Choose workspace for new session\"><div class=\"workspace-browser-card session-picker-card\"><header><strong>New session · choose workdir</strong><button type=\"button\" data-new-session-close aria-label=\"Close\">×</button></header>",
+        "<section id=\"session-workspace-picker\" class=\"workspace-browser\" role=\"dialog\" aria-label=\"Open workspace\"><div class=\"workspace-browser-card session-picker-card\"><header><strong>Open workspace · choose workdir</strong><button type=\"button\" data-new-session-close aria-label=\"Close\">×</button></header>",
     );
     let _ = write!(
         out,
@@ -1547,6 +1547,11 @@ mod tests {
         );
         assert!(html.contains("id=\"session-workspace-picker\""), "{html}");
         assert!(
+            html.contains("<strong>Open workspace · choose workdir</strong>"),
+            "{html}"
+        );
+        assert!(html.contains("aria-label=\"Open workspace\""), "{html}");
+        assert!(
             html.contains("data-new-session-workspace=\"tachyon\""),
             "{html}"
         );
@@ -1568,6 +1573,10 @@ mod tests {
             "{html}"
         );
         assert!(html.contains("data-new-session-create"), "{html}");
+        assert!(
+            html.contains("<strong>Open workspace · choose workdir</strong>"),
+            "{html}"
+        );
         assert!(
             html.contains(
                 "data-new-session-browse-path=\"/data3/litian/projects/tachyon_project\""
@@ -1619,6 +1628,19 @@ mod tests {
             "{html}"
         );
         assert!(html.contains("session-new-primary"), "{html}");
+        assert!(
+            html.contains("title=\"Open workspace\" aria-label=\"Open workspace\""),
+            "{html}"
+        );
+        assert!(html.contains("<span>Open workspace</span>"), "{html}");
+        assert!(
+            html.contains("M3.5 6.5A1.5 1.5 0 0 1 5 5h4l2 2h8"),
+            "{html}"
+        );
+        assert!(
+            !html.contains("M4 20h4l10-10-4-4L4 16v4Z"),
+            "pencil icon should be replaced: {html}"
+        );
         assert!(
             html.contains("session-section-label\">WORKSPACE</div>"),
             "{html}"
