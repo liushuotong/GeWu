@@ -1,0 +1,199 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  ci:
+    name: CI
+    uses: ./.github/workflows/ci.yml
+
+  verify-version:
+    name: Verify tag version
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v5
+
+      - name: Check tag matches gewu crate version
+        run: |
+          set -euo pipefail
+          version="$(sed -n 's/^version = "\(.*\)"/\1/p' gewu/Cargo.toml | head -n 1)"
+          if [[ "v${version}" != "${GITHUB_REF_NAME}" ]]; then
+            echo "::error::Tag ${GITHUB_REF_NAME} does not match gewu crate version v${version}"
+            exit 1
+          fi
+          echo "Releasing gewu v${version}"
+
+  build-linux:
+    name: Linux x86_64 (glibc 2.28)
+    needs: [ci, verify-version]
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v5
+
+      - name: Build in AlmaLinux 8
+        run: |
+          set -euo pipefail
+          docker run --rm \
+            -v "${PWD}:/src" \
+            -w /src \
+            -e HOST_UID="$(id -u)" \
+            -e HOST_GID="$(id -g)" \
+            almalinux:8 \
+            bash -c '
+              set -euo pipefail
+              dnf install -y ca-certificates gcc gcc-c++ make perl-core zlib-devel curl tar gzip
+              curl --proto "=https" --tlsv1.2 -sSf https://sh.rustup.rs \
+                | sh -s -- -y --profile minimal
+              . "$HOME/.cargo/env"
+
+              cd /tmp
+              curl -fsSL -o openssl-3.6.3.tar.gz \
+                https://www.openssl.org/source/openssl-3.6.3.tar.gz
+              echo "243a86649cf6f23eeb6a2ff2456e09e5d77dd9018a54d3d96b0c6bdd6ba6c7f1  openssl-3.6.3.tar.gz" \
+                | sha256sum -c -
+              tar -xzf openssl-3.6.3.tar.gz
+              cd openssl-3.6.3
+              CFLAGS="-fPIC" ./config \
+                --prefix=/usr/local/ssl \
+                --openssldir=/usr/local/ssl \
+                no-shared no-tests
+              make -j"$(nproc)"
+              make install_sw
+              cd /src
+
+              export OPENSSL_DIR=/usr/local/ssl
+              export OPENSSL_STATIC=1
+              export RUSTFLAGS="-C link-arg=-ldl -C link-arg=-lpthread -C link-arg=-lz"
+              cargo build --locked --release -p gewu
+
+              ldd target/release/gewu
+              if ldd target/release/gewu | grep -Eq "libssl|libcrypto"; then
+                echo "gewu still links OpenSSL dynamically" >&2
+                exit 1
+              fi
+
+              max_glibc="$(objdump -T target/release/gewu \
+                | grep -o "GLIBC_[0-9.]*" | sort -Vu | tail -n 1)"
+              if [[ -z "${max_glibc}" ]]; then
+                echo "could not determine the required glibc version" >&2
+                exit 1
+              fi
+              echo "Maximum required glibc symbol: ${max_glibc}"
+              max_version="${max_glibc#GLIBC_}"
+              if [[ "$(printf "%s\n" "${max_version}" "2.28" | sort -V | tail -n 1)" != "2.28" ]]; then
+                echo "gewu requires ${max_glibc}, which is newer than GLIBC_2.28" >&2
+                exit 1
+              fi
+
+              chown -R "${HOST_UID}:${HOST_GID}" target
+            '
+
+      - name: Smoke test on Ubuntu 20.04
+        run: |
+          docker run --rm \
+            -v "${PWD}/target/release:/test:ro" \
+            ubuntu:20.04 /test/gewu --version
+
+      - name: Package
+        run: |
+          set -euo pipefail
+          name="gewu-${GITHUB_REF_NAME}-x86_64-unknown-linux-gnu"
+          mkdir -p dist/licenses
+          cp target/release/gewu dist/gewu
+          cp README.md dist/
+          cp gewu-gui/assets/fonts/OFL-Inter.txt dist/licenses/
+          cp gewu-gui/assets/fonts/OFL-JetBrainsMono.txt dist/licenses/
+          tar -czf "${name}.tar.gz" -C dist gewu README.md licenses
+
+      - name: Upload archive
+        uses: actions/upload-artifact@v4
+        with:
+          name: gewu-x86_64-unknown-linux-gnu
+          path: gewu-*.tar.gz
+          if-no-files-found: error
+
+  build-macos:
+    name: macOS arm64
+    needs: [ci, verify-version]
+    runs-on: macos-latest
+    timeout-minutes: 60
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v5
+
+      - name: Setup Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-apple-darwin
+
+      - name: Build
+        run: cargo build --locked --release -p gewu --target aarch64-apple-darwin
+
+      - name: Smoke test
+        run: target/aarch64-apple-darwin/release/gewu --version
+
+      - name: Package
+        run: |
+          set -euo pipefail
+          name="gewu-${GITHUB_REF_NAME}-aarch64-apple-darwin"
+          mkdir -p dist/licenses
+          cp target/aarch64-apple-darwin/release/gewu dist/gewu
+          cp README.md dist/
+          cp gewu-gui/assets/fonts/OFL-Inter.txt dist/licenses/
+          cp gewu-gui/assets/fonts/OFL-JetBrainsMono.txt dist/licenses/
+          tar -czf "${name}.tar.gz" -C dist gewu README.md licenses
+
+      - name: Upload archive
+        uses: actions/upload-artifact@v4
+        with:
+          name: gewu-aarch64-apple-darwin
+          path: gewu-*.tar.gz
+          if-no-files-found: error
+
+  publish:
+    name: Publish GitHub Release
+    needs: [build-linux, build-macos]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Download archives
+        uses: actions/download-artifact@v4
+        with:
+          pattern: gewu-*
+          path: artifacts
+          merge-multiple: true
+
+      - name: Generate checksums
+        run: |
+          set -euo pipefail
+          cd artifacts
+          sha256sum gewu-*.tar.gz > SHA256SUMS
+          cat SHA256SUMS
+
+      - name: Create or update release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          tag="${GITHUB_REF_NAME}"
+          if gh release view "${tag}" >/dev/null 2>&1; then
+            gh release upload "${tag}" artifacts/* --clobber
+          else
+            gh release create "${tag}" artifacts/* \
+              --verify-tag \
+              --title "${tag}" \
+              --generate-notes
+          fi
