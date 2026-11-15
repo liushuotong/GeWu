@@ -453,15 +453,13 @@ impl ServerState {
             .with_context(|| format!("cannot list directory: {}", directory.display()))?
         {
             let entry = entry?;
-            let metadata = std::fs::symlink_metadata(entry.path())
-                .with_context(|| format!("cannot inspect entry: {}", entry.path().display()))?;
-            if !metadata.is_dir() {
-                continue;
-            }
             let path = entry.path();
             let Some(name) = entry.file_name().to_str().map(str::to_owned) else {
                 continue;
             };
+            if name.starts_with('.') || !path.is_dir() {
+                continue;
+            }
             entries.push(DirectoryEntry {
                 name,
                 path: path.to_string_lossy().to_string(),
@@ -3815,6 +3813,55 @@ mod tests {
             Handled::Reply(ServerMessage::FileContent { ref content, .. })
                 if content == "frontend root"
         ));
+    }
+
+    #[tokio::test]
+    async fn browsing_workspaces_hides_dot_entries_and_files() {
+        let cwd = tempfile::tempdir().unwrap();
+        for name in ["zebra", "Alpha", ".hidden"] {
+            std::fs::create_dir(cwd.path().join(name)).unwrap();
+        }
+        std::fs::write(cwd.path().join("file.txt"), "test").unwrap();
+        let state = server_state_with(TestLlm::plain());
+        let (_, _, entries) = state
+            .browse_workspace(cwd.path().to_str().unwrap())
+            .unwrap();
+        let names: Vec<_> = entries.iter().map(|entry| entry.name.as_str()).collect();
+        assert_eq!(names, ["Alpha", "zebra"]);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn browsing_workspaces_includes_only_visible_directory_symlinks() {
+        use std::os::unix::fs::symlink;
+
+        let cwd = tempfile::tempdir().unwrap();
+        let target = tempfile::tempdir().unwrap();
+        std::fs::write(target.path().join("file.txt"), "test").unwrap();
+        symlink(target.path(), cwd.path().join("linked-folder")).unwrap();
+        symlink(target.path(), cwd.path().join(".hidden-link")).unwrap();
+        symlink(
+            target.path().join("file.txt"),
+            cwd.path().join("linked-file"),
+        )
+        .unwrap();
+        symlink(target.path().join("missing"), cwd.path().join("broken")).unwrap();
+        symlink("cycle", cwd.path().join("cycle")).unwrap();
+        let state = server_state_with(TestLlm::plain());
+        let (_, _, entries) = state
+            .browse_workspace(cwd.path().to_str().unwrap())
+            .unwrap();
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].name, "linked-folder");
+        assert_eq!(
+            entries[0].path,
+            cwd.path().join("linked-folder").to_string_lossy()
+        );
+        let (path, _, _) = state.browse_workspace(&entries[0].path).unwrap();
+        assert_eq!(
+            path,
+            target.path().canonicalize().unwrap().to_string_lossy()
+        );
     }
 
     #[tokio::test]

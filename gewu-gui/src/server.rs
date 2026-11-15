@@ -280,6 +280,14 @@ mod tests {
 
     /// A scripted upstream server that answers the ops the GUI uses.
     async fn spawn_fake_upstream() -> std::net::SocketAddr {
+        spawn_recorded_fake_upstream().await.0
+    }
+
+    async fn spawn_recorded_fake_upstream() -> (
+        std::net::SocketAddr,
+        tokio::sync::mpsc::UnboundedReceiver<String>,
+    ) {
+        let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
         tokio::spawn(async move {
@@ -287,13 +295,16 @@ mod tests {
                 let Ok((stream, _)) = listener.accept().await else {
                     break;
                 };
-                tokio::spawn(handle_fake_connection(stream));
+                tokio::spawn(handle_fake_connection(stream, tx.clone()));
             }
         });
-        addr
+        (addr, rx)
     }
 
-    async fn handle_fake_connection(stream: tokio::net::TcpStream) {
+    async fn handle_fake_connection(
+        stream: tokio::net::TcpStream,
+        ops: tokio::sync::mpsc::UnboundedSender<String>,
+    ) {
         let (reader, mut writer) = stream.into_split();
         let mut lines = BufReader::new(reader).lines();
         while let Ok(Some(line)) = lines.next_line().await {
@@ -302,6 +313,7 @@ mod tests {
             };
             let id = request.get("id").cloned().unwrap_or(Value::Null);
             let op = request.get("op").and_then(Value::as_str).unwrap_or("");
+            let _ = ops.send(op.to_string());
             let replies: Vec<Value> = match op {
                 "subscribe_session" => vec![
                     json!({"type":"ready", "id":id, "request_id":"", "session_id":"sess-1", "agent":"build"}),
@@ -350,6 +362,12 @@ mod tests {
                         .map(|payload| payload.len() * 3 / 4)
                         .unwrap_or(0),
                 })],
+                "interrupt" => {
+                    vec![json!({"type": "interrupted", "id": id, "request_id": "req-1"})]
+                }
+                "delete_session" => vec![
+                    json!({"type":"error", "id":id, "error":"session deletion forbidden by test upstream"}),
+                ],
                 "ping" => vec![json!({"type": "pong", "id": id})],
                 "usage" => vec![json!({
                     "type": "usage", "id": id, "used_tokens": 1000, "context_limit": 10000,
@@ -584,6 +602,96 @@ mod tests {
         // Passing auth must lead to a normal session snapshot.
         let value = next_json(&mut ws).await;
         assert_eq!(value["type"], "snapshot");
+    }
+
+    #[tokio::test]
+    async fn workspace_close_preserves_sessions_and_reopens_groups() {
+        tokio::time::timeout(Duration::from_secs(5), async {
+            let (upstream, mut ops) = spawn_recorded_fake_upstream().await;
+            let addr = spawn_gui(AppState {
+                endpoint: Endpoint::Tcp {
+                    host: "127.0.0.1".into(),
+                    port: upstream.port(),
+                },
+                token: None,
+                server_token: None,
+            })
+            .await;
+            let (mut ws, _) = tokio_tungstenite::connect_async(format!("ws://{addr}/ws"))
+                .await
+                .unwrap();
+            let initial = next_json(&mut ws).await["active"].as_u64().unwrap();
+            ws.send(WsMessage::text(
+                json!({"op":"ask","tab":initial,"prompt":"hello"}).to_string(),
+            ))
+            .await
+            .unwrap();
+            loop {
+                let value = next_json(&mut ws).await;
+                if value["type"] == "tabs"
+                    && value["tabs"][0]["session_id"] == "sess-1"
+                    && value["tabs"][0]["busy"] == false
+                {
+                    break;
+                }
+            }
+            ws.send(WsMessage::text(
+                r#"{"op":"close_workspace","workspace":"cwd"}"#,
+            ))
+            .await
+            .unwrap();
+            loop {
+                let value = next_json(&mut ws).await;
+                assert_ne!(value["type"], "error");
+                if value["type"] == "tabs" {
+                    assert_eq!(value["tabs"].as_array().unwrap().len(), 1);
+                    assert_ne!(value["active"].as_u64().unwrap(), initial);
+                    assert_eq!(value["tabs"][0]["workspace"], "cwd");
+                    assert!(value["tabs"][0]["session_id"].is_null());
+                    break;
+                }
+            }
+            let sidebar = next_json(&mut ws).await;
+            assert_eq!(sidebar["type"], "session_sidebar");
+            assert!(
+                sidebar["html"]
+                    .as_str()
+                    .unwrap()
+                    .contains("data-session-workspace-group=\"cwd\"")
+            );
+            for op in ["create_tab", "close_workspace", "create_tab"] {
+                ws.send(WsMessage::text(
+                    json!({"op":op,"workspace":"runtime:/tmp/other","path":"/tmp/other"})
+                        .to_string(),
+                ))
+                .await
+                .unwrap();
+                loop {
+                    let value = next_json(&mut ws).await;
+                    assert_ne!(value["type"], "error");
+                    if value["type"] == "tabs" {
+                        let sidebar = next_json(&mut ws).await;
+                        assert_eq!(sidebar["type"], "session_sidebar");
+                        assert_eq!(
+                            sidebar["html"]
+                                .as_str()
+                                .unwrap()
+                                .contains("data-session-workspace-group=\"runtime:/tmp/other\""),
+                            op != "close_workspace"
+                        );
+                        break;
+                    }
+                }
+            }
+            let mut observed = Vec::new();
+            while let Ok(op) = ops.try_recv() {
+                observed.push(op);
+            }
+            assert!(observed.iter().any(|op| op == "interrupt"));
+            assert!(!observed.iter().any(|op| op == "delete_session"));
+        })
+        .await
+        .expect("workspace close must not use the forbidden delete_session operation");
     }
 
     #[tokio::test]

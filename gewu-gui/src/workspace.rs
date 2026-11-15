@@ -216,6 +216,16 @@ impl Workspace {
         self.tabs.iter().find(|t| t.id == id)
     }
 
+    pub fn close_workspace(&mut self, workspace: &str) -> Vec<Tab> {
+        let ids: Vec<_> = self
+            .tabs
+            .iter()
+            .filter(|tab| tab.workspace == workspace)
+            .map(|tab| tab.id)
+            .collect();
+        ids.into_iter().filter_map(|id| self.close(id)).collect()
+    }
+
     pub fn tab_mut(&mut self, id: u64) -> Option<&mut Tab> {
         self.tabs.iter_mut().find(|t| t.id == id)
     }
@@ -409,6 +419,25 @@ mod tests {
         assert!(ws.close(b).is_some());
         assert!(ws.is_empty());
         assert!(ws.close(999).is_none());
+    }
+
+    #[test]
+    fn close_workspace_keeps_other_tabs_and_selection() {
+        let mut ws = Workspace::new();
+        let a = ws.open_blank_in_workspace("project");
+        let b = ws.open_blank_in_workspace("cwd");
+        let c = ws.open_blank_in_workspace("project");
+        ws.switch_to_id(b);
+        let removed = ws.close_workspace("project");
+        assert_eq!(
+            removed.iter().map(|tab| tab.id).collect::<Vec<_>>(),
+            vec![a, c]
+        );
+        assert_eq!(ws.active_id(), b);
+        assert_eq!(ws.tabs.len(), 1);
+        assert!(ws.close_workspace("missing").is_empty());
+        ws.close_workspace("cwd");
+        assert!(ws.is_empty());
     }
 
     #[test]

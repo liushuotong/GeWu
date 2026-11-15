@@ -196,6 +196,7 @@ pub struct GuiSession {
     /// Working directory the upstream server's agent operates in.
     working_directory: Option<String>,
     workspaces: Vec<WorkspaceSummary>,
+    closed_workspaces: BTreeSet<String>,
     expanded_dirs: BTreeSet<String>,
     file_cache: BTreeMap<String, Vec<gewu_protocol::FileEntry>>,
     tab_tx: Option<mpsc::UnboundedSender<TabEvent>>,
@@ -304,6 +305,7 @@ impl GuiSession {
             tools,
             working_directory,
             workspaces,
+            closed_workspaces: BTreeSet::new(),
             expanded_dirs: BTreeSet::new(),
             file_cache,
             tab_tx: None,
@@ -430,7 +432,7 @@ impl GuiSession {
             ),
             session_sidebar: view::session_sidebar_html(
                 &self.workspace.infos(),
-                &self.workspaces,
+                &self.visible_workspaces(),
                 active,
             ),
         }
@@ -438,6 +440,14 @@ impl GuiSession {
 
     fn workspace_root(&self, id: &str) -> Option<&WorkspaceSummary> {
         self.workspaces.iter().find(|workspace| workspace.id == id)
+    }
+
+    fn visible_workspaces(&self) -> Vec<WorkspaceSummary> {
+        self.workspaces
+            .iter()
+            .filter(|root| !self.closed_workspaces.contains(&root.id))
+            .cloned()
+            .collect()
     }
 
     fn active_root_path(&self) -> Option<String> {
@@ -461,7 +471,7 @@ impl GuiSession {
             &ServerMsg::SessionSidebar {
                 html: view::session_sidebar_html(
                     &self.workspace.infos(),
-                    &self.workspaces,
+                    &self.visible_workspaces(),
                     self.workspace.active_id(),
                 ),
             },
@@ -990,6 +1000,7 @@ impl GuiSession {
                 }
                 match client.switch_workspace(workspace.clone()).await {
                     Ok((session_id, workspace)) => {
+                        self.closed_workspaces.remove(&workspace.id);
                         let tab_state = self.workspace.tab_mut(tab).expect("known tab");
                         tab_state.workspace = workspace.id;
                         tab_state.model.set_session(Some(session_id));
@@ -1049,6 +1060,7 @@ impl GuiSession {
                         path,
                     });
                 }
+                self.closed_workspaces.remove(&workspace);
                 let id = self.workspace.open_blank_in_workspace(workspace);
                 self.workspace.tab_mut(id).expect("just added").model_label =
                     self.model_label.clone();
@@ -1070,6 +1082,7 @@ impl GuiSession {
                 let client = self.client(tab).expect("ensured");
                 match client.add_workspace(path).await {
                     Ok((session_id, workspace)) => {
+                        self.closed_workspaces.remove(&workspace.id);
                         if !self.workspaces.iter().any(|root| root.id == workspace.id) {
                             self.workspaces.push(workspace.clone());
                         }
@@ -1127,6 +1140,24 @@ impl GuiSession {
             ClientMsg::CloseTab { tab } => {
                 self.close_tab(tab).await;
                 self.send_active_full(sender).await?;
+            }
+            ClientMsg::CloseWorkspace { workspace } => {
+                let active = self.workspace.active_id();
+                let tabs = self.workspace.close_workspace(&workspace);
+                for tab in tabs {
+                    self.stop_tab(tab.id).await;
+                }
+                self.closed_workspaces.insert(workspace);
+                self.ensure_blank_tab();
+                if self.workspace.active_id() != active {
+                    self.expanded_dirs.clear();
+                    self.file_cache.clear();
+                    self.send_active_full(sender).await?;
+                    self.send_refreshed_tree(sender).await?;
+                    self.activate_active(sender).await?;
+                } else {
+                    self.send_tabs(sender).await?;
+                }
             }
             ClientMsg::SwitchTab { tab } => {
                 if self.workspace.switch_to_id(tab) {
@@ -1452,6 +1483,34 @@ impl GuiSession {
     /// session from the store, then remove the tab. If deletion fails the tab
     /// stays open with an error note.
     async fn close_tab(&mut self, tab_id: u64) {
+        self.stop_tab(tab_id).await;
+
+        let session_id = self
+            .workspace
+            .tab(tab_id)
+            .and_then(|tab| tab.model.session_id.clone());
+        if let Some(session_id) = session_id
+            && let Err(e) = self.admin.delete_session(&session_id).await
+        {
+            if let Some(tab) = self.workspace.tab_mut(tab_id) {
+                tab.model.note(format!("could not delete session: {e}"));
+            }
+            return;
+        }
+
+        self.workspace.close(tab_id);
+        self.ensure_blank_tab();
+    }
+
+    fn ensure_blank_tab(&mut self) {
+        if self.workspace.is_empty() {
+            self.closed_workspaces.remove("cwd");
+            let id = self.workspace.open_blank();
+            self.workspace.tab_mut(id).expect("just added").model_label = self.model_label.clone();
+        }
+    }
+
+    async fn stop_tab(&mut self, tab_id: u64) {
         if let Some(mut conn) = self.conns.remove(&tab_id) {
             if let Some(task) = conn.task.take() {
                 if let Some(client) = &conn.client {
@@ -1468,25 +1527,6 @@ impl GuiSession {
             if let Some(observer) = conn.observer.take() {
                 observer.close().await;
             }
-        }
-
-        let session_id = self
-            .workspace
-            .tab(tab_id)
-            .and_then(|tab| tab.model.session_id.clone());
-        if let Some(session_id) = session_id
-            && let Err(e) = self.admin.delete_session(&session_id).await
-        {
-            if let Some(tab) = self.workspace.tab_mut(tab_id) {
-                tab.model.note(format!("could not delete session: {e}"));
-            }
-            return;
-        }
-
-        self.workspace.close(tab_id);
-        if self.workspace.is_empty() {
-            let id = self.workspace.open_blank();
-            self.workspace.tab_mut(id).expect("just added").model_label = self.model_label.clone();
         }
     }
 

@@ -85,6 +85,9 @@ pub enum ClientMsg {
     CloseTab {
         tab: u64,
     },
+    CloseWorkspace {
+        workspace: String,
+    },
     /// Focus a tab.
     SwitchTab {
         tab: u64,
@@ -259,6 +262,13 @@ mod tests {
         assert_eq!(
             serde_json::from_str::<ClientMsg>(r#"{"op":"open_tab"}"#).unwrap(),
             ClientMsg::OpenTab
+        );
+        assert_eq!(
+            serde_json::from_str::<ClientMsg>(r#"{"op":"close_workspace","workspace":"tachyon"}"#)
+                .unwrap(),
+            ClientMsg::CloseWorkspace {
+                workspace: "tachyon".into(),
+            }
         );
         assert_eq!(
             serde_json::from_str::<ClientMsg>(

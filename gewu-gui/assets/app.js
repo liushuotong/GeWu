@@ -365,6 +365,10 @@
         setBusy(message.tabs.some((tab) => tab.id === message.active && tab.busy));
         break;
       case "tabs": {
+        if (state.active !== message.active) {
+          const active = message.tabs.find((tab) => tab.id === message.active);
+          if (active) expandWorkspace(active.workspace);
+        }
         state.active = message.active;
         const alive = new Set(message.tabs.map((tab) => tab.id));
         for (const id of state.scrollTops.keys()) {
@@ -889,13 +893,6 @@
     if (event.target.closest("[data-tree-refresh]")) { send({ op: "refresh_tree" }); }
   });
 
-  el.sidebar.addEventListener("change", (event) => {
-    const workspace = event.target.closest("[data-workspace-select]");
-    if (workspace) {
-      send({ op: "switch_workspace", tab: state.active, workspace: workspace.value });
-    }
-  });
-
   el.sessionSidebar.addEventListener("click", (event) => {
     if (event.target.closest("[data-sessions-collapse]")) {
       setSessionsOpen(false, true);
@@ -909,6 +906,12 @@
     if (close) {
       event.stopPropagation();
       send({ op: "close_tab", tab: Number(close.dataset.sessionClose) });
+      return;
+    }
+    const closeWorkspace = event.target.closest("[data-session-workspace-close]");
+    if (closeWorkspace) {
+      event.stopPropagation();
+      send({ op: "close_workspace", workspace: closeWorkspace.dataset.sessionWorkspaceClose });
       return;
     }
     const workspaceToggle = event.target.closest("[data-session-workspace-toggle]");
