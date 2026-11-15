@@ -55,6 +55,8 @@
     refreshTimer: null,
     lastToast: { text: "", at: 0 },
     lastAlert: { text: "", at: 0 },
+    loadingEarlier: false,
+    follow: new Map(),
   };
 
   function loadToken() {
@@ -208,6 +210,8 @@
       state.connected = true;
       state.ready = false;
       state.attempt = 0;
+      state.follow.clear();
+      state.loadingEarlier = false;
       setOffline(false);
       updateComposer();
       if (state.authRequired) {
@@ -232,6 +236,8 @@
       state.ws = null;
       state.connected = false;
       state.ready = false;
+      state.follow.clear();
+      state.loadingEarlier = false;
       updateComposer();
       if (state.authRequired && !state.token) {
         setOffline(false);
@@ -300,6 +306,7 @@
         state.active = message.active;
         state.ready = true;
         state.transcriptTab = message.active;
+        state.loadingEarlier = false;
         setTranscript(message.transcript, true);
         setStatus(message.status);
         el.sidebar.innerHTML = message.sidebar || "";
@@ -312,6 +319,9 @@
         for (const id of state.scrollTops.keys()) {
           if (!alive.has(id)) state.scrollTops.delete(id);
         }
+        for (const id of state.follow.keys()) {
+          if (!alive.has(id)) state.follow.delete(id);
+        }
         setBusy(message.tabs.some((tab) => tab.id === message.active && tab.busy));
         break;
       }
@@ -319,7 +329,11 @@
         el.sessionSidebar.innerHTML = message.html || "";
         break;
       case "transcript":
+        state.loadingEarlier = false;
         setTranscript(message.html, false);
+        break;
+      case "transcript_prepend":
+        prependTranscript(message.html);
         break;
       case "tool_card":
         replaceToolCard(message.first, message.html);
@@ -340,6 +354,7 @@
         setStatus(message.html);
         break;
       case "error":
+        state.loadingEarlier = false;
         if (isUnauthorized(message.message)) {
           handleUnauthorized();
         } else {
@@ -421,14 +436,18 @@
   // unsticks; the next update re-anchors to the bottom instead. The live
   // offset is also recorded per tab so switching back restores it.
   el.transcript.addEventListener("scroll", () => {
+    const wasStuck = state.stuck;
     state.stuck = nearBottom();
     if (state.transcriptTab != null) {
       state.scrollTops.set(state.transcriptTab, el.transcript.scrollTop);
     }
+    if (wasStuck !== state.stuck) syncFollow();
+    maybeLoadEarlier();
   });
 
   function setTranscript(html, forceScroll) {
     const switched = state.transcriptTab !== state.active;
+    const previousTop = el.transcript.scrollTop;
     if (!switched && state.transcriptTab != null) {
       state.scrollTops.set(state.transcriptTab, el.transcript.scrollTop);
     }
@@ -438,10 +457,72 @@
       // Returning to a visited tab: put the viewport back where it was.
       el.transcript.scrollTop = state.scrollTops.get(state.active);
       state.stuck = nearBottom();
+    } else {
+      if (forceScroll || switched) state.stuck = true;
+      if (!forceScroll && !switched) {
+        // Same-tab refresh: keep the reader's approximate position.
+        el.transcript.scrollTop = previousTop;
+        state.stuck = nearBottom();
+      }
+      if (state.stuck) scrollToBottom();
+    }
+    syncFollow();
+    maybeLoadEarlier();
+  }
+
+  // Auto-load the previous page when the top sentinel comes into view. The
+  // server caps each request, so repeated calls while the transcript is
+  // shorter than the viewport fill the page a step at a time.
+  function maybeLoadEarlier() {
+    if (!state.ready || state.loadingEarlier) return;
+    if (state.transcriptTab !== state.active) return;
+    if (el.transcript.scrollTop > 80) return;
+    if (!el.transcript.querySelector("[data-load-earlier]")) return;
+    state.loadingEarlier = true;
+    if (!send({ op: "load_earlier", tab: state.active })) {
+      state.loadingEarlier = false;
+    }
+  }
+
+  // Tell the server whether new output should evict old rendered blocks.
+  function syncFollow() {
+    if (!state.connected || !state.ready) return;
+    if (state.transcriptTab !== state.active) return;
+    const following = state.stuck;
+    if (state.follow.get(state.active) === following) return;
+    state.follow.set(state.active, following);
+    if (!send({ op: "set_follow", tab: state.active, follow: following })) {
+      state.follow.delete(state.active);
+    }
+  }
+
+  // Insert a rendered older page above the transcript without moving the
+  // content the reader is looking at.
+  function prependTranscript(html) {
+    state.loadingEarlier = false;
+    if (state.transcriptTab !== state.active) {
+      requestRefresh();
       return;
     }
-    if (forceScroll || switched) state.stuck = true;
-    if (state.stuck) scrollToBottom();
+    const sentinel = el.transcript.querySelector(".load-earlier");
+    if (!sentinel) {
+      requestRefresh();
+      return;
+    }
+    const beforeHeight = el.transcript.scrollHeight;
+    const beforeTop = el.transcript.scrollTop;
+    sentinel.remove();
+    const template = document.createElement("template");
+    template.innerHTML = html;
+    el.transcript.insertBefore(template.content, el.transcript.firstChild);
+    el.transcript.scrollTop = beforeTop + (el.transcript.scrollHeight - beforeHeight);
+    if (state.transcriptTab != null) {
+      state.scrollTops.set(state.transcriptTab, el.transcript.scrollTop);
+    }
+    state.stuck = nearBottom();
+    state.follow.delete(state.active);
+    syncFollow();
+    maybeLoadEarlier();
   }
 
   // Replace one streaming block's rendered Markdown body in place: keeping
@@ -642,11 +723,17 @@
   el.status.addEventListener("click", (event) => {
     const button = event.target.closest("[data-mode]");
     if (button && !state.busy) send({ op: "switch_agent", tab: state.active, agent: button.dataset.mode });
-    if (!event.target.closest("[data-model-picker]")) el.prompt.focus();
+    if (!event.target.closest("[data-model-picker]") && !event.target.closest("[data-effort-picker]")) el.prompt.focus();
   });
   el.status.addEventListener("change", (event) => {
     const picker = event.target.closest("[data-model-picker]");
     if (picker && !state.busy) send({ op: "switch_model", tab: Number(picker.dataset.tab), model: picker.value });
+    const effort = event.target.closest("[data-effort-picker]");
+    if (effort && !state.busy) send({
+      op: "switch_reasoning_effort",
+      tab: Number(effort.dataset.tab),
+      effort: effort.value === "default" ? null : effort.value,
+    });
   });
 
   el.interrupt.addEventListener("click", () => {
@@ -659,6 +746,15 @@
   });
 
   el.transcript.addEventListener("click", (event) => {
+    const loadEarlier = event.target.closest("[data-load-earlier]");
+    if (loadEarlier) {
+      if (state.loadingEarlier) return;
+      state.loadingEarlier = true;
+      if (!send({ op: "load_earlier", tab: state.active })) {
+        state.loadingEarlier = false;
+      }
+      return;
+    }
     const revert = event.target.closest("[data-revert-block]");
     if (revert) {
       closeMessageMenus();

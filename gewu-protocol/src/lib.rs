@@ -106,6 +106,11 @@ pub enum Op {
     SwitchModel {
         model: String,
     },
+    /// Change the connection session's reasoning effort. `None` selects the
+    /// model's configured default.
+    SwitchReasoningEffort {
+        effort: Option<String>,
+    },
     /// Switch the session's active filesystem workspace root.
     SwitchWorkspace {
         workspace: String,
@@ -176,6 +181,7 @@ impl Serialize for ClientRequest {
                 self.op,
                 Op::SwitchAgent { .. }
                     | Op::SwitchModel { .. }
+                    | Op::SwitchReasoningEffort { .. }
                     | Op::SwitchWorkspace { .. }
                     | Op::BrowseWorkspace { .. }
                     | Op::AddWorkspace { .. }
@@ -206,6 +212,10 @@ impl Serialize for ClientRequest {
             Op::SwitchModel { model } => {
                 map.serialize_entry("op", "switch_model")?;
                 map.serialize_entry("model", model)?;
+            }
+            Op::SwitchReasoningEffort { effort } => {
+                map.serialize_entry("op", "switch_reasoning_effort")?;
+                map.serialize_entry("effort", effort)?;
             }
             Op::SwitchWorkspace { workspace } => {
                 map.serialize_entry("op", "switch_workspace")?;
@@ -292,6 +302,11 @@ impl ClientRequest {
                 model: model.into(),
             },
         )
+    }
+    /// Build a `switch_reasoning_effort` request. `None` selects the model's
+    /// configured default effort.
+    pub fn switch_reasoning_effort(id: impl Into<Value>, effort: Option<String>) -> Self {
+        Self::simple(id, Op::SwitchReasoningEffort { effort })
     }
     pub fn switch_workspace(id: impl Into<Value>, workspace: impl Into<String>) -> Self {
         Self::simple(
@@ -548,6 +563,18 @@ pub fn parse_request(line: &str) -> Result<ClientRequest, RequestError> {
                 .ok_or_else(|| RequestError::Invalid("switch_model requires model".into()))?
                 .to_string(),
         },
+        "switch_reasoning_effort" => {
+            let effort = match obj.get("effort") {
+                None | Some(Value::Null) => None,
+                Some(Value::String(effort)) => Some(effort.clone()),
+                Some(_) => {
+                    return Err(RequestError::Invalid(
+                        "effort must be a string or null".into(),
+                    ));
+                }
+            };
+            Op::SwitchReasoningEffort { effort }
+        }
         "switch_workspace" => Op::SwitchWorkspace {
             workspace: obj
                 .get("workspace")
@@ -749,7 +776,18 @@ pub struct ModelSummary {
     pub selector: String,
     /// Human-readable model id shown in UIs.
     pub label: String,
+    /// Whether the model accepts runtime reasoning-effort changes.
+    #[serde(default)]
+    pub supports_reasoning_effort: bool,
+    /// The effort the model runs with when no explicit effort is selected.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub default_effort: Option<String>,
 }
+
+/// Reasoning-effort values exposed by clients. Model support is reported by
+/// [`ModelSummary::supports_reasoning_effort`]; the model's configured default
+/// remains selectable separately.
+pub const REASONING_EFFORTS: &[&str] = &["low", "medium", "high", "max"];
 
 /// Messages the server sends to the client.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -767,6 +805,10 @@ pub enum ServerMessage {
         /// server tracks it. `None`/absent from older servers.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         model: Option<String>,
+        /// The session's explicit reasoning effort; absent means the model's
+        /// configured default.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        reasoning_effort: Option<String>,
     },
     AgentSwitched {
         id: Value,
@@ -784,6 +826,19 @@ pub enum ServerMessage {
         model: String,
         /// The new model's display label.
         label: String,
+        /// The session's explicit reasoning effort after the switch; absent
+        /// means the new model's configured default.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        reasoning_effort: Option<String>,
+    },
+    /// Reply to a `switch_reasoning_effort` request.
+    ReasoningEffortSwitched {
+        /// Echo of the client request id.
+        id: Value,
+        /// Session the switch applied to.
+        session_id: String,
+        /// The session's explicit effort; `None` means the model default.
+        effort: Option<String>,
     },
     /// Reply after changing the session's active filesystem root.
     WorkspaceSwitched {
@@ -1004,6 +1059,7 @@ impl ServerMessage {
             ServerMessage::SessionSnapshot { .. } => "session_snapshot",
             ServerMessage::AgentSwitched { .. } => "agent_switched",
             ServerMessage::ModelSwitched { .. } => "model_switched",
+            ServerMessage::ReasoningEffortSwitched { .. } => "reasoning_effort_switched",
             ServerMessage::WorkspaceSwitched { .. } => "workspace_switched",
             ServerMessage::Directories { .. } => "directories",
             ServerMessage::WorkspaceAdded { .. } => "workspace_added",
@@ -1037,6 +1093,7 @@ impl ServerMessage {
         match self {
             ServerMessage::AgentSwitched { id, .. } => Some(id),
             ServerMessage::ModelSwitched { id, .. } => Some(id),
+            ServerMessage::ReasoningEffortSwitched { id, .. } => Some(id),
             ServerMessage::WorkspaceSwitched { id, .. } => Some(id),
             ServerMessage::Directories { id, .. } => Some(id),
             ServerMessage::WorkspaceAdded { id, .. } => Some(id),
@@ -1143,6 +1200,7 @@ mod tests {
             session_id: "s".into(),
             model: "west/coding".into(),
             label: "deepseek-reasoner".into(),
+            reasoning_effort: None,
         };
         assert_eq!(reply.kind(), "model_switched");
         assert_eq!(reply.correlation_id(), Some(&Value::from(7)));
@@ -1163,6 +1221,8 @@ mod tests {
             models: vec![ModelSummary {
                 selector: "west/coding".into(),
                 label: "deepseek-reasoner".into(),
+                supports_reasoning_effort: true,
+                default_effort: Some("high".into()),
             }],
         };
         assert_eq!(reply.kind(), "models");
@@ -1187,10 +1247,32 @@ mod tests {
             busy: false,
             seq: 0,
             model: Some("west/coding".into()),
+            reasoning_effort: Some("high".into()),
         };
         let decoded: ServerMessage =
             serde_json::from_str(&serde_json::to_string(&with_model).unwrap()).unwrap();
         assert_eq!(decoded, with_model);
+    }
+
+    #[test]
+    fn switch_reasoning_effort_round_trip() {
+        for effort in [Some("high".to_string()), None] {
+            let request = ClientRequest::switch_reasoning_effort(7, effort.clone());
+            assert_eq!(parse_request(&request.to_line()).unwrap(), request);
+            assert_eq!(request.op, Op::SwitchReasoningEffort { effort });
+        }
+        assert!(parse_request(r#"{"id":1,"op":"switch_reasoning_effort","effort":4}"#).is_err());
+        let reply = ServerMessage::ReasoningEffortSwitched {
+            id: 7.into(),
+            session_id: "s".into(),
+            effort: Some("high".into()),
+        };
+        assert_eq!(reply.kind(), "reasoning_effort_switched");
+        assert_eq!(reply.correlation_id(), Some(&Value::from(7)));
+        assert_eq!(
+            serde_json::from_str::<ServerMessage>(&reply.to_line()).unwrap(),
+            reply
+        );
     }
 
     #[test]

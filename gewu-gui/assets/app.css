@@ -465,6 +465,30 @@ body {
   text-shadow: 0 0 30px var(--accent-glow);
 }
 
+.load-earlier {
+  max-width: var(--column);
+  margin: 0 auto 22px;
+  text-align: center;
+}
+
+.load-earlier-button {
+  font-family: var(--mono);
+  font-size: 12px;
+  color: var(--text-dim);
+  background: transparent;
+  border: 1px solid var(--line);
+  border-radius: 3px;
+  padding: 4px 12px;
+  cursor: pointer;
+  transition: background 0.12s, color 0.12s, border-color 0.12s;
+}
+
+.load-earlier-button:hover {
+  color: var(--accent);
+  border-color: var(--accent-dim);
+  background: var(--bg-hover);
+}
+
 .block,
 .tool-card {
   max-width: var(--column);
@@ -1322,23 +1346,11 @@ body {
   min-width: 0;
 }
 
-.status .k {
-  color: var(--text-faint);
-  text-transform: uppercase;
-  letter-spacing: 0.14em;
-  font-size: 9.5px;
-}
-
 .status .v {
   color: var(--text-dim);
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
-}
-
-.status .hint {
-  color: var(--text-faint);
-  opacity: 0.8;
 }
 
 .status .usage {
@@ -1760,10 +1772,10 @@ body {
 .mode-button { background: transparent; border: 1px solid var(--line); color: var(--text-dim); font: inherit; cursor: pointer; border-radius: 3px; }
 .mode-button[aria-pressed="true"] { color: var(--accent); border-color: var(--accent); }
 .mode-button:disabled { opacity: .5; cursor: default; }
-.model-picker { background: transparent; border: 1px solid var(--line); border-radius: 3px; color: var(--text-dim); font: 11px var(--mono); padding: 2px 4px; cursor: pointer; max-width: 180px; }
-.model-picker:hover:not(:disabled) { color: var(--accent); border-color: var(--accent); }
-.model-picker:disabled { opacity: .5; cursor: default; }
-.model-picker option { background: var(--bg, #111); color: var(--text, #eee); }
+.model-picker, .effort-picker { background: transparent; border: 1px solid var(--line); border-radius: 3px; color: var(--text-dim); font: 11px var(--mono); padding: 2px 4px; cursor: pointer; max-width: 180px; }
+.model-picker:hover:not(:disabled), .effort-picker:hover:not(:disabled) { color: var(--accent); border-color: var(--accent); }
+.model-picker:disabled, .effort-picker:disabled { opacity: .5; cursor: default; }
+.model-picker option, .effort-picker option { background: var(--bg, #111); color: var(--text, #eee); }
 
 .sidebar {
   grid-row: 1 / -1;
@@ -2344,8 +2356,7 @@ body {
 /* -- small screens ----------------------------------------------------- */
 
 @media (max-width: 640px) {
-  .brand-name,
-  .status .hint {
+  .brand-name {
     display: none;
   }
 

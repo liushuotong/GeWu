@@ -7,7 +7,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::fmt::Write as _;
 
 use gewu_client::session::{Block, Phase};
-use gewu_protocol::{DirectoryEntry, FileEntry, ModelSummary, WorkspaceSummary};
+use gewu_protocol::{DirectoryEntry, FileEntry, ModelSummary, REASONING_EFFORTS, WorkspaceSummary};
 use math_core::{LatexToMathML, MathCoreConfig, MathDisplay};
 use pulldown_cmark::{CowStr, Event, Options, Parser, Tag, html};
 
@@ -41,33 +41,61 @@ pub fn escape(text: &str) -> String {
 
 /// Render the active tab's transcript.
 pub fn transcript_html(tab: &Tab) -> String {
-    if tab.model.blocks.is_empty() {
+    let len = tab.model.blocks.len();
+    if len == 0 {
         return "<div class=\"empty\">connected — type a message and press Enter</div>".to_string();
     }
 
+    let start = tab.transcript_start.min(len - 1);
     let mut out = String::new();
-    let last = tab.model.blocks.len() - 1;
-    let mut index = 0;
-    while index < tab.model.blocks.len() {
+    if start > 0 {
+        write_load_earlier(&mut out, tab);
+    }
+    render_transcript_range(&mut out, tab, start, len);
+    out
+}
+
+/// Render the older page `[start, end)` for prepending above the loaded
+/// transcript.
+pub fn transcript_prepend_html(tab: &Tab, start: usize, end: usize) -> String {
+    let len = tab.model.blocks.len();
+    let start = start.min(len);
+    let end = end.clamp(start, len);
+    let mut out = String::new();
+    if start > 0 {
+        write_load_earlier(&mut out, tab);
+    }
+    render_transcript_range(&mut out, tab, start, end);
+    out
+}
+
+/// The sentinel that also serves as the auto-load trigger in the browser.
+fn write_load_earlier(out: &mut String, tab: &Tab) {
+    let _ = writeln!(
+        out,
+        "<div class=\"load-earlier\"><button type=\"button\" class=\"load-earlier-button\" data-load-earlier=\"{}\">Load earlier messages</button></div>",
+        tab.id
+    );
+}
+
+/// Render blocks `[start, end)` of a tab.
+fn render_transcript_range(out: &mut String, tab: &Tab, start: usize, end: usize) {
+    let last = tab.model.blocks.len().saturating_sub(1);
+    let mut index = start;
+    while index < end {
         if matches!(tab.model.blocks[index], Block::Tool { .. }) {
-            let run_len = tab.model.blocks[index..]
+            let run_len = tab.model.blocks[index..end]
                 .iter()
                 .take_while(|block| matches!(block, Block::Tool { .. }))
                 .count();
-            render_tool_run(
-                &mut out,
-                tab,
-                &tab.model.blocks[index..index + run_len],
-                index,
-            );
+            render_tool_run(out, tab, &tab.model.blocks[index..index + run_len], index);
             index += run_len;
         } else {
             let streaming = tab.busy() && index == last;
-            render_block(&mut out, tab, &tab.model.blocks[index], index, streaming);
+            render_block(out, tab, &tab.model.blocks[index], index, streaming);
             index += 1;
         }
     }
-    out
 }
 
 /// Render one non-tool transcript block.
@@ -774,6 +802,15 @@ fn format_k(tokens: u64) -> String {
     }
 }
 
+fn selected_model<'a>(tab: &Tab, models: &'a [ModelSummary]) -> Option<&'a ModelSummary> {
+    match &tab.model_selector {
+        Some(selector) => models.iter().find(|model| &model.selector == selector),
+        None => models
+            .iter()
+            .find(|model| Some(&model.label) == tab.model_label.as_ref()),
+    }
+}
+
 /// The status line: a telemetry strip with phase, model, key hints,
 /// and context usage on the right. With more than one switchable model,
 /// the model entry becomes a picker.
@@ -791,15 +828,10 @@ pub fn status_html(tab: &Tab, models: &[ModelSummary]) -> String {
     if models.len() > 1 {
         // The tab's current selection: its known selector, or the catalog
         // entry matching the server-reported default label.
-        let selected = tab.model_selector.clone().or_else(|| {
-            models
-                .iter()
-                .find(|model| Some(&model.label) == tab.model_label.as_ref())
-                .map(|model| model.selector.clone())
-        });
+        let selected = selected_model(tab, models).map(|model| model.selector.as_str());
         let _ = write!(
             out,
-            "<label class=\"kv\"><span class=\"k\">model</span><select class=\"model-picker\" data-model-picker data-tab=\"{}\" aria-label=\"switch model\"{}>",
+            "<label class=\"kv\"><select class=\"model-picker\" data-model-picker data-tab=\"{}\" aria-label=\"switch model\" title=\"Switch model\"{}>",
             tab.id,
             if tab.busy() { " disabled" } else { "" }
         );
@@ -808,7 +840,7 @@ pub fn status_html(tab: &Tab, models: &[ModelSummary]) -> String {
                 out,
                 "<option value=\"{}\"{}>{}</option>",
                 escape(&model.selector),
-                if selected.as_deref() == Some(model.selector.as_str()) {
+                if selected == Some(model.selector.as_str()) {
                     " selected"
                 } else {
                     ""
@@ -820,9 +852,50 @@ pub fn status_html(tab: &Tab, models: &[ModelSummary]) -> String {
     } else if let Some(label) = &tab.model_label {
         let _ = write!(
             out,
-            "<span class=\"kv\"><span class=\"k\">model</span><span class=\"v model\">{}</span></span>",
+            "<span class=\"kv\"><span class=\"v model\" title=\"Model\">{}</span></span>",
             escape(label)
         );
+    }
+    if let Some(model) = selected_model(tab, models) {
+        let disabled = tab.busy() || !model.supports_reasoning_effort;
+        let selected = tab
+            .reasoning_effort
+            .as_deref()
+            .filter(|effort| REASONING_EFFORTS.contains(effort))
+            .or_else(|| {
+                model
+                    .default_effort
+                    .as_deref()
+                    .filter(|effort| REASONING_EFFORTS.contains(effort))
+            })
+            .unwrap_or("default");
+        let _ = write!(
+            out,
+            "<label class=\"kv\"><select class=\"effort-picker\" data-effort-picker data-tab=\"{}\" aria-label=\"reasoning effort\" title=\"Reasoning effort\"{}>",
+            tab.id,
+            if disabled { " disabled" } else { "" }
+        );
+        let default_title = match &model.default_effort {
+            Some(effort) => format!(" title=\"configured default: {}\"", escape(effort)),
+            None => String::new(),
+        };
+        let _ = write!(
+            out,
+            "<option value=\"default\"{default_title}{}>default</option>",
+            if selected == "default" {
+                " selected"
+            } else {
+                ""
+            }
+        );
+        for effort in REASONING_EFFORTS {
+            let _ = write!(
+                out,
+                "<option value=\"{effort}\"{}>{effort}</option>",
+                if selected == *effort { " selected" } else { "" }
+            );
+        }
+        out.push_str("</select></label>");
     }
     match (&tab.model.phase, tab.model.status.as_deref()) {
         (Phase::Idle, _) => out.push_str("<span class=\"phase\"><i class=\"dot\"></i>idle</span>"),
@@ -843,15 +916,6 @@ pub fn status_html(tab: &Tab, models: &[ModelSummary]) -> String {
             out.push_str("<span class=\"phase busy\"><i class=\"dot\"></i>thinking…</span>");
         }
     }
-    // The idle key hints live in the composer placeholder; only the busy
-    // hint needs its own spot in the status strip.
-    if tab.model.phase == Phase::Busy {
-        let _ = write!(
-            out,
-            "<span class=\"hint\">Enter steer · Esc interrupt</span>"
-        );
-    }
-
     if let Some((used, limit)) = tab.context.filter(|(used, limit)| *used > 0 && *limit > 0) {
         let pct = (used * 100 / limit).min(100);
         let class = if pct >= 80 { "usage warn" } else { "usage" };
@@ -966,7 +1030,7 @@ pub fn session_sidebar_html(
     }
 
     let mut out = String::from(
-        "<aside class=\"session-sidebar\" aria-label=\"Sessions by workspace\"><header class=\"session-sidebar-header\"><span class=\"brand-mark session-brand\" title=\"GeWu agent\"><svg class=\"brand-icon\" viewBox=\"0 0 24 24\" fill=\"none\" stroke=\"currentColor\" stroke-width=\"1.7\" stroke-linecap=\"round\" stroke-linejoin=\"round\" aria-hidden=\"true\"><rect x=\"3.5\" y=\"3.5\" width=\"17\" height=\"17\" rx=\"3.5\"/><circle cx=\"12\" cy=\"12\" r=\"4.25\"/><path d=\"M12 3.5v4.25M12 16.25v4.25M3.5 12h4.25M16.25 12h4.25\"/></svg></span><span class=\"session-sidebar-title\">GeWu</span><button type=\"button\" class=\"session-collapse\" data-sessions-collapse title=\"Close sidebar\" aria-label=\"Close sidebar\"><svg viewBox=\"0 0 24 24\" fill=\"none\" stroke=\"currentColor\" stroke-width=\"1.8\" stroke-linecap=\"round\" stroke-linejoin=\"round\" aria-hidden=\"true\"><rect x=\"3\" y=\"4\" width=\"18\" height=\"16\" rx=\"2\"/><path d=\"M9 4v16\"/><path d=\"m16 15-3-3 3-3\"/></svg></button></header><button type=\"button\" class=\"session-new-primary\" data-session-new title=\"New session\" aria-label=\"New session\"><svg viewBox=\"0 0 24 24\" fill=\"none\" stroke=\"currentColor\" stroke-width=\"1.7\" stroke-linecap=\"round\" stroke-linejoin=\"round\" aria-hidden=\"true\"><path d=\"M4 20h4l10-10-4-4L4 16v4Z\"/><path d=\"M13 7l4 4\"/></svg><span>New session</span></button><div class=\"session-section-label\">RECENT</div><div class=\"session-workspace-groups\">",
+        "<aside class=\"session-sidebar\" aria-label=\"Sessions by workspace\"><header class=\"session-sidebar-header\"><span class=\"brand-mark session-brand\" title=\"GeWu agent\"><svg class=\"brand-icon\" viewBox=\"0 0 24 24\" fill=\"none\" stroke=\"currentColor\" stroke-width=\"1.7\" stroke-linecap=\"round\" stroke-linejoin=\"round\" aria-hidden=\"true\"><rect x=\"3.5\" y=\"3.5\" width=\"17\" height=\"17\" rx=\"3.5\"/><circle cx=\"12\" cy=\"12\" r=\"4.25\"/><path d=\"M12 3.5v4.25M12 16.25v4.25M3.5 12h4.25M16.25 12h4.25\"/></svg></span><span class=\"session-sidebar-title\">GeWu</span><button type=\"button\" class=\"session-collapse\" data-sessions-collapse title=\"Close sidebar\" aria-label=\"Close sidebar\"><svg viewBox=\"0 0 24 24\" fill=\"none\" stroke=\"currentColor\" stroke-width=\"1.8\" stroke-linecap=\"round\" stroke-linejoin=\"round\" aria-hidden=\"true\"><rect x=\"3\" y=\"4\" width=\"18\" height=\"16\" rx=\"2\"/><path d=\"M9 4v16\"/><path d=\"m16 15-3-3 3-3\"/></svg></button></header><button type=\"button\" class=\"session-new-primary\" data-session-new title=\"New session\" aria-label=\"New session\"><svg viewBox=\"0 0 24 24\" fill=\"none\" stroke=\"currentColor\" stroke-width=\"1.7\" stroke-linecap=\"round\" stroke-linejoin=\"round\" aria-hidden=\"true\"><path d=\"M4 20h4l10-10-4-4L4 16v4Z\"/><path d=\"M13 7l4 4\"/></svg><span>New session</span></button><div class=\"session-section-label\">WORKSPACE</div><div class=\"session-workspace-groups\">",
     );
     for workspace_id in workspace_ids {
         let summary = workspaces
@@ -1546,7 +1610,11 @@ mod tests {
             "{html}"
         );
         assert!(html.contains("session-new-primary"), "{html}");
-        assert!(html.contains("session-section-label"), "{html}");
+        assert!(
+            html.contains("session-section-label\">WORKSPACE</div>"),
+            "{html}"
+        );
+        assert!(!html.contains("RECENT"), "{html}");
         assert!(html.contains("data-session-new"), "{html}");
         assert!(html.contains("data-sessions-collapse"), "{html}");
         assert!(html.contains("data-session-tab=\"1\""), "{html}");
@@ -1618,6 +1686,65 @@ mod tests {
         );
         assert!(html.find("original question").unwrap() < html.find("Context compacted").unwrap());
         assert!(html.find("Context compacted").unwrap() < html.find("continued answer").unwrap());
+    }
+
+    #[test]
+    fn transcript_renders_only_the_loaded_window() {
+        let blocks: Vec<Block> = (0..250)
+            .map(|n| Block::User(format!("message {n}")))
+            .collect();
+        let (mut ws, id) = tab_with_blocks(blocks);
+        let tab = ws.tab_mut(id).unwrap();
+        tab.reset_transcript_window();
+
+        let html = transcript_html(tab);
+
+        assert!(html.contains("data-block=\"50\""), "{html}");
+        assert!(!html.contains("data-block=\"49\""), "{html}");
+        assert!(html.contains("data-load-earlier"), "{html}");
+        assert!(html.contains("Load earlier messages"), "{html}");
+    }
+
+    #[test]
+    fn transcript_without_hidden_history_has_no_load_control() {
+        let (ws, id) = tab_with_blocks(vec![Block::User("hello".into())]);
+        let html = transcript_html(ws.tab(id).unwrap());
+
+        assert!(!html.contains("load-earlier"), "{html}");
+    }
+
+    #[test]
+    fn prepend_renders_only_the_older_page() {
+        let blocks: Vec<Block> = (0..250)
+            .map(|n| Block::User(format!("message {n}")))
+            .collect();
+        let (mut ws, id) = tab_with_blocks(blocks);
+        let tab = ws.tab_mut(id).unwrap();
+        tab.transcript_start = 50;
+
+        let html = transcript_prepend_html(tab, 0, 50);
+
+        assert!(html.contains("data-block=\"0\""), "{html}");
+        assert!(html.contains("data-block=\"49\""), "{html}");
+        assert!(!html.contains("data-block=\"50\""), "{html}");
+        assert!(!html.contains("load-earlier"), "{html}");
+    }
+
+    #[test]
+    fn prepend_keeps_the_control_while_more_history_remains() {
+        let blocks: Vec<Block> = (0..250)
+            .map(|n| Block::User(format!("message {n}")))
+            .collect();
+        let (mut ws, id) = tab_with_blocks(blocks);
+        let tab = ws.tab_mut(id).unwrap();
+        tab.transcript_start = 150;
+
+        let html = transcript_prepend_html(tab, 50, 150);
+
+        assert!(html.contains("data-block=\"50\""), "{html}");
+        assert!(html.contains("data-block=\"149\""), "{html}");
+        assert!(!html.contains("data-block=\"150\""), "{html}");
+        assert!(html.contains("data-load-earlier"), "{html}");
     }
 
     #[test]
@@ -2118,6 +2245,7 @@ mod tests {
         tab.context = Some((34_000, 128_000));
         let html = status_html(ws.tab(id).unwrap(), &[]);
         assert!(html.contains("gpt-4o"), "{html}");
+        assert!(!html.contains("class=\"k\">model"), "{html}");
         assert!(!html.contains("openai"), "{html}");
         assert!(!html.contains("session"), "{html}");
         assert!(!html.contains("cache"), "{html}");
@@ -2131,10 +2259,14 @@ mod tests {
             ModelSummary {
                 selector: "west/big".into(),
                 label: "big-model".into(),
+                supports_reasoning_effort: false,
+                default_effort: None,
             },
             ModelSummary {
                 selector: "west/small".into(),
                 label: "small-model".into(),
+                supports_reasoning_effort: false,
+                default_effort: None,
             },
         ];
         let (mut ws, id) = tab_with_blocks(vec![]);
@@ -2144,6 +2276,7 @@ mod tests {
             html.contains("<select class=\"model-picker\" data-model-picker data-tab="),
             "{html}"
         );
+        assert!(!html.contains("class=\"k\">model"), "{html}");
         assert!(
             html.contains("<option value=\"west/big\">big-model</option>"),
             "{html}"
@@ -2166,12 +2299,105 @@ mod tests {
         let solo = vec![ModelSummary {
             selector: "west/big".into(),
             label: "big-model".into(),
+            supports_reasoning_effort: false,
+            default_effort: None,
         }];
         let (mut ws, id) = tab_with_blocks(vec![]);
         ws.tab_mut(id).unwrap().model_label = Some("big-model".into());
         let html = status_html(ws.tab(id).unwrap(), &solo);
         assert!(!html.contains("model-picker"), "{html}");
         assert!(html.contains("class=\"v model\""), "{html}");
+        assert!(!html.contains(">model</span>"), "{html}");
+        assert!(html.contains("title=\"Model\""), "{html}");
+    }
+
+    #[test]
+    fn status_renders_reasoning_effort_picker() {
+        let models = vec![
+            ModelSummary {
+                selector: "west/reasoning".into(),
+                label: "reasoning-model".into(),
+                supports_reasoning_effort: true,
+                default_effort: Some("high".into()),
+            },
+            ModelSummary {
+                selector: "west/plain".into(),
+                label: "plain-model".into(),
+                supports_reasoning_effort: false,
+                default_effort: None,
+            },
+        ];
+        let (mut ws, id) = tab_with_blocks(vec![]);
+        ws.tab_mut(id).unwrap().model_selector = Some("west/reasoning".into());
+        let html = status_html(ws.tab(id).unwrap(), &models);
+        assert!(
+            html.contains("<select class=\"effort-picker\" data-effort-picker data-tab="),
+            "{html}"
+        );
+        assert!(!html.contains("class=\"k\">effort"), "{html}");
+        assert!(
+            html.contains(
+                "<option value=\"default\" title=\"configured default: high\">default</option>"
+            ),
+            "{html}"
+        );
+        assert!(
+            html.contains("<option value=\"high\" selected>high</option>"),
+            "{html}"
+        );
+        assert!(
+            !html.contains("title=\"Reasoning effort\" disabled"),
+            "{html}"
+        );
+
+        // An explicit effort is selected; a busy tab disables the picker.
+        let tab = ws.tab_mut(id).unwrap();
+        tab.reasoning_effort = Some("max".into());
+        tab.model.phase = Phase::Busy;
+        let html = status_html(ws.tab(id).unwrap(), &models);
+        assert!(
+            html.contains("<option value=\"max\" selected>max</option>"),
+            "{html}"
+        );
+        assert!(
+            html.contains("title=\"Reasoning effort\" disabled"),
+            "{html}"
+        );
+
+        // Models without effort support keep a disabled picker.
+        let tab = ws.tab_mut(id).unwrap();
+        tab.model.phase = Phase::Idle;
+        tab.model_selector = Some("west/plain".into());
+        tab.reasoning_effort = None;
+        let html = status_html(ws.tab(id).unwrap(), &models);
+        assert!(
+            html.contains("title=\"Reasoning effort\" disabled"),
+            "{html}"
+        );
+        assert!(
+            html.contains("<option value=\"default\" selected>default</option>"),
+            "{html}"
+        );
+    }
+
+    #[test]
+    fn effort_picker_falls_back_for_unlisted_config_values() {
+        let models = [ModelSummary {
+            selector: "west/custom".into(),
+            label: "custom-model".into(),
+            supports_reasoning_effort: true,
+            default_effort: Some("vendor-defined".into()),
+        }];
+        let (mut ws, id) = tab_with_blocks(vec![]);
+        ws.tab_mut(id).unwrap().model_selector = Some("west/custom".into());
+        let html = status_html(ws.tab(id).unwrap(), &models);
+        assert!(
+            html.contains(
+                "<option value=\"default\" title=\"configured default: vendor-defined\" selected>default</option>"
+            ),
+            "{html}"
+        );
+        assert!(!html.contains("value=\"vendor-defined\""), "{html}");
     }
 
     #[test]
@@ -2204,12 +2430,12 @@ mod tests {
     }
 
     #[test]
-    fn busy_status_shows_interrupt_hint() {
+    fn busy_status_shows_thinking_phase() {
         let (mut ws, id) = tab_with_blocks(vec![]);
         ws.tab_mut(id).unwrap().model.submit("go".into());
         let html = status_html(ws.tab(id).unwrap(), &[]);
         assert!(html.contains("thinking…"), "{html}");
-        assert!(html.contains("Esc interrupt"), "{html}");
+        assert!(!html.contains("Esc interrupt"), "{html}");
     }
 
     #[test]

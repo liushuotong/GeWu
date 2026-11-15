@@ -207,15 +207,41 @@ impl Client {
         }
     }
     /// Switch the LLM model on an idle session, retaining its stored history.
-    /// Returns the session id and the new model's display label.
-    pub async fn switch_model(&self, model: impl Into<String>) -> Result<(String, String)> {
+    /// Returns the session id, the new model's display label, and the
+    /// session's explicit reasoning effort after the switch.
+    pub async fn switch_model(
+        &self,
+        model: impl Into<String>,
+    ) -> Result<(String, String, Option<String>)> {
         let request = ClientRequest::switch_model(self.next_correlation_id(), model);
         match self.request(request).await? {
             ServerMessage::ModelSwitched {
-                session_id, label, ..
-            } => Ok((session_id, label)),
+                session_id,
+                label,
+                reasoning_effort,
+                ..
+            } => Ok((session_id, label, reasoning_effort)),
             ServerMessage::Error { error, .. } => Err(Error::Server(error)),
             other => Err(unexpected(other, "model_switched")),
+        }
+    }
+    /// Change the explicit reasoning effort on an idle session. `None`
+    /// selects the model's configured default. Returns the session id and the
+    /// effort the server applied.
+    pub async fn switch_reasoning_effort(
+        &self,
+        effort: Option<&str>,
+    ) -> Result<(String, Option<String>)> {
+        let request = ClientRequest::switch_reasoning_effort(
+            self.next_correlation_id(),
+            effort.map(str::to_string),
+        );
+        match self.request(request).await? {
+            ServerMessage::ReasoningEffortSwitched {
+                session_id, effort, ..
+            } => Ok((session_id, effort)),
+            ServerMessage::Error { error, .. } => Err(Error::Server(error)),
+            other => Err(unexpected(other, "reasoning_effort_switched")),
         }
     }
     /// Connect over TCP (newline-delimited JSON; the server listens on

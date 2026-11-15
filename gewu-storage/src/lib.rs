@@ -80,6 +80,11 @@ async fn ensure_workspaces(pool: &SqlitePool) -> Result<()> {
     Ok(())
 }
 
+async fn ensure_reasoning_efforts(pool: &SqlitePool) -> Result<()> {
+    sqlx::query("CREATE TABLE IF NOT EXISTS session_reasoning_efforts (session_id TEXT PRIMARY KEY, effort TEXT NOT NULL)").execute(pool).await?;
+    Ok(())
+}
+
 async fn ensure_session_state(pool: &SqlitePool) -> Result<()> {
     sqlx::query(
         "CREATE TABLE IF NOT EXISTS session_state (\
@@ -422,6 +427,45 @@ pub async fn set_session_workspace(
     Ok(())
 }
 
+/// Session reasoning-effort metadata. `None` means the model's configured
+/// default (legacy sessions included).
+pub async fn session_reasoning_effort(
+    pool: &SqlitePool,
+    session_id: &str,
+) -> Result<Option<String>> {
+    ensure_reasoning_efforts(pool).await?;
+    Ok(
+        sqlx::query_scalar("SELECT effort FROM session_reasoning_efforts WHERE session_id = ?")
+            .bind(session_id)
+            .fetch_optional(pool)
+            .await?,
+    )
+}
+
+pub async fn set_session_reasoning_effort(
+    pool: &SqlitePool,
+    session_id: &str,
+    effort: Option<&str>,
+) -> Result<()> {
+    ensure_reasoning_efforts(pool).await?;
+    match effort {
+        Some(effort) => {
+            sqlx::query("INSERT INTO session_reasoning_efforts(session_id, effort) VALUES (?, ?) ON CONFLICT(session_id) DO UPDATE SET effort = excluded.effort")
+                .bind(session_id)
+                .bind(effort)
+                .execute(pool)
+                .await?;
+        }
+        None => {
+            sqlx::query("DELETE FROM session_reasoning_efforts WHERE session_id = ?")
+                .bind(session_id)
+                .execute(pool)
+                .await?;
+        }
+    }
+    Ok(())
+}
+
 /// SQLite-backed [`SessionStateStore`] for per-session tool state.
 ///
 /// Values are JSON strings keyed by `(session_id, key)`; tools access them
@@ -551,6 +595,7 @@ pub async fn delete_session(pool: &SqlitePool, session_id: &str) -> Result<u64> 
     ensure_models(pool).await?;
     ensure_agents(pool).await?;
     ensure_workspaces(pool).await?;
+    ensure_reasoning_efforts(pool).await?;
     ensure_reverts(pool).await?;
     ensure_session_state(pool).await?;
     let descendants = subagent_descendants(pool, session_id).await?;
@@ -583,6 +628,7 @@ pub async fn delete_session(pool: &SqlitePool, session_id: &str) -> Result<u64> 
             "session_models",
             "session_agents",
             "session_workspaces",
+            "session_reasoning_efforts",
             "chat_reverts",
             "session_state",
         ] {
@@ -880,6 +926,21 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn session_reasoning_effort_round_trips() -> Result<()> {
+        let pool = SqlitePoolOptions::new().connect("sqlite::memory:").await?;
+        assert_eq!(session_reasoning_effort(&pool, "s1").await?, None);
+        set_session_reasoning_effort(&pool, "s1", Some("high")).await?;
+        assert_eq!(
+            session_reasoning_effort(&pool, "s1").await?.as_deref(),
+            Some("high")
+        );
+        set_session_reasoning_effort(&pool, "s1", None).await?;
+        assert_eq!(session_reasoning_effort(&pool, "s1").await?, None);
+        assert_eq!(session_reasoning_effort(&pool, "other").await?, None);
+        Ok(())
+    }
+
+    #[tokio::test]
     async fn session_workspace_round_trips() -> Result<()> {
         let pool = SqlitePoolOptions::new().connect("sqlite::memory:").await?;
         assert_eq!(session_workspace(&pool, "s1").await?, None);
@@ -931,6 +992,7 @@ mod tests {
         set_session_model(&pool, "main", "east/m1").await?;
         set_session_agent(&pool, "main", "build").await?;
         set_session_workspace(&pool, "main", "frontend").await?;
+        set_session_reasoning_effort(&pool, "main", Some("high")).await?;
         let store = SqliteSessionStateStore::new(pool.clone());
         store.save("main", "todos", "[]".into()).await?;
         revert_chat(&pool, "main", None, false, None).await?;
@@ -941,6 +1003,7 @@ mod tests {
             "session_models",
             "session_agents",
             "session_workspaces",
+            "session_reasoning_efforts",
             "chat_reverts",
         ] {
             let count: i64 = sqlx::query_scalar(&format!(

@@ -16,6 +16,13 @@ use crate::protocol::TabInfo;
 /// large first prompts.
 const MAX_LABEL: usize = 200;
 
+/// Blocks rendered on first load and after eviction.
+pub const TRANSCRIPT_WINDOW_BLOCKS: usize = 200;
+/// Older blocks loaded per page.
+pub const TRANSCRIPT_PAGE_BLOCKS: usize = 100;
+/// Rendered-window size that triggers eviction while following output.
+pub const TRANSCRIPT_MAX_BLOCKS: usize = 300;
+
 /// One tab: a conversation plus its view state.
 #[derive(Debug)]
 pub struct Tab {
@@ -29,6 +36,8 @@ pub struct Tab {
     /// The tab's model selector (`endpoint/model`) into the server's model
     /// catalog; `None` until a snapshot reveals it (means "server default").
     pub model_selector: Option<String>,
+    /// The tab's explicit reasoning effort; `None` uses the model default.
+    pub reasoning_effort: Option<String>,
     /// Context usage `(used tokens, context limit)`.
     pub context: Option<(u64, u64)>,
     /// Provider-reported token accounting accumulated across the session,
@@ -46,6 +55,10 @@ pub struct Tab {
     /// Steered messages displayed at submit time and not yet confirmed by
     /// the agent's `steered` event: `(text, block index)` in submit order.
     pub pending_steers: Vec<(String, usize)>,
+    /// First block index currently rendered in the transcript window.
+    pub transcript_start: usize,
+    /// Whether the browser is following output at the bottom of the transcript.
+    pub follow: bool,
 }
 
 impl Tab {
@@ -57,6 +70,7 @@ impl Tab {
             model: SessionModel::new(),
             model_label: None,
             model_selector: None,
+            reasoning_effort: None,
             context: None,
             cache: None,
             expanded_groups: HashSet::new(),
@@ -64,11 +78,57 @@ impl Tab {
             expanded_outputs: HashSet::new(),
             expanded_thoughts: HashSet::new(),
             pending_steers: Vec::new(),
+            transcript_start: 0,
+            follow: true,
         }
     }
 
     pub fn busy(&self) -> bool {
         self.model.phase == Phase::Busy
+    }
+
+    /// Re-anchor the rendered window on the newest blocks.
+    pub fn reset_transcript_window(&mut self) {
+        self.transcript_start = window_start(
+            &self.model.blocks,
+            self.model.blocks.len(),
+            TRANSCRIPT_WINDOW_BLOCKS,
+        );
+    }
+
+    /// Move the rendered window back one page. Returns the newly revealed
+    /// range `(new_start, old_start)`.
+    pub fn load_earlier(&mut self) -> Option<(usize, usize)> {
+        if self.transcript_start >= self.model.blocks.len() {
+            self.reset_transcript_window();
+            return None;
+        }
+        let old_start = self.transcript_start;
+        if old_start == 0 {
+            return None;
+        }
+        let new_start = window_start(&self.model.blocks, old_start, TRANSCRIPT_PAGE_BLOCKS);
+        if new_start >= old_start {
+            return None;
+        }
+        self.follow = false;
+        self.transcript_start = new_start;
+        Some((new_start, old_start))
+    }
+
+    /// Trim the rendered window back to the newest page when it has grown past
+    /// the soft cap. Returns whether the window moved.
+    pub fn evict_overflow(&mut self) -> bool {
+        let len = self.model.blocks.len();
+        if len.saturating_sub(self.transcript_start) <= TRANSCRIPT_MAX_BLOCKS {
+            return false;
+        }
+        let new_start = window_start(&self.model.blocks, len, TRANSCRIPT_WINDOW_BLOCKS);
+        if new_start <= self.transcript_start {
+            return false;
+        }
+        self.transcript_start = new_start;
+        true
     }
 
     pub fn info(&self) -> TabInfo {
@@ -80,6 +140,20 @@ impl Tab {
             workspace: self.workspace.clone(),
         }
     }
+}
+
+/// Start index of a page ending before `before`, widened so a run of tool
+/// blocks is never split across pages.
+fn window_start(blocks: &[Block], before: usize, page: usize) -> usize {
+    let before = before.min(blocks.len());
+    let mut start = before.saturating_sub(page);
+    while start > 0
+        && matches!(blocks.get(start - 1), Some(Block::Tool { .. }))
+        && matches!(blocks.get(start), Some(Block::Tool { .. }))
+    {
+        start -= 1;
+    }
+    start
 }
 
 /// The set of open sessions.
@@ -122,6 +196,7 @@ impl Workspace {
             messages.len(),
             if messages.len() == 1 { "" } else { "s" }
         ));
+        tab.reset_transcript_window();
         id
     }
 
@@ -256,6 +331,62 @@ mod tests {
                 .iter()
                 .any(|b| matches!(b, Block::Info(text) if text.contains("abcdef12")))
         );
+    }
+
+    #[test]
+    fn open_session_renders_only_the_newest_window() {
+        let mut ws = Workspace::new();
+        let messages: Vec<Message> = (0..250)
+            .map(|n| user_message(&format!("message {n}")))
+            .collect();
+        let id = ws.open_session("s1", &messages);
+        let tab = ws.tab(id).unwrap();
+        // The resumed-session note is appended after the stored messages.
+        assert_eq!(tab.model.blocks.len(), 251);
+        assert_eq!(tab.transcript_start, 251 - TRANSCRIPT_WINDOW_BLOCKS);
+    }
+
+    #[test]
+    fn load_earlier_moves_back_a_page_and_stops_at_zero() {
+        let mut ws = Workspace::new();
+        let messages: Vec<Message> = (0..250)
+            .map(|n| user_message(&format!("message {n}")))
+            .collect();
+        let id = ws.open_session("s1", &messages);
+        let tab = ws.tab_mut(id).unwrap();
+        let old_start = tab.transcript_start;
+
+        assert_eq!(tab.load_earlier(), Some((0, old_start)));
+        assert!(!tab.follow);
+        assert_eq!(tab.transcript_start, 0);
+        assert_eq!(tab.load_earlier(), None);
+    }
+
+    #[test]
+    fn evict_overflow_trims_to_the_newest_window() {
+        let mut ws = Workspace::new();
+        let id = ws.open_blank();
+        let tab = ws.tab_mut(id).unwrap();
+        tab.model.blocks = (0..400)
+            .map(|n| Block::User(format!("message {n}")))
+            .collect();
+
+        assert!(tab.evict_overflow());
+        assert_eq!(tab.transcript_start, 200);
+        assert!(!tab.evict_overflow());
+    }
+
+    #[test]
+    fn window_never_starts_inside_a_tool_run() {
+        let tool = || Block::Tool {
+            tool: "bash".into(),
+            input: String::new(),
+            output: None,
+            status: None,
+        };
+        let blocks = vec![Block::User("start".into()), tool(), tool(), tool()];
+
+        assert_eq!(window_start(&blocks, blocks.len(), 1), 1);
     }
 
     #[test]

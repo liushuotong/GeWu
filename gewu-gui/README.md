@@ -109,6 +109,7 @@ clickable scrim, and `Esc` closes an open drawer.
 | `×` on a session | Close the session |
 | Tool row / `… +N lines` | Expand or collapse tool output |
 | `+ Explored: …` | Expand or collapse a run of tool calls |
+| Scroll to top / `Load earlier messages` | Fetch the previous page of the transcript |
 | `⬆` in the file tree | Open a file picker; selected files upload into the working-directory root |
 | Drag files onto the page | Upload the dropped files the same way |
 | `↻` in the file tree | Refresh the file listing |
@@ -116,9 +117,19 @@ clickable scrim, and `Esc` closes an open drawer.
 The transcript streams assistant text and replaces it with rendered Markdown
 when the reply finishes. The status line shows the phase, `provider/model`, the
 short session id, and context usage (`34k (26%)`), turning yellow from 80%.
+Models that support reasoning effort get an `effort` picker next to the model
+(`low`, `medium`, `high`, `max`). It starts at the model's configured effort;
+`default` restores that value after an override. The choice is saved per
+session.
 Scrolling up pins the history; scrolling back to the bottom re-follows streamed
 output. A dropped GUI connection reconnects with backoff and asks for a fresh
 snapshot; an `unauthorized` error returns to the token prompt.
+
+Only the active session's transcript is rendered. Long conversations open on
+the newest 200 blocks; scrolling to the top auto-loads older 100-block pages.
+While following output, the rendered window is kept under roughly 300 blocks
+and evicted back to the newest 200; scrolling up pauses eviction so older
+history stays readable.
 
 ## Incremental updates
 

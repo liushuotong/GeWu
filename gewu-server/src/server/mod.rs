@@ -105,6 +105,8 @@ struct LiveTurn {
     busy: bool,
     /// The model selector the turn runs on, echoed in reconnect snapshots.
     model: String,
+    /// The explicit reasoning effort the turn runs on, echoed in snapshots.
+    reasoning_effort: Option<String>,
     /// Notified (waiters) when `busy` flips back to false at turn
     /// finalization, so interrupts await completion without spinning.
     done: Arc<tokio::sync::Notify>,
@@ -146,6 +148,7 @@ async fn attach_subscriber(
             busy: live.busy,
             seq: live.seq,
             model: Some(live.model.clone()),
+            reasoning_effort: live.reasoning_effort.clone(),
         };
         subscriber
             .out
@@ -171,6 +174,7 @@ async fn attach_subscriber(
                 busy: false,
                 seq: 0,
                 model: Some(session.model.clone()),
+                reasoning_effort: session.reasoning_effort.clone(),
             }
             .to_line(),
         )
@@ -186,6 +190,7 @@ async fn attach_subscriber(
             seq: 0,
             busy: false,
             model: session.model.clone(),
+            reasoning_effort: session.reasoning_effort.clone(),
             done: Arc::new(tokio::sync::Notify::new()),
             subscribers: vec![subscriber],
             cancel: None,
@@ -206,6 +211,9 @@ struct ConnectionSession {
     model: String,
     /// The session's provider (the catalog entry for `model`).
     provider: Arc<dyn gewu_core::traits::LlmProvider>,
+    /// The session's explicit reasoning effort; `None` uses the model's
+    /// configured default.
+    reasoning_effort: Option<String>,
     /// Resolved context window (tokens) of the session's model.
     context_limit: usize,
     /// Cached tool names, taken from the agent at creation. The tool set is
@@ -576,6 +584,24 @@ impl ServerState {
             .get(&model)
             .cloned()
             .ok_or_else(|| anyhow::anyhow!("model '{model}' is not in the catalog"))?;
+        let stored_effort =
+            gewu_storage::session_reasoning_effort(&self.bootstrap.pool, &session_id).await?;
+        let reasoning_effort = stored_effort.and_then(|effort| {
+            if entry.effort_providers.contains_key(&effort) {
+                Some(effort)
+            } else {
+                warn!(
+                    "session {} stored unsupported reasoning effort '{}'; using the model default",
+                    session_id, effort
+                );
+                None
+            }
+        });
+        let provider = entry
+            .provider_for(reasoning_effort.as_deref())
+            .ok_or_else(|| {
+                anyhow::anyhow!("reasoning effort is unavailable for model '{model}'")
+            })?;
 
         let (agent, _registry) = create_agent(
             registry::ProfileInputs {
@@ -584,7 +610,7 @@ impl ServerState {
                     default: self.bootstrap.model_selector.clone(),
                 }),
                 name: &agent_name,
-                provider: entry.provider.clone(),
+                provider: provider.clone(),
                 pool: self.bootstrap.pool.clone(),
                 working_directory: workspace_path,
                 additional_tools: self.bootstrap.mcp_tools.clone(),
@@ -598,8 +624,11 @@ impl ServerState {
         )
         .await?;
         info!(
-            "Created session {} (agent: {}, model: {})",
-            session_id, agent_name, model
+            "Created session {} (agent: {}, model: {}, effort: {})",
+            session_id,
+            agent_name,
+            model,
+            reasoning_effort.as_deref().unwrap_or("default")
         );
 
         let steering = agent.steering().clone();
@@ -621,7 +650,8 @@ impl ServerState {
             session_id,
             agent_name,
             model,
-            provider: entry.provider,
+            provider,
+            reasoning_effort,
             context_limit: entry.context_limit,
             tools,
             steering: Arc::new(Mutex::new(Some(steering))),
@@ -895,6 +925,7 @@ async fn handle_request(
                     live.messages = messages.clone();
                     let seq = live.seq + 1;
                     let model = live.model.clone();
+                    let reasoning_effort = live.reasoning_effort.clone();
                     live.publish(ServerMessage::SessionSnapshot {
                         session_id: current.session_id.clone(),
                         messages: messages.clone(),
@@ -902,6 +933,7 @@ async fn handle_request(
                         busy: false,
                         seq,
                         model: Some(model),
+                        reasoning_effort,
                     });
                 }
             }
@@ -980,6 +1012,7 @@ async fn handle_request(
                             agent_name: target.clone(),
                             model: current.model.clone(),
                             provider: current.provider.clone(),
+                            reasoning_effort: current.reasoning_effort.clone(),
                             context_limit: current.context_limit,
                             tools: tools.clone(),
                             steering: current.steering.clone(),
@@ -1136,48 +1169,167 @@ async fn handle_request(
                 ));
             }
             let result = match state.bootstrap.models.get(&target) {
-                Some(entry) => match gewu_storage::set_session_model(
-                    &state.bootstrap.pool,
-                    &current.session_id,
-                    &target,
-                )
-                .await
-                {
-                    Ok(()) => {
+                Some(entry) => {
+                    // Keep the explicit effort only when the new model
+                    // supports it; otherwise fall back to its default.
+                    let reasoning_effort = current
+                        .reasoning_effort
+                        .clone()
+                        .filter(|effort| entry.effort_providers.contains_key(effort));
+                    let Some(provider) = entry.provider_for(reasoning_effort.as_deref()) else {
+                        state.release_session(&current.session_id).await;
+                        return Err(RequestError::Invalid(format!(
+                            "reasoning effort is unavailable for model '{target}'"
+                        )));
+                    };
+                    match gewu_storage::set_session_model(
+                        &state.bootstrap.pool,
+                        &current.session_id,
+                        &target,
+                    )
+                    .await
+                    {
+                        Ok(()) => match gewu_storage::set_session_reasoning_effort(
+                            &state.bootstrap.pool,
+                            &current.session_id,
+                            reasoning_effort.as_deref(),
+                        )
+                        .await
                         {
-                            let mut agent = current.agent.lock().await;
-                            agent.set_llm(entry.provider.clone());
-                            agent.context_limit = entry.context_limit;
-                        }
-                        let replacement = ConnectionSession {
-                            agent: current.agent.clone(),
-                            session_id: current.session_id.clone(),
-                            agent_name: current.agent_name.clone(),
-                            model: target.clone(),
-                            provider: entry.provider.clone(),
-                            context_limit: entry.context_limit,
-                            tools: current.tools.clone(),
-                            steering: current.steering.clone(),
-                            workspace: current.workspace.clone(),
-                        };
-                        *session = Some(replacement.clone());
-                        state
-                            .sessions
-                            .lock()
-                            .await
-                            .insert(current.session_id.clone(), replacement);
-                        Ok(Handled::Reply(ServerMessage::ModelSwitched {
-                            id: request.id,
-                            session_id: current.session_id.clone(),
-                            model: target,
-                            label: entry.label.clone(),
-                        }))
+                            Ok(()) => {
+                                {
+                                    let mut agent = current.agent.lock().await;
+                                    agent.set_llm(provider.clone());
+                                    agent.context_limit = entry.context_limit;
+                                }
+                                let replacement = ConnectionSession {
+                                    agent: current.agent.clone(),
+                                    session_id: current.session_id.clone(),
+                                    agent_name: current.agent_name.clone(),
+                                    model: target.clone(),
+                                    provider,
+                                    reasoning_effort: reasoning_effort.clone(),
+                                    context_limit: entry.context_limit,
+                                    tools: current.tools.clone(),
+                                    steering: current.steering.clone(),
+                                    workspace: current.workspace.clone(),
+                                };
+                                *session = Some(replacement.clone());
+                                state
+                                    .sessions
+                                    .lock()
+                                    .await
+                                    .insert(current.session_id.clone(), replacement);
+                                if let Some(turn) =
+                                    state.turns.lock().await.get(&current.session_id).cloned()
+                                {
+                                    let mut turn = turn.lock().await;
+                                    turn.model = target.clone();
+                                    turn.reasoning_effort = reasoning_effort.clone();
+                                }
+                                Ok(Handled::Reply(ServerMessage::ModelSwitched {
+                                    id: request.id,
+                                    session_id: current.session_id.clone(),
+                                    model: target,
+                                    label: entry.label.clone(),
+                                    reasoning_effort,
+                                }))
+                            }
+                            Err(e) => Err(RequestError::Failed(e.to_string())),
+                        },
+                        Err(e) => Err(RequestError::Failed(e.to_string())),
                     }
-                    Err(e) => Err(RequestError::Failed(e.to_string())),
-                },
+                }
                 None => Err(RequestError::Invalid(format!("unknown model: {target}"))),
             };
             state.busy_sessions.lock().await.remove(&current.session_id);
+            result
+        }
+        Op::SwitchReasoningEffort { effort } => {
+            if running.is_some() {
+                return Err(RequestError::Failed(
+                    "cannot switch reasoning effort while a turn is running".into(),
+                ));
+            }
+            let current = state
+                .get_or_create_session(session, request.session_id, None)
+                .await
+                .map_err(|e| RequestError::Failed(e.to_string()))?;
+            if !state.claim_session(&current.session_id).await {
+                return Err(RequestError::Failed(
+                    "session is busy on another connection".into(),
+                ));
+            }
+            let result = match state.bootstrap.models.get(&current.model).cloned() {
+                Some(entry) if !entry.supports_reasoning_effort => {
+                    Err(RequestError::Invalid(format!(
+                        "model '{}' does not support reasoning effort",
+                        current.model
+                    )))
+                }
+                Some(entry) => {
+                    if let Some(effort) = &effort
+                        && !protocol::REASONING_EFFORTS.contains(&effort.as_str())
+                    {
+                        Err(RequestError::Invalid(format!(
+                            "unknown reasoning effort: {effort}"
+                        )))
+                    } else {
+                        match entry.provider_for(effort.as_deref()) {
+                            Some(provider) => match gewu_storage::set_session_reasoning_effort(
+                                &state.bootstrap.pool,
+                                &current.session_id,
+                                effort.as_deref(),
+                            )
+                            .await
+                            {
+                                Ok(()) => {
+                                    current.agent.lock().await.set_llm(provider.clone());
+                                    let replacement = ConnectionSession {
+                                        agent: current.agent.clone(),
+                                        session_id: current.session_id.clone(),
+                                        agent_name: current.agent_name.clone(),
+                                        model: current.model.clone(),
+                                        provider,
+                                        reasoning_effort: effort.clone(),
+                                        context_limit: current.context_limit,
+                                        tools: current.tools.clone(),
+                                        steering: current.steering.clone(),
+                                        workspace: current.workspace.clone(),
+                                    };
+                                    *session = Some(replacement.clone());
+                                    state
+                                        .sessions
+                                        .lock()
+                                        .await
+                                        .insert(current.session_id.clone(), replacement);
+                                    if let Some(turn) =
+                                        state.turns.lock().await.get(&current.session_id).cloned()
+                                    {
+                                        turn.lock().await.reasoning_effort = effort.clone();
+                                    }
+                                    Ok(Handled::Reply(ServerMessage::ReasoningEffortSwitched {
+                                        id: request.id,
+                                        session_id: current.session_id.clone(),
+                                        effort,
+                                    }))
+                                }
+                                Err(e) => Err(RequestError::Failed(e.to_string())),
+                            },
+                            None => Err(RequestError::Invalid(format!(
+                                "reasoning effort '{}' is unavailable for model '{}'",
+                                effort.as_deref().unwrap_or("default"),
+                                current.model
+                            ))),
+                        }
+                    }
+                }
+                None => Err(RequestError::Failed(format!(
+                    "unknown model: {}",
+                    current.model
+                ))),
+            };
+            state.release_session(&current.session_id).await;
             result
         }
         Op::ListModels => Ok(Handled::Reply(ServerMessage::Models {
@@ -1189,6 +1341,8 @@ async fn handle_request(
                 .map(|(selector, entry)| protocol::ModelSummary {
                     selector: selector.clone(),
                     label: entry.label.clone(),
+                    supports_reasoning_effort: entry.supports_reasoning_effort,
+                    default_effort: entry.default_effort.clone(),
                 })
                 .collect(),
         })),
@@ -1767,6 +1921,7 @@ async fn start_session_turn(
         seq: 0,
         busy: true,
         model: session.model.clone(),
+        reasoning_effort: session.reasoning_effort.clone(),
         done: Arc::new(tokio::sync::Notify::new()),
         subscribers: vec![],
         cancel: Some(cancel),
@@ -1788,6 +1943,7 @@ async fn start_session_turn(
             busy: true,
             seq: 0,
             model: Some(session.model.clone()),
+            reasoning_effort: session.reasoning_effort.clone(),
         }
         .to_line();
         for observer in previous
@@ -2578,6 +2734,7 @@ mod tests {
             agent_name: "build".to_string(),
             model: "test-model".to_string(),
             provider: llm,
+            reasoning_effort: None,
             context_limit: 256_000,
             tools,
             steering: Arc::new(Mutex::new(None)),
@@ -2603,6 +2760,7 @@ mod tests {
             agent_name: "build".to_string(),
             model: "test-model".to_string(),
             provider: llm,
+            reasoning_effort: None,
             context_limit: 256_000,
             tools,
             steering: Arc::new(Mutex::new(None)),
@@ -3230,15 +3388,35 @@ mod tests {
                 )])),
                 enforcement: PathEnforcement::None,
                 context_limit: None,
-                models: BTreeMap::from([(
-                    "test-model".to_string(),
-                    crate::bootstrap::ModelEntry {
-                        provider: provider.clone(),
-                        provider_name: "test".to_string(),
-                        label: "test-model".to_string(),
-                        context_limit: 256_000,
-                    },
-                )]),
+                models: BTreeMap::from([
+                    (
+                        "test-model".to_string(),
+                        crate::bootstrap::ModelEntry {
+                            provider: provider.clone(),
+                            provider_name: "test".to_string(),
+                            label: "test-model".to_string(),
+                            context_limit: 256_000,
+                            default_effort: Some("high".to_string()),
+                            effort_providers: protocol::REASONING_EFFORTS
+                                .iter()
+                                .map(|effort| (effort.to_string(), provider.clone()))
+                                .collect(),
+                            supports_reasoning_effort: true,
+                        },
+                    ),
+                    (
+                        "test-plain".to_string(),
+                        crate::bootstrap::ModelEntry {
+                            provider: provider.clone(),
+                            provider_name: "test".to_string(),
+                            label: "test-plain".to_string(),
+                            context_limit: 256_000,
+                            default_effort: None,
+                            effort_providers: BTreeMap::new(),
+                            supports_reasoning_effort: false,
+                        },
+                    ),
+                ]),
                 model_selector: "test-model".to_string(),
                 agents: Arc::new(BTreeMap::new()),
             },
@@ -3248,6 +3426,105 @@ mod tests {
             turns: Mutex::new(HashMap::new()),
             lifecycle: Mutex::new(()),
         })
+    }
+
+    #[tokio::test]
+    async fn reasoning_effort_switch_persists_and_reconnects() {
+        let state = server_state_with(TestLlm::plain());
+        let (input, mut output, _connection) = spawn_connection(state.clone()).await;
+
+        input
+            .send(r#"{"id":1,"op":"list_models"}"#.into())
+            .await
+            .unwrap();
+        let models = recv_json(&mut output).await;
+        assert_eq!(models["models"][0]["supports_reasoning_effort"], true);
+        assert_eq!(models["models"][0]["default_effort"], "high");
+
+        input
+            .send(
+                r#"{"id":2,"op":"switch_reasoning_effort","session_id":"eff","effort":"low"}"#
+                    .into(),
+            )
+            .await
+            .unwrap();
+        let reply = recv_json(&mut output).await;
+        assert_eq!(reply["type"], "reasoning_effort_switched");
+        assert_eq!(reply["effort"], "low");
+        assert_eq!(
+            gewu_storage::session_reasoning_effort(&state.bootstrap.pool, "eff")
+                .await
+                .unwrap()
+                .as_deref(),
+            Some("low")
+        );
+        let session = state.sessions.lock().await.get("eff").unwrap().clone();
+        assert_eq!(session.reasoning_effort.as_deref(), Some("low"));
+
+        input
+            .send(ClientRequest::subscribe_session(3, "eff").to_line())
+            .await
+            .unwrap();
+        assert_eq!(recv_json(&mut output).await["type"], "ready");
+        let snapshot = recv_json(&mut output).await;
+        assert_eq!(snapshot["type"], "session_snapshot");
+        assert_eq!(snapshot["reasoning_effort"], "low");
+
+        // Selecting default clears the explicit effort.
+        input
+            .send(r#"{"id":4,"op":"switch_reasoning_effort","effort":null}"#.into())
+            .await
+            .unwrap();
+        let reply = recv_json(&mut output).await;
+        assert_eq!(reply["type"], "reasoning_effort_switched");
+        assert_eq!(reply["effort"], Value::Null);
+        assert_eq!(
+            gewu_storage::session_reasoning_effort(&state.bootstrap.pool, "eff")
+                .await
+                .unwrap(),
+            None
+        );
+
+        input
+            .send(ClientRequest::subscribe_session(5, "eff").to_line())
+            .await
+            .unwrap();
+        assert_eq!(recv_json(&mut output).await["type"], "ready");
+        let snapshot = recv_json(&mut output).await;
+        assert_eq!(snapshot["type"], "session_snapshot");
+        assert!(snapshot.get("reasoning_effort").is_none(), "{snapshot}");
+
+        input
+            .send(r#"{"id":6,"op":"switch_reasoning_effort","effort":"bogus"}"#.into())
+            .await
+            .unwrap();
+        let error = recv_json(&mut output).await;
+        assert_eq!(error["type"], "error");
+        assert!(
+            error["error"]
+                .as_str()
+                .unwrap()
+                .contains("unknown reasoning effort"),
+            "{error}"
+        );
+
+        // Switching to a model without effort support clears the selection.
+        input
+            .send(r#"{"id":7,"op":"switch_model","model":"test-plain"}"#.into())
+            .await
+            .unwrap();
+        let reply = recv_json(&mut output).await;
+        assert_eq!(reply["type"], "model_switched");
+        assert!(reply.get("reasoning_effort").is_none(), "{reply}");
+        let session = state.sessions.lock().await.get("eff").unwrap().clone();
+        assert_eq!(session.model, "test-plain");
+        assert_eq!(session.reasoning_effort, None);
+        assert_eq!(
+            gewu_storage::session_reasoning_effort(&state.bootstrap.pool, "eff")
+                .await
+                .unwrap(),
+            None
+        );
     }
 
     #[tokio::test]
@@ -4013,6 +4290,9 @@ mod tests {
                         provider_name: "test".to_string(),
                         label: "test-model".to_string(),
                         context_limit: 256_000,
+                        default_effort: None,
+                        effort_providers: BTreeMap::new(),
+                        supports_reasoning_effort: false,
                     },
                 )]),
                 model_selector: "test-model".to_string(),
@@ -4580,6 +4860,7 @@ mod tests {
             agent_name: "build".to_string(),
             model: "test-model".to_string(),
             provider: Arc::new(ToolCallLoopLlm),
+            reasoning_effort: None,
             context_limit: 256_000,
             tools: vec!["echo".to_string()],
             steering: Arc::new(Mutex::new(None)),

@@ -315,14 +315,18 @@ mod tests {
                 "list_models" => vec![json!({
                     "type": "models", "id": id,
                     "models": [
-                        {"selector": "fake/one", "label": "fake-model"},
-                        {"selector": "fake/two", "label": "fake-other"},
+                        {"selector": "fake/one", "label": "fake-model", "supports_reasoning_effort": true, "default_effort": "high"},
+                        {"selector": "fake/two", "label": "fake-other", "supports_reasoning_effort": false},
                     ],
                 })],
                 "switch_model" => vec![json!({
                     "type": "model_switched", "id": id, "session_id": "sess-1",
                     "model": request.get("model").and_then(Value::as_str).unwrap_or(""),
                     "label": "fake-other",
+                })],
+                "switch_reasoning_effort" => vec![json!({
+                    "type": "reasoning_effort_switched", "id": id, "session_id": "sess-1",
+                    "effort": request.get("effort").cloned().unwrap_or(Value::Null),
                 })],
                 "list_sessions" => vec![json!({
                     "type": "sessions", "id": id, "sessions": [],
@@ -832,6 +836,54 @@ mod tests {
         assert!(
             switched.is_some(),
             "the switched model should be selected in a status update"
+        );
+    }
+
+    #[tokio::test]
+    async fn browser_can_switch_reasoning_effort_from_the_picker() {
+        let upstream = spawn_fake_upstream().await;
+        let addr = spawn_gui(AppState {
+            endpoint: Endpoint::Tcp {
+                host: "127.0.0.1".to_string(),
+                port: upstream.port(),
+            },
+            token: None,
+            server_token: None,
+        })
+        .await;
+
+        let (mut ws, _) = tokio_tungstenite::connect_async(format!("ws://{addr}/ws"))
+            .await
+            .unwrap();
+
+        let snapshot = next_json(&mut ws).await;
+        assert_eq!(snapshot["type"], "snapshot");
+        let status = snapshot["status"].as_str().unwrap();
+        assert!(status.contains("effort-picker"), "{status}");
+        assert!(
+            status.contains("<option value=\"high\" selected>high</option>"),
+            "{status}"
+        );
+
+        ws.send(WsMessage::text(
+            r#"{"op":"switch_reasoning_effort","tab":1,"effort":"max"}"#,
+        ))
+        .await
+        .unwrap();
+        let mut switched = None;
+        for _ in 0..20 {
+            let value = next_json(&mut ws).await;
+            if value["type"] == "status" {
+                let html = value["html"].as_str().unwrap();
+                if html.contains("<option value=\"max\" selected>max</option>") {
+                    switched = Some(html.to_string());
+                    break;
+                }
+            }
+        }
+        assert!(
+            switched.is_some(),
+            "the switched effort should be selected in a status update"
         );
     }
 

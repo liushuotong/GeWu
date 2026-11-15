@@ -34,6 +34,12 @@ pub enum ClientMsg {
         tab: u64,
         model: String,
     },
+    /// Change the tab's explicit reasoning effort; `None` selects the model
+    /// default.
+    SwitchReasoningEffort {
+        tab: u64,
+        effort: Option<String>,
+    },
     /// Switch the tab's active filesystem workspace root.
     SwitchWorkspace {
         tab: u64,
@@ -98,6 +104,15 @@ pub enum ClientMsg {
         tab: u64,
         block: usize,
     },
+    /// Reveal the previous page of the active transcript.
+    LoadEarlier {
+        tab: u64,
+    },
+    /// Report whether the browser is following output at the transcript bottom.
+    SetFollow {
+        tab: u64,
+        follow: bool,
+    },
     /// Ask for a fresh snapshot (e.g. after a transient UI error).
     Refresh,
     /// Expand or collapse a directory in the file tree.
@@ -147,6 +162,8 @@ pub enum ServerMsg {
     SessionSidebar { html: String },
     /// Replace the active transcript with freshly rendered HTML.
     Transcript { html: String },
+    /// Prepend older rendered blocks to the active transcript.
+    TranscriptPrepend { html: String },
     /// Replace one tool card in the active transcript (`first` is its run's
     /// starting block index).
     ToolCard { first: usize, html: String },
@@ -226,6 +243,18 @@ mod tests {
             serde_json::from_str::<ClientMsg>(r#"{"op":"toggle_thought","tab":2,"block":5}"#)
                 .unwrap(),
             ClientMsg::ToggleThought { tab: 2, block: 5 }
+        );
+        assert_eq!(
+            serde_json::from_str::<ClientMsg>(r#"{"op":"load_earlier","tab":4}"#).unwrap(),
+            ClientMsg::LoadEarlier { tab: 4 }
+        );
+        assert_eq!(
+            serde_json::from_str::<ClientMsg>(r#"{"op":"set_follow","tab":4,"follow":false}"#)
+                .unwrap(),
+            ClientMsg::SetFollow {
+                tab: 4,
+                follow: false,
+            }
         );
         assert_eq!(
             serde_json::from_str::<ClientMsg>(r#"{"op":"open_tab"}"#).unwrap(),
@@ -335,6 +364,13 @@ mod tests {
         assert_eq!(json["type"], "block_replace");
         assert_eq!(json["index"], 2);
 
+        let msg = ServerMsg::TranscriptPrepend {
+            html: "<div class=\"block\"></div>".to_string(),
+        };
+        let json = serde_json::to_value(&msg).unwrap();
+        assert_eq!(json["type"], "transcript_prepend");
+        assert_eq!(json["html"], "<div class=\"block\"></div>");
+
         // Keyed errors carry their dedup key; unkeyed ones omit the field.
         let msg = ServerMsg::Error {
             message: "LLM request failed: 502; retrying in 2s (attempt 2)".to_string(),
@@ -402,6 +438,30 @@ mod tests {
                 r#"{"op":"upload_files","files":[{"name":"a.txt"}]}"#
             )
             .is_err()
+        );
+    }
+
+    #[test]
+    fn parses_reasoning_effort_switch() {
+        assert_eq!(
+            serde_json::from_str::<ClientMsg>(
+                r#"{"op":"switch_reasoning_effort","tab":3,"effort":"high"}"#
+            )
+            .unwrap(),
+            ClientMsg::SwitchReasoningEffort {
+                tab: 3,
+                effort: Some("high".into()),
+            }
+        );
+        assert_eq!(
+            serde_json::from_str::<ClientMsg>(
+                r#"{"op":"switch_reasoning_effort","tab":3,"effort":null}"#
+            )
+            .unwrap(),
+            ClientMsg::SwitchReasoningEffort {
+                tab: 3,
+                effort: None,
+            }
         );
     }
 }

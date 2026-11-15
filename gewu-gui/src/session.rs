@@ -490,7 +490,9 @@ impl GuiSession {
     /// cannot be located.
     async fn send_tool_card(&self, tab_id: u64, block: usize, sender: &mut Sender) -> Result<()> {
         if let Some(tab) = self.workspace.tab(tab_id)
+            && block >= tab.transcript_start
             && let Some(first) = tool_run_start(&tab.model.blocks, block)
+            && first >= tab.transcript_start
             && let Some(html) = view::tool_card_html(tab, first)
         {
             return send_msg(sender, &ServerMsg::ToolCard { first, html }).await;
@@ -508,6 +510,7 @@ impl GuiSession {
         sender: &mut Sender,
     ) -> Result<()> {
         if let Some(tab) = self.workspace.tab(tab_id)
+            && block >= tab.transcript_start
             && let Some(html) = view::assistant_body_html(tab, block, false)
         {
             return send_msg(sender, &ServerMsg::StreamingBody { index: block, html }).await;
@@ -848,6 +851,7 @@ impl GuiSession {
                         tab_state
                             .model
                             .note("Conversation updated. Workspace files were NOT undone.");
+                        tab_state.reset_transcript_window();
                         tab_state.expanded_groups.clear();
                         tab_state.expanded_outputs.clear();
                         tab_state.context = None;
@@ -920,11 +924,42 @@ impl GuiSession {
                     return self.send_error(sender, e.to_string()).await;
                 }
                 match client.switch_model(model.clone()).await {
-                    Ok((id, label)) => {
+                    Ok((id, label, reasoning_effort)) => {
                         let tab_state = self.workspace.tab_mut(tab).expect("known tab");
                         tab_state.model.set_session(Some(id));
                         tab_state.model_selector = Some(model);
                         tab_state.model_label = Some(label);
+                        tab_state.reasoning_effort = reasoning_effort;
+                        if self.workspace.active_id() == tab {
+                            self.send_status(sender).await?;
+                        }
+                    }
+                    Err(e) => self.send_error(sender, e.to_string()).await?,
+                }
+            }
+            ClientMsg::SwitchReasoningEffort { tab, effort } => {
+                if self.workspace.tab(tab).is_none_or(|tab| tab.busy()) {
+                    return self
+                        .send_error(sender, "wait for the current turn to finish")
+                        .await;
+                }
+                if let Err(e) = self.ensure_client(tab).await {
+                    return self.send_error(sender, e.to_string()).await;
+                }
+                let client = self.client(tab).expect("ensured");
+                if let Some(id) = self
+                    .workspace
+                    .tab(tab)
+                    .and_then(|tab| tab.model.session_id.clone())
+                    && let Err(e) = client.usage(Some(&id)).await
+                {
+                    return self.send_error(sender, e.to_string()).await;
+                }
+                match client.switch_reasoning_effort(effort.as_deref()).await {
+                    Ok((id, effort)) => {
+                        let tab_state = self.workspace.tab_mut(tab).expect("known tab");
+                        tab_state.model.set_session(Some(id));
+                        tab_state.reasoning_effort = effort;
                         if self.workspace.active_id() == tab {
                             self.send_status(sender).await?;
                         }
@@ -1137,6 +1172,32 @@ impl GuiSession {
                 }
                 if self.workspace.active_id() == tab {
                     self.send_thought_body(tab, block, sender).await?;
+                }
+            }
+            ClientMsg::LoadEarlier { tab } => {
+                let page = if self.workspace.active_id() == tab {
+                    self.workspace
+                        .tab_mut(tab)
+                        .and_then(|tab_state| tab_state.load_earlier())
+                } else {
+                    None
+                };
+                let Some((start, end)) = page else {
+                    // Already at the beginning (or the tab switched under the
+                    // click): a full render re-syncs the browser.
+                    return self.send_transcript(sender).await;
+                };
+                let tab_state = self.workspace.tab(tab).expect("page loaded from a tab");
+                let html = view::transcript_prepend_html(tab_state, start, end);
+                send_msg(sender, &ServerMsg::TranscriptPrepend { html }).await?;
+            }
+            ClientMsg::SetFollow { tab, follow } => {
+                let evicted = self.workspace.tab_mut(tab).is_some_and(|tab_state| {
+                    tab_state.follow = follow;
+                    follow && tab_state.evict_overflow()
+                });
+                if evicted && self.workspace.active_id() == tab {
+                    self.send_transcript(sender).await?;
                 }
             }
             ClientMsg::Refresh => {
@@ -1474,6 +1535,7 @@ impl GuiSession {
                     frames,
                     busy,
                     model: snapshot_model,
+                    reasoning_effort: snapshot_effort,
                     ..
                 })) => {
                     let mut model = gewu_client::SessionModel::new();
@@ -1492,6 +1554,9 @@ impl GuiSession {
                     let changed =
                         tab.model.blocks != model.blocks || tab.model.phase != model.phase;
                     tab.model = model;
+                    if changed {
+                        tab.reset_transcript_window();
+                    }
                     // The snapshot is authoritative: an ingested steer is
                     // already in its frames/messages, and one still queued
                     // upstream re-arrives as a live `steered` event.
@@ -1501,6 +1566,7 @@ impl GuiSession {
                         tab.model_label =
                             Some(label_for(&self.models, &selector).unwrap_or(selector));
                     }
+                    tab.reasoning_effort = snapshot_effort;
                     terminal = !busy;
                     update = if changed {
                         TabUpdate::Full
@@ -1652,6 +1718,9 @@ impl GuiSession {
                 // A steer queued upstream but dropped before ingestion (turn
                 // ended first) must not suppress a future identical steer.
                 tab.pending_steers.clear();
+            }
+            if tab.follow && tab.evict_overflow() && event.tab_id == active_id {
+                update = TabUpdate::Full;
             }
         }
 

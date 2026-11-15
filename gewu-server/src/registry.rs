@@ -271,7 +271,31 @@ impl SqliteAgentFactory {
                 .get(&selector)
                 .ok_or_else(|| format!("unknown subagent model: {selector}"))?;
             gewu_storage::set_session_model(&self.pool, &session_id, &selector).await?;
-            (entry.provider.clone(), Some(entry.context_limit))
+            // Subagents inherit the parent's explicit effort unless their own
+            // session already selected one.
+            let effort = match gewu_storage::session_reasoning_effort(&self.pool, &session_id)
+                .await?
+            {
+                Some(effort) => Some(effort),
+                None => {
+                    let inherited =
+                        gewu_storage::session_reasoning_effort(&self.pool, parent_session).await?;
+                    if let Some(effort) = &inherited {
+                        gewu_storage::set_session_reasoning_effort(
+                            &self.pool,
+                            &session_id,
+                            Some(effort),
+                        )
+                        .await?;
+                    }
+                    inherited
+                }
+            };
+            let effort = effort.filter(|effort| entry.effort_providers.contains_key(effort));
+            let provider = entry.provider_for(effort.as_deref()).ok_or_else(|| {
+                format!("reasoning effort is unavailable for subagent model: {selector}")
+            })?;
+            (provider, Some(entry.context_limit))
         } else {
             (self.provider.clone(), self.context_limit)
         };
@@ -868,6 +892,9 @@ mod tests {
                         provider_name: key.into(),
                         label: key.into(),
                         context_limit,
+                        default_effort: None,
+                        effort_providers: std::collections::BTreeMap::new(),
+                        supports_reasoning_effort: false,
                     },
                 )
             })

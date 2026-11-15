@@ -6,6 +6,7 @@
 use anyhow::{Context, Result};
 use gewu_core::traits::{LlmProvider, RequestLog};
 use gewu_core::types::PathEnforcement;
+use gewu_protocol::REASONING_EFFORTS;
 use gewu_providers::{
     AnthropicProvider, ChatCompletionsProvider, DeepSeekProvider, GlmProvider, MoonshotProvider,
     OpenAIProvider, ProviderProfile,
@@ -63,12 +64,30 @@ pub struct CommonArgs {
 /// One switchable model: a ready provider plus the settings agents need.
 #[derive(Clone)]
 pub struct ModelEntry {
+    /// Provider for the model's configured default effort.
     pub provider: Arc<dyn LlmProvider>,
     pub provider_name: String,
     /// API model id (or catalog key) shown in UIs.
     pub label: String,
     /// Resolved context window used for compaction.
     pub context_limit: usize,
+    /// Effort configured as the model default; `None` sends no effort field.
+    pub default_effort: Option<String>,
+    /// Providers for the selectable explicit efforts.
+    pub effort_providers: BTreeMap<String, Arc<dyn LlmProvider>>,
+    /// Whether the model accepts runtime reasoning-effort changes.
+    pub supports_reasoning_effort: bool,
+}
+
+impl ModelEntry {
+    /// The provider for an explicit effort, or the configured default when
+    /// `effort` is `None`. Returns `None` for an unsupported effort.
+    pub fn provider_for(&self, effort: Option<&str>) -> Option<Arc<dyn LlmProvider>> {
+        match effort {
+            None => Some(self.provider.clone()),
+            Some(effort) => self.effort_providers.get(effort).cloned(),
+        }
+    }
 }
 
 /// AgentBuilder's default context window, used when a model configures none.
@@ -358,6 +377,37 @@ pub fn build_model_catalog(
                 model_config.reasoning_summary,
             ) {
                 Ok(provider) => {
+                    let default_effort = model_config.reasoning_effort.clone();
+                    // OpenAI-family and Anthropic models expose the control
+                    // by default; other services opt in through config.
+                    let supports_reasoning_effort = default_effort.is_some()
+                        || matches!(
+                            profile,
+                            ProviderProfile::Openai
+                                | ProviderProfile::OpenaiCompatible
+                                | ProviderProfile::Anthropic
+                        );
+                    let mut effort_providers = BTreeMap::new();
+                    if supports_reasoning_effort {
+                        for effort in REASONING_EFFORTS {
+                            match construct_provider(
+                                profile,
+                                &api_key,
+                                &settings.base_url,
+                                &label,
+                                model_config.max_tokens,
+                                Some(*effort),
+                                model_config.reasoning_summary,
+                            ) {
+                                Ok(provider) => {
+                                    effort_providers.insert((*effort).to_string(), provider);
+                                }
+                                Err(e) => warn!(
+                                    "model '{selector}' effort '{effort}' is unavailable: {e}"
+                                ),
+                            }
+                        }
+                    }
                     catalog.insert(
                         selector.clone(),
                         ModelEntry {
@@ -367,6 +417,9 @@ pub fn build_model_catalog(
                             context_limit: model_config
                                 .context_limit
                                 .unwrap_or(DEFAULT_CONTEXT_LIMIT),
+                            default_effort,
+                            effort_providers,
+                            supports_reasoning_effort,
                         },
                     );
                 }
@@ -442,6 +495,9 @@ pub async fn bootstrap(args: &CommonArgs) -> Result<Bootstrap> {
                 provider_name: provider_name.clone(),
                 label: model.clone(),
                 context_limit: context_limit.unwrap_or(DEFAULT_CONTEXT_LIMIT),
+                default_effort: None,
+                effort_providers: BTreeMap::new(),
+                supports_reasoning_effort: false,
             },
         );
         selector
@@ -460,6 +516,9 @@ pub async fn bootstrap(args: &CommonArgs) -> Result<Bootstrap> {
                 provider_name: provider_name.clone(),
                 label: model.clone(),
                 context_limit: context_limit.unwrap_or(DEFAULT_CONTEXT_LIMIT),
+                default_effort: None,
+                effort_providers: BTreeMap::new(),
+                supports_reasoning_effort: false,
             });
         selected
     };
@@ -727,6 +786,20 @@ mod tests {
         assert_eq!(catalog["west/fast"].label, "fast");
         assert_eq!(catalog["west/fast"].provider_name, "openai");
         assert_eq!(catalog["west/fast"].context_limit, DEFAULT_CONTEXT_LIMIT);
+        assert!(!catalog["west/coding"].supports_reasoning_effort);
+        assert!(catalog["west/fast"].supports_reasoning_effort);
+        assert_eq!(
+            catalog["west/fast"].effort_providers.len(),
+            REASONING_EFFORTS.len()
+        );
+        assert_eq!(
+            catalog["west/fast"]
+                .provider_for(Some("low"))
+                .unwrap()
+                .build(&[], &[])
+                .unwrap()["reasoning"]["effort"],
+            "low"
+        );
         assert_eq!(
             catalog["west/coding"].provider.build(&[], &[]).unwrap()["max_tokens"],
             2048
