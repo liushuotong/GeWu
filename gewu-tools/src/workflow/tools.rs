@@ -1,13 +1,12 @@
-//! The four workflow tools.
+//! The three workflow tools.
 //!
-//! All four share one [`WorkflowManager`]: `workflow_start` validates the
+//! All three share one [`WorkflowManager`]: `workflow_start` validates the
 //! spec and returns a `run_id` immediately, `workflow_status` snapshots a
-//! run without waiting, `workflow_wait` polls up to a caller-provided
-//! limit, and `workflow_cancel` aborts a run and reports its partial
-//! results.
+//! run without waiting, and `workflow_cancel` aborts a run and reports its
+//! partial results. Runs publish live progress to the server, which renders
+//! it in the GUI.
 
-use crate::workflow::engine::RunStatus;
-use crate::workflow::manager::{DEFAULT_WAIT_SECS, RunSnapshot, WorkflowManager};
+use crate::workflow::manager::{RunSnapshot, WorkflowManager};
 use crate::workflow::spec::WorkflowSpec;
 use anyhow::anyhow;
 use async_trait::async_trait;
@@ -44,16 +43,6 @@ pub struct WorkflowStartArgs {
 pub struct WorkflowStatusArgs {
     /// The run_id returned by workflow_start.
     pub run_id: String,
-}
-
-#[derive(Debug, Deserialize, schemars::JsonSchema)]
-pub struct WorkflowWaitArgs {
-    /// The run_id returned by workflow_start.
-    pub run_id: String,
-    /// Seconds to wait before returning the current status (default 60,
-    /// capped at 600).
-    #[serde(default)]
-    pub wait_secs: Option<u64>,
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
@@ -114,7 +103,8 @@ impl Tool for WorkflowStartTool {
             "workflow_start",
             format!(
                 "Started workflow run {run_id}. It executes in the background; check on it with \
-                 workflow_status or workflow_wait (run_id: \"{run_id}\")."
+                 workflow_status (run_id: \"{run_id}\"). This session is notified when it \
+                 finishes."
             ),
         ))
     }
@@ -162,60 +152,6 @@ impl Tool for WorkflowStatusTool {
     }
 }
 
-/// Waits up to N seconds for a run to finish, then returns its snapshot.
-#[derive(Clone)]
-pub struct WorkflowWaitTool {
-    manager: Arc<WorkflowManager>,
-}
-
-impl WorkflowWaitTool {
-    pub fn new(manager: Arc<WorkflowManager>) -> Self {
-        Self { manager }
-    }
-}
-
-#[async_trait]
-impl Tool for WorkflowWaitTool {
-    fn name(&self) -> &str {
-        "workflow_wait"
-    }
-
-    fn description(&self) -> &str {
-        "Waits up to `wait_secs` for a workflow run to finish, then returns the final result \
-         or the current status if it is still running. Use this instead of repeatedly polling \
-         workflow_status when you can afford to block."
-    }
-
-    fn schema(&self) -> RootSchema {
-        schemars::schema_for!(WorkflowWaitArgs)
-    }
-
-    async fn execute(
-        &self,
-        args: serde_json::Value,
-        ctx: &ToolContext,
-    ) -> Result<ToolResult, Box<dyn Error + Send + Sync>> {
-        let input: WorkflowWaitArgs = serde_json::from_value(args).map_err(tool_error)?;
-        let snapshot = self
-            .manager
-            .wait(
-                &input.run_id,
-                &ctx.session_id,
-                input.wait_secs.unwrap_or(DEFAULT_WAIT_SECS),
-            )
-            .await
-            .map_err(tool_error)?;
-        let mut text = snapshot_text(&snapshot);
-        if snapshot.status == RunStatus::Running {
-            text.push_str(
-                "\n\nThe run is still going. Call workflow_wait again to keep waiting, or \
-                 workflow_status for a spot check.",
-            );
-        }
-        Ok(ToolResult::new("workflow_wait", text))
-    }
-}
-
 /// Aborts a run and returns whatever partial results exist.
 #[derive(Clone)]
 pub struct WorkflowCancelTool {
@@ -258,16 +194,6 @@ impl Tool for WorkflowCancelTool {
     }
 }
 
-fn status_label(status: RunStatus) -> &'static str {
-    match status {
-        RunStatus::Running => "running",
-        RunStatus::Completed => "completed",
-        RunStatus::Canceled => "canceled",
-        RunStatus::TimedOut => "timed out",
-        RunStatus::Failed => "failed",
-    }
-}
-
 /// Renders a snapshot as compact text for the model: one summary line,
 /// per-node progress with failures and agent session ids, then the latest
 /// completed node's output.
@@ -276,7 +202,7 @@ fn snapshot_text(snapshot: &RunSnapshot) -> String {
         "run {} ({}): {}, {} task(s) done, {} failed, {} attempted",
         snapshot.run_id,
         snapshot.name.as_deref().unwrap_or("unnamed"),
-        status_label(snapshot.status),
+        snapshot.status.label(),
         snapshot.tasks_done,
         snapshot.tasks_failed,
         snapshot.tasks_attempted,
@@ -374,7 +300,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn start_returns_run_id_and_wait_reports_completion() {
+    async fn start_returns_run_id_and_status_reports_completion() {
         let (manager, _factory) = manager();
         let tool = WorkflowStartTool::new(manager.clone());
 
@@ -392,14 +318,21 @@ mod tests {
 
         let run_id = run_id_from(&result.output);
 
-        let wait = WorkflowWaitTool::new(manager.clone());
-        let snapshot = wait
-            .execute(
-                serde_json::json!({ "run_id": run_id, "wait_secs": 10 }),
-                &ctx(),
-            )
+        let status = WorkflowStatusTool::new(manager.clone());
+        let mut snapshot = status
+            .execute(serde_json::json!({ "run_id": run_id }), &ctx())
             .await
-            .expect("wait should succeed");
+            .expect("status should succeed");
+        for _ in 0..100 {
+            if snapshot.output.contains("completed") {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(25)).await;
+            snapshot = status
+                .execute(serde_json::json!({ "run_id": run_id }), &ctx())
+                .await
+                .expect("status should succeed");
+        }
         assert!(snapshot.output.contains("completed"), "{}", snapshot.output);
         assert!(snapshot.output.contains("node one: ok, 1 done"));
     }
@@ -474,17 +407,10 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn status_wait_and_cancel_report_unknown_runs() {
+    async fn status_and_cancel_report_unknown_runs() {
         let (manager, _factory) = manager();
         let status = WorkflowStatusTool::new(manager.clone());
         let error = status
-            .execute(serde_json::json!({ "run_id": "nope" }), &ctx())
-            .await
-            .expect_err("unknown run should error");
-        assert!(error.to_string().contains("unknown run_id"), "{error}");
-
-        let wait = WorkflowWaitTool::new(manager.clone());
-        let error = wait
             .execute(serde_json::json!({ "run_id": "nope" }), &ctx())
             .await
             .expect_err("unknown run should error");

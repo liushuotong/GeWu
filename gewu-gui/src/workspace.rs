@@ -4,12 +4,13 @@
 //! `gewu_client::session::SessionModel`; this module adds only the tab list
 //! and the per-tab view state.
 
-use std::collections::HashSet;
+use std::collections::{BTreeMap, HashSet};
 
 use gewu_client::session::{Block, Phase, SessionModel};
 use gewu_protocol::{Message, TokenUsage};
 
 use crate::protocol::TabInfo;
+use crate::workflow::WfSnapshot;
 
 /// Safety cap for tab labels sent to the GUI. The sidebar ellipsizes labels
 /// to its actual width in CSS, so this only guards against pathologically
@@ -55,6 +56,9 @@ pub struct Tab {
     /// Steered messages displayed at submit time and not yet confirmed by
     /// the agent's `steered` event: `(text, block index)` in submit order.
     pub pending_steers: Vec<(String, usize)>,
+    /// Latest live workflow-run state pushed by the server, keyed by run_id.
+    /// Survives transcript rebuilds so cards keep their graphs.
+    pub workflows: BTreeMap<String, WfSnapshot>,
     /// First block index currently rendered in the transcript window.
     pub transcript_start: usize,
     /// Whether the browser is following output at the bottom of the transcript.
@@ -78,6 +82,7 @@ impl Tab {
             expanded_outputs: HashSet::new(),
             expanded_thoughts: HashSet::new(),
             pending_steers: Vec::new(),
+            workflows: BTreeMap::new(),
             transcript_start: 0,
             follow: true,
         }

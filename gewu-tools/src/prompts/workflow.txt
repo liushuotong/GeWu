@@ -1,7 +1,7 @@
 Start a dynamic workflow: you write a JSON graph spec, and the engine compiles
 it into a real state graph and runs it in the background. This returns a run_id
-immediately while the run executes; check on it later with workflow_status,
-block for it with workflow_wait, or abort it with workflow_cancel.
+immediately while the run executes; check on it later with workflow_status, or
+abort it with workflow_cancel. This session is notified when the run finishes.
 
 When to use this:
 - The job decomposes into many similar, independent steps: reviewing a list
@@ -10,7 +10,7 @@ When to use this:
 - The steps have structure a straight sequence can't express: fan-out then
   join, retry-until-good loops, or "if X failed, fix it, else finish".
 - You want the steps to keep running while you talk to the user or work on
-  something else, and results come back only when you ask for them.
+  something else; the run notifies you when it finishes.
 
 When NOT to use this: for a single one-off subtask use the task tool; for
 steps that need your judgement between them, do them yourself.
@@ -94,3 +94,5 @@ node — "edges": [["split","left"],["split","right"],["left","merge"],
 Write precise, self-contained task prompts: the subagents see nothing but
 the prompt. Start the run as early as possible so it works in the
 background, and keep prompts small enough that dozens of tasks stay cheap.
+Do not poll workflow_status in a loop; do other work or end your turn — the
+completion notification resumes you.

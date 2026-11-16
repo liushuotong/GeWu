@@ -1182,8 +1182,8 @@ body {
 }
 
 /* -- workflow graph cards ------------------------------------------------ *
- * `workflow_start` cards draw the run's spec as a layered graph; status and
- * wait cards reuse it, coloring each node from the snapshot's node lines. */
+ * Workflow cards draw the run's spec as a layered graph; status and cancel
+ * cards reuse it, coloring each node from the latest live or snapshot state. */
 .wf-card {
   margin: 4px 0 4px 6px;
   padding: 10px 12px 12px;
@@ -1193,7 +1193,11 @@ body {
   overflow-x: auto;
 }
 
-.wf-caption {
+.wf-head {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 6px 10px;
   font-family: var(--mono);
   font-size: 11px;
   line-height: 1.5;
@@ -1203,8 +1207,82 @@ body {
 }
 
 .wf-run {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
   text-transform: uppercase;
   letter-spacing: 0.08em;
+}
+
+.wf-run-dot {
+  width: 6px;
+  height: 6px;
+  border-radius: 50%;
+  background: currentColor;
+  box-shadow: 0 0 6px currentColor;
+}
+.wf-run-running .wf-run-dot {
+  animation: wf-blink 1.4s var(--ease) infinite;
+}
+@keyframes wf-blink {
+  50% {
+    opacity: 0.35;
+  }
+}
+
+.wf-stat {
+  color: var(--text-faint);
+}
+.wf-stat-failed {
+  color: var(--error);
+}
+.wf-current-node {
+  color: var(--text-faint);
+}
+.wf-current-node b {
+  color: var(--accent);
+  font-weight: 600;
+}
+.wf-error {
+  overflow: hidden;
+  max-width: 46ch;
+  color: var(--error);
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.wf-expand {
+  margin-left: auto;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 24px;
+  height: 22px;
+  border: 1px solid var(--line-strong);
+  border-radius: 3px;
+  background: transparent;
+  color: var(--text-faint);
+  font: 12px/1 var(--mono);
+  cursor: pointer;
+  transition:
+    color 0.15s var(--ease),
+    border-color 0.15s var(--ease),
+    background 0.15s var(--ease);
+}
+.wf-expand:hover {
+  color: var(--accent);
+  border-color: var(--accent-dim);
+  background: var(--accent-soft);
+}
+
+.wf-canvas {
+  display: inline-block;
+  min-width: 100%;
+  vertical-align: top;
+  line-height: 0;
+}
+.wf-canvas[data-action] {
+  cursor: zoom-in;
 }
 
 .wf-run-running {
@@ -1223,7 +1301,6 @@ body {
 
 .wf-svg {
   display: block;
-  width: 100%;
   height: auto;
 }
 
@@ -1232,6 +1309,9 @@ body {
 }
 .wf-marker.route {
   fill: var(--violet);
+}
+.wf-marker.hot {
+  fill: var(--accent);
 }
 
 .wf-edge {
@@ -1243,6 +1323,10 @@ body {
   stroke: var(--violet);
   stroke-dasharray: 5 4;
 }
+.wf-edge.wf-hot {
+  stroke: var(--accent);
+  stroke-width: 1.8;
+}
 
 .wf-edge-label {
   font-family: var(--mono);
@@ -1251,29 +1335,76 @@ body {
   text-anchor: middle;
 }
 
-.wf-node rect {
+.wf-node .wf-node-bg {
   fill: var(--bg-raised);
   stroke: var(--line-strong);
   stroke-width: 1;
 }
-.wf-node.wf-entry rect {
+.wf-node.wf-entry .wf-node-bg {
   stroke: var(--accent-dim);
 }
-.wf-node.wf-ok rect {
+.wf-node.wf-ok .wf-node-bg {
   stroke: var(--green);
   fill: var(--green-soft);
 }
-.wf-node.wf-failed rect {
+.wf-node.wf-failed .wf-node-bg {
   stroke: var(--error);
   fill: var(--error-soft);
 }
-.wf-node.wf-skipped rect {
+.wf-node.wf-skipped .wf-node-bg {
   opacity: 0.4;
 }
-.wf-node.wf-current rect {
+.wf-node.wf-current .wf-node-bg {
   stroke: var(--accent);
   stroke-width: 1.5;
   animation: wf-pulse 1.6s var(--ease) infinite;
+}
+
+.wf-entry-bar {
+  fill: var(--accent);
+}
+
+.wf-glyph-stroke {
+  fill: none;
+  stroke: currentColor;
+  stroke-width: 1.6;
+  stroke-linecap: round;
+  stroke-linejoin: round;
+}
+.wf-glyph-ring {
+  fill: none;
+  stroke: var(--line-strong);
+  stroke-dasharray: 2 2;
+}
+.wf-glyph-dot {
+  fill: currentColor;
+}
+.wf-node.wf-ok .wf-glyph {
+  color: var(--green);
+}
+.wf-node.wf-failed .wf-glyph {
+  color: var(--error);
+}
+.wf-node.wf-skipped .wf-glyph {
+  color: var(--text-faint);
+}
+.wf-node.wf-current .wf-glyph {
+  color: var(--accent);
+}
+
+.wf-badge {
+  font-family: var(--mono);
+  font-size: 9px;
+  letter-spacing: 0.04em;
+  fill: var(--violet);
+}
+.wf-meta {
+  font-family: var(--mono);
+  font-size: 9.5px;
+  fill: var(--text-faint);
+}
+.wf-meta-failed {
+  fill: var(--error);
 }
 
 @keyframes wf-pulse {
@@ -1282,7 +1413,8 @@ body {
   }
 }
 @media (prefers-reduced-motion: reduce) {
-  .wf-node.wf-current rect {
+  .wf-node.wf-current .wf-node-bg,
+  .wf-run-running .wf-run-dot {
     animation: none;
   }
 }
@@ -1310,6 +1442,175 @@ body {
   letter-spacing: 0.08em;
   fill: var(--text-faint);
   text-anchor: middle;
+}
+
+/* -- workflow graph zoom panel ------------------------------------------- */
+.wf-zoom-overlay {
+  position: fixed;
+  inset: 0;
+  z-index: 30;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  padding: 3vh 3vw;
+  background: rgba(3, 6, 10, 0.68);
+  backdrop-filter: blur(3px);
+}
+.wf-zoom-overlay.hidden {
+  display: none;
+}
+
+.wf-zoom-panel {
+  display: flex;
+  flex-direction: column;
+  width: min(1240px, 100%);
+  height: min(860px, 100%);
+  overflow: hidden;
+  background: var(--bg-panel);
+  border: 1px solid var(--line-strong);
+  border-radius: 6px;
+  box-shadow: 0 24px 64px rgba(0, 0, 0, 0.55);
+}
+
+.wf-zoom-header {
+  flex: none;
+}
+
+.wf-zoom-controls {
+  display: flex;
+  align-items: center;
+  gap: 5px;
+}
+
+.wf-zoom-btn {
+  min-width: 28px;
+  height: 26px;
+  padding: 0 8px;
+  border: 1px solid var(--line-strong);
+  border-radius: 3px;
+  background: var(--bg-raised);
+  color: var(--text-dim);
+  font: 12px/1 var(--mono);
+  cursor: pointer;
+  transition:
+    color 0.15s var(--ease),
+    border-color 0.15s var(--ease);
+}
+.wf-zoom-btn:hover {
+  color: var(--accent);
+  border-color: var(--accent-dim);
+}
+.wf-zoom-btn.wide {
+  font-size: 10px;
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+}
+
+.wf-zoom-level {
+  min-width: 46px;
+  color: var(--text-faint);
+  font: 11px var(--mono);
+  text-align: center;
+}
+
+.wf-zoom-bar {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 8px 14px;
+  padding: 8px 18px;
+  border-bottom: 1px solid var(--line);
+  color: var(--text-dim);
+  font: 11px/1.5 var(--mono);
+  letter-spacing: 0.04em;
+}
+
+.wf-legend {
+  display: flex;
+  gap: 10px;
+  color: var(--text-faint);
+  font: 9.5px var(--mono);
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+}
+.wf-legend span {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+}
+.wf-legend i {
+  display: inline-block;
+  width: 7px;
+  height: 7px;
+  border-radius: 50%;
+}
+.wf-dot-ok {
+  background: var(--green);
+}
+.wf-dot-failed {
+  background: var(--error);
+}
+.wf-dot-pending {
+  border: 1px solid var(--line-strong);
+}
+.wf-dot-skipped {
+  background: var(--text-faint);
+  opacity: 0.45;
+}
+
+.wf-zoom-hint {
+  margin-left: auto;
+  color: var(--text-faint);
+  font: 10px var(--mono);
+  letter-spacing: 0.05em;
+}
+
+.wf-zoom-viewport {
+  position: relative;
+  flex: 1;
+  overflow: hidden;
+  cursor: grab;
+  touch-action: none;
+  background-color: var(--bg-inset);
+  background-image: radial-gradient(rgba(255, 255, 255, 0.07) 1px, transparent 1px);
+  background-size: 22px 22px;
+}
+.wf-zoom-viewport.dragging {
+  cursor: grabbing;
+}
+
+.wf-zoom-stage {
+  position: absolute;
+  top: 0;
+  left: 0;
+  width: max-content;
+  transform-origin: 0 0;
+  will-change: transform;
+}
+
+.wf-card-zoom {
+  margin: 0;
+  padding: 24px;
+  overflow: visible;
+  background: transparent;
+  border: 0;
+  border-radius: 0;
+  user-select: none;
+}
+
+@media (max-width: 800px) {
+  .wf-zoom-overlay {
+    padding: 0;
+  }
+  .wf-zoom-panel {
+    width: 100%;
+    height: 100%;
+    border: 0;
+    border-radius: 0;
+  }
+  .wf-zoom-hint {
+    display: none;
+  }
 }
 
 /* while any tool in a group is still running, its label pulses */

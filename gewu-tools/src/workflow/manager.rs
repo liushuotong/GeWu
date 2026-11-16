@@ -1,9 +1,14 @@
 //! Tracks background workflow runs.
 //!
 //! [`WorkflowManager`] validates specs, spawns runs as detached Tokio
-//! tasks, and answers status/wait/cancel queries. Runs are keyed by a
+//! tasks, and answers status/cancel queries. Runs are keyed by a
 //! generated `run_id` and owned by the session that started them; dropping
 //! the manager aborts every run it still holds.
+//!
+//! When the manager is built with a progress channel, a lightweight watcher
+//! publishes a [`RunProgress`] snapshot whenever the shared run state
+//! visibly changes and once more at the terminal status. The server forwards
+//! those snapshots to clients so UIs can render the run's graph live.
 
 use crate::task::{AgentFactory, AgentOverrides};
 use crate::workflow::engine::{self, RunState, RunStatus};
@@ -13,15 +18,14 @@ use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
-use std::time::{Duration, Instant};
+use std::time::Duration;
+use tokio::sync::broadcast;
 use tokio::task::JoinHandle;
 
 /// Concurrent runs allowed per session.
 pub const MAX_RUNS_PER_SESSION: usize = 3;
-/// `workflow_wait` wait time when the call does not set one.
-pub const DEFAULT_WAIT_SECS: u64 = 60;
-/// Hard cap on a single `workflow_wait` call.
-pub const MAX_WAIT_SECS: u64 = 600;
+/// How often a run's progress is compared against the last published state.
+const PROGRESS_POLL: Duration = Duration::from_millis(150);
 
 /// One node's report in a run snapshot. A node the graph never reached is
 /// reported with status `pending` (run in progress) or `skipped` (run
@@ -53,6 +57,41 @@ pub struct RunSnapshot {
     pub error: Option<String>,
 }
 
+/// A live progress snapshot published by a [`WorkflowManager`] with a
+/// progress channel. It carries the fields a UI needs to draw the run's
+/// graph, without the (potentially large) node output text.
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct RunProgress {
+    /// Session that started the run; progress is scoped to it.
+    pub owner_session: String,
+    pub run_id: String,
+    pub name: Option<String>,
+    pub status: RunStatus,
+    pub current_node: Option<String>,
+    pub tasks_done: usize,
+    pub tasks_failed: usize,
+    pub tasks_attempted: usize,
+    pub nodes: Vec<NodeReport>,
+    pub error: Option<String>,
+}
+
+impl RunProgress {
+    fn from_snapshot(owner_session: String, snapshot: &RunSnapshot) -> Self {
+        Self {
+            owner_session,
+            run_id: snapshot.run_id.clone(),
+            name: snapshot.name.clone(),
+            status: snapshot.status,
+            current_node: snapshot.current_node.clone(),
+            tasks_done: snapshot.tasks_done,
+            tasks_failed: snapshot.tasks_failed,
+            tasks_attempted: snapshot.tasks_attempted,
+            nodes: snapshot.nodes.clone(),
+            error: snapshot.error.clone(),
+        }
+    }
+}
+
 struct RunHandle {
     owner_session: String,
     name: Option<String>,
@@ -68,14 +107,25 @@ pub struct WorkflowManager {
     /// Predefined profiles workflow agents may use as a base.
     builtin_agents: Vec<String>,
     runs: Mutex<HashMap<String, RunHandle>>,
+    /// Optional live progress channel shared with the process (the server).
+    progress: Option<broadcast::Sender<RunProgress>>,
 }
 
 impl WorkflowManager {
     pub fn new(factory: Arc<dyn AgentFactory>, builtin_agents: Vec<String>) -> Self {
+        Self::with_progress(factory, builtin_agents, None)
+    }
+
+    pub fn with_progress(
+        factory: Arc<dyn AgentFactory>,
+        builtin_agents: Vec<String>,
+        progress: Option<broadcast::Sender<RunProgress>>,
+    ) -> Self {
         Self {
             factory,
             builtin_agents,
             runs: Mutex::new(HashMap::new()),
+            progress,
         }
     }
 
@@ -142,7 +192,12 @@ impl WorkflowManager {
         }
 
         let run_id = uuid::Uuid::new_v4().to_string();
-        let state = Arc::new(Mutex::new(RunState::default()));
+        // Seed the node order synchronously so even the first progress
+        // snapshot lists every node (the engine repeats this when it runs).
+        let state = Arc::new(Mutex::new(RunState {
+            order: spec.nodes.iter().map(|node| node.id.clone()).collect(),
+            ..RunState::default()
+        }));
         let cancel = Arc::new(AtomicBool::new(false));
         let run = engine::run_in(
             spec.clone(),
@@ -152,6 +207,15 @@ impl WorkflowManager {
             cancel.clone(),
             state.clone(),
         );
+        if let Some(progress) = self.progress.clone() {
+            spawn_progress_watcher(
+                progress,
+                owner_session,
+                &run_id,
+                spec.name.clone(),
+                state.clone(),
+            );
+        }
         let completion_state = state.clone();
         let completion_id = run_id.clone();
         let handle = tokio::spawn(async move {
@@ -162,13 +226,7 @@ impl WorkflowManager {
                 state.status = RunStatus::Failed;
                 state.error = Some("workflow task panicked".into());
             }
-            let status = match state.status {
-                RunStatus::Running => "running",
-                RunStatus::Completed => "completed",
-                RunStatus::Canceled => "canceled",
-                RunStatus::TimedOut => "timed out",
-                RunStatus::Failed => "failed",
-            };
+            let status = state.status.label();
             if let Some(inbox) = inbox {
                 inbox.notify(gewu_core::agent::BackgroundNotification {
                     source: "workflow".into(),
@@ -207,24 +265,6 @@ impl WorkflowManager {
         Ok(snapshot(run_id, run))
     }
 
-    /// Polls the run until it reaches a terminal status or `wait_secs`
-    /// elapse, then returns the snapshot.
-    pub async fn wait(
-        &self,
-        run_id: &str,
-        owner_session: &str,
-        wait_secs: u64,
-    ) -> Result<RunSnapshot, String> {
-        let deadline = Instant::now() + Duration::from_secs(wait_secs.min(MAX_WAIT_SECS));
-        loop {
-            let snapshot = self.status(run_id, owner_session)?;
-            if snapshot.status != RunStatus::Running || Instant::now() >= deadline {
-                return Ok(snapshot);
-            }
-            tokio::time::sleep(Duration::from_millis(200)).await;
-        }
-    }
-
     /// Aborts the run and returns whatever partial results exist.
     pub async fn cancel(&self, run_id: &str, owner_session: &str) -> Result<RunSnapshot, String> {
         let state = {
@@ -258,6 +298,13 @@ impl Drop for WorkflowManager {
             .values()
         {
             run.handle.abort();
+            // Let the progress watcher observe a terminal state and stop
+            // instead of polling a run whose task was aborted.
+            if let Ok(mut state) = run.state.lock()
+                && state.status == RunStatus::Running
+            {
+                state.status = RunStatus::Canceled;
+            }
         }
     }
 }
@@ -268,10 +315,14 @@ fn unknown_run() -> String {
 
 fn snapshot(run_id: &str, run: &RunHandle) -> RunSnapshot {
     let state = run.state.lock().expect("run state mutex poisoned");
+    snapshot_from(run_id, run.name.as_deref(), &state)
+}
+
+fn snapshot_from(run_id: &str, name: Option<&str>, state: &RunState) -> RunSnapshot {
     let running = state.status == RunStatus::Running;
     RunSnapshot {
         run_id: run_id.to_string(),
-        name: run.name.clone(),
+        name: name.map(str::to_string),
         status: state.status,
         current_node: state.current_node.clone(),
         tasks_done: state.tasks_done,
@@ -300,6 +351,67 @@ fn snapshot(run_id: &str, run: &RunHandle) -> RunSnapshot {
         final_output: (!state.nodes.is_empty()).then(|| state.final_output()),
         error: state.error.clone(),
     }
+}
+
+/// A cheap view of what a UI can observe, used to publish only on change.
+#[derive(PartialEq)]
+struct ProgressFingerprint {
+    status: RunStatus,
+    current_node: Option<String>,
+    tasks_done: usize,
+    tasks_failed: usize,
+    tasks_attempted: usize,
+    nodes: Vec<(String, String, usize)>,
+}
+
+impl ProgressFingerprint {
+    fn of(snapshot: &RunSnapshot) -> Self {
+        Self {
+            status: snapshot.status,
+            current_node: snapshot.current_node.clone(),
+            tasks_done: snapshot.tasks_done,
+            tasks_failed: snapshot.tasks_failed,
+            tasks_attempted: snapshot.tasks_attempted,
+            nodes: snapshot
+                .nodes
+                .iter()
+                .map(|node| (node.id.clone(), node.status.clone(), node.done))
+                .collect(),
+        }
+    }
+}
+
+/// Publishes a run's progress on the shared channel: once immediately, then
+/// whenever the observable state changes, and a final time at the terminal
+/// status. The watcher stops with the run.
+fn spawn_progress_watcher(
+    progress: broadcast::Sender<RunProgress>,
+    owner_session: &str,
+    run_id: &str,
+    name: Option<String>,
+    state: Arc<Mutex<RunState>>,
+) {
+    let owner = owner_session.to_string();
+    let run_id = run_id.to_string();
+    tokio::spawn(async move {
+        let mut last: Option<ProgressFingerprint> = None;
+        loop {
+            let snapshot = {
+                let state = state.lock().expect("run state mutex poisoned");
+                snapshot_from(&run_id, name.as_deref(), &state)
+            };
+            let fingerprint = ProgressFingerprint::of(&snapshot);
+            let terminal = snapshot.status != RunStatus::Running;
+            if last.as_ref() != Some(&fingerprint) {
+                let _ = progress.send(RunProgress::from_snapshot(owner.clone(), &snapshot));
+                last = Some(fingerprint);
+            }
+            if terminal {
+                break;
+            }
+            tokio::time::sleep(PROGRESS_POLL).await;
+        }
+    });
 }
 
 /// Every distinct inline agent (base + overrides) referenced by the spec's
@@ -378,6 +490,51 @@ mod tests {
         })
     }
 
+    /// Polls `status` until the run reaches a terminal status.
+    async fn wait_terminal(manager: &WorkflowManager, run_id: &str) -> RunSnapshot {
+        for _ in 0..200 {
+            let snapshot = manager.status(run_id, OWNER).unwrap();
+            if snapshot.status != RunStatus::Running {
+                return snapshot;
+            }
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+        panic!("run {run_id} did not finish");
+    }
+
+    #[tokio::test]
+    async fn progress_channel_publishes_running_and_terminal_snapshots() {
+        let factory = Arc::new(ScriptedFactory::new(Duration::from_millis(100)));
+        let (progress, mut events) = broadcast::channel(64);
+        let manager = Arc::new(WorkflowManager::with_progress(
+            factory,
+            vec!["build".to_string(), "general".to_string()],
+            Some(progress),
+        ));
+        let run_id = manager.start(spec_value(), OWNER).await.unwrap();
+
+        let mut seen = Vec::new();
+        loop {
+            let event = tokio::time::timeout(Duration::from_secs(5), events.recv())
+                .await
+                .expect("progress should arrive")
+                .expect("progress channel stays open");
+            assert_eq!(event.owner_session, OWNER);
+            assert_eq!(event.run_id, run_id);
+            let status = event.status;
+            seen.push(status);
+            if status != RunStatus::Running {
+                assert_eq!(status, RunStatus::Completed);
+                assert_eq!(event.nodes[0].status, "ok");
+                assert_eq!(event.tasks_done, 1);
+                break;
+            }
+            assert_eq!(event.nodes[0].status, "pending");
+        }
+        assert_eq!(seen.first(), Some(&RunStatus::Running));
+        assert_eq!(seen.last(), Some(&RunStatus::Completed));
+    }
+
     #[tokio::test]
     async fn start_rejects_invalid_specs_before_spawning() {
         let (manager, factory) = setup(Duration::ZERO);
@@ -400,16 +557,12 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn status_wait_and_cancel_refuse_other_sessions() {
+    async fn status_and_cancel_refuse_other_sessions() {
         let (manager, _factory) = setup(Duration::ZERO);
         let run_id = manager.start(spec_value(), OWNER).await.unwrap();
 
         assert_eq!(
             manager.status(&run_id, "someone-else").unwrap_err(),
-            unknown_run()
-        );
-        assert_eq!(
-            manager.wait(&run_id, "someone-else", 1).await.unwrap_err(),
             unknown_run()
         );
         assert_eq!(
@@ -421,15 +574,15 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn wait_polls_until_terminal_and_reports_counts() {
+    async fn snapshots_report_terminal_counts() {
         let (manager, factory) = setup(Duration::from_millis(150));
         let run_id = manager.start(spec_value(), OWNER).await.unwrap();
 
-        // A zero-second wait on a running run returns immediately.
-        let snapshot = manager.wait(&run_id, OWNER, 0).await.unwrap();
+        // A snapshot taken immediately reports the run in progress.
+        let snapshot = manager.status(&run_id, OWNER).unwrap();
         assert_eq!(snapshot.status, RunStatus::Running);
 
-        let snapshot = manager.wait(&run_id, OWNER, 30).await.unwrap();
+        let snapshot = wait_terminal(&manager, &run_id).await;
         assert_eq!(snapshot.status, RunStatus::Completed);
         assert_eq!(snapshot.tasks_done, 1);
         assert_eq!(snapshot.tasks_failed, 0);
@@ -457,7 +610,7 @@ mod tests {
             )
             .await
             .unwrap();
-        let snapshot = manager.wait(&run_id, OWNER, 30).await.unwrap();
+        let snapshot = wait_terminal(&manager, &run_id).await;
 
         assert_eq!(snapshot.status, RunStatus::Completed);
         assert_eq!(snapshot.nodes[0].status, "ok");

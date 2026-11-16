@@ -180,6 +180,12 @@ fn label_for(models: &[gewu_protocol::ModelSummary], selector: &str) -> Option<S
         .map(|model| model.label.clone())
 }
 
+/// A workflow run whose graph the zoom panel is showing.
+struct ZoomTarget {
+    tab: u64,
+    run_id: String,
+}
+
 /// One browser's isolated GUI session.
 pub struct GuiSession {
     endpoint: Endpoint,
@@ -201,6 +207,8 @@ pub struct GuiSession {
     closed_workspaces: BTreeSet<String>,
     expanded_dirs: BTreeSet<String>,
     file_cache: BTreeMap<String, Vec<gewu_protocol::FileEntry>>,
+    /// Workflow run currently shown in the zoom panel, if any.
+    zoom: Option<ZoomTarget>,
     tab_tx: Option<mpsc::UnboundedSender<TabEvent>>,
 }
 
@@ -315,6 +323,7 @@ impl GuiSession {
             closed_workspaces: BTreeSet::new(),
             expanded_dirs: BTreeSet::new(),
             file_cache,
+            zoom: None,
             tab_tx: None,
         })
     }
@@ -849,6 +858,7 @@ impl GuiSession {
     ) -> Result<()> {
         match msg {
             ClientMsg::RevertChat { tab, block, undo } => {
+                self.close_zoom_for_tab(tab, sender).await?;
                 let Some(tab_state) = self.workspace.tab(tab) else {
                     return self.send_error(sender, "unknown tab").await;
                 };
@@ -1129,12 +1139,21 @@ impl GuiSession {
                 .await?;
             }
             ClientMsg::CloseTab { tab } => {
+                self.close_zoom_for_tab(tab, sender).await?;
                 self.close_tab(tab).await;
                 self.send_active_full(sender).await?;
             }
             ClientMsg::CloseWorkspace { workspace } => {
                 let active = self.workspace.active_id();
                 let tabs = self.workspace.close_workspace(&workspace);
+                let closed: Vec<u64> = tabs.iter().map(|tab| tab.id).collect();
+                if self
+                    .zoom
+                    .as_ref()
+                    .is_some_and(|zoom| closed.contains(&zoom.tab))
+                {
+                    self.close_zoom(sender).await?;
+                }
                 for tab in tabs {
                     self.stop_tab(tab.id).await;
                 }
@@ -1151,7 +1170,11 @@ impl GuiSession {
                 }
             }
             ClientMsg::SwitchTab { tab } => {
+                let previous = self.workspace.active_id();
                 if self.workspace.switch_to_id(tab) {
+                    if previous != tab {
+                        self.close_zoom(sender).await?;
+                    }
                     self.expanded_dirs.clear();
                     self.file_cache.clear();
                     self.send_active_full(sender).await?;
@@ -1195,6 +1218,32 @@ impl GuiSession {
                 if self.workspace.active_id() == tab {
                     self.send_thought_body(tab, block, sender).await?;
                 }
+            }
+            ClientMsg::ZoomWorkflow { tab, block } => {
+                let Some(tab_state) = self.workspace.tab(tab) else {
+                    return self.send_error(sender, "unknown tab").await;
+                };
+                let Some(run_id) =
+                    crate::workflow::run_id_for_block(&tab_state.model.blocks, block)
+                else {
+                    return self
+                        .send_error(sender, "this workflow run is not ready yet")
+                        .await;
+                };
+                let Some(html) = crate::workflow::zoom_html(tab_state, &run_id) else {
+                    return self
+                        .send_error(sender, "could not render the workflow graph")
+                        .await;
+                };
+                self.zoom = Some(ZoomTarget {
+                    tab,
+                    run_id: run_id.clone(),
+                });
+                send_msg(sender, &ServerMsg::WorkflowZoom { run_id, html }).await?;
+            }
+            ClientMsg::CloseWorkflowZoom => {
+                self.zoom = None;
+                send_msg(sender, &ServerMsg::CloseWorkflowZoom).await?;
             }
             ClientMsg::LoadEarlier { tab } => {
                 let page = if self.workspace.active_id() == tab {
@@ -1462,6 +1511,23 @@ impl GuiSession {
         Ok(())
     }
 
+    /// Dismiss the zoom panel if it belongs to `tab`.
+    async fn close_zoom_for_tab(&mut self, tab: u64, sender: &mut Sender) -> Result<()> {
+        if self.zoom.as_ref().is_some_and(|zoom| zoom.tab == tab) {
+            self.zoom = None;
+            send_msg(sender, &ServerMsg::CloseWorkflowZoom).await?;
+        }
+        Ok(())
+    }
+
+    /// Dismiss the zoom panel unconditionally.
+    async fn close_zoom(&mut self, sender: &mut Sender) -> Result<()> {
+        if self.zoom.take().is_some() {
+            send_msg(sender, &ServerMsg::CloseWorkflowZoom).await?;
+        }
+        Ok(())
+    }
+
     async fn send_after_tab_change(&self, tab_id: u64, sender: &mut Sender) -> Result<()> {
         if self.workspace.active_id() == tab_id {
             self.send_active_full(sender).await
@@ -1550,6 +1616,8 @@ impl GuiSession {
         // "Thinking…" settled to "Thought Ns"); the triggering event usually
         // appends a different block, so the settled body needs its own swap.
         let mut collapsed = None;
+        // Run id to refresh in the zoom panel after this event.
+        let mut zoom_run = None;
         // Decide the throttle before borrowing the tab below.
         let stream_due = self.stream_update_due(event.tab_id);
 
@@ -1574,11 +1642,22 @@ impl GuiSession {
                     for message in &messages {
                         model.apply_message(message);
                     }
+                    let mut workflows_changed = false;
                     for frame in frames {
-                        if let ServerMessage::Event { event, .. } = frame
-                            && let Ok(event) = serde_json::from_value::<AgentEvent>(event)
-                        {
-                            model.apply_event(&event);
+                        match frame {
+                            ServerMessage::Event { event, .. } => {
+                                if let Ok(event) = serde_json::from_value::<AgentEvent>(event) {
+                                    model.apply_event(&event);
+                                }
+                            }
+                            ServerMessage::WorkflowProgress { run, .. } => {
+                                tab.workflows.insert(
+                                    run.run_id.clone(),
+                                    crate::workflow::WfSnapshot::from_run(&run),
+                                );
+                                workflows_changed = true;
+                            }
+                            _ => {}
                         }
                     }
                     model.phase = if busy { Phase::Busy } else { Phase::Idle };
@@ -1599,7 +1678,7 @@ impl GuiSession {
                     }
                     tab.reasoning_effort = snapshot_effort;
                     terminal = !busy;
-                    update = if changed {
+                    update = if changed || workflows_changed {
                         TabUpdate::Full
                     } else {
                         TabUpdate::None
@@ -1718,6 +1797,27 @@ impl GuiSession {
                         }
                     }
                 }
+                Some(Ok(ServerMessage::WorkflowProgress { run, .. })) => {
+                    // Live workflow state: re-render the start card's whole
+                    // group with the new node colors. If the start card's
+                    // output is not in yet, the later ToolFinish re-renders
+                    // it with this stored state.
+                    let target = crate::workflow::run_update_target(&tab.model.blocks, &run.run_id);
+                    tab.workflows.insert(
+                        run.run_id.clone(),
+                        crate::workflow::WfSnapshot::from_run(&run),
+                    );
+                    if self
+                        .zoom
+                        .as_ref()
+                        .is_some_and(|zoom| zoom.tab == event.tab_id && zoom.run_id == run.run_id)
+                    {
+                        zoom_run = Some(run.run_id.clone());
+                    }
+                    if let Some(first) = target {
+                        update = TabUpdate::ToolCard(first);
+                    }
+                }
                 Some(Ok(ServerMessage::Result { session_id, .. })) => {
                     tab.model.set_session(Some(session_id));
                     terminal = true;
@@ -1752,6 +1852,20 @@ impl GuiSession {
             }
             if tab.follow && tab.evict_overflow() && event.tab_id == active_id {
                 update = TabUpdate::Full;
+            }
+        }
+
+        if let Some(run_id) = zoom_run {
+            let html = self
+                .workspace
+                .tab(event.tab_id)
+                .and_then(|tab| crate::workflow::zoom_html(tab, &run_id));
+            match html {
+                Some(html) => send_msg(sender, &ServerMsg::WorkflowZoom { run_id, html }).await?,
+                None => {
+                    self.zoom = None;
+                    send_msg(sender, &ServerMsg::CloseWorkflowZoom).await?;
+                }
             }
         }
 

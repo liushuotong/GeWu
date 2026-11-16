@@ -24,7 +24,6 @@
 //! | [`TaskTool`] | `task` | Launch sub-agents for complex tasks |
 //! | [`WorkflowStartTool`] | `workflow_start` | Start a background workflow run from a JSON spec |
 //! | [`WorkflowStatusTool`] | `workflow_status` | Snapshot a workflow run without waiting |
-//! | [`WorkflowWaitTool`] | `workflow_wait` | Wait for a workflow run to finish |
 //! | [`WorkflowCancelTool`] | `workflow_cancel` | Abort a workflow run |
 //! | [`SkillTool`] | `skill` | Load skill instructions into the conversation |
 //!
@@ -85,6 +84,4 @@ pub use skill::{SkillInfo, SkillTool};
 pub use task::{AgentFactory, AgentOverrides, TaskTool};
 pub use todo::{TodoItem, TodoReadTool, TodoWriteTool};
 pub use web_fetch::WebFetchTool;
-pub use workflow::{
-    WorkflowCancelTool, WorkflowManager, WorkflowStartTool, WorkflowStatusTool, WorkflowWaitTool,
-};
+pub use workflow::{WorkflowCancelTool, WorkflowManager, WorkflowStartTool, WorkflowStatusTool};

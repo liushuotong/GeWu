@@ -481,7 +481,6 @@ fn tool_name(tool: &str) -> &str {
         "shell" => "bash",
         "workflow_start" => "wf·start",
         "workflow_status" => "wf·status",
-        "workflow_wait" => "wf·wait",
         "workflow_cancel" => "wf·cancel",
         other => other,
     }
@@ -490,8 +489,8 @@ fn tool_name(tool: &str) -> &str {
 fn tool_row<'a>(tool: &'a str, input: &str) -> (&'a str, String) {
     let title = match tool {
         "workflow_start" => crate::workflow::spec_title(input).unwrap_or_else(|| input.to_string()),
-        // Status/wait/cancel inputs are already just the run_id.
-        "workflow_status" | "workflow_wait" | "workflow_cancel" => input.to_string(),
+        // Status/cancel inputs are already just the run_id.
+        "workflow_status" | "workflow_cancel" => input.to_string(),
         _ if input.is_empty() => tool.to_string(),
         _ => input.to_string(),
     };
@@ -2055,7 +2054,7 @@ mod tests {
             "conditional_edges":{"polish":{"path":"{{nodes.polish.status}}",
             "map":{"ok":"END","failed":"polish"}}}}"#;
         let start = "Started workflow run r-77. It executes in the background; check on it with \
-             workflow_status or workflow_wait (run_id: \"r-77\").";
+             workflow_status (run_id: \"r-77\").";
         let snapshot = "run r-77 (docs): running, 1 task(s) done, 0 failed, 1 attempted\n\
              current node: polish\n\
              node read: ok, 1 done, 0 failed\n\
@@ -2090,9 +2089,127 @@ mod tests {
         assert!(html.contains("wf-card"), "{html}");
         assert!(html.contains("wf-ok"), "{html}");
         assert!(html.contains("wf-run-running"), "{html}");
-        assert!(html.contains("current: polish"), "{html}");
+        assert!(html.contains("current <b>polish</b>"), "{html}");
         // its row title is just the run id
         assert!(html.contains(">r-77</span>"), "{html}");
+    }
+
+    fn live_run() -> gewu_protocol::WorkflowRunState {
+        gewu_protocol::WorkflowRunState {
+            run_id: "r-9".into(),
+            name: Some("docs".into()),
+            status: "running".into(),
+            current_node: Some("read".into()),
+            tasks_done: 1,
+            tasks_failed: 0,
+            tasks_attempted: 1,
+            nodes: vec![
+                gewu_protocol::WorkflowNodeState {
+                    id: "read".into(),
+                    status: "ok".into(),
+                    done: 1,
+                    failed: 0,
+                },
+                gewu_protocol::WorkflowNodeState {
+                    id: "write".into(),
+                    status: "pending".into(),
+                    done: 0,
+                    failed: 0,
+                },
+            ],
+            error: None,
+        }
+    }
+
+    #[test]
+    fn workflow_start_card_draws_live_progress() {
+        let spec = r#"{"name":"docs","nodes":[
+            {"id":"read","agent":"reader","prompt":"p"},
+            {"id":"write","agent":"writer","prompt":"p"}]}"#;
+        let start = "Started workflow run r-9. It executes in the background; check on it with \
+             workflow_status (run_id: \"r-9\").";
+        let (mut ws, id) = tab_with_blocks(vec![Block::Tool {
+            tool: "workflow_start".into(),
+            input: spec.into(),
+            output: Some(start.into()),
+            images: Vec::new(),
+            status: None,
+        }]);
+        ws.tab_mut(id).unwrap().workflows.insert(
+            "r-9".into(),
+            crate::workflow::WfSnapshot::from_run(&live_run()),
+        );
+        let html = tool_card_html(ws.tab(id).unwrap(), 0).expect("start card");
+        assert!(html.contains("wf-card"), "{html}");
+        assert!(html.contains("wf-run-running"), "{html}");
+        assert!(html.contains("wf-ok"), "{html}");
+        assert!(html.contains("current <b>read</b>"), "{html}");
+        assert!(html.contains("docs · 2 nodes"), "{html}");
+    }
+
+    #[test]
+    fn workflow_start_without_live_state_stays_plain() {
+        let (ws, id) = tab_with_blocks(vec![Block::Tool {
+            tool: "workflow_start".into(),
+            input: r#"{"name":"docs","nodes":[{"id":"read","agent":"reader","prompt":"p"}]}"#
+                .into(),
+            output: Some("Started workflow run r-9. It executes in the background.".into()),
+            images: Vec::new(),
+            status: None,
+        }]);
+        let html = tool_card_html(ws.tab(id).unwrap(), 0).expect("start card");
+        assert!(!html.contains("wf-card"), "{html}");
+    }
+
+    #[test]
+    fn running_workflow_start_draws_a_pending_graph() {
+        let (ws, id) = tab_with_blocks(vec![Block::Tool {
+            tool: "workflow_start".into(),
+            input: r#"{"name":"docs","nodes":[
+                {"id":"read","agent":"reader","prompt":"p"},
+                {"id":"write","agent":"writer","prompt":"p"}]}"#
+                .into(),
+            output: None,
+            images: Vec::new(),
+            status: None,
+        }]);
+        let html = tool_card_html(ws.tab(id).unwrap(), 0).expect("start card");
+        assert!(html.contains("wf-card"), "{html}");
+        assert_eq!(html.matches("wf-pending").count(), 2, "{html}");
+    }
+
+    #[test]
+    fn status_card_prefers_live_state_over_its_text_snapshot() {
+        let spec = r#"{"name":"docs","nodes":[
+            {"id":"read","agent":"reader","prompt":"p"},
+            {"id":"write","agent":"writer","prompt":"p"}]}"#;
+        let start = "Started workflow run r-9. It executes in the background.";
+        let stale = "run r-9 (docs): running, 0 task(s) done, 0 failed, 0 attempted\n\
+             node read: pending, 0 done, 0 failed";
+        let (mut ws, id) = tab_with_blocks(vec![
+            Block::Tool {
+                tool: "workflow_start".into(),
+                input: spec.into(),
+                output: Some(start.into()),
+                images: Vec::new(),
+                status: None,
+            },
+            Block::Tool {
+                tool: "workflow_status".into(),
+                input: "r-9".into(),
+                output: Some(stale.into()),
+                images: Vec::new(),
+                status: None,
+            },
+        ]);
+        ws.tab_mut(id).unwrap().workflows.insert(
+            "r-9".into(),
+            crate::workflow::WfSnapshot::from_run(&live_run()),
+        );
+        let html = tool_card_html(ws.tab(id).unwrap(), 1).expect("status card");
+        assert!(html.contains("wf-ok"), "{html}");
+        assert!(html.contains("current <b>read</b>"), "{html}");
+        assert!(html.contains("1 done"), "{html}");
     }
 
     #[test]

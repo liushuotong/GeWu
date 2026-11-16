@@ -789,6 +789,34 @@ pub struct ModelSummary {
 /// remains selectable separately.
 pub const REASONING_EFFORTS: &[&str] = &["low", "medium", "high", "max"];
 
+/// Live progress of one workflow node, as shown in a run's graph.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct WorkflowNodeState {
+    pub id: String,
+    /// `ok`, `failed`, `pending`, or `skipped`.
+    pub status: String,
+    pub done: u32,
+    pub failed: u32,
+}
+
+/// Live state of a background workflow run.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct WorkflowRunState {
+    pub run_id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub name: Option<String>,
+    /// `running`, `completed`, `canceled`, `timed out`, or `failed`.
+    pub status: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub current_node: Option<String>,
+    pub tasks_done: u32,
+    pub tasks_failed: u32,
+    pub tasks_attempted: u32,
+    pub nodes: Vec<WorkflowNodeState>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
+}
+
 /// Messages the server sends to the client.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(tag = "type", rename_all = "snake_case")]
@@ -883,6 +911,14 @@ pub enum ServerMessage {
         request_id: String,
         /// The agent event.
         event: Value,
+    },
+    /// Live progress of a background workflow run, pushed to subscribers of
+    /// the session that started it. Unsolicited: it carries no request id.
+    WorkflowProgress {
+        /// Session that owns the run.
+        session_id: String,
+        /// The run's current state.
+        run: WorkflowRunState,
     },
     /// Final result of a successful `ask`.
     Result {
@@ -1065,6 +1101,7 @@ impl ServerMessage {
             ServerMessage::WorkspaceAdded { .. } => "workspace_added",
             ServerMessage::Ready { .. } => "ready",
             ServerMessage::Event { .. } => "event",
+            ServerMessage::WorkflowProgress { .. } => "workflow_progress",
             ServerMessage::Result { .. } => "result",
             ServerMessage::Interrupted { .. } => "interrupted",
             ServerMessage::Steered { .. } => "steered",
@@ -1115,7 +1152,8 @@ impl ServerMessage {
             ServerMessage::Steered { id, .. } => Some(id),
             ServerMessage::Event { .. }
             | ServerMessage::Result { .. }
-            | ServerMessage::SessionSnapshot { .. } => None,
+            | ServerMessage::SessionSnapshot { .. }
+            | ServerMessage::WorkflowProgress { .. } => None,
         }
     }
 
@@ -1165,6 +1203,42 @@ mod tests {
         assert_eq!(reply.correlation_id(), Some(&9.into()));
         // Steering never terminates the ask it injects into.
         assert_eq!(reply.is_ask_terminal(), None);
+    }
+
+    #[test]
+    fn workflow_progress_round_trip() {
+        let progress = ServerMessage::WorkflowProgress {
+            session_id: "s".into(),
+            run: WorkflowRunState {
+                run_id: "r-1".into(),
+                name: Some("docs".into()),
+                status: "running".into(),
+                current_node: Some("read".into()),
+                tasks_done: 1,
+                tasks_failed: 0,
+                tasks_attempted: 1,
+                nodes: vec![
+                    WorkflowNodeState {
+                        id: "read".into(),
+                        status: "ok".into(),
+                        done: 1,
+                        failed: 0,
+                    },
+                    WorkflowNodeState {
+                        id: "write".into(),
+                        status: "pending".into(),
+                        done: 0,
+                        failed: 0,
+                    },
+                ],
+                error: None,
+            },
+        };
+        assert_eq!(progress.kind(), "workflow_progress");
+        assert_eq!(progress.correlation_id(), None);
+        assert_eq!(progress.is_ask_terminal(), None);
+        let decoded: ServerMessage = serde_json::from_str(&progress.to_line()).unwrap();
+        assert_eq!(decoded, progress);
     }
 
     #[test]

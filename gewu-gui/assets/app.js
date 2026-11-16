@@ -36,6 +36,7 @@
     filesExpand: document.getElementById("files-expand"),
     drawerBackdrop: document.getElementById("drawer-backdrop"),
     filePreview: document.getElementById("file-preview"),
+    workflowZoom: document.getElementById("workflow-zoom"),
   };
 
   const state = {
@@ -58,6 +59,7 @@
     lastAlert: { text: "", at: 0 },
     loadingEarlier: false,
     follow: new Map(),
+    workflowZoom: { runId: null, scale: 1, x: 0, y: 0 },
   };
 
   function loadToken() {
@@ -452,6 +454,21 @@
         el.filePreview.classList.add("hidden");
         el.filePreview.textContent = "";
         break;
+      case "workflow_zoom": {
+        const keep =
+          !el.workflowZoom.classList.contains("hidden") &&
+          state.workflowZoom.runId === message.run_id;
+        if (!keep) state.workflowZoom = { runId: message.run_id, scale: 1, x: 0, y: 0 };
+        zoomDrag = null;
+        el.workflowZoom.innerHTML = message.html;
+        el.workflowZoom.classList.remove("hidden");
+        if (keep) applyWorkflowZoom();
+        else fitWorkflowZoom();
+        break;
+      }
+      case "close_workflow_zoom":
+        hideWorkflowZoom();
+        break;
       default:
         break;
     }
@@ -467,6 +484,90 @@
     setOffline(false);
     if (state.ws) state.ws.close();
     showLogin("That token was not accepted.");
+  }
+
+  // -- workflow graph zoom panel ------------------------------------------
+
+  const ZOOM_MIN = 0.1;
+  const ZOOM_MAX = 4;
+  const ZOOM_STEP = 1.25;
+  let zoomDrag = null;
+
+  function workflowZoomParts() {
+    return {
+      viewport: el.workflowZoom.querySelector("[data-zoom-viewport]"),
+      stage: el.workflowZoom.querySelector("[data-zoom-stage]"),
+      level: el.workflowZoom.querySelector("[data-zoom-level]"),
+    };
+  }
+
+  function workflowZoomSize(stage) {
+    const previous = stage.style.transform;
+    stage.style.transform = "none";
+    const size = stage.getBoundingClientRect();
+    stage.style.transform = previous;
+    return size;
+  }
+
+  function applyWorkflowZoom() {
+    const { stage, level } = workflowZoomParts();
+    if (!stage) return;
+    const { scale, x, y } = state.workflowZoom;
+    stage.style.transform = `translate(${x}px, ${y}px) scale(${scale})`;
+    if (level) level.textContent = `${Math.round(scale * 100)}%`;
+  }
+
+  function fitWorkflowZoom() {
+    const { viewport, stage } = workflowZoomParts();
+    if (!viewport || !stage) return;
+    const view = viewport.getBoundingClientRect();
+    if (!view.width || !view.height) return;
+    const natural = workflowZoomSize(stage);
+    if (!natural.width || !natural.height) return;
+    const padding = 24;
+    const fit = Math.min(
+      1,
+      (view.width - padding) / natural.width,
+      (view.height - padding) / natural.height,
+    );
+    const scale = Math.max(ZOOM_MIN, Math.round(fit * 100) / 100);
+    state.workflowZoom.scale = scale;
+    state.workflowZoom.x = (view.width - natural.width * scale) / 2;
+    state.workflowZoom.y = (view.height - natural.height * scale) / 2;
+    applyWorkflowZoom();
+  }
+
+  function resetWorkflowZoom() {
+    const { viewport, stage } = workflowZoomParts();
+    if (!viewport || !stage) return;
+    const view = viewport.getBoundingClientRect();
+    const natural = workflowZoomSize(stage);
+    state.workflowZoom.scale = 1;
+    state.workflowZoom.x = Math.max(12, (view.width - natural.width) / 2);
+    state.workflowZoom.y = Math.max(12, (view.height - natural.height) / 2);
+    applyWorkflowZoom();
+  }
+
+  function zoomWorkflowBy(factor, originX, originY) {
+    const { viewport, stage } = workflowZoomParts();
+    if (!viewport || !stage) return;
+    const view = viewport.getBoundingClientRect();
+    const px = originX ?? view.width / 2;
+    const py = originY ?? view.height / 2;
+    const before = state.workflowZoom.scale;
+    const after = Math.min(ZOOM_MAX, Math.max(ZOOM_MIN, before * factor));
+    if (after === before) return;
+    const k = after / before;
+    state.workflowZoom.x = px - k * (px - state.workflowZoom.x);
+    state.workflowZoom.y = py - k * (py - state.workflowZoom.y);
+    state.workflowZoom.scale = after;
+    applyWorkflowZoom();
+  }
+
+  function hideWorkflowZoom() {
+    el.workflowZoom.classList.add("hidden");
+    el.workflowZoom.textContent = "";
+    state.workflowZoom = { runId: null, scale: 1, x: 0, y: 0 };
   }
 
   function setBusy(busy) {
@@ -754,7 +855,9 @@
   });
 
   document.addEventListener("keydown", (event) => {
-    if (event.key === "Escape" && !el.filePreview.classList.contains("hidden")) {
+    if (event.key === "Escape" && !el.workflowZoom.classList.contains("hidden")) {
+      send({ op: "close_workflow_zoom" });
+    } else if (event.key === "Escape" && !el.filePreview.classList.contains("hidden")) {
       send({ op: "close_preview" });
     } else if (event.key === "Escape" && state.busy && el.login.classList.contains("hidden")) {
       send({ op: "interrupt", tab: state.active });
@@ -849,6 +952,8 @@
       send({ op: "toggle_group", tab, block });
     } else if (button.dataset.action === "toggle_thought") {
       send({ op: "toggle_thought", tab, block });
+    } else if (button.dataset.action === "zoom_workflow") {
+      send({ op: "zoom_workflow", tab, block });
     }
   });
 
@@ -1084,6 +1189,76 @@
   el.filePreview.addEventListener("click", (event) => {
     if (event.target.closest("[data-preview-close]")) send({ op: "close_preview" });
   });
+
+  el.workflowZoom.addEventListener("click", (event) => {
+    if (event.target.closest("[data-zoom-close]")) {
+      send({ op: "close_workflow_zoom" });
+      return;
+    }
+    const control = event.target.closest("[data-zoom]");
+    if (control) {
+      const action = control.dataset.zoom;
+      if (action === "in") zoomWorkflowBy(ZOOM_STEP);
+      else if (action === "out") zoomWorkflowBy(1 / ZOOM_STEP);
+      else if (action === "fit") fitWorkflowZoom();
+      else if (action === "reset") resetWorkflowZoom();
+      return;
+    }
+    if (event.target === el.workflowZoom) send({ op: "close_workflow_zoom" });
+  });
+
+  el.workflowZoom.addEventListener(
+    "wheel",
+    (event) => {
+      const viewport = event.target.closest("[data-zoom-viewport]");
+      if (!viewport) return;
+      event.preventDefault();
+      const rect = viewport.getBoundingClientRect();
+      const delta =
+        event.deltaMode === 1
+          ? event.deltaY * 16
+          : event.deltaMode === 2
+            ? event.deltaY * rect.height
+            : event.deltaY;
+      zoomWorkflowBy(
+        Math.exp(-delta * 0.0015),
+        event.clientX - rect.left,
+        event.clientY - rect.top,
+      );
+    },
+    { passive: false },
+  );
+
+  el.workflowZoom.addEventListener("pointerdown", (event) => {
+    if (event.button !== 0) return;
+    const viewport = event.target.closest("[data-zoom-viewport]");
+    if (!viewport) return;
+    zoomDrag = {
+      id: event.pointerId,
+      x: event.clientX,
+      y: event.clientY,
+      originX: state.workflowZoom.x,
+      originY: state.workflowZoom.y,
+    };
+    viewport.classList.add("dragging");
+    viewport.setPointerCapture(event.pointerId);
+  });
+
+  el.workflowZoom.addEventListener("pointermove", (event) => {
+    if (!zoomDrag || event.pointerId !== zoomDrag.id) return;
+    state.workflowZoom.x = zoomDrag.originX + event.clientX - zoomDrag.x;
+    state.workflowZoom.y = zoomDrag.originY + event.clientY - zoomDrag.y;
+    applyWorkflowZoom();
+  });
+
+  function endZoomDrag(event) {
+    if (!zoomDrag || event.pointerId !== zoomDrag.id) return;
+    el.workflowZoom.querySelector("[data-zoom-viewport]")?.classList.remove("dragging");
+    zoomDrag = null;
+  }
+
+  el.workflowZoom.addEventListener("pointerup", endZoomDrag);
+  el.workflowZoom.addEventListener("pointercancel", endZoomDrag);
 
   // -- login --------------------------------------------------------------
 

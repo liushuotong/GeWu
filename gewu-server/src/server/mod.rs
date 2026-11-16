@@ -32,10 +32,12 @@ use futures::{SinkExt, StreamExt};
 use gewu_core::ToolRegistry;
 use gewu_core::types::{AgentEvent, Message, PathEnforcement};
 pub use gewu_protocol as protocol;
-use gewu_protocol::{DirectoryEntry, FileEntry, WorkspaceSummary};
+use gewu_protocol::{
+    DirectoryEntry, FileEntry, WorkflowNodeState, WorkflowRunState, WorkspaceSummary,
+};
 use registry::create_agent;
 use serde_json::Value;
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::net::SocketAddr;
 use std::sync::Arc;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWriteExt};
@@ -72,6 +74,13 @@ struct ServerState {
     busy_sessions: Mutex<HashSet<String>>,
     sessions: Mutex<HashMap<String, ConnectionSession>>,
     turns: Mutex<HashMap<String, Arc<Mutex<LiveTurn>>>>,
+    /// Broadcast channel of live workflow-run progress. Every workflow
+    /// manager the process builds publishes into it; the forwarder below
+    /// routes each run's updates to its owning session's subscribers.
+    workflow_progress: tokio::sync::broadcast::Sender<gewu_tools::workflow::RunProgress>,
+    /// Latest live state of each session's workflow runs, replayed to
+    /// (re)connecting subscribers.
+    workflows: Mutex<HashMap<String, BTreeMap<String, WorkflowRunState>>>,
     /// Serializes turn registration, snapshots, and lifecycle mutations.
     lifecycle: Mutex<()>,
 }
@@ -155,6 +164,29 @@ async fn attach_subscriber(
             .send(snapshot.to_line())
             .await
             .map_err(|_| RequestError::Failed("subscriber disconnected".into()))?;
+        // Replay the latest workflow state so a reconnecting UI can draw
+        // live graphs again. Sent under the turn lock, so no live publish
+        // can slip between the snapshot and its workflow state.
+        let runs: Vec<WorkflowRunState> = state
+            .workflows
+            .lock()
+            .await
+            .get(session_id)
+            .map(|runs| runs.values().cloned().collect())
+            .unwrap_or_default();
+        for run in runs {
+            subscriber
+                .out
+                .send(
+                    ServerMessage::WorkflowProgress {
+                        session_id: session_id.to_owned(),
+                        run,
+                    }
+                    .to_line(),
+                )
+                .await
+                .map_err(|_| RequestError::Failed("subscriber disconnected".into()))?;
+        }
         live.subscribers
             .retain(|s| !s.out.same_channel(&subscriber.out));
         live.subscribers.push(subscriber);
@@ -164,12 +196,35 @@ async fn attach_subscriber(
         return Err(RequestError::Failed("unknown session".into()));
     };
     let messages = session.agent.lock().await.memory.messages().to_vec();
+    let live = Arc::new(Mutex::new(LiveTurn {
+        request_id: String::new(),
+        messages,
+        frames: vec![],
+        bytes: 0,
+        seq: 0,
+        busy: false,
+        model: session.model.clone(),
+        reasoning_effort: session.reasoning_effort.clone(),
+        done: Arc::new(tokio::sync::Notify::new()),
+        subscribers: Vec::new(),
+        cancel: None,
+        terminal: None,
+    }));
+    // Hold the fresh turn's lock across the snapshot/replay/registration
+    // below, so a publisher that finds the turn cannot emit a frame ahead
+    // of its snapshot.
+    let mut live_guard = live.lock().await;
+    state
+        .turns
+        .lock()
+        .await
+        .insert(session_id.to_owned(), live.clone());
     subscriber
         .out
         .send(
             ServerMessage::SessionSnapshot {
                 session_id: session_id.to_owned(),
-                messages: messages.clone(),
+                messages: live_guard.messages.clone(),
                 frames: vec![],
                 busy: false,
                 seq: 0,
@@ -180,24 +235,98 @@ async fn attach_subscriber(
         )
         .await
         .map_err(|_| RequestError::Failed("subscriber disconnected".into()))?;
-    state.turns.lock().await.insert(
-        session_id.to_owned(),
-        Arc::new(Mutex::new(LiveTurn {
-            request_id: String::new(),
-            messages,
-            frames: vec![],
-            bytes: 0,
-            seq: 0,
-            busy: false,
-            model: session.model.clone(),
-            reasoning_effort: session.reasoning_effort.clone(),
-            done: Arc::new(tokio::sync::Notify::new()),
-            subscribers: vec![subscriber],
-            cancel: None,
-            terminal: None,
-        })),
-    );
+    let runs: Vec<WorkflowRunState> = state
+        .workflows
+        .lock()
+        .await
+        .get(session_id)
+        .map(|runs| runs.values().cloned().collect())
+        .unwrap_or_default();
+    for run in runs {
+        subscriber
+            .out
+            .send(
+                ServerMessage::WorkflowProgress {
+                    session_id: session_id.to_owned(),
+                    run,
+                }
+                .to_line(),
+            )
+            .await
+            .map_err(|_| RequestError::Failed("subscriber disconnected".into()))?;
+    }
+    live_guard.subscribers.push(subscriber);
     Ok(())
+}
+
+/// Workflow runs kept per session for replay to reconnecting subscribers.
+const MAX_TRACKED_WORKFLOWS: usize = 16;
+
+fn count_u32(value: usize) -> u32 {
+    value.min(u32::MAX as usize) as u32
+}
+
+/// Converts a manager progress event into its wire form.
+fn workflow_run_state(progress: &gewu_tools::workflow::RunProgress) -> WorkflowRunState {
+    WorkflowRunState {
+        run_id: progress.run_id.clone(),
+        name: progress.name.clone(),
+        status: progress.status.label().to_string(),
+        current_node: progress.current_node.clone(),
+        tasks_done: count_u32(progress.tasks_done),
+        tasks_failed: count_u32(progress.tasks_failed),
+        tasks_attempted: count_u32(progress.tasks_attempted),
+        nodes: progress
+            .nodes
+            .iter()
+            .map(|node| WorkflowNodeState {
+                id: node.id.clone(),
+                status: node.status.clone(),
+                done: count_u32(node.done),
+                failed: count_u32(node.failed.len()),
+            })
+            .collect(),
+        error: progress.error.clone(),
+    }
+}
+
+/// Forwards workflow progress to the owning session's subscribers and keeps
+/// the latest state for replay on reconnect. Recent finished runs are
+/// retained (bounded per session) so a reload can still draw their graphs.
+async fn forward_workflow_progress(
+    state: Arc<ServerState>,
+    mut progress: tokio::sync::broadcast::Receiver<gewu_tools::workflow::RunProgress>,
+) {
+    loop {
+        let event = match progress.recv().await {
+            Ok(event) => event,
+            Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => continue,
+            Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
+        };
+        let session_id = event.owner_session.clone();
+        let run = workflow_run_state(&event);
+        {
+            let mut workflows = state.workflows.lock().await;
+            let runs = workflows.entry(session_id.clone()).or_default();
+            runs.insert(run.run_id.clone(), run.clone());
+            if runs.len() > MAX_TRACKED_WORKFLOWS {
+                let victim = runs
+                    .iter()
+                    .find(|(_, run)| run.status != "running")
+                    .map(|(id, _)| id.clone())
+                    .or_else(|| runs.keys().next().cloned());
+                if let Some(id) = victim {
+                    runs.remove(&id);
+                }
+            }
+        }
+        let turn = state.turns.lock().await.get(&session_id).cloned();
+        if let Some(turn) = turn {
+            turn.lock()
+                .await
+                .publish(ServerMessage::WorkflowProgress { session_id, run });
+        }
+    }
 }
 
 /// Per-connection session: one agent plus its identity.
@@ -255,14 +384,18 @@ pub async fn serve(
         .await
         .with_context(|| format!("Failed to bind TCP listener on {}", tcp_addr))?;
 
+    let (workflow_progress, workflow_rx) = tokio::sync::broadcast::channel(256);
     let state = Arc::new(ServerState {
         bootstrap,
         token,
         busy_sessions: Mutex::new(HashSet::new()),
         sessions: Mutex::new(HashMap::new()),
         turns: Mutex::new(HashMap::new()),
+        workflow_progress,
+        workflows: Mutex::new(HashMap::new()),
         lifecycle: Mutex::new(()),
     });
+    tokio::spawn(forward_workflow_progress(state.clone(), workflow_rx));
 
     info!("gewu server listening:");
     info!("  WebSocket: ws://{}", ws_addr);
@@ -617,6 +750,7 @@ impl ServerState {
                 image_limits: self.bootstrap.image_limits,
                 context_limit: Some(entry.context_limit),
                 agents: self.bootstrap.agents.clone(),
+                workflow_progress: Some(self.workflow_progress.clone()),
                 session_id: &session_id,
             },
             self.bootstrap.log_writer.clone(),
@@ -981,6 +1115,7 @@ async fn handle_request(
                 image_limits: state.bootstrap.image_limits,
                 context_limit: Some(current.context_limit),
                 agents: state.bootstrap.agents.clone(),
+                workflow_progress: Some(state.workflow_progress.clone()),
                 session_id: &current.session_id,
             });
             let result = match replacement {
@@ -1671,6 +1806,7 @@ async fn handle_request(
             if deleted.is_ok() {
                 state.sessions.lock().await.remove(&session_id);
                 state.turns.lock().await.remove(&session_id);
+                state.workflows.lock().await.remove(&session_id);
             }
             state.release_session(&session_id).await;
             deleted?;
@@ -3160,6 +3296,125 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn subscribe_replays_live_workflow_progress() {
+        let state = server_state_with(TestLlm::plain());
+        let run = WorkflowRunState {
+            run_id: "r-1".into(),
+            name: Some("docs".into()),
+            status: "running".into(),
+            current_node: Some("read".into()),
+            tasks_done: 1,
+            tasks_failed: 0,
+            tasks_attempted: 1,
+            nodes: vec![
+                WorkflowNodeState {
+                    id: "read".into(),
+                    status: "ok".into(),
+                    done: 1,
+                    failed: 0,
+                },
+                WorkflowNodeState {
+                    id: "write".into(),
+                    status: "pending".into(),
+                    done: 0,
+                    failed: 0,
+                },
+            ],
+            error: None,
+        };
+        state
+            .workflows
+            .lock()
+            .await
+            .insert("observed".into(), BTreeMap::from([("r-1".into(), run)]));
+
+        let (observer, mut updates, observer_task) = spawn_connection(state.clone()).await;
+        observer
+            .send(ClientRequest::subscribe_session(1, "observed").to_line())
+            .await
+            .unwrap();
+        assert_eq!(recv_json(&mut updates).await["type"], "ready");
+        assert_eq!(recv_json(&mut updates).await["type"], "session_snapshot");
+        let progress = recv_json(&mut updates).await;
+        assert_eq!(progress["type"], "workflow_progress");
+        assert_eq!(progress["session_id"], "observed");
+        assert_eq!(progress["run"]["run_id"], "r-1");
+        assert_eq!(progress["run"]["status"], "running");
+        assert_eq!(progress["run"]["nodes"][0]["status"], "ok");
+        assert_eq!(progress["run"]["nodes"][1]["status"], "pending");
+
+        drop(observer);
+        drop(updates);
+        observer_task.await.unwrap().unwrap();
+    }
+
+    #[tokio::test]
+    async fn workflow_progress_is_forwarded_only_to_the_owning_session() {
+        use gewu_tools::workflow::RunProgress;
+        use gewu_tools::workflow::engine::RunStatus;
+        use gewu_tools::workflow::manager::NodeReport;
+
+        let state = server_state_with(TestLlm::plain());
+        let (observer, mut updates, observer_task) = spawn_connection(state.clone()).await;
+        observer
+            .send(ClientRequest::subscribe_session(1, "owner").to_line())
+            .await
+            .unwrap();
+        assert_eq!(recv_json(&mut updates).await["type"], "ready");
+        assert_eq!(recv_json(&mut updates).await["type"], "session_snapshot");
+
+        let (tx, rx) = tokio::sync::broadcast::channel(8);
+        tokio::spawn(forward_workflow_progress(state.clone(), rx));
+        let progress = |session: &str| RunProgress {
+            owner_session: session.into(),
+            run_id: "r-1".into(),
+            name: Some("docs".into()),
+            status: RunStatus::Running,
+            current_node: Some("read".into()),
+            tasks_done: 0,
+            tasks_failed: 0,
+            tasks_attempted: 0,
+            nodes: vec![NodeReport {
+                id: "read".into(),
+                status: "pending".into(),
+                done: 0,
+                failed: Vec::new(),
+                sessions: Vec::new(),
+            }],
+            error: None,
+        };
+        // Another session's progress must not reach this observer.
+        tx.send(progress("other")).unwrap();
+        assert!(
+            tokio::time::timeout(
+                std::time::Duration::from_millis(200),
+                recv_json(&mut updates)
+            )
+            .await
+            .is_err()
+        );
+
+        tx.send(progress("owner")).unwrap();
+        let message = recv_json(&mut updates).await;
+        assert_eq!(message["type"], "workflow_progress");
+        assert_eq!(message["run"]["run_id"], "r-1");
+        assert_eq!(message["run"]["nodes"][0]["status"], "pending");
+        assert!(
+            state
+                .workflows
+                .lock()
+                .await
+                .get("owner")
+                .is_some_and(|runs| runs.contains_key("r-1"))
+        );
+
+        drop(tx);
+        drop(observer);
+        drop(updates);
+        observer_task.await.unwrap().unwrap();
+    }
+
+    #[tokio::test]
     async fn observer_survives_a_revert_and_sees_the_next_turn() {
         let state = server_state_with(TestLlm::plain());
         let (observer, mut updates, observer_task) = spawn_connection(state.clone()).await;
@@ -3425,6 +3680,8 @@ mod tests {
             busy_sessions: Mutex::new(HashSet::new()),
             sessions: Mutex::new(HashMap::new()),
             turns: Mutex::new(HashMap::new()),
+            workflow_progress: tokio::sync::broadcast::channel(16).0,
+            workflows: Mutex::new(HashMap::new()),
             lifecycle: Mutex::new(()),
         })
     }
@@ -4353,6 +4610,8 @@ mod tests {
             busy_sessions: Mutex::new(HashSet::new()),
             sessions: Mutex::new(HashMap::new()),
             turns: Mutex::new(HashMap::new()),
+            workflow_progress: tokio::sync::broadcast::channel(16).0,
+            workflows: Mutex::new(HashMap::new()),
             lifecycle: Mutex::new(()),
         });
         let (in_tx, mut out_rx, handle) = spawn_connection(state).await;

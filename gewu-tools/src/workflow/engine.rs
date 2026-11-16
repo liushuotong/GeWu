@@ -37,6 +37,19 @@ pub enum RunStatus {
     Failed,
 }
 
+impl RunStatus {
+    /// Short human-readable label used in tool output and progress payloads.
+    pub fn label(self) -> &'static str {
+        match self {
+            RunStatus::Running => "running",
+            RunStatus::Completed => "completed",
+            RunStatus::Canceled => "canceled",
+            RunStatus::TimedOut => "timed out",
+            RunStatus::Failed => "failed",
+        }
+    }
+}
+
 /// Live state of a run, shared between the engine and the manager.
 #[derive(Debug, Clone, Default)]
 pub struct RunState {

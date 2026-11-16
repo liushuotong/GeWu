@@ -1412,7 +1412,7 @@ fn workflow_tool_inputs_are_summarized_for_the_gui() {
         "r-1"
     );
     assert_eq!(
-        summarize_tool_input("workflow_wait", r#"{"run_id":"r-2","wait_secs":5}"#),
+        summarize_tool_input("workflow_cancel", r#"{"run_id":"r-2"}"#),
         "r-2"
     );
 }

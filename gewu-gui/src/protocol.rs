@@ -107,6 +107,13 @@ pub enum ClientMsg {
         tab: u64,
         block: usize,
     },
+    /// Open a workflow run's graph in the zoom panel.
+    ZoomWorkflow {
+        tab: u64,
+        block: usize,
+    },
+    /// Close the workflow zoom panel.
+    CloseWorkflowZoom,
     /// Reveal the previous page of the active transcript.
     LoadEarlier {
         tab: u64,
@@ -223,6 +230,10 @@ pub enum ServerMsg {
     FilePreview { html: String },
     /// Close the file preview overlay.
     ClosePreview,
+    /// Show or refresh the workflow graph zoom panel.
+    WorkflowZoom { run_id: String, html: String },
+    /// Close the workflow graph zoom panel.
+    CloseWorkflowZoom,
 }
 
 #[cfg(test)]
@@ -246,6 +257,15 @@ mod tests {
             serde_json::from_str::<ClientMsg>(r#"{"op":"toggle_thought","tab":2,"block":5}"#)
                 .unwrap(),
             ClientMsg::ToggleThought { tab: 2, block: 5 }
+        );
+        assert_eq!(
+            serde_json::from_str::<ClientMsg>(r#"{"op":"zoom_workflow","tab":2,"block":5}"#)
+                .unwrap(),
+            ClientMsg::ZoomWorkflow { tab: 2, block: 5 }
+        );
+        assert_eq!(
+            serde_json::from_str::<ClientMsg>(r#"{"op":"close_workflow_zoom"}"#).unwrap(),
+            ClientMsg::CloseWorkflowZoom
         );
         assert_eq!(
             serde_json::from_str::<ClientMsg>(r#"{"op":"load_earlier","tab":4}"#).unwrap(),
@@ -416,6 +436,19 @@ mod tests {
         let json = serde_json::to_value(&msg).unwrap();
         assert_eq!(json["type"], "notice");
         assert_eq!(json["message"], "Uploaded notes.bin (1 kB)");
+
+        let msg = ServerMsg::WorkflowZoom {
+            run_id: "r-1".to_string(),
+            html: "<div class=\"wf-card\"></div>".to_string(),
+        };
+        let json = serde_json::to_value(&msg).unwrap();
+        assert_eq!(json["type"], "workflow_zoom");
+        assert_eq!(json["run_id"], "r-1");
+        assert_eq!(json["html"], "<div class=\"wf-card\"></div>");
+
+        let msg = ServerMsg::CloseWorkflowZoom;
+        let json = serde_json::to_value(&msg).unwrap();
+        assert_eq!(json["type"], "close_workflow_zoom");
     }
 
     #[test]

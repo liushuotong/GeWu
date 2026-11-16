@@ -6,7 +6,7 @@ use gewu_core::{Agent, AgentTemplate};
 use gewu_storage::{SqliteMemory, SqliteSessionStateStore};
 use gewu_tools::task::{AgentFactory, AgentOverrides};
 use gewu_tools::workflow::{
-    WorkflowCancelTool, WorkflowManager, WorkflowStartTool, WorkflowStatusTool, WorkflowWaitTool,
+    RunProgress, WorkflowCancelTool, WorkflowManager, WorkflowStartTool, WorkflowStatusTool,
 };
 use gewu_tools::{
     ApplyPatchTool, BashTool, CodeSearchTool, EditFileTool, GlobTool, GrepTool, ImageLimits,
@@ -31,7 +31,6 @@ const RESERVED_ADDITIONAL_TOOL_NAMES: &[&str] = &[
     "todoread",
     "workflow_start",
     "workflow_status",
-    "workflow_wait",
     "workflow_cancel",
 ];
 
@@ -59,6 +58,9 @@ pub struct ProfileInputs<'a> {
     /// User-defined agents (from the config file) resolvable as subagent
     /// profiles alongside the built-ins.
     pub agents: Arc<BTreeMap<String, AgentEntry>>,
+    /// Live workflow progress channel, when the process has an observer
+    /// (the server forwards it to clients; the CLI has none).
+    pub workflow_progress: Option<tokio::sync::broadcast::Sender<RunProgress>>,
     pub session_id: &'a str,
 }
 
@@ -144,6 +146,8 @@ struct SqliteAgentFactory {
     context_limit: Option<usize>,
     /// User-defined agents resolvable as subagent profiles.
     agents: Arc<BTreeMap<String, AgentEntry>>,
+    /// Live workflow progress channel shared with the server.
+    workflow_progress: Option<tokio::sync::broadcast::Sender<RunProgress>>,
     /// Cached per-profile templates: the expensive tool-registry/prompt
     /// build runs once per profile, spawns clone it.
     templates: Mutex<HashMap<String, AgentTemplate>>,
@@ -159,7 +163,6 @@ const COMPOSED_AGENT_FORBIDDEN_TOOLS: &[&str] = &[
     "task",
     "workflow_start",
     "workflow_status",
-    "workflow_wait",
     "workflow_cancel",
 ];
 
@@ -366,6 +369,7 @@ impl SqliteAgentFactory {
             image_limits: self.image_limits,
             context_limit: self.context_limit,
             agents: self.agents.clone(),
+            workflow_progress: self.workflow_progress.clone(),
             session_id: "",
         })?;
         let session_state =
@@ -400,6 +404,7 @@ fn agent_factory(
     image_limits: ImageLimits,
     context_limit: Option<usize>,
     agents: Arc<BTreeMap<String, AgentEntry>>,
+    workflow_progress: Option<tokio::sync::broadcast::Sender<RunProgress>>,
 ) -> Arc<SqliteAgentFactory> {
     Arc::new(SqliteAgentFactory {
         model_catalog,
@@ -411,6 +416,7 @@ fn agent_factory(
         image_limits,
         context_limit,
         agents: agents.clone(),
+        workflow_progress,
         templates: Mutex::new(HashMap::new()),
     })
 }
@@ -438,11 +444,18 @@ fn task_tool(
 }
 
 /// One workflow manager per profile: it validates specs, spawns runs, and
-/// answers status/wait/cancel for the four workflow tools. Agents derive
-/// from the same factory the task tool uses, so delegation stays one level
-/// deep (composed agents never receive `task` or `workflow_*` tools).
-fn workflow_manager(factory: Arc<SqliteAgentFactory>) -> Arc<WorkflowManager> {
-    Arc::new(WorkflowManager::new(factory, list_agent_names()))
+/// answers status/cancel for the workflow tools. Agents derive from the
+/// same factory the task tool uses, so delegation stays one level deep
+/// (composed agents never receive `task` or `workflow_*` tools).
+fn workflow_manager(
+    factory: Arc<SqliteAgentFactory>,
+    progress: Option<tokio::sync::broadcast::Sender<RunProgress>>,
+) -> Arc<WorkflowManager> {
+    Arc::new(WorkflowManager::with_progress(
+        factory,
+        list_agent_names(),
+        progress,
+    ))
 }
 
 fn build_tool_registry_and_list(inputs: &ProfileInputs) -> Result<RegistryBundle> {
@@ -457,6 +470,7 @@ fn build_tool_registry_and_list(inputs: &ProfileInputs) -> Result<RegistryBundle
         image_limits,
         context_limit,
         agents,
+        workflow_progress,
         ..
     } = inputs;
     let mut tools: Vec<Box<dyn Tool>> = match *name {
@@ -471,13 +485,13 @@ fn build_tool_registry_and_list(inputs: &ProfileInputs) -> Result<RegistryBundle
                 *image_limits,
                 *context_limit,
                 agents.clone(),
+                workflow_progress.clone(),
             );
-            let workflows = workflow_manager(factory.clone());
+            let workflows = workflow_manager(factory.clone(), workflow_progress.clone());
             vec![
                 Box::new(task_tool(factory, agents.clone(), &[])),
                 Box::new(WorkflowStartTool::new(workflows.clone())),
                 Box::new(WorkflowStatusTool::new(workflows.clone())),
-                Box::new(WorkflowWaitTool::new(workflows.clone())),
                 Box::new(WorkflowCancelTool::new(workflows)),
                 Box::new(ReadFileTool {
                     working_directory: working_directory.clone(),
@@ -525,6 +539,7 @@ fn build_tool_registry_and_list(inputs: &ProfileInputs) -> Result<RegistryBundle
                         *image_limits,
                         *context_limit,
                         agents.clone(),
+                        workflow_progress.clone(),
                     ),
                     agents.clone(),
                     &["explore"],
@@ -587,13 +602,13 @@ fn build_tool_registry_and_list(inputs: &ProfileInputs) -> Result<RegistryBundle
                 *image_limits,
                 *context_limit,
                 agents.clone(),
+                workflow_progress.clone(),
             );
-            let workflows = workflow_manager(factory.clone());
+            let workflows = workflow_manager(factory.clone(), workflow_progress.clone());
             vec![
                 Box::new(task_tool(factory, agents.clone(), &[])),
                 Box::new(WorkflowStartTool::new(workflows.clone())),
                 Box::new(WorkflowStatusTool::new(workflows.clone())),
-                Box::new(WorkflowWaitTool::new(workflows.clone())),
                 Box::new(WorkflowCancelTool::new(workflows)),
                 Box::new(ReadFileTool {
                     working_directory: working_directory.clone(),
@@ -700,6 +715,7 @@ fn build_custom_agent_tools(
         image_limits: inputs.image_limits,
         context_limit: inputs.context_limit,
         agents: inputs.agents.clone(),
+        workflow_progress: inputs.workflow_progress.clone(),
         session_id: inputs.session_id,
     })?;
     let tools: Vec<Arc<dyn Tool>> = match &entry.tools {
@@ -746,6 +762,7 @@ pub async fn create_agent(
         image_limits,
         context_limit,
         agents,
+        workflow_progress,
         session_id,
         working_directory,
     } = inputs;
@@ -764,6 +781,7 @@ pub async fn create_agent(
         image_limits,
         context_limit,
         agents,
+        workflow_progress,
         session_id,
     })?;
     let mut builder = Agent::builder()
@@ -825,6 +843,7 @@ pub fn agent_profile(inputs: ProfileInputs) -> Result<ProfileBundle> {
         image_limits,
         context_limit,
         agents,
+        workflow_progress,
         session_id,
     } = inputs;
     let (registry, tools_arc) = build_tool_registry_and_list(&ProfileInputs {
@@ -839,6 +858,7 @@ pub fn agent_profile(inputs: ProfileInputs) -> Result<ProfileBundle> {
         image_limits,
         context_limit,
         agents: agents.clone(),
+        workflow_progress,
         session_id,
     })?;
 
@@ -931,6 +951,7 @@ mod tests {
             image_limits: ImageLimits::default(),
             context_limit: Some(10_000),
             agents: Arc::new(BTreeMap::new()),
+            workflow_progress: None,
             templates: Mutex::new(HashMap::new()),
         };
         gewu_storage::set_session_model(&pool, "parent", "new")
@@ -978,6 +999,7 @@ mod tests {
             image_limits: ImageLimits::default(),
             context_limit: None,
             agents: Arc::new(BTreeMap::new()),
+            workflow_progress: None,
             session_id,
         }
     }
@@ -1443,6 +1465,7 @@ mod tests {
             image_limits: ImageLimits::default(),
             context_limit: None,
             agents: Arc::new(BTreeMap::new()),
+            workflow_progress: None,
             templates: Mutex::new(HashMap::new()),
         };
         // The parent conversation is passed per call, not held by the factory.
@@ -1684,6 +1707,7 @@ mod tests {
                 "reviewer".to_string(),
                 custom_entry("general", Some("Be meticulous."), Some(&["read_file"])),
             )])),
+            workflow_progress: None,
             templates: Mutex::new(HashMap::new()),
         };
         let (agent, session_id) = factory.create("reviewer", None, "parent").await.unwrap();
@@ -1725,6 +1749,7 @@ mod tests {
             image_limits: ImageLimits::default(),
             context_limit: None,
             agents: Arc::new(BTreeMap::new()),
+            workflow_progress: None,
             templates: Mutex::new(HashMap::new()),
         };
 
@@ -1784,12 +1809,7 @@ mod tests {
                 "session",
             ))
             .unwrap();
-            for expected in [
-                "workflow_start",
-                "workflow_status",
-                "workflow_wait",
-                "workflow_cancel",
-            ] {
+            for expected in ["workflow_start", "workflow_status", "workflow_cancel"] {
                 assert!(
                     tools.iter().any(|tool| tool.name() == expected),
                     "{profile} is missing {expected}"
@@ -1808,12 +1828,7 @@ mod tests {
                 "session",
             ))
             .unwrap();
-            for forbidden in [
-                "workflow_start",
-                "workflow_status",
-                "workflow_wait",
-                "workflow_cancel",
-            ] {
+            for forbidden in ["workflow_start", "workflow_status", "workflow_cancel"] {
                 assert!(
                     !tools.iter().any(|tool| tool.name() == forbidden),
                     "{profile} exposes {forbidden}"
@@ -1839,6 +1854,7 @@ mod tests {
             ImageLimits::default(),
             None,
             Arc::new(BTreeMap::new()),
+            None,
         );
 
         // A workflow agent derived from build never carries the delegation
@@ -1911,6 +1927,7 @@ mod tests {
             ImageLimits::default(),
             None,
             Arc::new(BTreeMap::new()),
+            None,
         );
 
         let (agent, _) = factory

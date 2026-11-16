@@ -8,8 +8,7 @@
 //! - [`engine`] — compiles and runs one workflow (fan-out, routing,
 //!   review/redo, limits)
 //! - [`manager`] — tracks background runs (`WorkflowManager`)
-//! - [`tools`] — `workflow_start` / `workflow_status` / `workflow_wait` /
-//!   `workflow_cancel`
+//! - [`tools`] — `workflow_start` / `workflow_status` / `workflow_cancel`
 
 pub mod engine;
 pub mod graph_state;
@@ -21,5 +20,5 @@ pub mod template;
 pub(crate) mod testutil;
 pub mod tools;
 
-pub use manager::WorkflowManager;
-pub use tools::{WorkflowCancelTool, WorkflowStartTool, WorkflowStatusTool, WorkflowWaitTool};
+pub use manager::{RunProgress, WorkflowManager};
+pub use tools::{WorkflowCancelTool, WorkflowStartTool, WorkflowStatusTool};
