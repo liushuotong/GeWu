@@ -2590,7 +2590,7 @@ mod tests {
     use gewu_core::types::{ContentPart, ToolContext, ToolResult};
     use std::collections::BTreeMap;
     use std::error::Error;
-    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
     // -- Test doubles -------------------------------------------------------
 
@@ -2762,19 +2762,55 @@ mod tests {
     /// history reaches the model.
     struct RecordingLlm {
         delay_ms: u64,
-        user_prompts: std::sync::Mutex<Vec<String>>,
+        /// User prompts per provider request, in build order.
+        requests: std::sync::Mutex<Vec<Vec<String>>>,
+        /// Block the first `send` until the test releases it.
+        gate_first_send: bool,
+        first_send: tokio::sync::Notify,
+        release_first: tokio::sync::Notify,
+        first_send_seen: AtomicBool,
     }
 
     impl RecordingLlm {
         fn slow() -> Arc<Self> {
+            Self::new(500, false)
+        }
+
+        fn gated() -> Arc<Self> {
+            Self::new(0, true)
+        }
+
+        fn new(delay_ms: u64, gate_first_send: bool) -> Arc<Self> {
             Arc::new(Self {
-                delay_ms: 500,
-                user_prompts: std::sync::Mutex::new(Vec::new()),
+                delay_ms,
+                requests: std::sync::Mutex::new(Vec::new()),
+                gate_first_send,
+                first_send: tokio::sync::Notify::new(),
+                release_first: tokio::sync::Notify::new(),
+                first_send_seen: AtomicBool::new(false),
             })
         }
 
         fn prompts(&self) -> Vec<String> {
-            self.user_prompts.lock().unwrap().clone()
+            self.requests
+                .lock()
+                .unwrap()
+                .iter()
+                .flatten()
+                .cloned()
+                .collect()
+        }
+
+        fn requests(&self) -> Vec<Vec<String>> {
+            self.requests.lock().unwrap().clone()
+        }
+
+        async fn wait_for_first_send(&self) {
+            self.first_send.notified().await;
+        }
+
+        fn release_first_send(&self) {
+            self.release_first.notify_one();
         }
     }
 
@@ -2785,6 +2821,7 @@ mod tests {
             messages: &[Message],
             _tools: &[Arc<dyn gewu_core::traits::Tool>],
         ) -> std::result::Result<Value, Box<dyn Error + Send + Sync>> {
+            let mut request = Vec::new();
             for message in messages {
                 if let Message::User { content } = message {
                     let text = content
@@ -2796,9 +2833,12 @@ mod tests {
                         .collect::<Vec<_>>()
                         .join(" ");
                     if !text.is_empty() {
-                        self.user_prompts.lock().unwrap().push(text);
+                        request.push(text);
                     }
                 }
+            }
+            if !request.is_empty() {
+                self.requests.lock().unwrap().push(request);
             }
             Ok(serde_json::json!({}))
         }
@@ -2813,6 +2853,10 @@ mod tests {
             >,
             Box<dyn Error + Send + Sync>,
         > {
+            if self.gate_first_send && !self.first_send_seen.swap(true, Ordering::SeqCst) {
+                self.first_send.notify_one();
+                self.release_first.notified().await;
+            }
             if self.delay_ms > 0 {
                 tokio::time::sleep(std::time::Duration::from_millis(self.delay_ms)).await;
             }
@@ -4897,11 +4941,10 @@ mod tests {
 
     #[tokio::test]
     async fn connection_steer_injects_message_into_running_ask() {
-        // The slow LLM delays before its first response, so the steer lands
-        // while the turn is mid-flight. RecordingLlm records the user
-        // prompts it is asked with, proving the steered text reached the
-        // model as a user message on the follow-up request.
-        let llm = RecordingLlm::slow();
+        // Hold the first provider response until the steer has been queued,
+        // so the test always exercises the mid-flight path instead of racing
+        // the first request build.
+        let llm = RecordingLlm::gated();
         let state = server_state_with(llm.clone());
         let (in_tx, mut out_rx, handle) = spawn_connection(state).await;
 
@@ -4913,6 +4956,7 @@ mod tests {
         assert_eq!(ready["type"], "ready");
         let session_id = ready["session_id"].as_str().unwrap().to_string();
 
+        llm.wait_for_first_send().await;
         in_tx
             .send(r#"{"id": 2, "op": "steer", "text": "focus on tests"}"#.to_string())
             .await
@@ -4932,6 +4976,7 @@ mod tests {
                 _ => continue,
             }
         }
+        llm.release_first_send();
 
         // The steered message extends the run; wait for the final result.
         loop {
@@ -4940,13 +4985,28 @@ mod tests {
             }
         }
 
-        // The agent streamed the steered message as an event...
-        let prompts = llm.prompts();
-        assert!(
-            prompts.iter().any(|p| p.contains("focus on tests")),
-            "steered text never reached the model: {prompts:?}"
+        let requests = llm.requests();
+        assert_eq!(
+            requests.len(),
+            2,
+            "steer must trigger a follow-up request: {requests:?}"
         );
-        assert_eq!(prompts.len(), 2, "steer must trigger a follow-up request");
+        assert!(
+            requests[0].iter().any(|prompt| prompt.contains("go")),
+            "first request should contain the original prompt: {requests:?}"
+        );
+        assert!(
+            !requests[0]
+                .iter()
+                .any(|prompt| prompt.contains("focus on tests")),
+            "steer must not be in the first request: {requests:?}"
+        );
+        assert!(
+            requests[1]
+                .iter()
+                .any(|prompt| prompt.contains("focus on tests")),
+            "steered text never reached the follow-up request: {requests:?}"
+        );
 
         drop(in_tx);
         handle.await.unwrap().unwrap();
