@@ -95,7 +95,7 @@ async fn main() -> Result<()> {
     let cli = Cli::parse();
     match cli.command {
         Some(Command::Serve { args }) => gewu_server::cli::serve_command(args).await,
-        Some(Command::Gui { args }) => gewu_gui::run(args).await,
+        Some(Command::Gui { args }) => gewu_gui::run(args, env!("CARGO_PKG_VERSION")).await,
         None => {
             up::run(up::UpArgs {
                 common: cli.common,

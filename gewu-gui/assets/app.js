@@ -861,12 +861,29 @@
     }
   }
 
+  function closeWorkspaceMenus(restoreFocus = false) {
+    for (const trigger of el.sessionSidebar.querySelectorAll('.session-workspace-menu-trigger[aria-expanded="true"]')) {
+      trigger.setAttribute("aria-expanded", "false");
+      const menu = document.getElementById(trigger.getAttribute("aria-controls"));
+      if (menu) menu.hidden = true;
+      if (restoreFocus) trigger.focus();
+    }
+  }
+
   document.addEventListener("click", (event) => {
     if (!event.target.closest(".block.user")) closeMessageMenus();
+    if (!event.target.closest(".session-workspace-menu") && !event.target.closest("[data-session-workspace-menu]")) {
+      closeWorkspaceMenus();
+    }
   });
   document.addEventListener("keydown", (event) => {
     if (event.key === "Escape" && el.transcript.querySelector('.message-menu-trigger[aria-expanded="true"]')) {
       closeMessageMenus(true);
+      event.preventDefault();
+      event.stopImmediatePropagation();
+    }
+    if (event.key === "Escape" && el.sessionSidebar.querySelector('.session-workspace-menu-trigger[aria-expanded="true"]')) {
+      closeWorkspaceMenus(true);
       event.preventDefault();
       event.stopImmediatePropagation();
     }
@@ -902,6 +919,21 @@
       send({ op: "open_tab" });
       return;
     }
+    const workspaceMenu = event.target.closest("[data-session-workspace-menu]");
+    if (workspaceMenu) {
+      const open = workspaceMenu.getAttribute("aria-expanded") !== "true";
+      closeWorkspaceMenus();
+      if (open) {
+        workspaceMenu.setAttribute("aria-expanded", "true");
+        const menu = document.getElementById(workspaceMenu.getAttribute("aria-controls"));
+        if (menu) {
+          menu.hidden = false;
+          const item = menu.querySelector("button");
+          if (item) item.focus();
+        }
+      }
+      return;
+    }
     const close = event.target.closest("[data-session-close]");
     if (close) {
       event.stopPropagation();
@@ -911,6 +943,7 @@
     const closeWorkspace = event.target.closest("[data-session-workspace-close]");
     if (closeWorkspace) {
       event.stopPropagation();
+      closeWorkspaceMenus();
       send({ op: "close_workspace", workspace: closeWorkspace.dataset.sessionWorkspaceClose });
       return;
     }

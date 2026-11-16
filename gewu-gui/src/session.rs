@@ -184,6 +184,8 @@ fn label_for(models: &[gewu_protocol::ModelSummary], selector: &str) -> Option<S
 pub struct GuiSession {
     endpoint: Endpoint,
     server_token: Option<String>,
+    /// Version shown in the session sidebar.
+    version: String,
     admin: Client,
     workspace: Workspace,
     conns: HashMap<u64, Conn>,
@@ -209,7 +211,11 @@ enum Incoming {
 
 impl GuiSession {
     /// Connect upstream and load the stored sessions into tabs.
-    pub async fn new(endpoint: &Endpoint, server_token: Option<&str>) -> Result<Self> {
+    pub async fn new(
+        endpoint: &Endpoint,
+        server_token: Option<&str>,
+        version: &str,
+    ) -> Result<Self> {
         let admin = endpoint
             .connect_with_token(server_token)
             .await
@@ -297,6 +303,7 @@ impl GuiSession {
         Ok(Self {
             endpoint: endpoint.clone(),
             server_token: server_token.map(str::to_string),
+            version: version.to_string(),
             admin,
             workspace,
             conns: HashMap::new(),
@@ -434,6 +441,7 @@ impl GuiSession {
                 &self.workspace.infos(),
                 &self.visible_workspaces(),
                 active,
+                &self.version,
             ),
         }
     }
@@ -473,6 +481,7 @@ impl GuiSession {
                     &self.workspace.infos(),
                     &self.visible_workspaces(),
                     self.workspace.active_id(),
+                    &self.version,
                 ),
             },
         )

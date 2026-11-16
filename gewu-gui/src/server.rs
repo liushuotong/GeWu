@@ -60,6 +60,8 @@ const AUTH_TIMEOUT: Duration = Duration::from_secs(30);
 pub struct AppState {
     /// Upstream server every browser session connects to.
     pub endpoint: Endpoint,
+    /// Version shown in the session sidebar.
+    pub version: String,
     /// Required browser token; `None` means loopback-only anonymous access.
     pub token: Option<String>,
     /// Token for the upstream gewu server, when it requires one.
@@ -165,7 +167,13 @@ async fn handle_socket(mut socket: WebSocket, state: AppState) {
         }
     }
 
-    match GuiSession::new(&state.endpoint, state.server_token.as_deref()).await {
+    match GuiSession::new(
+        &state.endpoint,
+        state.server_token.as_deref(),
+        &state.version,
+    )
+    .await
+    {
         Ok(session) => {
             if let Err(e) = session.run(socket).await {
                 warn!("browser session ended with an error: {e:#}");
@@ -266,6 +274,7 @@ mod tests {
             },
             token: token.map(str::to_string),
             server_token: None,
+            version: "0.0.0-test".to_string(),
         }
     }
 
@@ -573,8 +582,7 @@ mod tests {
             });
             let addr = spawn_gui(AppState {
                 endpoint: Endpoint::Tcp { host: "127.0.0.1".into(), port: upstream.port() },
-                token: None,
-                server_token: None,
+                ..test_state(None)
             }).await;
             let (mut ws, _) = tokio_tungstenite::connect_async(format!("ws://{addr}/ws")).await.unwrap();
             let snapshot = next_json(&mut ws).await;
@@ -749,8 +757,7 @@ mod tests {
                 host: "127.0.0.1".to_string(),
                 port: upstream.port(),
             },
-            token: Some("secret".to_string()),
-            server_token: None,
+            ..test_state(Some("secret"))
         })
         .await;
         let (mut ws, _) = tokio_tungstenite::connect_async(format!("ws://{addr}/ws"))
@@ -774,8 +781,7 @@ mod tests {
                     host: "127.0.0.1".into(),
                     port: upstream.port(),
                 },
-                token: None,
-                server_token: None,
+                ..test_state(None)
             })
             .await;
             let (mut ws, _) = tokio_tungstenite::connect_async(format!("ws://{addr}/ws"))
@@ -863,8 +869,7 @@ mod tests {
                 host: "127.0.0.1".to_string(),
                 port: upstream.port(),
             },
-            token: None,
-            server_token: None,
+            ..test_state(None)
         })
         .await;
         let (mut ws, _) = tokio_tungstenite::connect_async(format!("ws://{addr}/ws"))
@@ -911,8 +916,7 @@ mod tests {
                 host: "127.0.0.1".to_string(),
                 port: upstream.port(),
             },
-            token: None,
-            server_token: None,
+            ..test_state(None)
         })
         .await;
         let (mut ws, _) = tokio_tungstenite::connect_async(format!("ws://{addr}/ws"))
@@ -952,8 +956,7 @@ mod tests {
                 host: "127.0.0.1".to_string(),
                 port: upstream.port(),
             },
-            token: None,
-            server_token: None,
+            ..test_state(None)
         })
         .await;
 
@@ -968,6 +971,11 @@ mod tests {
         let sidebar = snapshot["sidebar"].as_str().unwrap();
         assert!(sidebar.contains("<li>read</li>"), "{sidebar}");
         assert!(sidebar.contains("<li>grep</li>"), "{sidebar}");
+        let session_sidebar = snapshot["session_sidebar"].as_str().unwrap();
+        assert!(
+            session_sidebar.contains("class=\"session-sidebar-version\">v0.0.0-test</span>"),
+            "{session_sidebar}"
+        );
         // The working directory appears once as the file tree root.
         assert!(
             sidebar
@@ -1084,8 +1092,7 @@ mod tests {
                 host: "127.0.0.1".to_string(),
                 port: upstream.port(),
             },
-            token: None,
-            server_token: None,
+            ..test_state(None)
         })
         .await;
 
@@ -1136,8 +1143,7 @@ mod tests {
                 host: "127.0.0.1".to_string(),
                 port: upstream.port(),
             },
-            token: None,
-            server_token: None,
+            ..test_state(None)
         })
         .await;
 
@@ -1184,8 +1190,7 @@ mod tests {
                 host: "127.0.0.1".to_string(),
                 port: upstream.port(),
             },
-            token: None,
-            server_token: None,
+            ..test_state(None)
         })
         .await;
 
@@ -1267,8 +1272,7 @@ mod tests {
                 host: "127.0.0.1".to_string(),
                 port: upstream.port(),
             },
-            token: None,
-            server_token: None,
+            ..test_state(None)
         })
         .await;
 
@@ -1366,8 +1370,7 @@ mod tests {
                 host: "127.0.0.1".to_string(),
                 port: upstream.port(),
             },
-            token: None,
-            server_token: None,
+            ..test_state(None)
         })
         .await;
 
@@ -1431,8 +1434,7 @@ mod tests {
                 host: "127.0.0.1".to_string(),
                 port: upstream.port(),
             },
-            token: None,
-            server_token: None,
+            ..test_state(None)
         })
         .await;
 
@@ -1513,8 +1515,7 @@ mod tests {
                 host: "127.0.0.1".to_string(),
                 port: upstream.port(),
             },
-            token: None,
-            server_token: None,
+            ..test_state(None)
         })
         .await;
 

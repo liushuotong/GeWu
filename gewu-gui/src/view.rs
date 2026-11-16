@@ -31,8 +31,6 @@ const INLINE_IMAGE_MIMES: [&str; 4] = ["image/png", "image/jpeg", "image/gif", "
 /// Base64 cap for inline rendering. Normalization keeps images under 5 MiB;
 /// this protects transcript snapshots when the server limit is raised.
 const MAX_INLINE_IMAGE_BYTES: usize = 4 * 1024 * 1024;
-/// Version shown in the sessions sidebar, from `gewu-gui`'s package metadata.
-const GEWU_GUI_VERSION: &str = env!("CARGO_PKG_VERSION");
 
 /// Escape text for use in HTML text or a double-quoted attribute.
 pub fn escape(text: &str) -> String {
@@ -1084,10 +1082,13 @@ pub fn sidebar_tabs_with_workspaces_html(
 }
 
 /// Render the left session manager: workspace groups with their sessions.
+///
+/// `version` is the running app's version, shown next to the brand.
 pub fn session_sidebar_html(
     tabs: &[TabInfo],
     workspaces: &[WorkspaceSummary],
     active: u64,
+    version: &str,
 ) -> String {
     let mut workspace_ids: Vec<String> = workspaces
         .iter()
@@ -1101,7 +1102,7 @@ pub fn session_sidebar_html(
 
     let mut out = format!(
         "<aside class=\"session-sidebar\" aria-label=\"Sessions by workspace\"><header class=\"session-sidebar-header\"><span class=\"brand-mark session-brand\" title=\"GeWu agent\"><svg class=\"brand-icon\" viewBox=\"0 0 24 24\" fill=\"none\" stroke=\"currentColor\" stroke-width=\"1.7\" stroke-linecap=\"round\" stroke-linejoin=\"round\" aria-hidden=\"true\"><rect x=\"3.5\" y=\"3.5\" width=\"17\" height=\"17\" rx=\"3.5\"/><circle cx=\"12\" cy=\"12\" r=\"4.25\"/><path d=\"M12 3.5v4.25M12 16.25v4.25M3.5 12h4.25M16.25 12h4.25\"/></svg></span><span class=\"session-sidebar-title\">GeWu <span class=\"session-sidebar-version\">v{}</span></span><button type=\"button\" class=\"session-collapse\" data-sessions-collapse title=\"Close sidebar\" aria-label=\"Close sidebar\"><svg viewBox=\"0 0 24 24\" fill=\"none\" stroke=\"currentColor\" stroke-width=\"1.8\" stroke-linecap=\"round\" stroke-linejoin=\"round\" aria-hidden=\"true\"><rect x=\"3\" y=\"4\" width=\"18\" height=\"16\" rx=\"2\"/><path d=\"M9 4v16\"/><path d=\"m16 15-3-3 3-3\"/></svg></button></header><button type=\"button\" class=\"session-new-primary\" data-session-new title=\"Open workspace\" aria-label=\"Open workspace\"><svg viewBox=\"0 0 24 24\" fill=\"none\" stroke=\"currentColor\" stroke-width=\"1.7\" stroke-linecap=\"round\" stroke-linejoin=\"round\" aria-hidden=\"true\"><path d=\"M3.5 6.5A1.5 1.5 0 0 1 5 5h4l2 2h8a1.5 1.5 0 0 1 1.5 1.5V10\"/><path d=\"M3.5 10.5h17l-2 8h-13l-2-8Z\"/></svg><span>Open workspace</span></button><div class=\"session-section-label\">WORKSPACE</div><div class=\"session-workspace-groups\">",
-        GEWU_GUI_VERSION
+        escape(version)
     );
     for (group_index, workspace_id) in workspace_ids.into_iter().enumerate() {
         let summary = workspaces
@@ -1119,17 +1120,16 @@ pub fn session_sidebar_html(
             .map(workspace_label)
             .unwrap_or_else(|| workspace_id.clone());
         let list_id = format!("session-list-{group_index}");
+        let menu_id = format!("session-workspace-menu-{group_index}");
         let _ = write!(
             out,
-            "<section class=\"session-workspace-group\" data-session-workspace-group=\"{}\"><header class=\"session-workspace-header\"><button type=\"button\" class=\"session-workspace-toggle\" data-session-workspace-toggle=\"{}\" aria-expanded=\"true\" aria-controls=\"{list_id}\"><span class=\"session-workspace-caret\" aria-hidden=\"true\"></span><span class=\"session-workspace-heading\"><strong>{}</strong><code title=\"{}\">{}</code></span></button><button type=\"button\" class=\"session-new\" data-session-new-workspace=\"{}\" data-session-new-path=\"{}\" title=\"New session in {}\" aria-label=\"New session in {}\">＋</button><button type=\"button\" class=\"session-workspace-close\" data-session-workspace-close=\"{}\" title=\"Close workspace\" aria-label=\"Close workspace {}\">×</button></header><div class=\"session-list\" id=\"{list_id}\">",
+            "<section class=\"session-workspace-group\" data-session-workspace-group=\"{}\"><header class=\"session-workspace-header\"><button type=\"button\" class=\"session-workspace-toggle\" data-session-workspace-toggle=\"{}\" aria-expanded=\"true\" aria-controls=\"{list_id}\"><span class=\"session-workspace-caret\" aria-hidden=\"true\"></span><span class=\"session-workspace-heading\"><strong>{}</strong><code title=\"{}\">{}</code></span></button><button type=\"button\" class=\"session-workspace-menu-trigger\" data-session-workspace-menu=\"{}\" aria-haspopup=\"menu\" aria-expanded=\"false\" aria-controls=\"{menu_id}\" title=\"Workspace actions\" aria-label=\"Workspace actions for {}\">⋯</button><div id=\"{menu_id}\" class=\"session-workspace-menu\" role=\"menu\" hidden><button type=\"button\" role=\"menuitem\" class=\"session-workspace-close\" data-session-workspace-close=\"{}\" title=\"Close workspace; sessions are kept\" aria-label=\"Close workspace {}\">Close workspace</button></div></header><div class=\"session-list\" id=\"{list_id}\">",
             escape(&workspace_id),
             escape(&workspace_id),
             escape(&label),
             escape(&path),
             escape(&path),
             escape(&workspace_id),
-            escape(&path),
-            escape(&label),
             escape(&label),
             escape(&workspace_id),
             escape(&label),
@@ -1138,28 +1138,32 @@ pub fn session_sidebar_html(
             .iter()
             .filter(|tab| tab.workspace == workspace_id)
             .collect();
-        if group_tabs.is_empty() {
-            out.push_str("<p class=\"session-empty\">No sessions</p>");
-        } else {
-            for tab in group_tabs {
-                let active_class = if tab.id == active { " active" } else { "" };
-                let busy = if tab.busy { " busy" } else { "" };
-                let _ = write!(
-                    out,
-                    "<div class=\"session-row{active_class}{busy}\"><button type=\"button\" class=\"session-select\" data-session-tab=\"{}\" title=\"{}\"><span class=\"session-label\">{}</span>{}</button><button type=\"button\" class=\"session-close\" data-session-close=\"{}\" title=\"Close session\" aria-label=\"Close {}\">×</button></div>",
-                    tab.id,
-                    escape(&tab.label),
-                    escape(&tab.label),
-                    if tab.busy {
-                        "<span class=\"session-spinner\" aria-label=\"working\"></span>"
-                    } else {
-                        ""
-                    },
-                    tab.id,
-                    escape(&tab.label),
-                );
-            }
+        for tab in group_tabs {
+            let active_class = if tab.id == active { " active" } else { "" };
+            let busy = if tab.busy { " busy" } else { "" };
+            let _ = write!(
+                out,
+                "<div class=\"session-row{active_class}{busy}\"><button type=\"button\" class=\"session-select\" data-session-tab=\"{}\" title=\"{}\"><span class=\"session-label\">{}</span>{}</button><button type=\"button\" class=\"session-close\" data-session-close=\"{}\" title=\"Close session\" aria-label=\"Close {}\">×</button></div>",
+                tab.id,
+                escape(&tab.label),
+                escape(&tab.label),
+                if tab.busy {
+                    "<span class=\"session-spinner\" aria-label=\"working\"></span>"
+                } else {
+                    ""
+                },
+                tab.id,
+                escape(&tab.label),
+            );
         }
+        let _ = write!(
+            out,
+            "<button type=\"button\" class=\"session-add\" data-session-new-workspace=\"{}\" data-session-new-path=\"{}\" title=\"New session in {}\" aria-label=\"New session in {}\"><span class=\"session-add-glyph\" aria-hidden=\"true\">＋</span><span>New session</span></button>",
+            escape(&workspace_id),
+            escape(&path),
+            escape(&label),
+            escape(&label),
+        );
         out.push_str("</div></section>");
     }
     out.push_str("</div></aside>");
@@ -1654,16 +1658,16 @@ mod tests {
                 },
             ],
             2,
+            "9.9.9-test",
         );
         assert!(html.contains("class=\"session-sidebar\""), "{html}");
         assert!(html.contains("session-brand"), "{html}");
         assert!(html.contains("class=\"brand-icon\""), "{html}");
         assert!(!html.contains("格物"), "{html}");
         assert!(
-            html.contains(&format!(
-                "session-sidebar-title\">GeWu <span class=\"session-sidebar-version\">v{}</span></span>",
-                GEWU_GUI_VERSION
-            )),
+            html.contains(
+                "session-sidebar-title\">GeWu <span class=\"session-sidebar-version\">v9.9.9-test</span></span>"
+            ),
             "{html}"
         );
         assert!(html.contains("session-new-primary"), "{html}");
@@ -1711,6 +1715,37 @@ mod tests {
         assert!(html.contains("aria-expanded=\"true\""), "{html}");
         assert!(html.contains("session-row active"), "{html}");
         assert!(html.contains("data-session-close=\"2\""), "{html}");
+        assert!(
+            html.contains("class=\"session-add\" data-session-new-workspace=\"tachyon\""),
+            "{html}"
+        );
+        assert!(
+            html.contains(
+                "class=\"session-workspace-menu-trigger\" data-session-workspace-menu=\"tachyon\" aria-haspopup=\"menu\" aria-expanded=\"false\" aria-controls=\"session-workspace-menu-0\""
+            ),
+            "{html}"
+        );
+        assert!(
+            html.contains(
+                "id=\"session-workspace-menu-0\" class=\"session-workspace-menu\" role=\"menu\" hidden"
+            ),
+            "{html}"
+        );
+        assert!(
+            html.contains("data-session-workspace-close=\"tachyon\""),
+            "{html}"
+        );
+        assert!(html.contains(">Close workspace</button>"), "{html}");
+        assert!(
+            html.contains("aria-controls=\"session-workspace-menu-1\""),
+            "{html}"
+        );
+        assert!(!html.contains("class=\"session-new\""), "{html}");
+        let list = html.find("id=\"session-list-0\"").expect("list rendered");
+        let add = html
+            .find("class=\"session-add\"")
+            .expect("add row rendered");
+        assert!(list < add, "{html}");
     }
 
     #[test]
@@ -1722,8 +1757,13 @@ mod tests {
                 path: "/tmp/project".into(),
             }],
             0,
+            "test",
         );
-        assert!(html.contains("No sessions"), "{html}");
+        assert!(
+            html.contains("class=\"session-add\" data-session-new-workspace=\"cwd\""),
+            "{html}"
+        );
+        assert!(!html.contains("No sessions"), "{html}");
         assert!(
             html.contains("data-session-workspace-toggle=\"cwd\""),
             "{html}"
@@ -1741,10 +1781,23 @@ mod tests {
                 path: "/tmp/project".into(),
             }],
             0,
+            "test",
+        );
+        assert!(
+            html.contains("data-session-workspace-menu=\"project&quot;&lt;&amp;\""),
+            "{html}"
+        );
+        assert!(
+            html.contains("aria-label=\"Workspace actions for project&quot;&lt;&amp;\""),
+            "{html}"
+        );
+        assert!(
+            html.contains("class=\"session-workspace-menu\" role=\"menu\" hidden"),
+            "{html}"
         );
         assert!(html.contains("data-session-workspace-close=\"project&quot;&lt;&amp;\""));
         assert!(html.contains("aria-label=\"Close workspace project&quot;&lt;&amp;\""));
-        assert!(html.contains("title=\"Close workspace\""));
+        assert!(html.contains("title=\"Close workspace; sessions are kept\""));
     }
 
     #[test]

@@ -5,5 +5,5 @@ use clap::Parser;
 
 #[tokio::main]
 async fn main() -> Result<()> {
-    gewu_gui::run(gewu_gui::Cli::parse()).await
+    gewu_gui::run(gewu_gui::Cli::parse(), env!("CARGO_PKG_VERSION")).await
 }

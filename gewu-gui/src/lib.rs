@@ -33,7 +33,10 @@ use crate::cli::Endpoint;
 use crate::server::AppState;
 
 /// Validate options, bind the listener, and serve until shutdown.
-pub async fn run(cli: Cli) -> Result<()> {
+///
+/// `version` is displayed in the session sidebar. Callers pass their own
+/// package version so the GUI reports the app the user is actually running.
+pub async fn run(cli: Cli, version: impl Into<String>) -> Result<()> {
     init_tracing(&cli.log_level);
     let token = cli
         .token
@@ -87,6 +90,7 @@ pub async fn run(cli: Cli) -> Result<()> {
 
     let state = AppState {
         endpoint,
+        version: version.into(),
         token,
         server_token: cli
             .server_token

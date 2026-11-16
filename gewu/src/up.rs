@@ -96,7 +96,7 @@ pub async fn run(args: UpArgs) -> Result<()> {
     println!("  agent server: {server_url}");
     println!("  web GUI:      {gui_url}");
 
-    let gui_task = tokio::spawn(gewu_gui::run(gui_cli));
+    let gui_task = tokio::spawn(gewu_gui::run(gui_cli, env!("CARGO_PKG_VERSION")));
 
     let ctrl_c = tokio::signal::ctrl_c();
     tokio::pin!(ctrl_c);
