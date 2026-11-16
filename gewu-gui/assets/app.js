@@ -916,7 +916,7 @@
     const revert = event.target.closest("[data-revert-block]");
     if (revert) {
       closeMessageMenus();
-      if (!state.busy && window.confirm("Revert chat from this message? File changes will NOT be undone.")) {
+      if (!state.busy) {
         send({ op: "revert_chat", tab: state.active, block: Number(revert.dataset.revertBlock), undo: false });
       }
       return;
