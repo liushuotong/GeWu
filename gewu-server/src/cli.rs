@@ -12,7 +12,7 @@ use crate::server;
 /// Run an agent as a server other programs can connect to.
 #[derive(clap::Parser, Debug)]
 pub struct ServeArgs {
-    /// Host to bind both listeners to
+    /// Host to bind all listeners to
     #[arg(long, default_value = server::DEFAULT_HOST)]
     pub host: String,
 
@@ -23,6 +23,10 @@ pub struct ServeArgs {
     /// Port for the newline-delimited JSON TCP listener
     #[arg(long, default_value_t = server::DEFAULT_TCP_PORT)]
     pub tcp_port: u16,
+
+    /// Port for the HTTP file-download listener
+    #[arg(long, default_value_t = server::DEFAULT_HTTP_PORT)]
+    pub http_port: u16,
 
     /// Shared token clients must authenticate with (also GEWU_SERVE_TOKEN).
     /// Required when binding a non-loopback host unless --allow-anonymous.
@@ -66,6 +70,7 @@ pub async fn serve_command(cli: ServeArgs) -> Result<()> {
         &cli.host,
         cli.ws_port,
         cli.tcp_port,
+        cli.http_port,
         cli.token.filter(|t| !t.is_empty()),
     )
     .await
@@ -82,6 +87,7 @@ mod tests {
         assert_eq!(args.host, server::DEFAULT_HOST);
         assert_eq!(args.ws_port, server::DEFAULT_WS_PORT);
         assert_eq!(args.tcp_port, server::DEFAULT_TCP_PORT);
+        assert_eq!(args.http_port, server::DEFAULT_HTTP_PORT);
         assert_eq!(args.common.agent, "build");
         assert_eq!(args.token, None);
         assert!(!args.allow_anonymous);
@@ -97,6 +103,8 @@ mod tests {
             "9000",
             "--tcp-port",
             "9001",
+            "--http-port",
+            "9002",
             "--agent",
             "explore",
             "--token",
@@ -106,6 +114,7 @@ mod tests {
         assert_eq!(args.host, "0.0.0.0");
         assert_eq!(args.ws_port, 9000);
         assert_eq!(args.tcp_port, 9001);
+        assert_eq!(args.http_port, 9002);
         assert_eq!(args.common.agent, "explore");
         assert_eq!(args.token.as_deref(), Some("secret"));
     }

@@ -40,13 +40,31 @@ streamed agent events:
 cargo run -p gewu-server -- serve
 ```
 
-This starts two listeners (Ctrl+C to stop):
+This starts three listeners (Ctrl+C to stop):
 
 - `ws://127.0.0.1:8420` — WebSocket, one JSON message per text frame
 - `tcp://127.0.0.1:8421` — newline-delimited JSON, one message per line
+- `http://127.0.0.1:8422` — file downloads over `GET`/`HEAD /download`
 
-Options: `--host`, `--ws-port`, `--tcp-port`, plus all shared options
+Options: `--host`, `--ws-port`, `--tcp-port`, `--http-port`, plus all shared options
 (`--agent`, `--model`, `--provider`, `--db-path`, `--llm-config`, ...).
+
+#### File downloads
+
+The HTTP listener streams a file, or a ZIP of a directory, for a session's
+workspace:
+
+```bash
+curl -fL "http://127.0.0.1:8422/download?session_id=s1&path=src/main.rs" -o main.rs
+```
+
+`path` is resolved against that session's workspace with the same containment
+rules as the file tools. Files are served as attachments; directories become
+a ZIP whose root is the directory itself and whose entries mirror the visible
+file tree (hidden and gitignored entries are skipped, symlinks are not
+followed). A folder download is capped at 20,000 entries and 2 GiB
+uncompressed. When the server runs with `--token`, send
+`Authorization: Bearer <token>`.
 
 #### Authentication
 

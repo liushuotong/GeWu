@@ -29,6 +29,14 @@ pub struct Cli {
     #[arg(long, env = "GEWU_SERVER", default_value = "ws://127.0.0.1:8420")]
     pub server: String,
 
+    /// Upstream HTTP file-download endpoint
+    #[arg(
+        long,
+        env = "GEWU_SERVER_HTTP",
+        default_value = "http://127.0.0.1:8422"
+    )]
+    pub server_http: String,
+
     /// Shared token required for browser connections (also GEWU_GUI_TOKEN)
     #[arg(long, env = "GEWU_GUI_TOKEN")]
     pub token: Option<String>,
@@ -139,6 +147,7 @@ mod tests {
         assert_eq!(cli.host, "127.0.0.1");
         assert_eq!(cli.port, 8430);
         assert_eq!(cli.server, "ws://127.0.0.1:8420");
+        assert_eq!(cli.server_http, "http://127.0.0.1:8422");
         assert_eq!(cli.token, None);
         assert_eq!(cli.server_token, None);
         assert!(!cli.allow_anonymous);
@@ -155,6 +164,8 @@ mod tests {
             "9000",
             "--server",
             "tcp://example.org:8421",
+            "--server-http",
+            "http://example.org:8422",
             "--token",
             "secret",
             "--server-token",
@@ -166,6 +177,7 @@ mod tests {
         assert_eq!(cli.host, "0.0.0.0");
         assert_eq!(cli.port, 9000);
         assert_eq!(cli.server, "tcp://example.org:8421");
+        assert_eq!(cli.server_http, "http://example.org:8422");
         assert_eq!(cli.token.as_deref(), Some("secret"));
         assert_eq!(cli.server_token.as_deref(), Some("upstream-secret"));
         assert!(cli.allow_anonymous);
@@ -182,6 +194,7 @@ mod tests {
                 .is_some()
         };
         assert!(has_env("server"));
+        assert!(has_env("server_http"));
         assert!(has_env("token"));
         assert!(has_env("server_token"));
     }

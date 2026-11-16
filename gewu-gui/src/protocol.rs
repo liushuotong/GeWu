@@ -133,6 +133,10 @@ pub enum ClientMsg {
     ReadFile {
         path: String,
     },
+    /// Prepare a download for a workspace-relative file or folder.
+    Download {
+        path: String,
+    },
     /// Refresh the file tree.
     RefreshTree,
     /// Upload files into the working-directory root. Names are sanitized
@@ -228,6 +232,8 @@ pub enum ServerMsg {
     CloseWorkspaceBrowser,
     /// Show the requested file preview.
     FilePreview { html: String },
+    /// A ready-to-use download URL (a short-lived same-origin ticket).
+    DownloadReady { url: String },
     /// Close the file preview overlay.
     ClosePreview,
     /// Show or refresh the workflow graph zoom panel.
@@ -305,6 +311,12 @@ mod tests {
                 .unwrap(),
             ClientMsg::BrowseNewSession {
                 path: "/tmp".into()
+            }
+        );
+        assert_eq!(
+            serde_json::from_str::<ClientMsg>(r#"{"op":"download","path":"src/main.rs"}"#).unwrap(),
+            ClientMsg::Download {
+                path: "src/main.rs".into()
             }
         );
     }
@@ -449,6 +461,13 @@ mod tests {
         let msg = ServerMsg::CloseWorkflowZoom;
         let json = serde_json::to_value(&msg).unwrap();
         assert_eq!(json["type"], "close_workflow_zoom");
+
+        let msg = ServerMsg::DownloadReady {
+            url: "/download/abc".to_string(),
+        };
+        let json = serde_json::to_value(&msg).unwrap();
+        assert_eq!(json["type"], "download_ready");
+        assert_eq!(json["url"], "/download/abc");
     }
 
     #[test]

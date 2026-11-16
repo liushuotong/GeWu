@@ -11,6 +11,7 @@
 //! text deltas.
 
 pub mod cli;
+mod download;
 mod protocol;
 mod server;
 mod session;
@@ -23,6 +24,8 @@ pub use protocol::{ClientMsg, ServerMsg, TabInfo};
 
 use std::net::SocketAddr;
 use std::process::Command;
+use std::sync::Arc;
+use std::time::Duration;
 
 use anyhow::{Context, Result, bail};
 use tokio::net::TcpListener;
@@ -31,6 +34,7 @@ use tracing::{debug, info, warn};
 use tracing_subscriber::filter::LevelFilter;
 
 use crate::cli::Endpoint;
+use crate::download::DownloadTickets;
 use crate::server::AppState;
 
 /// Validate options, bind the listener, and serve until shutdown.
@@ -129,6 +133,13 @@ pub async fn run_with_updates(
         open_browser(&url);
     }
 
+    // Downloads can take minutes on a slow link; bound only the connect
+    // phase, since reqwest applies no total timeout by default.
+    let http_client = reqwest::Client::builder()
+        .connect_timeout(Duration::from_secs(10))
+        .build()
+        .context("failed to build the download HTTP client")?;
+
     let state = AppState {
         endpoint,
         version,
@@ -140,6 +151,9 @@ pub async fn run_with_updates(
             .map(str::trim)
             .filter(|t| !t.is_empty())
             .map(str::to_string),
+        server_http: cli.server_http.clone(),
+        http_client,
+        downloads: Arc::new(DownloadTickets::default()),
     };
     server::serve(listener, state).await
 }

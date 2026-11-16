@@ -21,6 +21,8 @@ pub struct UpArgs {
     pub ws_port: u16,
     /// TCP port (`0` = pick a free port).
     pub tcp_port: u16,
+    /// HTTP file-download port (`0` = pick a free port).
+    pub http_port: u16,
     /// Host the web GUI binds to.
     pub gui_host: String,
     /// Port of the web GUI.
@@ -65,13 +67,13 @@ pub async fn run(args: UpArgs) -> Result<()> {
         args.common.agent, boot.model, boot.provider_name
     );
 
-    let (ws_port, tcp_port) = resolve_ports(&args).await?;
+    let (ws_port, tcp_port, http_port) = resolve_ports(&args).await?;
     let server_url = format!("ws://{}:{}", args.host, ws_port);
 
     let server_task = tokio::spawn({
         let host = args.host.clone();
         let token = token.clone();
-        async move { gewu_server::server::serve(boot, &host, ws_port, tcp_port, token).await }
+        async move { gewu_server::server::serve(boot, &host, ws_port, tcp_port, http_port, token).await }
     });
 
     // Wait until the server accepts connections before starting the GUI, so
@@ -91,6 +93,7 @@ pub async fn run(args: UpArgs) -> Result<()> {
         host: args.gui_host.clone(),
         port: args.gui_port,
         server: server_url.clone(),
+        server_http: format!("http://{}:{}", args.host, http_port),
         token: args.gui_token.clone(),
         server_token: token.clone(),
         allow_anonymous: args.allow_anonymous,
@@ -145,36 +148,58 @@ fn is_loopback(host: &str) -> bool {
 /// ports are reserved together (and dropped) so they are guaranteed
 /// distinct; there is a small window in which another process could claim
 /// one before the server rebinds it, in which case the server fails loudly.
-async fn resolve_ports(args: &UpArgs) -> Result<(u16, u16)> {
-    let (ws_port, tcp_port) = (args.ws_port, args.tcp_port);
-    if ws_port != 0 || tcp_port != 0 {
-        if ws_port == tcp_port {
-            bail!("--ws-port and --tcp-port must differ (both are {ws_port})");
+async fn resolve_ports(args: &UpArgs) -> Result<(u16, u16, u16)> {
+    let ports = [args.ws_port, args.tcp_port, args.http_port];
+    let flags = ["--ws-port", "--tcp-port", "--http-port"];
+    for i in 0..ports.len() {
+        for j in i + 1..ports.len() {
+            if ports[i] != 0 && ports[i] == ports[j] {
+                bail!(
+                    "{} and {} must differ (both are {})",
+                    flags[i],
+                    flags[j],
+                    ports[i]
+                );
+            }
         }
-        if ws_port != 0 && tcp_port != 0 {
-            return Ok((ws_port, tcp_port));
-        }
-        if ws_port != 0 {
-            return Ok((ws_port, pick_free_port(&args.host).await?));
-        }
-        return Ok((pick_free_port(&args.host).await?, tcp_port));
+    }
+    if ports.iter().all(|port| *port != 0) {
+        return Ok((ports[0], ports[1], ports[2]));
     }
 
-    // Both ports are ephemeral: hold two listeners open simultaneously so
-    // the two picks cannot collide, then release them for the server.
-    let ws_listener = TcpListener::bind((args.host.as_str(), 0)).await?;
-    let tcp_listener = TcpListener::bind((args.host.as_str(), 0)).await?;
-    let ws_port = ws_listener.local_addr()?.port();
-    let tcp_port = tcp_listener.local_addr()?.port();
-    drop(ws_listener);
-    drop(tcp_listener);
-    if ws_port == tcp_port {
-        bail!("could not pick two distinct free ports on {}", args.host);
+    // Ephemeral ports are reserved together (and dropped) so the picks are
+    // guaranteed distinct and cannot collide with an explicit flag.
+    let mut listeners = Vec::new();
+    let ephemeral = ports.iter().filter(|port| **port == 0).count();
+    while listeners.len() < ephemeral {
+        let listener = TcpListener::bind((args.host.as_str(), 0)).await?;
+        let port = listener.local_addr()?.port();
+        if ports.contains(&port) {
+            continue;
+        }
+        listeners.push((port, listener));
     }
-    Ok((ws_port, tcp_port))
+    let mut picked = listeners.into_iter().map(|(port, _)| port);
+    let ws_port = if ports[0] != 0 {
+        ports[0]
+    } else {
+        picked.next().unwrap()
+    };
+    let tcp_port = if ports[1] != 0 {
+        ports[1]
+    } else {
+        picked.next().unwrap()
+    };
+    let http_port = if ports[2] != 0 {
+        ports[2]
+    } else {
+        picked.next().unwrap()
+    };
+    Ok((ws_port, tcp_port, http_port))
 }
 
 /// Bind an ephemeral port on `host`, read it back, and release it.
+#[cfg(test)]
 async fn pick_free_port(host: &str) -> Result<u16> {
     let listener = TcpListener::bind((host, 0)).await?;
     Ok(listener.local_addr()?.port())
@@ -212,6 +237,7 @@ mod tests {
             host: host.to_string(),
             ws_port,
             tcp_port,
+            http_port: 0,
             gui_host: "127.0.0.1".to_string(),
             gui_port: 8430,
             token: None,
@@ -224,32 +250,58 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn picks_two_distinct_ephemeral_ports() {
-        let (ws, tcp) = resolve_ports(&args("127.0.0.1", 0, 0)).await.unwrap();
+    async fn picks_three_distinct_ephemeral_ports() {
+        let (ws, tcp, http) = resolve_ports(&args("127.0.0.1", 0, 0)).await.unwrap();
         assert_ne!(ws, 0);
         assert_ne!(tcp, 0);
+        assert_ne!(http, 0);
         assert_ne!(ws, tcp);
+        assert_ne!(ws, http);
+        assert_ne!(tcp, http);
     }
 
     #[tokio::test]
     async fn explicit_ports_win_over_auto_pick() {
-        let (ws, tcp) = resolve_ports(&args("127.0.0.1", 9100, 9101)).await.unwrap();
+        let (ws, tcp, http) = resolve_ports(&args("127.0.0.1", 9100, 9101)).await.unwrap();
         assert_eq!(ws, 9100);
         assert_eq!(tcp, 9101);
+        assert_ne!(http, 0);
+        assert_ne!(http, ws);
+        assert_ne!(http, tcp);
     }
 
     #[tokio::test]
     async fn mixes_explicit_and_ephemeral_ports() {
-        let (ws, tcp) = resolve_ports(&args("127.0.0.1", 9100, 0)).await.unwrap();
+        let (ws, tcp, http) = resolve_ports(&args("127.0.0.1", 9100, 0)).await.unwrap();
         assert_eq!(ws, 9100);
         assert_ne!(tcp, 0);
+        assert_ne!(http, 0);
         assert_ne!(tcp, 9100);
+        assert_ne!(http, 9100);
+        assert_ne!(http, tcp);
     }
 
     #[tokio::test]
     async fn rejects_identical_explicit_ports() {
         let err = resolve_ports(&args("127.0.0.1", 9100, 9100)).await;
         assert!(err.is_err(), "same ws/tcp port must be rejected");
+    }
+
+    #[tokio::test]
+    async fn honors_an_explicit_http_port() {
+        let mut args = args("127.0.0.1", 0, 0);
+        args.http_port = 9102;
+        let (ws, tcp, http) = resolve_ports(&args).await.unwrap();
+        assert_eq!(http, 9102);
+        assert_ne!(ws, http);
+        assert_ne!(tcp, http);
+    }
+
+    #[tokio::test]
+    async fn rejects_an_http_port_collision() {
+        let mut args = args("127.0.0.1", 9100, 9101);
+        args.http_port = 9100;
+        assert!(resolve_ports(&args).await.is_err());
     }
 
     #[tokio::test]

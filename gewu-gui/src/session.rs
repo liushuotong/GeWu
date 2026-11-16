@@ -5,6 +5,7 @@
 //! The output is JSON messages carrying rendered HTML.
 
 use std::collections::{BTreeMap, BTreeSet, HashMap};
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
@@ -19,6 +20,7 @@ use tokio::task::JoinHandle;
 use tracing::{debug, warn};
 
 use crate::cli::Endpoint;
+use crate::download::DownloadTickets;
 use crate::protocol::{ClientMsg, ServerMsg};
 use crate::view;
 use crate::workspace::{Workspace, short_id};
@@ -214,6 +216,7 @@ pub struct GuiSession {
     file_cache: BTreeMap<String, Vec<gewu_protocol::FileEntry>>,
     /// Workflow run currently shown in the zoom panel, if any.
     zoom: Option<ZoomTarget>,
+    downloads: Arc<DownloadTickets>,
     tab_tx: Option<mpsc::UnboundedSender<TabEvent>>,
 }
 
@@ -230,6 +233,7 @@ impl GuiSession {
         server_token: Option<&str>,
         version: &str,
         updates: watch::Receiver<Option<gewu_update::Update>>,
+        downloads: Arc<DownloadTickets>,
     ) -> Result<Self> {
         let admin = endpoint
             .connect_with_token(server_token)
@@ -334,6 +338,7 @@ impl GuiSession {
             expanded_dirs: BTreeSet::new(),
             file_cache,
             zoom: None,
+            downloads,
             tab_tx: None,
         })
     }
@@ -1382,6 +1387,30 @@ impl GuiSession {
                     }
                     Err(e) => {
                         self.send_error(sender, format!("could not preview file: {e}"))
+                            .await?
+                    }
+                }
+            }
+            ClientMsg::Download { path } => {
+                let tab_id = self.workspace.active_id();
+                self.file_client().await?;
+                let session_id = self
+                    .workspace
+                    .tab(tab_id)
+                    .and_then(|tab| tab.model.session_id.clone());
+                match session_id {
+                    Some(session_id) => {
+                        let id = self.downloads.mint(session_id, path);
+                        send_msg(
+                            sender,
+                            &ServerMsg::DownloadReady {
+                                url: format!("/download/{id}"),
+                            },
+                        )
+                        .await?
+                    }
+                    None => {
+                        self.send_error(sender, "no active session to download from")
                             .await?
                     }
                 }

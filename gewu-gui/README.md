@@ -32,6 +32,7 @@ browser, so the server does not need to be exposed to every browser.
 | `--host` | `127.0.0.1` | Host the GUI's HTTP/WebSocket listener binds to; use `0.0.0.0` for remote browsers |
 | `--port` | `8430` | Port for the GUI's HTTP and WebSocket listener |
 | `--server` | `ws://127.0.0.1:8420` | Upstream server: `ws://`, `wss://`, or `tcp://host:port` (also `GEWU_SERVER`) |
+| `--server-http` | `http://127.0.0.1:8422` | Upstream HTTP file-download endpoint (also `GEWU_SERVER_HTTP`) |
 | `--token` | — | Shared token required from browsers (also `GEWU_GUI_TOKEN`) |
 | `--allow-anonymous` | off | Permit a non-loopback bind without a token |
 | `--open` | off | Open the GUI in the default browser after starting |
@@ -65,6 +66,14 @@ reverse proxy, TLS, and a strong token.
 File uploads (picker or drag-and-drop) are part of the same surface: they
 write into the upstream server's working-directory root, capped at 50 MB per
 file, with traversal names sanitized and existing files overwritten.
+
+Downloads use a separate HTTP path because a browser download cannot carry the
+WebSocket auth frame. Right-clicking a file or folder in the tree offers
+**Download…**; the GUI mints a 120-second ticket and returns a same-origin
+`/download/<ticket>` URL. The browser never sees the GUI or server token in a
+URL. The GUI streams the file (or folder ZIP) from the upstream endpoint
+configured with `--server-http`, attaching the server token as a bearer
+credential when one is configured.
 
 ## Sessions
 
@@ -114,6 +123,7 @@ clickable scrim, and `Esc` closes an open drawer.
 | `⬆` in the file tree | Open a file picker; selected files upload into the working-directory root |
 | Drag files onto the page | Upload the dropped files the same way |
 | `↻` in the file tree | Refresh the file listing |
+| Right-click a tree file or folder | Download it (folders arrive as a ZIP) |
 
 The transcript streams assistant text and replaces it with rendered Markdown
 when the reply finishes. The status line shows the phase, `provider/model`, the
@@ -168,10 +178,11 @@ its escaped source instead. Prices like `$5 and $10` are left as plain text.
 gewu-gui
   src/cli.rs        flags and upstream endpoint parsing
   src/protocol.rs   browser <-> GUI JSON messages
+  src/download.rs   short-lived HTTP download tickets
   src/workspace.rs  tabs over the shared SessionModel
   src/session.rs    per-browser workspace, upstream connections, event loop
   src/view.rs       transcript/Markdown/tool/status rendering to HTML
-  src/server.rs     axum router, static assets, token auth, /ws
+  src/server.rs     axum router, static assets, token auth, /ws, /download
   src/lib.rs        startup, security checks, listener
   assets/           index.html, app.js, app.css (embedded at build time)
   assets/fonts/     Inter and JetBrains Mono (woff2, SIL OFL 1.1; see OFL-*.txt)

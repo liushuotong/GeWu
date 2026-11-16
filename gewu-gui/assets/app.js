@@ -36,6 +36,7 @@
     filesExpand: document.getElementById("files-expand"),
     drawerBackdrop: document.getElementById("drawer-backdrop"),
     filePreview: document.getElementById("file-preview"),
+    fileMenu: document.getElementById("file-menu"),
     workflowZoom: document.getElementById("workflow-zoom"),
   };
 
@@ -60,6 +61,7 @@
     loadingEarlier: false,
     follow: new Map(),
     workflowZoom: { runId: null, scale: 1, x: 0, y: 0 },
+    fileMenu: { path: null, entry: null },
   };
 
   function loadToken() {
@@ -450,6 +452,11 @@
         el.filePreview.innerHTML = message.html;
         el.filePreview.classList.remove("hidden");
         break;
+      case "download_ready": {
+        if (typeof message.url !== "string" || !message.url.startsWith("/download/")) break;
+        void startDownload(message.url);
+        break;
+      }
       case "close_preview":
         el.filePreview.classList.add("hidden");
         el.filePreview.textContent = "";
@@ -975,13 +982,69 @@
     }
   }
 
+  function openFileMenu(entry, x, y) {
+    state.fileMenu = { path: entry.dataset.path, entry };
+    el.fileMenu.hidden = false;
+    el.fileMenu.style.left = "0px";
+    el.fileMenu.style.top = "0px";
+    const rect = el.fileMenu.getBoundingClientRect();
+    const left = Math.max(8, Math.min(x, window.innerWidth - rect.width - 8));
+    const top = Math.max(8, Math.min(y, window.innerHeight - rect.height - 8));
+    el.fileMenu.style.left = `${left}px`;
+    el.fileMenu.style.top = `${top}px`;
+    const item = el.fileMenu.querySelector("button");
+    if (item) item.focus({ preventScroll: true });
+  }
+
+  function closeFileMenu(restoreFocus = false) {
+    if (el.fileMenu.hidden) return;
+    el.fileMenu.hidden = true;
+    const entry = state.fileMenu.entry;
+    state.fileMenu = { path: null, entry: null };
+    if (restoreFocus && entry) entry.focus({ preventScroll: true });
+  }
+
+  async function startDownload(url) {
+    try {
+      const head = await fetch(url, { method: "HEAD", credentials: "same-origin" });
+      if (!head.ok) {
+        const message = await head.text();
+        showAlert(message || `Download failed (${head.status})`, "error");
+        return;
+      }
+    } catch (error) {
+      showAlert(`Download failed: ${error}`, "error");
+      return;
+    }
+    const link = document.createElement("a");
+    link.href = url;
+    link.download = "";
+    link.rel = "noopener";
+    link.hidden = true;
+    document.body.appendChild(link);
+    link.click();
+    link.remove();
+  }
+
   document.addEventListener("click", (event) => {
     if (!event.target.closest(".block.user")) closeMessageMenus();
     if (!event.target.closest(".session-workspace-menu") && !event.target.closest("[data-session-workspace-menu]")) {
       closeWorkspaceMenus();
     }
+    if (!event.target.closest("#file-menu")) closeFileMenu();
+  });
+  document.addEventListener("contextmenu", (event) => {
+    if (event.target.closest("#file-menu")) return;
+    if (event.target.closest("[data-path].tree-file, [data-path].tree-dir")) return;
+    closeFileMenu();
   });
   document.addEventListener("keydown", (event) => {
+    if (event.key === "Escape" && !el.fileMenu.hidden) {
+      closeFileMenu(true);
+      event.preventDefault();
+      event.stopImmediatePropagation();
+      return;
+    }
     if (event.key === "Escape" && el.transcript.querySelector('.message-menu-trigger[aria-expanded="true"]')) {
       closeMessageMenus(true);
       event.preventDefault();
@@ -1014,6 +1077,32 @@
     }
     if (event.target.closest("[data-tree-refresh]")) { send({ op: "refresh_tree" }); }
   });
+
+  el.sidebar.addEventListener("contextmenu", (event) => {
+    const entry = event.target.closest("[data-path].tree-file, [data-path].tree-dir");
+    if (!entry) return;
+    event.preventDefault();
+    openFileMenu(entry, event.clientX, event.clientY);
+  });
+
+  el.sidebar.addEventListener("keydown", (event) => {
+    if (event.key !== "ContextMenu" && !(event.shiftKey && event.key === "F10")) return;
+    const entry = event.target.closest("[data-path].tree-file, [data-path].tree-dir");
+    if (!entry) return;
+    event.preventDefault();
+    const rect = entry.getBoundingClientRect();
+    openFileMenu(entry, rect.left + 16, rect.bottom);
+  });
+
+  el.fileMenu.addEventListener("click", (event) => {
+    if (!event.target.closest("[data-file-download]")) return;
+    const path = state.fileMenu.path;
+    closeFileMenu();
+    if (path) send({ op: "download", path });
+  });
+
+  window.addEventListener("resize", () => closeFileMenu());
+  el.sidebar.addEventListener("scroll", () => closeFileMenu(), true);
 
   el.sessionSidebar.addEventListener("click", (event) => {
     if (event.target.closest("[data-sessions-collapse]")) {

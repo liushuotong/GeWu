@@ -52,6 +52,10 @@ struct Cli {
     #[arg(long, default_value_t = 0)]
     tcp_port: u16,
 
+    /// HTTP file-download port of the agent server (0 = pick a free port)
+    #[arg(long, default_value_t = 0)]
+    http_port: u16,
+
     /// Host the web GUI binds to
     #[arg(long, default_value = "127.0.0.1")]
     gui_host: String,
@@ -122,6 +126,7 @@ async fn main() -> Result<()> {
                 host: cli.host,
                 ws_port: cli.ws_port,
                 tcp_port: cli.tcp_port,
+                http_port: cli.http_port,
                 gui_host: cli.gui_host,
                 gui_port: cli.gui_port,
                 token: cli.token,

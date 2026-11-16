@@ -1,10 +1,12 @@
 //! Server mode for gewu-server.
 //!
 //! Lets other programs connect to a running GeWu agent, send prompts, and
-//! receive streamed agent events. Supports two transports:
+//! receive streamed agent events. Two transports carry the agent protocol,
+//! and a third serves downloads:
 //!
 //! - **WebSocket** (port 8420): text frames, one JSON message per frame.
 //! - **TCP** (port 8421): newline-delimited JSON, one message per line.
+//! - **HTTP** (port 8422): streaming file and folder-ZIP downloads.
 //!
 //! Both transports share the same protocol (see [`protocol`]) and the same
 //! session model: each connection gets an agent created lazily on its first
@@ -39,6 +41,7 @@ use registry::create_agent;
 use serde_json::Value;
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::net::SocketAddr;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
@@ -51,12 +54,16 @@ use crate::bootstrap::Bootstrap;
 use crate::registry;
 pub use protocol::{ClientRequest, Op, RequestError, ServerMessage};
 
-/// Default bind address for both listeners.
+mod download;
+
+/// Default bind address for all listeners.
 pub const DEFAULT_HOST: &str = "127.0.0.1";
 /// Default port for the WebSocket listener.
 pub const DEFAULT_WS_PORT: u16 = 8420;
 /// Default port for the TCP listener.
 pub const DEFAULT_TCP_PORT: u16 = 8421;
+/// Default port for the HTTP file-download listener.
+pub const DEFAULT_HTTP_PORT: u16 = 8422;
 
 /// Maximum accepted inbound TCP line length. Larger lines (and lines that
 /// never terminate within this budget) are rejected with an error frame
@@ -368,6 +375,7 @@ pub async fn serve(
     host: &str,
     ws_port: u16,
     tcp_port: u16,
+    http_port: u16,
     token: Option<String>,
 ) -> Result<()> {
     let ws_addr: SocketAddr = format!("{}:{}", host, ws_port)
@@ -376,6 +384,9 @@ pub async fn serve(
     let tcp_addr: SocketAddr = format!("{}:{}", host, tcp_port)
         .parse()
         .context("Invalid TCP bind address")?;
+    let http_addr: SocketAddr = format!("{}:{}", host, http_port)
+        .parse()
+        .context("Invalid HTTP bind address")?;
 
     let ws_listener = TcpListener::bind(ws_addr)
         .await
@@ -383,6 +394,9 @@ pub async fn serve(
     let tcp_listener = TcpListener::bind(tcp_addr)
         .await
         .with_context(|| format!("Failed to bind TCP listener on {}", tcp_addr))?;
+    let http_listener = TcpListener::bind(http_addr)
+        .await
+        .with_context(|| format!("Failed to bind HTTP listener on {}", http_addr))?;
 
     let (workflow_progress, workflow_rx) = tokio::sync::broadcast::channel(256);
     let state = Arc::new(ServerState {
@@ -400,6 +414,7 @@ pub async fn serve(
     info!("gewu server listening:");
     info!("  WebSocket: ws://{}", ws_addr);
     info!("  TCP (newline-delimited JSON): {}", tcp_addr);
+    info!("  HTTP downloads: http://{}", http_addr);
     if state.token.is_some() {
         info!("authentication required (clients send the 'auth' op first)");
     }
@@ -422,6 +437,12 @@ pub async fn serve(
         Transport::Tcp,
         conn_tx.clone(),
     ));
+    let http_router = download::router(state.clone());
+    tasks.spawn(async move {
+        if let Err(error) = axum::serve(http_listener, http_router).await {
+            warn!("HTTP listener failed: {error}");
+        }
+    });
     drop(conn_tx); // accept loops hold the remaining senders
 
     // Run until Ctrl+C (or until both accept loops exit). Connection
@@ -940,6 +961,32 @@ enum Handled {
         id: Value,
         session: ConnectionSession,
     },
+}
+
+/// Resolve `path` inside `root`, applying the configured containment level.
+fn resolve_workspace_path(
+    root: &str,
+    path: &str,
+    enforcement: PathEnforcement,
+) -> Result<PathBuf, RequestError> {
+    match enforcement {
+        PathEnforcement::None => Ok(Path::new(root).join(path)),
+        _ => {
+            let file = gewu_tools::fs_utils::resolve_safe_path(root, path)
+                .map_err(|e| RequestError::Invalid(e.to_string()))?;
+            let canonical_root = std::fs::canonicalize(root).map_err(|e| {
+                RequestError::Failed(format!("cannot resolve working directory: {e}"))
+            })?;
+            let canonical_file = std::fs::canonicalize(&file)
+                .map_err(|e| RequestError::Failed(format!("cannot read file: {e}")))?;
+            if !canonical_file.starts_with(&canonical_root) {
+                return Err(RequestError::Invalid(
+                    "file is outside the working directory".into(),
+                ));
+            }
+            Ok(canonical_file)
+        }
+    }
 }
 
 /// Handle one parsed client request, producing a reply or an ask to run.
@@ -1653,24 +1700,7 @@ async fn handle_request(
                 .as_ref()
                 .map(|current| current.workspace.path.clone())
                 .unwrap_or_else(|| state.bootstrap.working_directory.clone());
-            let file = match state.bootstrap.enforcement {
-                PathEnforcement::None => std::path::Path::new(&root).join(&path),
-                _ => {
-                    let file = gewu_tools::fs_utils::resolve_safe_path(&root, &path)
-                        .map_err(|e| RequestError::Invalid(e.to_string()))?;
-                    let canonical_root = std::fs::canonicalize(&root).map_err(|e| {
-                        RequestError::Failed(format!("cannot resolve working directory: {e}"))
-                    })?;
-                    let canonical_file = std::fs::canonicalize(&file)
-                        .map_err(|e| RequestError::Failed(format!("cannot read file: {e}")))?;
-                    if !canonical_file.starts_with(&canonical_root) {
-                        return Err(RequestError::Invalid(
-                            "file is outside the working directory".into(),
-                        ));
-                    }
-                    canonical_file
-                }
-            };
+            let file = resolve_workspace_path(&root, &path, state.bootstrap.enforcement)?;
             let metadata = std::fs::metadata(&file)
                 .map_err(|e| RequestError::Failed(format!("cannot read file: {e}")))?;
             if !metadata.is_file() {

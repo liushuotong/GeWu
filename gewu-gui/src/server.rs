@@ -1,14 +1,17 @@
 //! The HTTP/WebSocket surface of the web GUI.
 //!
 //! A single axum listener serves the embedded single-page app plus the JSON
-//! configuration endpoint and the `/ws` connection that carries
-//! [`ClientMsg`] and [`ServerMsg`] frames. When a token is configured, the
-//! first WebSocket frame must be `{"op":"auth","token":"…"}`.
+//! configuration endpoint, the `/ws` connection that carries [`ClientMsg`]
+//! and [`ServerMsg`] frames, and ticket-authorized `/download` streaming.
+//! When a token is configured, the first WebSocket frame must be
+//! `{"op":"auth","token":"…"}`.
 
+use std::sync::Arc;
 use std::time::Duration;
 
 use axum::Json;
 use axum::Router;
+use axum::body::Body;
 use axum::extract::ws::{Message, WebSocket, WebSocketUpgrade};
 use axum::extract::{Path, State};
 use axum::http::{StatusCode, header};
@@ -21,6 +24,7 @@ use tokio::time::timeout;
 use tracing::{info, warn};
 
 use crate::cli::Endpoint;
+use crate::download::DownloadTickets;
 use crate::protocol::{ClientMsg, ServerMsg};
 use crate::session::GuiSession;
 
@@ -69,6 +73,12 @@ pub struct AppState {
     pub token: Option<String>,
     /// Token for the upstream gewu server, when it requires one.
     pub server_token: Option<String>,
+    /// Upstream HTTP endpoint used for file downloads.
+    pub server_http: String,
+    /// Client for streaming download responses from the upstream.
+    pub http_client: reqwest::Client,
+    /// Short-lived download tickets minted by browser sessions.
+    pub downloads: Arc<DownloadTickets>,
 }
 
 /// Serve the GUI until the listener fails.
@@ -90,6 +100,7 @@ pub fn router(state: AppState) -> Router {
         .route("/app.css", get(app_css))
         .route("/fonts/{name}", get(font))
         .route("/api/config", get(config))
+        .route("/download/{ticket}", get(download).head(download_head))
         .route("/ws", get(ws_handler))
         .with_state(state)
 }
@@ -156,6 +167,77 @@ async fn config(State(state): State<AppState>) -> Json<ConfigResponse> {
     })
 }
 
+async fn download(State(state): State<AppState>, Path(ticket): Path<String>) -> Response {
+    proxy_download(state, ticket, false).await
+}
+
+async fn download_head(State(state): State<AppState>, Path(ticket): Path<String>) -> Response {
+    proxy_download(state, ticket, true).await
+}
+
+/// Stream one ticket-authorized download from the upstream HTTP endpoint.
+async fn proxy_download(state: AppState, ticket: String, head_only: bool) -> Response {
+    let Ok(id) = uuid::Uuid::parse_str(&ticket) else {
+        return (StatusCode::NOT_FOUND, "download link is invalid or expired").into_response();
+    };
+    let Some((session_id, path)) = state.downloads.get(&id) else {
+        return (StatusCode::NOT_FOUND, "download link is invalid or expired").into_response();
+    };
+
+    let url = format!("{}/download", state.server_http.trim_end_matches('/'));
+    let request = if head_only {
+        state.http_client.head(&url)
+    } else {
+        state.http_client.get(&url)
+    };
+    let mut request =
+        request.query(&[("session_id", session_id.as_str()), ("path", path.as_str())]);
+    if let Some(token) = state.server_token.as_deref() {
+        request = request.bearer_auth(token);
+    }
+    let upstream = match request.send().await {
+        Ok(response) => response,
+        Err(error) => {
+            return (StatusCode::BAD_GATEWAY, format!("download failed: {error}")).into_response();
+        }
+    };
+    let status = StatusCode::from_u16(upstream.status().as_u16())
+        .unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
+    if !upstream.status().is_success() {
+        let message = upstream
+            .text()
+            .await
+            .unwrap_or_else(|_| "download failed".to_string());
+        return (status, message).into_response();
+    }
+
+    let mut builder = Response::builder()
+        .status(status)
+        .header(header::CACHE_CONTROL, "no-store");
+    for name in [
+        header::CONTENT_TYPE,
+        header::CONTENT_LENGTH,
+        header::CONTENT_DISPOSITION,
+        header::X_CONTENT_TYPE_OPTIONS,
+    ] {
+        if let Some(value) = upstream.headers().get(&name) {
+            builder = builder.header(name, value);
+        }
+    }
+    let body = if head_only {
+        Body::empty()
+    } else {
+        Body::from_stream(upstream.bytes_stream())
+    };
+    builder.body(body).unwrap_or_else(|error| {
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("download response failed: {error}"),
+        )
+            .into_response()
+    })
+}
+
 async fn ws_handler(ws: WebSocketUpgrade, State(state): State<AppState>) -> Response {
     ws.on_upgrade(move |socket| handle_socket(socket, state))
 }
@@ -175,6 +257,7 @@ async fn handle_socket(mut socket: WebSocket, state: AppState) {
         state.server_token.as_deref(),
         &state.version,
         state.updates.clone(),
+        state.downloads.clone(),
     )
     .await
     {
@@ -280,6 +363,9 @@ mod tests {
             server_token: None,
             version: "0.0.0-test".to_string(),
             updates: watch::channel(None).1,
+            server_http: "http://127.0.0.1:8422".to_string(),
+            http_client: reqwest::Client::new(),
+            downloads: Arc::new(DownloadTickets::default()),
         }
     }
 
@@ -723,6 +809,142 @@ mod tests {
         let mut response = Vec::new();
         stream.read_to_end(&mut response).await.unwrap();
         response
+    }
+
+    /// A tiny HTTP upstream that records requests and answers `/download`.
+    async fn spawn_http_upstream(
+        status: &'static str,
+        body: &'static str,
+    ) -> (
+        std::net::SocketAddr,
+        tokio::sync::mpsc::UnboundedReceiver<String>,
+    ) {
+        let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            loop {
+                let Ok((mut stream, _)) = listener.accept().await else {
+                    break;
+                };
+                let tx = tx.clone();
+                tokio::spawn(async move {
+                    let mut request = Vec::new();
+                    let mut chunk = [0u8; 1024];
+                    loop {
+                        let Ok(read) = stream.read(&mut chunk).await else {
+                            return;
+                        };
+                        if read == 0 {
+                            return;
+                        }
+                        request.extend_from_slice(&chunk[..read]);
+                        if request.windows(4).any(|window| window == b"\r\n\r\n") {
+                            break;
+                        }
+                    }
+                    let request = String::from_utf8_lossy(&request).into_owned();
+                    let head_only = request.starts_with("HEAD ");
+                    let _ = tx.send(request);
+                    let headers = format!(
+                        "HTTP/1.1 {status}\r\ncontent-type: application/octet-stream\r\n\
+                         content-disposition: attachment; filename=\"note.txt\"\r\n\
+                         content-length: {}\r\nconnection: close\r\n\r\n",
+                        body.len()
+                    );
+                    let response = if head_only {
+                        headers
+                    } else {
+                        format!("{headers}{body}")
+                    };
+                    let _ = stream.write_all(response.as_bytes()).await;
+                    let _ = stream.shutdown().await;
+                });
+            }
+        });
+        (addr, rx)
+    }
+
+    fn download_client() -> reqwest::Client {
+        reqwest::Client::builder().no_proxy().build().unwrap()
+    }
+
+    #[tokio::test]
+    async fn streams_ticketed_downloads_from_the_http_endpoint() {
+        let (upstream, mut requests) = spawn_http_upstream("200 OK", "hello from upstream").await;
+        let state = AppState {
+            server_http: format!("http://{upstream}"),
+            server_token: Some("upstream-secret".to_string()),
+            ..test_state(None)
+        };
+        let id = state
+            .downloads
+            .mint("sess-1".to_string(), "notes/a note.txt".to_string());
+        let addr = spawn_gui(state).await;
+        let client = download_client();
+
+        let response = client
+            .get(format!("http://{addr}/download/{id}"))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status(), reqwest::StatusCode::OK);
+        assert_eq!(
+            response.headers()[header::CONTENT_DISPOSITION],
+            "attachment; filename=\"note.txt\""
+        );
+        assert_eq!(response.headers()[header::CACHE_CONTROL], "no-store");
+        assert_eq!(response.text().await.unwrap(), "hello from upstream");
+
+        let request = requests.recv().await.unwrap().to_lowercase();
+        assert!(request.starts_with("get /download?"), "{request}");
+        assert!(
+            request.contains("authorization: bearer upstream-secret"),
+            "{request}"
+        );
+        assert!(request.contains("session_id=sess-1"), "{request}");
+        assert!(request.contains("path=notes%2fa"), "{request}");
+
+        let response = client
+            .head(format!("http://{addr}/download/{id}"))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status(), reqwest::StatusCode::OK);
+        assert!(response.text().await.unwrap().is_empty());
+        let request = requests.recv().await.unwrap().to_lowercase();
+        assert!(request.starts_with("head /download?"), "{request}");
+    }
+
+    #[tokio::test]
+    async fn rejects_unknown_download_tickets() {
+        let addr = spawn_gui(test_state(None)).await;
+        let response = download_client()
+            .get(format!("http://{addr}/download/{}", uuid::Uuid::new_v4()))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status(), reqwest::StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn forwards_upstream_download_failures() {
+        let (upstream, _requests) = spawn_http_upstream("404 Not Found", "no such file").await;
+        let state = AppState {
+            server_http: format!("http://{upstream}"),
+            ..test_state(None)
+        };
+        let id = state
+            .downloads
+            .mint("sess-1".to_string(), "missing.txt".to_string());
+        let addr = spawn_gui(state).await;
+        let response = download_client()
+            .get(format!("http://{addr}/download/{id}"))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status(), reqwest::StatusCode::NOT_FOUND);
+        assert_eq!(response.text().await.unwrap(), "no such file");
     }
 
     #[tokio::test]
