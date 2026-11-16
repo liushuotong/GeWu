@@ -93,10 +93,7 @@ fn render_transcript_range(out: &mut String, tab: &Tab, start: usize, end: usize
     let mut index = start;
     while index < end {
         if matches!(tab.model.blocks[index], Block::Tool { .. }) {
-            let run_len = tab.model.blocks[index..end]
-                .iter()
-                .take_while(|block| matches!(block, Block::Tool { .. }))
-                .count();
+            let run_len = tool_run_len(&tab.model.blocks, index, end);
             render_tool_run(out, tab, &tab.model.blocks[index..index + run_len], index);
             index += run_len;
         } else {
@@ -250,10 +247,7 @@ pub fn tool_card_html(tab: &Tab, first: usize) -> Option<String> {
     if !matches!(tab.model.blocks.get(first), Some(Block::Tool { .. })) {
         return None;
     }
-    let run_len = tab.model.blocks[first..]
-        .iter()
-        .take_while(|block| matches!(block, Block::Tool { .. }))
-        .count();
+    let run_len = tool_run_len(&tab.model.blocks, first, tab.model.blocks.len());
     let mut out = String::new();
     render_tool_run(
         &mut out,
@@ -262,6 +256,32 @@ pub fn tool_card_html(tab: &Tab, first: usize) -> Option<String> {
         first,
     );
     Some(out)
+}
+
+/// Whether `next` continues the tool run started by `prev`. Skill loads are
+/// standalone cards so their name stays visible instead of folding into an
+/// "Explored" group.
+pub(crate) fn same_tool_run(prev: &Block, next: &Block) -> bool {
+    match (prev, next) {
+        (Block::Tool { tool: prev, .. }, Block::Tool { tool: next, .. }) => {
+            prev != "skill" && next != "skill"
+        }
+        _ => false,
+    }
+}
+
+/// Number of blocks rendered as one tool card, starting at the tool block
+/// `first` and clamped to `end`.
+pub(crate) fn tool_run_len(blocks: &[Block], first: usize, end: usize) -> usize {
+    let end = end.min(blocks.len());
+    if first >= end || !matches!(blocks[first], Block::Tool { .. }) {
+        return 0;
+    }
+    let mut len = 1;
+    while first + len < end && same_tool_run(&blocks[first + len - 1], &blocks[first + len]) {
+        len += 1;
+    }
+    len
 }
 
 /// Render a run of consecutive tool blocks inside one card.
@@ -2016,6 +2036,7 @@ mod tests {
             ("read", "src/a.rs".to_string())
         );
         assert_eq!(tool_row("apply_patch", "p.diff").0, "patch");
+        assert_eq!(tool_row("skill", "demo"), ("skill", "demo".to_string()));
         assert_eq!(tool_row("custom_tool", "{}").0, "custom_tool");
     }
 
@@ -2522,6 +2543,56 @@ mod tests {
         let html = transcript_html(ws.tab(id).unwrap());
         assert!(html.contains("− Explored: 1 bash, 1 read"), "{html}");
         assert!(html.contains("src/main.rs"), "{html}");
+    }
+
+    #[test]
+    fn skill_loads_are_not_grouped_with_neighboring_tools() {
+        let (ws, id) = tab_with_blocks(vec![
+            Block::Tool {
+                tool: "bash".into(),
+                input: "ls".into(),
+                output: Some("a".into()),
+                images: Vec::new(),
+                status: None,
+            },
+            Block::Tool {
+                tool: "read_file".into(),
+                input: "src/main.rs".into(),
+                output: Some("b".into()),
+                images: Vec::new(),
+                status: None,
+            },
+            Block::Tool {
+                tool: "skill".into(),
+                input: "demo".into(),
+                output: Some("<skill_content name=\"demo\">body</skill_content>".into()),
+                images: Vec::new(),
+                status: None,
+            },
+            Block::Tool {
+                tool: "bash".into(),
+                input: "pwd".into(),
+                output: Some("/tmp".into()),
+                images: Vec::new(),
+                status: None,
+            },
+            Block::Tool {
+                tool: "read_file".into(),
+                input: "Cargo.toml".into(),
+                output: Some("c".into()),
+                images: Vec::new(),
+                status: None,
+            },
+        ]);
+        let html = transcript_html(ws.tab(id).unwrap());
+        assert_eq!(
+            html.matches("Explored: 1 bash, 1 read").count(),
+            2,
+            "{html}"
+        );
+        assert!(html.contains("tool-name\">skill"), "{html}");
+        assert!(html.contains("tool-title\">demo"), "{html}");
+        assert!(!html.contains("1 skill"), "{html}");
     }
 
     #[test]

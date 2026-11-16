@@ -1028,6 +1028,7 @@ mod tests {
             summarize_tool_input("read_file", r#"{"file_path":"/a/b.rs"}"#),
             "/a/b.rs"
         );
+        assert_eq!(summarize_tool_input("skill", r#"{"name":"demo"}"#), "demo");
         assert_eq!(summarize_tool_input("bash", "not json"), "not json");
     }
 

@@ -726,6 +726,10 @@ pub fn summarize_tool_input(tool: &str, input: &str) -> String {
             .get("description")
             .and_then(|d| d.as_str())
             .map(str::to_string),
+        "skill" => value
+            .get("name")
+            .and_then(|n| n.as_str())
+            .map(str::to_string),
         // The GUI renders the workflow graph from the spec, so keep it whole.
         "workflow_start" => value.get("spec").map(|spec| spec.to_string()),
         "workflow_status" | "workflow_cancel" => value

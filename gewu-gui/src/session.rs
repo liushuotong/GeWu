@@ -77,7 +77,8 @@ fn tool_update(blocks: &[Block], affected: Option<usize>, appended: bool) -> Tab
     let Some(run_start) = tool_run_start(blocks, index) else {
         return TabUpdate::Full;
     };
-    let new_run = appended && (index == 0 || !matches!(blocks[index - 1], Block::Tool { .. }));
+    let new_run =
+        appended && (index == 0 || !view::same_tool_run(&blocks[index - 1], &blocks[index]));
     if new_run {
         TabUpdate::ToolCardStart(run_start)
     } else {
@@ -1218,11 +1219,8 @@ impl GuiSession {
                 if let Some(tab) = self.workspace.tab_mut(tab) {
                     // Workflow runs default to expanded, so their toggle
                     // collapses; other runs toggle expansion as before.
-                    let run_len = tab.model.blocks.get(block..).map_or(0, |rest| {
-                        rest.iter()
-                            .take_while(|b| matches!(b, Block::Tool { .. }))
-                            .count()
-                    });
+                    let run_len =
+                        view::tool_run_len(&tab.model.blocks, block, tab.model.blocks.len());
                     let workflow = block < tab.model.blocks.len()
                         && crate::view::is_workflow_run(&tab.model.blocks[block..block + run_len]);
                     if workflow {
@@ -2049,7 +2047,7 @@ fn tool_run_start(blocks: &[Block], block: usize) -> Option<usize> {
         return None;
     }
     let mut start = block;
-    while start > 0 && matches!(blocks[start - 1], Block::Tool { .. }) {
+    while start > 0 && view::same_tool_run(&blocks[start - 1], &blocks[start]) {
         start -= 1;
     }
     Some(start)
@@ -2200,6 +2198,29 @@ mod tests {
             tool_update(&blocks, Some(2), true),
             TabUpdate::ToolCardStart(2)
         ));
+    }
+
+    #[test]
+    fn tool_update_treats_skill_cards_as_standalone() {
+        // A skill next to another tool gets its own card.
+        let blocks = vec![tool("bash", Some("out")), tool("skill", None)];
+        assert_eq!(tool_run_start(&blocks, 1), Some(1));
+        assert!(matches!(
+            tool_update(&blocks, Some(1), false),
+            TabUpdate::ToolCard(1)
+        ));
+
+        // A tool after a skill starts a fresh card.
+        let blocks = vec![tool("skill", Some("loaded")), tool("bash", None)];
+        assert_eq!(tool_run_start(&blocks, 1), Some(1));
+        assert!(matches!(
+            tool_update(&blocks, Some(1), true),
+            TabUpdate::ToolCardStart(1)
+        ));
+
+        // Two skills never share a card.
+        let blocks = vec![tool("skill", None), tool("skill", Some("loaded"))];
+        assert_eq!(tool_run_start(&blocks, 1), Some(1));
     }
 
     #[test]

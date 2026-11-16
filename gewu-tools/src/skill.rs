@@ -2,8 +2,8 @@
 //!
 //! This module provides the [`SkillTool`] which loads specialized skill
 //! instructions into the conversation. Skills are markdown files named
-//! `SKILL.md` with frontmatter (`name`, optional `description`) discovered
-//! from config-declared directories.
+//! `SKILL.md` with YAML frontmatter (`name`, optional `description`)
+//! discovered from config-declared directories.
 //!
 //! # Tool Definition
 //!
@@ -34,6 +34,14 @@ pub struct SkillInfo {
     pub content: String,
 }
 
+/// Parsed YAML frontmatter. Unknown keys are ignored.
+#[derive(Debug, Deserialize)]
+struct SkillFrontmatter {
+    name: String,
+    #[serde(default)]
+    description: Option<String>,
+}
+
 /// Splits markdown frontmatter (`key: value` lines between leading `---`
 /// fences) from the body. Returns `None` when there is no frontmatter.
 fn split_frontmatter(content: &str) -> Option<(&str, &str)> {
@@ -45,37 +53,12 @@ fn split_frontmatter(content: &str) -> Option<(&str, &str)> {
     Some((front, body))
 }
 
-/// Parses simple `key: value` entries from frontmatter text.
-///
-/// Values may be quoted; unknown keys, comments, and blank lines are ignored.
-fn parse_entries(front: &str) -> Vec<(String, String)> {
-    front
-        .lines()
-        .filter_map(|line| {
-            let line = line.trim();
-            if line.is_empty() || line.starts_with('#') {
-                return None;
-            }
-            let (key, value) = line.split_once(':')?;
-            let value = value.trim().trim_matches(|c| c == '"' || c == '\'');
-            Some((key.trim().to_string(), value.to_string()))
-        })
-        .collect()
-}
-
-fn lookup<'a>(entries: &'a [(String, String)], key: &str) -> Option<&'a str> {
-    entries
-        .iter()
-        .find(|(k, _)| k == key)
-        .map(|(_, v)| v.as_str())
-}
-
 /// Scans directories for `SKILL.md` files and parses their frontmatter.
 ///
-/// The `name` frontmatter key is required; files without it are skipped.
-/// Directories are processed in the given order and entries within each
-/// directory are sorted, so duplicate names deterministically let the
-/// later path win.
+/// The `name` frontmatter key is required and files with invalid frontmatter
+/// are skipped. Directories are processed in the given order and entries
+/// within each directory are sorted, so duplicate names deterministically
+/// let the later path win.
 pub fn discover(directories: &[PathBuf]) -> Vec<SkillInfo> {
     let mut skills: Vec<SkillInfo> = Vec::new();
     for directory in directories {
@@ -99,22 +82,26 @@ pub fn discover(directories: &[PathBuf]) -> Vec<SkillInfo> {
             let Some((front, body)) = split_frontmatter(&content) else {
                 continue;
             };
-            let entries = parse_entries(front);
-            let Some(name) = lookup(&entries, "name") else {
-                continue;
+            let frontmatter: SkillFrontmatter = match yaml_serde::from_str(front) {
+                Ok(frontmatter) => frontmatter,
+                Err(error) => {
+                    warn!(
+                        "skipping skill {}: invalid frontmatter: {error}",
+                        location.display()
+                    );
+                    continue;
+                }
             };
-            let name = name.to_string();
-            let description = lookup(&entries, "description").map(str::to_string);
             let skill = SkillInfo {
-                name: name.clone(),
-                description,
+                name: frontmatter.name.clone(),
+                description: frontmatter.description,
                 location,
                 content: body.to_string(),
             };
-            if let Some(existing) = skills.iter_mut().find(|s| s.name == name) {
+            if let Some(existing) = skills.iter_mut().find(|s| s.name == skill.name) {
                 warn!(
                     "duplicate skill name {} ({} overrides {})",
-                    name,
+                    skill.name,
                     skill.location.display(),
                     existing.location.display()
                 );
@@ -376,14 +363,69 @@ mod tests {
     }
 
     #[test]
-    fn parse_entries_handles_quotes_comments_and_unknown_keys() {
-        let entries = parse_entries(
-            "name: \"my-skill\"\ndescription: 'Does things'\nversion: 2\n# comment\n",
+    fn discover_parses_yaml_frontmatter() {
+        let dir = tempdir().unwrap();
+        let root = dir.path().to_path_buf();
+        write_skill(
+            &root,
+            "demo",
+            "name: \"my-skill\"\ndescription: 'Does things'\nversion: 2\n\
+             references:\n  - workers\n  - pages\n# comment",
+            "body",
         );
-        assert_eq!(lookup(&entries, "name"), Some("my-skill"));
-        assert_eq!(lookup(&entries, "description"), Some("Does things"));
-        assert_eq!(lookup(&entries, "version"), Some("2"));
-        assert_eq!(lookup(&entries, "missing"), None);
+
+        let skills = discover(&[root]);
+        assert_eq!(skills.len(), 1);
+        assert_eq!(skills[0].name, "my-skill");
+        assert_eq!(skills[0].description.as_deref(), Some("Does things"));
+    }
+
+    #[test]
+    fn discover_supports_literal_block_description() {
+        let dir = tempdir().unwrap();
+        let root = dir.path().to_path_buf();
+        write_skill(
+            &root,
+            "multiline",
+            "name: multiline\ndescription: |\n  First line.\n\n  Second paragraph.",
+            "body",
+        );
+
+        let skills = discover(&[root]);
+        assert_eq!(
+            skills[0].description.as_deref(),
+            Some("First line.\n\nSecond paragraph.")
+        );
+    }
+
+    #[test]
+    fn discover_supports_folded_block_description() {
+        let dir = tempdir().unwrap();
+        let root = dir.path().to_path_buf();
+        write_skill(
+            &root,
+            "folded",
+            "name: folded\ndescription: >\n  Folded text\n  across two lines.",
+            "body",
+        );
+
+        let skills = discover(&[root]);
+        assert_eq!(
+            skills[0].description.as_deref(),
+            Some("Folded text across two lines.")
+        );
+    }
+
+    #[test]
+    fn discover_skips_invalid_frontmatter() {
+        let dir = tempdir().unwrap();
+        let root = dir.path().to_path_buf();
+        write_skill(&root, "broken", "name: [unclosed", "body");
+        write_skill(&root, "valid", "name: valid", "body");
+
+        let skills = discover(&[root]);
+        assert_eq!(skills.len(), 1);
+        assert_eq!(skills[0].name, "valid");
     }
 
     #[test]

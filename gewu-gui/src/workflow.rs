@@ -200,7 +200,7 @@ pub(crate) fn run_update_target(blocks: &[Block], run_id: &str) -> Option<usize>
         )
     })?;
     let mut start = index;
-    while start > 0 && matches!(blocks[start - 1], Block::Tool { .. }) {
+    while start > 0 && crate::view::same_tool_run(&blocks[start - 1], &blocks[start]) {
         start -= 1;
     }
     Some(start)
@@ -227,10 +227,17 @@ pub(crate) fn run_id_for_block(blocks: &[Block], block: usize) -> Option<String>
 /// Only the newest workflow row draws the graph, so a start card followed by
 /// status cards does not stack duplicate graphs.
 fn later_workflow_row(blocks: &[Block], index: usize) -> bool {
-    blocks[index + 1..]
-        .iter()
-        .take_while(|block| matches!(block, Block::Tool { .. }))
-        .any(|block| matches!(block, Block::Tool { tool, .. } if tool.starts_with("workflow_")))
+    let mut prev = &blocks[index];
+    for block in &blocks[index + 1..] {
+        if !crate::view::same_tool_run(prev, block) {
+            break;
+        }
+        if matches!(block, Block::Tool { tool, .. } if tool.starts_with("workflow_")) {
+            return true;
+        }
+        prev = block;
+    }
+    false
 }
 
 /// The run_id from a status/cancel input: plain id (summarized) or the
@@ -1092,6 +1099,37 @@ mod tests {
         assert_eq!(run_id_for_block(&blocks, 1).as_deref(), Some("r-1"));
         assert_eq!(run_id_for_block(&blocks, 2).as_deref(), Some("r-1"));
         assert_eq!(run_id_for_block(&blocks, 0), None);
+    }
+
+    #[test]
+    fn skill_cards_bound_workflow_run_groups() {
+        let blocks = vec![
+            Block::Tool {
+                tool: "skill".into(),
+                input: "demo".into(),
+                output: Some("loaded".into()),
+                images: Vec::new(),
+                status: None,
+            },
+            Block::Tool {
+                tool: "workflow_start".into(),
+                input: SPEC.into(),
+                output: Some("Started workflow run r-1. It executes in the background.".into()),
+                images: Vec::new(),
+                status: None,
+            },
+            Block::Tool {
+                tool: "workflow_status".into(),
+                input: "r-1".into(),
+                output: Some(SNAPSHOT.into()),
+                images: Vec::new(),
+                status: None,
+            },
+        ];
+        // The skill is not part of the workflow start's card.
+        assert_eq!(run_update_target(&blocks, "r-1"), Some(1));
+        assert!(!later_workflow_row(&blocks, 0));
+        assert!(later_workflow_row(&blocks, 1));
     }
 
     #[test]
