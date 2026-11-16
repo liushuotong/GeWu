@@ -14,7 +14,7 @@ use futures::{SinkExt, StreamExt};
 use gewu_client::session::{Block, Phase};
 use gewu_client::{AskStream, Client, Error as ClientError};
 use gewu_protocol::{AgentEvent, ServerMessage, WorkspaceSummary};
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, watch};
 use tokio::task::JoinHandle;
 use tracing::{debug, warn};
 
@@ -192,6 +192,10 @@ pub struct GuiSession {
     server_token: Option<String>,
     /// Version shown in the session sidebar.
     version: String,
+    /// Latest release notice shown in the session sidebar.
+    update: Option<gewu_update::Update>,
+    /// Release notices published by the GUI's background check.
+    updates: watch::Receiver<Option<gewu_update::Update>>,
     admin: Client,
     workspace: Workspace,
     conns: HashMap<u64, Conn>,
@@ -215,6 +219,7 @@ pub struct GuiSession {
 enum Incoming {
     Socket(Option<Result<Message, axum::Error>>),
     Tab(Option<TabEvent>),
+    Update(bool),
 }
 
 impl GuiSession {
@@ -223,6 +228,7 @@ impl GuiSession {
         endpoint: &Endpoint,
         server_token: Option<&str>,
         version: &str,
+        updates: watch::Receiver<Option<gewu_update::Update>>,
     ) -> Result<Self> {
         let admin = endpoint
             .connect_with_token(server_token)
@@ -308,10 +314,13 @@ impl GuiSession {
             tab.model_label = model_label.clone();
         }
 
+        let update = updates.borrow().clone();
         Ok(Self {
             endpoint: endpoint.clone(),
             server_token: server_token.map(str::to_string),
             version: version.to_string(),
+            update,
+            updates,
             admin,
             workspace,
             conns: HashMap::new(),
@@ -379,10 +388,12 @@ impl GuiSession {
         // tab's upstream connection.
         self.activate_active(&mut sender).await?;
 
+        let mut updates_live = true;
         loop {
             let incoming = tokio::select! {
                 message = receiver.next() => Incoming::Socket(message),
                 event = tab_rx.recv() => Incoming::Tab(event),
+                changed = self.updates.changed(), if updates_live => Incoming::Update(changed.is_ok()),
             };
 
             match incoming {
@@ -416,6 +427,17 @@ impl GuiSession {
                         self.send_error(&mut sender, e.to_string()).await?;
                     }
                 }
+                Incoming::Update(true) => {
+                    self.update = self.updates.borrow().clone();
+                    send_msg(
+                        &mut sender,
+                        &ServerMsg::SessionSidebar {
+                            html: self.session_sidebar(),
+                        },
+                    )
+                    .await?;
+                }
+                Incoming::Update(false) => updates_live = false,
                 // The keepalive sender means this cannot normally happen.
                 Incoming::Tab(None) => break,
             }
@@ -446,12 +468,7 @@ impl GuiSession {
                 &self.expanded_dirs,
                 &self.file_cache,
             ),
-            session_sidebar: view::session_sidebar_html(
-                &self.workspace.infos(),
-                &self.visible_workspaces(),
-                active,
-                &self.version,
-            ),
+            session_sidebar: self.session_sidebar(),
         }
     }
 
@@ -474,6 +491,18 @@ impl GuiSession {
             .or_else(|| self.working_directory.clone())
     }
 
+    /// Session sidebar HTML, including any available release notice.
+    fn session_sidebar(&self) -> String {
+        let latest = self.update.as_ref().map(|update| update.latest.to_string());
+        view::session_sidebar_html_with_update(
+            &self.workspace.infos(),
+            &self.visible_workspaces(),
+            self.workspace.active_id(),
+            &self.version,
+            latest.as_deref(),
+        )
+    }
+
     async fn send_tabs(&self, sender: &mut Sender) -> Result<()> {
         send_msg(
             sender,
@@ -486,12 +515,7 @@ impl GuiSession {
         send_msg(
             sender,
             &ServerMsg::SessionSidebar {
-                html: view::session_sidebar_html(
-                    &self.workspace.infos(),
-                    &self.visible_workspaces(),
-                    self.workspace.active_id(),
-                    &self.version,
-                ),
+                html: self.session_sidebar(),
             },
         )
         .await?;

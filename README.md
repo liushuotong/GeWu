@@ -30,6 +30,22 @@ On other platforms, build from source with a Rust toolchain (see
 cargo install --path gewu    # builds and installs the `gewu` binary
 ```
 
+## Update
+
+At startup, `gewu` checks GitHub for a newer release and prints a notice in
+the terminal and the session sidebar. It never installs on its own. To update
+explicitly:
+
+```bash
+gewu update          # download, verify, and replace the current binary
+gewu update --check  # only report what is available
+```
+
+`gewu update` verifies the release archive against the published SHA-256
+checksum, and the new version takes effect on the next launch. Set
+`GEWU_NO_UPDATE_CHECK=1` or pass `--no-update-check` to disable the startup
+check.
+
 ## Configure
 
 GeWu needs one LLM endpoint. Either export credentials:

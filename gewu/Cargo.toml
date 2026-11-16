@@ -7,6 +7,7 @@ edition = "2024"
 gewu-client = { path = "../gewu-client" }
 gewu-gui = { path = "../gewu-gui" }
 gewu-server = { path = "../gewu-server" }
+gewu-update = { path = "../gewu-update" }
 anyhow = "1.0"
 clap = { version = "4.5", features = ["derive", "env"] }
 dotenvy = "0.15"

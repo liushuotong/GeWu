@@ -1083,11 +1083,13 @@ pub fn sidebar_tabs_with_workspaces_html(
 /// Render the left session manager: workspace groups with their sessions.
 ///
 /// `version` is the running app's version, shown next to the brand.
-pub fn session_sidebar_html(
+/// Render the session sidebar, with an optional newest-release badge.
+pub fn session_sidebar_html_with_update(
     tabs: &[TabInfo],
     workspaces: &[WorkspaceSummary],
     active: u64,
     version: &str,
+    latest: Option<&str>,
 ) -> String {
     let mut workspace_ids: Vec<String> = workspaces
         .iter()
@@ -1099,8 +1101,20 @@ pub fn session_sidebar_html(
         }
     }
 
+    let update = latest
+        .map(|latest| {
+            format!(
+                "<div class=\"session-update\" role=\"status\" aria-live=\"polite\" \
+                 title=\"Run `gewu update` in a terminal, then restart GeWu.\">\
+                 <span class=\"session-update-icon\" aria-hidden=\"true\">↑</span>\
+                 <span>Update available: v{}</span></div>",
+                escape(latest)
+            )
+        })
+        .unwrap_or_default();
+
     let mut out = format!(
-        "<aside class=\"session-sidebar\" aria-label=\"Sessions by workspace\"><header class=\"session-sidebar-header\"><span class=\"brand-mark session-brand\" title=\"GeWu agent\"><svg class=\"brand-icon\" viewBox=\"0 0 24 24\" fill=\"none\" stroke=\"currentColor\" stroke-width=\"1.7\" stroke-linecap=\"round\" stroke-linejoin=\"round\" aria-hidden=\"true\"><rect x=\"3.5\" y=\"3.5\" width=\"17\" height=\"17\" rx=\"3.5\"/><circle cx=\"12\" cy=\"12\" r=\"4.25\"/><path d=\"M12 3.5v4.25M12 16.25v4.25M3.5 12h4.25M16.25 12h4.25\"/></svg></span><span class=\"session-sidebar-title\">GeWu <span class=\"session-sidebar-version\">v{}</span></span><button type=\"button\" class=\"session-collapse\" data-sessions-collapse title=\"Close sidebar\" aria-label=\"Close sidebar\"><svg viewBox=\"0 0 24 24\" fill=\"none\" stroke=\"currentColor\" stroke-width=\"1.8\" stroke-linecap=\"round\" stroke-linejoin=\"round\" aria-hidden=\"true\"><rect x=\"3\" y=\"4\" width=\"18\" height=\"16\" rx=\"2\"/><path d=\"M9 4v16\"/><path d=\"m16 15-3-3 3-3\"/></svg></button></header><button type=\"button\" class=\"session-new-primary\" data-session-new title=\"Open workspace\" aria-label=\"Open workspace\"><svg viewBox=\"0 0 24 24\" fill=\"none\" stroke=\"currentColor\" stroke-width=\"1.7\" stroke-linecap=\"round\" stroke-linejoin=\"round\" aria-hidden=\"true\"><path d=\"M3.5 6.5A1.5 1.5 0 0 1 5 5h4l2 2h8a1.5 1.5 0 0 1 1.5 1.5V10\"/><path d=\"M3.5 10.5h17l-2 8h-13l-2-8Z\"/></svg><span>Open workspace</span></button><div class=\"session-section-label\">WORKSPACE</div><div class=\"session-workspace-groups\">",
+        "<aside class=\"session-sidebar\" aria-label=\"Sessions by workspace\"><header class=\"session-sidebar-header\"><span class=\"brand-mark session-brand\" title=\"GeWu agent\"><svg class=\"brand-icon\" viewBox=\"0 0 24 24\" fill=\"none\" stroke=\"currentColor\" stroke-width=\"1.7\" stroke-linecap=\"round\" stroke-linejoin=\"round\" aria-hidden=\"true\"><rect x=\"3.5\" y=\"3.5\" width=\"17\" height=\"17\" rx=\"3.5\"/><circle cx=\"12\" cy=\"12\" r=\"4.25\"/><path d=\"M12 3.5v4.25M12 16.25v4.25M3.5 12h4.25M16.25 12h4.25\"/></svg></span><span class=\"session-sidebar-title\">GeWu <span class=\"session-sidebar-version\">v{}</span></span><button type=\"button\" class=\"session-collapse\" data-sessions-collapse title=\"Close sidebar\" aria-label=\"Close sidebar\"><svg viewBox=\"0 0 24 24\" fill=\"none\" stroke=\"currentColor\" stroke-width=\"1.8\" stroke-linecap=\"round\" stroke-linejoin=\"round\" aria-hidden=\"true\"><rect x=\"3\" y=\"4\" width=\"18\" height=\"16\" rx=\"2\"/><path d=\"M9 4v16\"/><path d=\"m16 15-3-3 3-3\"/></svg></button></header>{update}<button type=\"button\" class=\"session-new-primary\" data-session-new title=\"Open workspace\" aria-label=\"Open workspace\"><svg viewBox=\"0 0 24 24\" fill=\"none\" stroke=\"currentColor\" stroke-width=\"1.7\" stroke-linecap=\"round\" stroke-linejoin=\"round\" aria-hidden=\"true\"><path d=\"M3.5 6.5A1.5 1.5 0 0 1 5 5h4l2 2h8a1.5 1.5 0 0 1 1.5 1.5V10\"/><path d=\"M3.5 10.5h17l-2 8h-13l-2-8Z\"/></svg><span>Open workspace</span></button><div class=\"session-section-label\">WORKSPACE</div><div class=\"session-workspace-groups\">",
         escape(version)
     );
     for (group_index, workspace_id) in workspace_ids.into_iter().enumerate() {
@@ -1629,7 +1643,7 @@ mod tests {
 
     #[test]
     fn session_sidebar_groups_sessions_by_workspace() {
-        let html = session_sidebar_html(
+        let html = session_sidebar_html_with_update(
             &[
                 TabInfo {
                     id: 1,
@@ -1658,6 +1672,7 @@ mod tests {
             ],
             2,
             "9.9.9-test",
+            None,
         );
         assert!(html.contains("class=\"session-sidebar\""), "{html}");
         assert!(html.contains("session-brand"), "{html}");
@@ -1748,8 +1763,23 @@ mod tests {
     }
 
     #[test]
+    fn session_sidebar_shows_an_update_notice() {
+        let html = session_sidebar_html_with_update(&[], &[], 0, "0.1.4", Some("0.1.5"));
+        assert!(html.contains("class=\"session-update\""), "{html}");
+        assert!(html.contains("Update available: v0.1.5"), "{html}");
+        assert!(html.contains("Run `gewu update`"), "{html}");
+
+        let escaped = session_sidebar_html_with_update(&[], &[], 0, "0.1.4", Some("<0.1.5>"));
+        assert!(escaped.contains("v&lt;0.1.5&gt;"), "{escaped}");
+        assert!(
+            !session_sidebar_html_with_update(&[], &[], 0, "0.1.4", None)
+                .contains("session-update")
+        );
+    }
+
+    #[test]
     fn empty_workspace_group_still_has_disclosure() {
-        let html = session_sidebar_html(
+        let html = session_sidebar_html_with_update(
             &[],
             &[WorkspaceSummary {
                 id: "cwd".into(),
@@ -1757,6 +1787,7 @@ mod tests {
             }],
             0,
             "test",
+            None,
         );
         assert!(
             html.contains("class=\"session-add\" data-session-new-workspace=\"cwd\""),
@@ -1773,7 +1804,7 @@ mod tests {
 
     #[test]
     fn workspace_close_is_accessible_and_attribute_escaped() {
-        let html = session_sidebar_html(
+        let html = session_sidebar_html_with_update(
             &[],
             &[WorkspaceSummary {
                 id: "project\"<&".into(),
@@ -1781,6 +1812,7 @@ mod tests {
             }],
             0,
             "test",
+            None,
         );
         assert!(
             html.contains("data-session-workspace-menu=\"project&quot;&lt;&amp;\""),

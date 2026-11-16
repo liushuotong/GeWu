@@ -5,6 +5,7 @@
 //! gewu --no-gui     # agent server only
 //! gewu serve        # exactly `gewu-server serve` (headless)
 //! gewu gui          # exactly `gewu-gui` (proxy for a separately started server)
+//! gewu update       # check for or install the latest release
 //! ```
 //!
 //! The composed mode keeps the process split deployment available through
@@ -34,6 +35,10 @@ struct Cli {
     /// Do not open the browser once the GUI is up
     #[arg(long)]
     no_open: bool,
+
+    /// Do not check GitHub for a newer release
+    #[arg(long, global = true)]
+    no_update_check: bool,
 
     /// Host the agent server binds to
     #[arg(long, default_value = gewu_server::server::DEFAULT_HOST)]
@@ -86,6 +91,15 @@ enum Command {
         #[command(flatten)]
         args: gewu_gui::Cli,
     },
+    /// Check for or install the latest release
+    Update {
+        /// Only report whether an update is available
+        #[arg(long)]
+        check: bool,
+        /// Reinstall even when the running version is current
+        #[arg(long)]
+        force: bool,
+    },
 }
 
 #[tokio::main]
@@ -93,9 +107,15 @@ async fn main() -> Result<()> {
     dotenvy::dotenv().ok();
 
     let cli = Cli::parse();
+    let no_update_check = cli.no_update_check;
     match cli.command {
         Some(Command::Serve { args }) => gewu_server::cli::serve_command(args).await,
-        Some(Command::Gui { args }) => gewu_gui::run(args, env!("CARGO_PKG_VERSION")).await,
+        Some(Command::Gui { args }) => {
+            gewu_gui::run_with_updates(args, env!("CARGO_PKG_VERSION"), !no_update_check).await
+        }
+        Some(Command::Update { check, force }) => {
+            gewu_update::install(env!("CARGO_PKG_VERSION"), check, force).await
+        }
         None => {
             up::run(up::UpArgs {
                 common: cli.common,
@@ -109,8 +129,32 @@ async fn main() -> Result<()> {
                 allow_anonymous: cli.allow_anonymous,
                 no_gui: cli.no_gui,
                 no_open: cli.no_open,
+                no_update_check,
             })
             .await
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parses_the_update_subcommand() {
+        let cli = Cli::try_parse_from(["gewu", "update", "--check"]).unwrap();
+        assert!(matches!(
+            cli.command,
+            Some(Command::Update {
+                check: true,
+                force: false
+            })
+        ));
+    }
+
+    #[test]
+    fn no_update_check_is_global() {
+        let cli = Cli::try_parse_from(["gewu", "gui", "--no-update-check"]).unwrap();
+        assert!(cli.no_update_check);
     }
 }

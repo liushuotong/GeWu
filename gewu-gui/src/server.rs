@@ -16,6 +16,7 @@ use axum::response::{Html, IntoResponse, Response};
 use axum::routing::get;
 use serde::Serialize;
 use tokio::net::TcpListener;
+use tokio::sync::watch;
 use tokio::time::timeout;
 use tracing::{info, warn};
 
@@ -62,6 +63,8 @@ pub struct AppState {
     pub endpoint: Endpoint,
     /// Version shown in the session sidebar.
     pub version: String,
+    /// Latest release notice from the background check, if any.
+    pub updates: watch::Receiver<Option<gewu_update::Update>>,
     /// Required browser token; `None` means loopback-only anonymous access.
     pub token: Option<String>,
     /// Token for the upstream gewu server, when it requires one.
@@ -171,6 +174,7 @@ async fn handle_socket(mut socket: WebSocket, state: AppState) {
         &state.endpoint,
         state.server_token.as_deref(),
         &state.version,
+        state.updates.clone(),
     )
     .await
     {
@@ -275,6 +279,7 @@ mod tests {
             token: token.map(str::to_string),
             server_token: None,
             version: "0.0.0-test".to_string(),
+            updates: watch::channel(None).1,
         }
     }
 
@@ -946,6 +951,73 @@ mod tests {
             "{}",
             error
         );
+    }
+
+    #[tokio::test]
+    async fn snapshot_shows_an_available_update() {
+        let upstream = spawn_fake_upstream().await;
+        let update = gewu_update::update_from_tags("0.1.4", "v0.1.5")
+            .unwrap()
+            .expect("newer release");
+        let (_, updates) = watch::channel(Some(update));
+        let addr = spawn_gui(AppState {
+            endpoint: Endpoint::Tcp {
+                host: "127.0.0.1".to_string(),
+                port: upstream.port(),
+            },
+            updates,
+            ..test_state(None)
+        })
+        .await;
+
+        let (mut ws, _) = tokio_tungstenite::connect_async(format!("ws://{addr}/ws"))
+            .await
+            .unwrap();
+        let snapshot = next_json(&mut ws).await;
+        let sidebar = snapshot["session_sidebar"].as_str().unwrap();
+        assert!(sidebar.contains("class=\"session-update\""), "{sidebar}");
+        assert!(sidebar.contains("Update available: v0.1.5"), "{sidebar}");
+    }
+
+    #[tokio::test]
+    async fn live_update_notice_is_pushed_to_the_sidebar() {
+        let upstream = spawn_fake_upstream().await;
+        let (update_tx, updates) = watch::channel(None);
+        let addr = spawn_gui(AppState {
+            endpoint: Endpoint::Tcp {
+                host: "127.0.0.1".to_string(),
+                port: upstream.port(),
+            },
+            updates,
+            ..test_state(None)
+        })
+        .await;
+
+        let (mut ws, _) = tokio_tungstenite::connect_async(format!("ws://{addr}/ws"))
+            .await
+            .unwrap();
+        let snapshot = next_json(&mut ws).await;
+        assert!(
+            !snapshot["session_sidebar"]
+                .as_str()
+                .unwrap()
+                .contains("session-update")
+        );
+
+        let update = gewu_update::update_from_tags("0.0.0-test", "v0.1.5")
+            .unwrap()
+            .expect("newer release");
+        update_tx.send(Some(update)).unwrap();
+
+        let sidebar = loop {
+            let value = next_json(&mut ws).await;
+            if value["type"] == "session_sidebar" {
+                break value;
+            }
+        };
+        let html = sidebar["html"].as_str().unwrap();
+        assert!(html.contains("class=\"session-update\""), "{html}");
+        assert!(html.contains("Update available: v0.1.5"), "{html}");
     }
 
     #[tokio::test]

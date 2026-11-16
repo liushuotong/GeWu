@@ -6,6 +6,7 @@ edition = "2024"
 [dependencies]
 gewu-client = { path = "../gewu-client" }
 gewu-protocol = { path = "../gewu-protocol" }
+gewu-update = { path = "../gewu-update" }
 anyhow = "1.0"
 axum = { version = "0.8", features = ["ws"] }
 base64 = "0.22"

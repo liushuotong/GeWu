@@ -26,7 +26,8 @@ use std::process::Command;
 
 use anyhow::{Context, Result, bail};
 use tokio::net::TcpListener;
-use tracing::{info, warn};
+use tokio::sync::watch;
+use tracing::{debug, info, warn};
 use tracing_subscriber::filter::LevelFilter;
 
 use crate::cli::Endpoint;
@@ -37,7 +38,19 @@ use crate::server::AppState;
 /// `version` is displayed in the session sidebar. Callers pass their own
 /// package version so the GUI reports the app the user is actually running.
 pub async fn run(cli: Cli, version: impl Into<String>) -> Result<()> {
+    run_with_updates(cli, version, false).await
+}
+
+/// Like [`run`], but also checks for a newer release and surfaces it in the
+/// session sidebar. Standalone `gewu-gui` passes `false` because its crate
+/// version is not the released app version.
+pub async fn run_with_updates(
+    cli: Cli,
+    version: impl Into<String>,
+    update_check: bool,
+) -> Result<()> {
     init_tracing(&cli.log_level);
+    let version = version.into();
     let token = cli
         .token
         .as_deref()
@@ -58,6 +71,34 @@ pub async fn run(cli: Cli, version: impl Into<String>) -> Result<()> {
     let local = listener
         .local_addr()
         .unwrap_or_else(|_| SocketAddr::from(([127, 0, 0, 1], cli.port)));
+
+    let update_enabled = update_check && gewu_update::enabled();
+    let initial = update_enabled
+        .then(|| gewu_update::cached(&version))
+        .flatten();
+    if let Some(update) = &initial {
+        eprintln!("{}", gewu_update::notice(update));
+    }
+    let (update_tx, update_rx) = watch::channel(initial.clone());
+    if update_enabled {
+        let current = version.clone();
+        let announced = initial.clone();
+        tokio::spawn(async move {
+            match gewu_update::check(&current, false).await {
+                Ok(Some(update)) => {
+                    if announced.as_ref() != Some(&update) {
+                        eprintln!("{}", gewu_update::notice(&update));
+                    }
+                    let _ = update_tx.send(Some(update));
+                }
+                Ok(None) => {
+                    // The cache may have been stale; clear a cached notice.
+                    let _ = update_tx.send(None);
+                }
+                Err(e) => debug!("update check failed: {e:#}"),
+            }
+        });
+    }
 
     // Fail early with a clear message instead of accepting browsers and then
     // failing per connection. The probe connection is closed immediately.
@@ -90,7 +131,8 @@ pub async fn run(cli: Cli, version: impl Into<String>) -> Result<()> {
 
     let state = AppState {
         endpoint,
-        version: version.into(),
+        version,
+        updates: update_rx,
         token,
         server_token: cli
             .server_token

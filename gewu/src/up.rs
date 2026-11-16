@@ -35,11 +35,17 @@ pub struct UpArgs {
     pub no_gui: bool,
     /// Do not open the browser once the GUI is up.
     pub no_open: bool,
+    /// Do not check GitHub for a newer release.
+    pub no_update_check: bool,
 }
 
 /// Run the agent server (and GUI) until Ctrl+C or an unexpected exit.
 pub async fn run(args: UpArgs) -> Result<()> {
     let token = args.token.clone().filter(|t| !t.is_empty());
+
+    if args.no_gui && !args.no_update_check {
+        tokio::spawn(gewu_update::notify(env!("CARGO_PKG_VERSION")));
+    }
 
     // Same remote-exposure rule as `gewu-server serve`.
     if !is_loopback(&args.host) && token.is_none() && !args.allow_anonymous {
@@ -96,7 +102,11 @@ pub async fn run(args: UpArgs) -> Result<()> {
     println!("  agent server: {server_url}");
     println!("  web GUI:      {gui_url}");
 
-    let gui_task = tokio::spawn(gewu_gui::run(gui_cli, env!("CARGO_PKG_VERSION")));
+    let gui_task = tokio::spawn(gewu_gui::run_with_updates(
+        gui_cli,
+        env!("CARGO_PKG_VERSION"),
+        !args.no_update_check,
+    ));
 
     let ctrl_c = tokio::signal::ctrl_c();
     tokio::pin!(ctrl_c);
@@ -209,6 +219,7 @@ mod tests {
             allow_anonymous: false,
             no_gui: false,
             no_open: false,
+            no_update_check: true,
         }
     }
 
