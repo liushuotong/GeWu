@@ -2757,48 +2757,25 @@ mod tests {
         }
     }
 
-    /// LLM that records the user prompts it is asked with, and delays before
-    /// responding (so asks are interruptible). Used to observe exactly what
-    /// history reaches the model.
+    /// LLM that records the user prompts of every provider request and can
+    /// hold the first response so tests observe a turn mid-flight. Used to
+    /// observe exactly what history reaches the model.
     struct RecordingLlm {
-        delay_ms: u64,
         /// User prompts per provider request, in build order.
         requests: std::sync::Mutex<Vec<Vec<String>>>,
-        /// Block the first `send` until the test releases it.
-        gate_first_send: bool,
         first_send: tokio::sync::Notify,
         release_first: tokio::sync::Notify,
         first_send_seen: AtomicBool,
     }
 
     impl RecordingLlm {
-        fn slow() -> Arc<Self> {
-            Self::new(500, false)
-        }
-
         fn gated() -> Arc<Self> {
-            Self::new(0, true)
-        }
-
-        fn new(delay_ms: u64, gate_first_send: bool) -> Arc<Self> {
             Arc::new(Self {
-                delay_ms,
                 requests: std::sync::Mutex::new(Vec::new()),
-                gate_first_send,
                 first_send: tokio::sync::Notify::new(),
                 release_first: tokio::sync::Notify::new(),
                 first_send_seen: AtomicBool::new(false),
             })
-        }
-
-        fn prompts(&self) -> Vec<String> {
-            self.requests
-                .lock()
-                .unwrap()
-                .iter()
-                .flatten()
-                .cloned()
-                .collect()
         }
 
         fn requests(&self) -> Vec<Vec<String>> {
@@ -2853,12 +2830,9 @@ mod tests {
             >,
             Box<dyn Error + Send + Sync>,
         > {
-            if self.gate_first_send && !self.first_send_seen.swap(true, Ordering::SeqCst) {
+            if !self.first_send_seen.swap(true, Ordering::SeqCst) {
                 self.first_send.notify_one();
                 self.release_first.notified().await;
-            }
-            if self.delay_ms > 0 {
-                tokio::time::sleep(std::time::Duration::from_millis(self.delay_ms)).await;
             }
             let s = async_stream::try_stream! {
                 yield gewu_core::types::ProviderEvent::ContentDelta {
@@ -5676,8 +5650,9 @@ mod tests {
     #[tokio::test]
     async fn interrupt_drops_prompt_across_full_connection() {
         // The next ask must not be steered by an interrupted prompt that
-        // never produced output (Bug 11).
-        let llm = RecordingLlm::slow();
+        // never produced output (Bug 11). Hold the first response so the
+        // interrupt always lands after the first request was built.
+        let llm = RecordingLlm::gated();
         let state = server_state_with(llm.clone() as Arc<dyn gewu_core::traits::LlmProvider>);
         let (in_tx, mut out_rx, handle) = spawn_connection(state).await;
 
@@ -5688,7 +5663,9 @@ mod tests {
         let ready = recv_json(&mut out_rx).await;
         assert_eq!(ready["type"], "ready");
 
-        // Interrupt before the (delayed) LLM produced anything.
+        // Interrupt after the first request is in flight but before it
+        // produced any output.
+        llm.wait_for_first_send().await;
         in_tx
             .send(r#"{"id": 2, "op": "interrupt"}"#.to_string())
             .await
@@ -5710,14 +5687,27 @@ mod tests {
             }
         }
 
-        let prompts = llm.prompts();
-        assert!(
-            !prompts.iter().any(|p| p.contains("essay")),
-            "aborted prompt leaked into the next LLM request: {prompts:?}"
+        let requests = llm.requests();
+        assert_eq!(
+            requests.len(),
+            2,
+            "interrupt and follow-up should each make one request: {requests:?}"
         );
         assert!(
-            prompts.iter().any(|p| p.contains("Say ok")),
-            "the new prompt should reach the LLM: {prompts:?}"
+            requests[0]
+                .iter()
+                .any(|prompt| prompt.contains("write an essay")),
+            "the interrupted request should have reached the model: {requests:?}"
+        );
+        assert!(
+            requests[1]
+                .iter()
+                .all(|prompt| !prompt.contains("write an essay")),
+            "aborted prompt leaked into the next LLM request: {requests:?}"
+        );
+        assert!(
+            requests[1].iter().any(|prompt| prompt.contains("Say ok")),
+            "the new prompt should reach the LLM: {requests:?}"
         );
 
         drop(in_tx);
