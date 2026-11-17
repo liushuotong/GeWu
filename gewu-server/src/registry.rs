@@ -1,5 +1,6 @@
 use anyhow::{Result, anyhow};
 use async_trait::async_trait;
+use gewu_core::QuestionBroker;
 use gewu_core::traits::{LlmProvider, RequestLog, Tool, ToolRegistry};
 use gewu_core::types::{PathEnforcement, SessionState, ToolContext, ToolResult};
 use gewu_core::{Agent, AgentTemplate};
@@ -10,8 +11,8 @@ use gewu_tools::workflow::{
 };
 use gewu_tools::{
     ApplyPatchTool, BashTool, CodeSearchTool, EditFileTool, GlobTool, GrepTool, ImageLimits,
-    ListTool, ReadFileTool, SkillInfo, SkillTool, TaskTool, TodoReadTool, TodoWriteTool,
-    WebFetchTool, WebSearchTool, WriteFileTool,
+    ListTool, QuestionTool, ReadFileTool, SkillInfo, SkillTool, TaskTool, TodoReadTool,
+    TodoWriteTool, WebFetchTool, WebSearchTool, WriteFileTool,
 };
 use serde_json::Value;
 use sqlx::SqlitePool;
@@ -27,6 +28,7 @@ const RESERVED_ADDITIONAL_TOOL_NAMES: &[&str] = &[
     "edit_file",
     "task",
     "skill",
+    "question",
     "todowrite",
     "todoread",
     "workflow_start",
@@ -61,6 +63,9 @@ pub struct ProfileInputs<'a> {
     /// Live workflow progress channel, when the process has an observer
     /// (the server forwards it to clients; the CLI has none).
     pub workflow_progress: Option<tokio::sync::broadcast::Sender<RunProgress>>,
+    /// Broker backing the `question` tool. `None` disables asking (CLI,
+    /// subagents, workflow agents).
+    pub question_broker: Option<Arc<QuestionBroker>>,
     pub session_id: &'a str,
 }
 
@@ -164,6 +169,7 @@ const COMPOSED_AGENT_FORBIDDEN_TOOLS: &[&str] = &[
     "workflow_start",
     "workflow_status",
     "workflow_cancel",
+    "question",
 ];
 
 #[async_trait]
@@ -370,6 +376,7 @@ impl SqliteAgentFactory {
             context_limit: self.context_limit,
             agents: self.agents.clone(),
             workflow_progress: self.workflow_progress.clone(),
+            question_broker: None,
             session_id: "",
         })?;
         let session_state =
@@ -471,6 +478,7 @@ fn build_tool_registry_and_list(inputs: &ProfileInputs) -> Result<RegistryBundle
         context_limit,
         agents,
         workflow_progress,
+        question_broker,
         ..
     } = inputs;
     let mut tools: Vec<Box<dyn Tool>> = match *name {
@@ -658,6 +666,14 @@ fn build_tool_registry_and_list(inputs: &ProfileInputs) -> Result<RegistryBundle
     if !skills.is_empty() {
         tools.push(Box::new(SkillTool::new(skills.clone())));
     }
+    // Only top-level build/plan/general sessions can ask: subagent templates
+    // and config-defined agents are built with `question_broker: None`, since
+    // no front-end would render their questions.
+    if let Some(broker) = question_broker
+        && matches!(*name, "build" | "plan" | "general")
+    {
+        tools.push(Box::new(QuestionTool::new(broker.clone())));
+    }
 
     let mut tools_arc: Vec<Arc<dyn Tool>> = tools
         .into_iter()
@@ -716,6 +732,7 @@ fn build_custom_agent_tools(
         context_limit: inputs.context_limit,
         agents: inputs.agents.clone(),
         workflow_progress: inputs.workflow_progress.clone(),
+        question_broker: None,
         session_id: inputs.session_id,
     })?;
     let tools: Vec<Arc<dyn Tool>> = match &entry.tools {
@@ -763,6 +780,7 @@ pub async fn create_agent(
         context_limit,
         agents,
         workflow_progress,
+        question_broker,
         session_id,
         working_directory,
     } = inputs;
@@ -782,6 +800,7 @@ pub async fn create_agent(
         context_limit,
         agents,
         workflow_progress,
+        question_broker,
         session_id,
     })?;
     let mut builder = Agent::builder()
@@ -844,6 +863,7 @@ pub fn agent_profile(inputs: ProfileInputs) -> Result<ProfileBundle> {
         context_limit,
         agents,
         workflow_progress,
+        question_broker,
         session_id,
     } = inputs;
     let (registry, tools_arc) = build_tool_registry_and_list(&ProfileInputs {
@@ -859,6 +879,7 @@ pub fn agent_profile(inputs: ProfileInputs) -> Result<ProfileBundle> {
         context_limit,
         agents: agents.clone(),
         workflow_progress,
+        question_broker,
         session_id,
     })?;
 
@@ -977,6 +998,65 @@ mod tests {
         assert!(factory.create("explore", None, "parent").await.is_err());
     }
 
+    /// The `question` tool needs a broker (only the server wires one), and
+    /// only top-level profiles expose it to the model.
+    #[tokio::test]
+    async fn question_tool_requires_a_broker_and_a_top_level_profile() {
+        let pool = SqlitePool::connect_lazy("sqlite::memory:").unwrap();
+        let dir = tempdir().unwrap();
+        let provider: Arc<dyn LlmProvider> = Arc::new(DummyLlm);
+        let broker = Arc::new(gewu_core::QuestionBroker::new());
+        for profile in ["build", "plan", "general"] {
+            let (_, tools) = build_tool_registry_and_list(&ProfileInputs {
+                question_broker: Some(broker.clone()),
+                ..test_inputs(
+                    profile,
+                    provider.clone(),
+                    pool.clone(),
+                    dir.path().to_path_buf(),
+                    vec![],
+                    vec![],
+                    "session",
+                )
+            })
+            .unwrap();
+            assert!(
+                tools.iter().any(|tool| tool.name() == "question"),
+                "{profile} should expose question"
+            );
+        }
+
+        let (_, tools) = build_tool_registry_and_list(&ProfileInputs {
+            question_broker: Some(broker.clone()),
+            ..test_inputs(
+                "explore",
+                provider.clone(),
+                pool.clone(),
+                dir.path().to_path_buf(),
+                vec![],
+                vec![],
+                "session",
+            )
+        })
+        .unwrap();
+        assert!(!tools.iter().any(|tool| tool.name() == "question"));
+
+        let (_, tools) = build_tool_registry_and_list(&test_inputs(
+            "build",
+            provider,
+            pool,
+            dir.path().to_path_buf(),
+            vec![],
+            vec![],
+            "session",
+        ))
+        .unwrap();
+        assert!(
+            !tools.iter().any(|tool| tool.name() == "question"),
+            "without a broker the tool must not be offered"
+        );
+    }
+
     /// Builds `ProfileInputs` for tests; session defaults to "session".
     fn test_inputs<'a>(
         name: &'a str,
@@ -1000,6 +1080,7 @@ mod tests {
             context_limit: None,
             agents: Arc::new(BTreeMap::new()),
             workflow_progress: None,
+            question_broker: None,
             session_id,
         }
     }

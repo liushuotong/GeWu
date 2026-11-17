@@ -6,7 +6,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt::Write as _;
 
-use gewu_client::session::{Block, Phase};
+use gewu_client::session::{Block, Phase, QuestionState};
 use gewu_protocol::{
     ContentPart, DirectoryEntry, FileEntry, ModelSummary, REASONING_EFFORTS, WorkspaceSummary,
 };
@@ -258,13 +258,13 @@ pub fn tool_card_html(tab: &Tab, first: usize) -> Option<String> {
     Some(out)
 }
 
-/// Whether `next` continues the tool run started by `prev`. Skill loads are
-/// standalone cards so their name stays visible instead of folding into an
-/// "Explored" group.
+/// Whether `next` continues the tool run started by `prev`. Skill loads and
+/// questions are standalone cards so their content stays visible instead of
+/// folding into an "Explored" group.
 pub(crate) fn same_tool_run(prev: &Block, next: &Block) -> bool {
     match (prev, next) {
         (Block::Tool { tool: prev, .. }, Block::Tool { tool: next, .. }) => {
-            prev != "skill" && next != "skill"
+            prev != "skill" && next != "skill" && prev != "question" && next != "question"
         }
         _ => false,
     }
@@ -284,6 +284,152 @@ pub(crate) fn tool_run_len(blocks: &[Block], first: usize, end: usize) -> usize 
     len
 }
 
+/// Render the interactive form (or its settled summary) for a `question`
+/// tool block. Questions are tabs; one Submit applies every tab's answer.
+fn render_question_card(out: &mut String, tab: &Tab, state: &QuestionState, index: usize) {
+    let questions = state.questions();
+    let title = match questions {
+        [question] => short_header(&question.header),
+        _ => format!("{} questions", questions.len()),
+    };
+    let _ = writeln!(
+        out,
+        "<div class=\"tool question depth-0\" data-block=\"{index}\">\
+         <div class=\"question-head\"><span class=\"tool-name\">question</span>\
+         <span class=\"question-title\">{}</span></div>",
+        escape(&title)
+    );
+    match state {
+        QuestionState::Pending { request_id, .. } => {
+            render_question_form(out, tab, request_id, questions, index);
+        }
+        QuestionState::Answered { answers, .. } => {
+            render_question_answers(out, questions, answers);
+        }
+        QuestionState::Dismissed { .. } => {
+            out.push_str("<div class=\"question-dismissed\">Dismissed</div>\n");
+        }
+    }
+    out.push_str("</div>\n");
+}
+
+fn short_header(header: &str) -> String {
+    let header = header.trim();
+    let mut label: String = header.chars().take(30).collect();
+    if header.chars().count() > 30 {
+        label.push('…');
+    }
+    label
+}
+
+fn render_question_form(
+    out: &mut String,
+    tab: &Tab,
+    request_id: &str,
+    questions: &[gewu_protocol::Question],
+    index: usize,
+) {
+    let _ = writeln!(
+        out,
+        "<form class=\"question-form\" data-tab=\"{}\" data-request=\"{}\" data-block=\"{index}\">",
+        tab.id,
+        escape(request_id)
+    );
+    // One question needs no tab strip: the card title already names it.
+    if questions.len() > 1 {
+        out.push_str("<div class=\"question-tabs\" role=\"tablist\">");
+        for (number, question) in questions.iter().enumerate() {
+            let active = number == 0;
+            let _ = write!(
+                out,
+                "<button type=\"button\" role=\"tab\" class=\"question-tab{}\" data-qtab=\"{number}\" \
+                 aria-selected=\"{}\">{}</button>",
+                if active { " active" } else { "" },
+                active,
+                escape(&short_header(&question.header))
+            );
+        }
+        out.push_str("</div>\n");
+    }
+
+    for (number, question) in questions.iter().enumerate() {
+        let active = number == 0;
+        let _ = writeln!(
+            out,
+            "<div class=\"question-panel{}\" data-qpanel=\"{number}\" role=\"tabpanel\"{}>",
+            if active { " active" } else { "" },
+            if active { "" } else { " hidden" }
+        );
+        let _ = writeln!(
+            out,
+            "<p class=\"question-text\">{}</p>",
+            escape(question.question.trim())
+        );
+        let kind = if question.multiple {
+            "checkbox"
+        } else {
+            "radio"
+        };
+        let name = format!("q-{}-{number}", escape(request_id));
+        for option in &question.options {
+            let label = option.label.trim();
+            let _ = write!(
+                out,
+                "<label class=\"question-option\"><input type=\"{kind}\" name=\"{name}\" \
+                 value=\"{}\"><span class=\"question-option-text\"><span class=\"question-label\">{}</span>",
+                escape(label),
+                escape(label)
+            );
+            let description = option.description.trim();
+            if !description.is_empty() {
+                let _ = write!(
+                    out,
+                    "<span class=\"question-desc\">{}</span>",
+                    escape(description)
+                );
+            }
+            out.push_str("</span></label>");
+        }
+        if question.custom {
+            let _ = writeln!(
+                out,
+                "<label class=\"question-custom-row\"><span class=\"question-custom-label\">Type your own answer</span>\
+                 <input type=\"text\" class=\"question-custom\" data-custom=\"{number}\" autocomplete=\"off\"></label>"
+            );
+        }
+        out.push_str("</div>\n");
+    }
+    out.push_str(
+        "<div class=\"question-actions\"><button type=\"submit\" class=\"question-submit\">Submit</button>\
+         <button type=\"button\" class=\"question-dismiss\" data-question-dismiss>Dismiss</button></div>\
+         </form>\n",
+    );
+}
+
+fn render_question_answers(
+    out: &mut String,
+    questions: &[gewu_protocol::Question],
+    answers: &[Vec<String>],
+) {
+    out.push_str("<div class=\"question-answers\">");
+    for (number, question) in questions.iter().enumerate() {
+        let answer = answers.get(number).map(Vec::as_slice).unwrap_or_default();
+        let answer = if answer.is_empty() {
+            "Unanswered".to_string()
+        } else {
+            answer.join(", ")
+        };
+        let _ = write!(
+            out,
+            "<div class=\"question-answer\"><span class=\"question-answer-q\">{}</span>\
+             <span class=\"question-answer-a\">{}</span></div>",
+            escape(question.question.trim()),
+            escape(&answer)
+        );
+    }
+    out.push_str("</div>\n");
+}
+
 /// Render a run of consecutive tool blocks inside one card.
 fn render_tool_run(out: &mut String, tab: &Tab, run: &[Block], first: usize) {
     let tools: Vec<ToolView> = run
@@ -295,18 +441,25 @@ fn render_tool_run(out: &mut String, tab: &Tab, run: &[Block], first: usize) {
                 output,
                 images,
                 status,
+                question,
             } => Some(ToolView {
                 tool,
                 input,
                 output: output.as_deref(),
                 status: status.as_deref(),
                 images,
+                question: question.as_ref(),
             }),
             _ => None,
         })
         .collect();
 
-    let _ = writeln!(out, "<div class=\"tool-card\" data-card=\"{first}\">");
+    let card_class = if is_question_run(run) {
+        "tool-card question-card"
+    } else {
+        "tool-card"
+    };
+    let _ = writeln!(out, "<div class=\"{card_class}\" data-card=\"{first}\">");
     if tools.len() == 1 {
         render_tool(out, tab, &tools[0], first, 0);
     } else {
@@ -347,6 +500,12 @@ pub(crate) fn is_workflow_run(run: &[Block]) -> bool {
         .any(|block| matches!(block, Block::Tool { tool, .. } if tool.starts_with("workflow_")))
 }
 
+/// Whether a tool run is the standalone `question` card. The card's rail and
+/// bezel live on the wrapper, so the wrapper needs its own accent class.
+pub(crate) fn is_question_run(run: &[Block]) -> bool {
+    matches!(run, [Block::Tool { tool, .. }] if tool == "question")
+}
+
 /// One tool row's render inputs.
 struct ToolView<'a> {
     tool: &'a str,
@@ -354,6 +513,7 @@ struct ToolView<'a> {
     output: Option<&'a str>,
     status: Option<&'a str>,
     images: &'a [ContentPart],
+    question: Option<&'a QuestionState>,
 }
 
 /// One tool row plus its output.
@@ -364,7 +524,12 @@ fn render_tool(out: &mut String, tab: &Tab, view: &ToolView, index: usize, depth
         output,
         status,
         images,
+        question,
     } = view;
+    if let Some(question) = question {
+        render_question_card(out, tab, question, index);
+        return;
+    }
     let (tool, input, output, status) = (*tool, *input, *output, *status);
     let (name, title) = tool_row(tool, input);
     let running = output.is_none();
@@ -2043,6 +2208,7 @@ mod tests {
     #[test]
     fn single_tool_renders_row_and_output() {
         let (ws, id) = tab_with_blocks(vec![Block::Tool {
+            question: None,
             tool: "bash".into(),
             input: "ls".into(),
             output: Some("a.rs\nb.rs".into()),
@@ -2068,6 +2234,7 @@ mod tests {
     fn tool_card_html_renders_one_run() {
         let (mut ws, id) = tab_with_blocks(vec![
             Block::Tool {
+                question: None,
                 tool: "bash".into(),
                 input: "first".into(),
                 output: Some("one".into()),
@@ -2076,6 +2243,7 @@ mod tests {
             },
             Block::Assistant("between".into()),
             Block::Tool {
+                question: None,
                 tool: "bash".into(),
                 input: "second".into(),
                 output: Some(
@@ -2114,6 +2282,7 @@ mod tests {
              node polish: pending, 0 done, 0 failed";
         let (ws, id) = tab_with_blocks(vec![
             Block::Tool {
+                question: None,
                 tool: "workflow_start".into(),
                 input: spec.into(),
                 output: Some(start.into()),
@@ -2121,6 +2290,7 @@ mod tests {
                 status: None,
             },
             Block::Tool {
+                question: None,
                 tool: "workflow_status".into(),
                 input: "r-77".into(),
                 output: Some(snapshot.into()),
@@ -2182,6 +2352,7 @@ mod tests {
         let start = "Started workflow run r-9. It executes in the background; check on it with \
              workflow_status (run_id: \"r-9\").";
         let (mut ws, id) = tab_with_blocks(vec![Block::Tool {
+            question: None,
             tool: "workflow_start".into(),
             input: spec.into(),
             output: Some(start.into()),
@@ -2203,6 +2374,7 @@ mod tests {
     #[test]
     fn workflow_start_without_live_state_stays_plain() {
         let (ws, id) = tab_with_blocks(vec![Block::Tool {
+            question: None,
             tool: "workflow_start".into(),
             input: r#"{"name":"docs","nodes":[{"id":"read","agent":"reader","prompt":"p"}]}"#
                 .into(),
@@ -2217,6 +2389,7 @@ mod tests {
     #[test]
     fn running_workflow_start_draws_a_pending_graph() {
         let (ws, id) = tab_with_blocks(vec![Block::Tool {
+            question: None,
             tool: "workflow_start".into(),
             input: r#"{"name":"docs","nodes":[
                 {"id":"read","agent":"reader","prompt":"p"},
@@ -2241,6 +2414,7 @@ mod tests {
              node read: pending, 0 done, 0 failed";
         let (mut ws, id) = tab_with_blocks(vec![
             Block::Tool {
+                question: None,
                 tool: "workflow_start".into(),
                 input: spec.into(),
                 output: Some(start.into()),
@@ -2248,6 +2422,7 @@ mod tests {
                 status: None,
             },
             Block::Tool {
+                question: None,
                 tool: "workflow_status".into(),
                 input: "r-9".into(),
                 output: Some(stale.into()),
@@ -2272,6 +2447,7 @@ mod tests {
         let start = "Started workflow run r-77. It executes in the background.";
         let (mut ws, id) = tab_with_blocks(vec![
             Block::Tool {
+                question: None,
                 tool: "workflow_start".into(),
                 input: r#"{"name":"docs","nodes":[{"id":"read","agent":"reader","prompt":"p"}]}"#
                     .into(),
@@ -2280,6 +2456,7 @@ mod tests {
                 status: None,
             },
             Block::Tool {
+                question: None,
                 tool: "workflow_status".into(),
                 input: "r-77".into(),
                 output: Some(snapshot.into()),
@@ -2287,6 +2464,7 @@ mod tests {
                 status: None,
             },
             Block::Tool {
+                question: None,
                 tool: "workflow_status".into(),
                 input: "r-77".into(),
                 output: Some(snapshot.into()),
@@ -2309,6 +2487,7 @@ mod tests {
         let tab = ws.tab(id).unwrap();
         assert!(is_workflow_run(&tab.model.blocks[0..2]));
         assert!(!is_workflow_run(&[Block::Tool {
+            question: None,
             tool: "bash".into(),
             input: String::new(),
             output: None,
@@ -2374,6 +2553,7 @@ mod tests {
             .collect::<Vec<_>>()
             .join("\n");
         let (mut ws, id) = tab_with_blocks(vec![Block::Tool {
+            question: None,
             tool: "bash".into(),
             input: "seq 10".into(),
             output: Some(output),
@@ -2401,6 +2581,7 @@ mod tests {
     #[test]
     fn expanded_tool_renders_image_media_inline() {
         let (mut ws, id) = tab_with_blocks(vec![Block::Tool {
+            question: None,
             tool: "read_file".into(),
             input: "shot.png".into(),
             output: Some("Image read successfully".into()),
@@ -2427,6 +2608,7 @@ mod tests {
     #[test]
     fn non_raster_media_is_never_inlined() {
         let (mut ws, id) = tab_with_blocks(vec![Block::Tool {
+            question: None,
             tool: "read_file".into(),
             input: "icon.svg".into(),
             output: Some("Image read successfully".into()),
@@ -2444,6 +2626,7 @@ mod tests {
     fn oversized_image_falls_back_to_a_note() {
         let data = "A".repeat(MAX_INLINE_IMAGE_BYTES + 4);
         let (mut ws, id) = tab_with_blocks(vec![Block::Tool {
+            question: None,
             tool: "read_file".into(),
             input: "huge.png".into(),
             output: Some("Image read successfully".into()),
@@ -2460,6 +2643,7 @@ mod tests {
     #[test]
     fn image_payload_is_attribute_escaped() {
         let (mut ws, id) = tab_with_blocks(vec![Block::Tool {
+            question: None,
             tool: "read_file".into(),
             input: "shot.png".into(),
             output: Some("Image read successfully".into()),
@@ -2476,6 +2660,7 @@ mod tests {
     fn expanded_tool_shows_the_full_command() {
         let long_command = format!("echo {} # padded well past one line", "x".repeat(120));
         let (mut ws, id) = tab_with_blocks(vec![Block::Tool {
+            question: None,
             tool: "bash".into(),
             input: long_command.clone(),
             output: Some("done".into()),
@@ -2499,6 +2684,7 @@ mod tests {
             .collect::<Vec<_>>()
             .join("\n");
         let (mut ws, id) = tab_with_blocks(vec![Block::Tool {
+            question: None,
             tool: "bash".into(),
             input: "seq 600".into(),
             output: Some(output),
@@ -2515,6 +2701,7 @@ mod tests {
     fn consecutive_tools_group_and_expand() {
         let (mut ws, id) = tab_with_blocks(vec![
             Block::Tool {
+                question: None,
                 tool: "bash".into(),
                 input: "ls".into(),
                 output: Some("a".into()),
@@ -2522,6 +2709,7 @@ mod tests {
                 status: None,
             },
             Block::Tool {
+                question: None,
                 tool: "read_file".into(),
                 input: "src/main.rs".into(),
                 output: Some("b".into()),
@@ -2549,6 +2737,7 @@ mod tests {
     fn skill_loads_are_not_grouped_with_neighboring_tools() {
         let (ws, id) = tab_with_blocks(vec![
             Block::Tool {
+                question: None,
                 tool: "bash".into(),
                 input: "ls".into(),
                 output: Some("a".into()),
@@ -2556,6 +2745,7 @@ mod tests {
                 status: None,
             },
             Block::Tool {
+                question: None,
                 tool: "read_file".into(),
                 input: "src/main.rs".into(),
                 output: Some("b".into()),
@@ -2563,6 +2753,7 @@ mod tests {
                 status: None,
             },
             Block::Tool {
+                question: None,
                 tool: "skill".into(),
                 input: "demo".into(),
                 output: Some("<skill_content name=\"demo\">body</skill_content>".into()),
@@ -2570,6 +2761,7 @@ mod tests {
                 status: None,
             },
             Block::Tool {
+                question: None,
                 tool: "bash".into(),
                 input: "pwd".into(),
                 output: Some("/tmp".into()),
@@ -2577,6 +2769,7 @@ mod tests {
                 status: None,
             },
             Block::Tool {
+                question: None,
                 tool: "read_file".into(),
                 input: "Cargo.toml".into(),
                 output: Some("c".into()),
@@ -2598,6 +2791,7 @@ mod tests {
     #[test]
     fn running_tool_shows_spinner() {
         let (ws, id) = tab_with_blocks(vec![Block::Tool {
+            question: None,
             tool: "bash".into(),
             input: "sleep 30".into(),
             output: None,
@@ -2615,6 +2809,7 @@ mod tests {
     #[test]
     fn finished_tool_has_no_running_indicator() {
         let (ws, id) = tab_with_blocks(vec![Block::Tool {
+            question: None,
             tool: "bash".into(),
             input: "ls".into(),
             output: Some("a".into()),
@@ -2630,6 +2825,7 @@ mod tests {
     #[test]
     fn running_tool_shows_its_live_status() {
         let (ws, id) = tab_with_blocks(vec![Block::Tool {
+            question: None,
             tool: "task".into(),
             input: "explore".into(),
             output: None,
@@ -2647,6 +2843,7 @@ mod tests {
     #[test]
     fn tool_status_is_hidden_once_the_tool_finishes() {
         let (ws, id) = tab_with_blocks(vec![Block::Tool {
+            question: None,
             tool: "task".into(),
             input: "explore".into(),
             output: Some("done".into()),
@@ -2661,6 +2858,7 @@ mod tests {
     fn running_group_says_exploring() {
         let (ws, id) = tab_with_blocks(vec![
             Block::Tool {
+                question: None,
                 tool: "bash".into(),
                 input: "ls".into(),
                 output: None,
@@ -2668,6 +2866,7 @@ mod tests {
                 status: None,
             },
             Block::Tool {
+                question: None,
                 tool: "grep".into(),
                 input: "TODO".into(),
                 output: None,
@@ -2684,6 +2883,7 @@ mod tests {
     fn finished_group_has_no_running_class() {
         let (ws, id) = tab_with_blocks(vec![
             Block::Tool {
+                question: None,
                 tool: "bash".into(),
                 input: "ls".into(),
                 output: Some("a".into()),
@@ -2691,6 +2891,7 @@ mod tests {
                 status: None,
             },
             Block::Tool {
+                question: None,
                 tool: "grep".into(),
                 input: "TODO".into(),
                 output: Some("b".into()),
@@ -2713,6 +2914,7 @@ mod tests {
         // label pulses and the expanded rows show only the pending spinner.
         let (mut ws, id) = tab_with_blocks(vec![
             Block::Tool {
+                question: None,
                 tool: "bash".into(),
                 input: "ls".into(),
                 output: Some("a".into()),
@@ -2720,6 +2922,7 @@ mod tests {
                 status: None,
             },
             Block::Tool {
+                question: None,
                 tool: "grep".into(),
                 input: "TODO".into(),
                 output: None,
@@ -3050,6 +3253,138 @@ mod tests {
         }
         let html = block_html(ws.tab(id).unwrap(), 0).unwrap();
         assert!(!html.contains("queue-status"), "{html}");
+    }
+
+    fn question_block(question: QuestionState) -> Block {
+        Block::Tool {
+            question: Some(question),
+            tool: "question".into(),
+            input: "Database".into(),
+            output: None,
+            images: Vec::new(),
+            status: None,
+        }
+    }
+
+    fn sample_question() -> gewu_protocol::Question {
+        gewu_protocol::Question {
+            question: "Which database?".into(),
+            header: "Database".into(),
+            options: vec![
+                gewu_protocol::QuestionOption {
+                    label: "Postgres".into(),
+                    description: "Relational".into(),
+                },
+                gewu_protocol::QuestionOption {
+                    label: "SQLite".into(),
+                    description: String::new(),
+                },
+            ],
+            multiple: false,
+            custom: true,
+        }
+    }
+
+    #[test]
+    fn pending_question_card_renders_tabbed_form() {
+        let multi = gewu_protocol::Question {
+            question: "Which features?".into(),
+            header: "Features".into(),
+            options: vec![gewu_protocol::QuestionOption {
+                label: "Auth".into(),
+                description: "Login".into(),
+            }],
+            multiple: true,
+            custom: false,
+        };
+        let state = QuestionState::Pending {
+            request_id: "que_1".into(),
+            questions: vec![sample_question(), multi],
+        };
+        let (ws, id) = tab_with_blocks(vec![question_block(state)]);
+        let html = tool_card_html(ws.tab(id).unwrap(), 0).expect("question card");
+
+        // The wrapper carries the card's distinct accent class.
+        assert!(html.contains("class=\"tool-card question-card\""), "{html}");
+        assert!(html.contains("class=\"question-form\""), "{html}");
+        assert!(html.contains("data-qtab=\"0\""), "{html}");
+        assert!(html.contains("data-qtab=\"1\""), "{html}");
+        assert!(html.contains("type=\"radio\""), "{html}");
+        assert!(html.contains("type=\"checkbox\""), "{html}");
+        assert!(html.contains("name=\"q-que_1-0\""), "{html}");
+        assert!(html.contains("data-custom=\"0\""), "{html}");
+        assert!(html.contains("question-submit"), "{html}");
+        assert!(html.contains("data-question-dismiss"), "{html}");
+        // Forms are not click-to-toggle tool cards.
+        assert!(!html.contains("toggle_tool"), "{html}");
+        // The custom row is absent where the question forbids it.
+        assert!(!html.contains("data-custom=\"1\""), "{html}");
+    }
+
+    #[test]
+    fn question_card_escapes_model_authored_text() {
+        let state = QuestionState::Pending {
+            request_id: "que_1".into(),
+            questions: vec![gewu_protocol::Question {
+                question: "<script>alert(1)</script>".into(),
+                header: "\"><img src=x>".into(),
+                options: vec![gewu_protocol::QuestionOption {
+                    label: "\"><script>x</script>".into(),
+                    description: "<b>bad</b>".into(),
+                }],
+                multiple: false,
+                custom: true,
+            }],
+        };
+        let (ws, id) = tab_with_blocks(vec![question_block(state)]);
+        let html = tool_card_html(ws.tab(id).unwrap(), 0).expect("question card");
+        assert!(!html.contains("<script>"), "{html}");
+        assert!(!html.contains("<img src=x>"), "{html}");
+        assert!(!html.contains("<b>bad</b>"), "{html}");
+        assert!(html.contains("&lt;script&gt;"), "{html}");
+        // A single question has no tab strip.
+        assert!(!html.contains("question-tabs"), "{html}");
+    }
+
+    #[test]
+    fn settled_question_card_shows_answers_or_dismissal() {
+        let questions = vec![sample_question()];
+        let answered = QuestionState::Answered {
+            request_id: "que_1".into(),
+            questions: questions.clone(),
+            answers: vec![vec!["SQLite".into()]],
+        };
+        let (ws, id) = tab_with_blocks(vec![question_block(answered)]);
+        let html = tool_card_html(ws.tab(id).unwrap(), 0).expect("question card");
+        assert!(html.contains("question-answer"), "{html}");
+        assert!(html.contains("SQLite"), "{html}");
+        assert!(!html.contains("question-form"), "{html}");
+
+        let dismissed = QuestionState::Dismissed {
+            request_id: "que_2".into(),
+            questions,
+        };
+        let (ws, id) = tab_with_blocks(vec![question_block(dismissed)]);
+        let html = tool_card_html(ws.tab(id).unwrap(), 0).expect("question card");
+        assert!(html.contains("Dismissed"), "{html}");
+    }
+
+    #[test]
+    fn question_cards_are_standalone_runs() {
+        let question = question_block(QuestionState::Pending {
+            request_id: "que_1".into(),
+            questions: vec![sample_question()],
+        });
+        let bash = Block::Tool {
+            question: None,
+            tool: "bash".into(),
+            input: "ls".into(),
+            output: None,
+            images: Vec::new(),
+            status: None,
+        };
+        assert!(!same_tool_run(&question, &bash));
+        assert!(!same_tool_run(&bash, &question));
     }
 
     #[test]

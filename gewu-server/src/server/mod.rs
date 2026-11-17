@@ -88,6 +88,10 @@ struct ServerState {
     /// Latest live state of each session's workflow runs, replayed to
     /// (re)connecting subscribers.
     workflows: Mutex<HashMap<String, BTreeMap<String, WorkflowRunState>>>,
+    /// Pending `question` tool requests. Questions are live-only: entries
+    /// disappear when answered, dismissed, or when the asking tool is
+    /// dropped (interrupt).
+    questions: Arc<gewu_core::QuestionBroker>,
     /// Serializes turn registration, snapshots, and lifecycle mutations.
     lifecycle: Mutex<()>,
 }
@@ -407,6 +411,7 @@ pub async fn serve(
         turns: Mutex::new(HashMap::new()),
         workflow_progress,
         workflows: Mutex::new(HashMap::new()),
+        questions: Arc::new(gewu_core::QuestionBroker::new()),
         lifecycle: Mutex::new(()),
     });
     tokio::spawn(forward_workflow_progress(state.clone(), workflow_rx));
@@ -772,6 +777,7 @@ impl ServerState {
                 context_limit: Some(entry.context_limit),
                 agents: self.bootstrap.agents.clone(),
                 workflow_progress: Some(self.workflow_progress.clone()),
+                question_broker: Some(self.questions.clone()),
                 session_id: &session_id,
             },
             self.bootstrap.log_writer.clone(),
@@ -1163,6 +1169,7 @@ async fn handle_request(
                 context_limit: Some(current.context_limit),
                 agents: state.bootstrap.agents.clone(),
                 workflow_progress: Some(state.workflow_progress.clone()),
+                question_broker: Some(state.questions.clone()),
                 session_id: &current.session_id,
             });
             let result = match replacement {
@@ -1862,6 +1869,49 @@ async fn handle_request(
             }))
         }
 
+        Op::QuestionReply {
+            request_id,
+            answers,
+        } => {
+            let session_id = request
+                .session_id
+                .or_else(|| session.as_ref().map(|s| s.session_id.clone()))
+                .or_else(|| state.questions.session_of(&request_id))
+                .ok_or_else(|| {
+                    RequestError::Failed("no session for this question reply".to_string())
+                })?;
+            let answers = state
+                .questions
+                .reply(&session_id, &request_id, answers)
+                .map_err(|e| RequestError::Failed(e.to_string()))?;
+            Ok(Handled::Reply(ServerMessage::QuestionReplied {
+                id: request.id,
+                session_id,
+                request_id,
+                answers: Some(answers),
+            }))
+        }
+
+        Op::QuestionReject { request_id } => {
+            let session_id = request
+                .session_id
+                .or_else(|| session.as_ref().map(|s| s.session_id.clone()))
+                .or_else(|| state.questions.session_of(&request_id))
+                .ok_or_else(|| {
+                    RequestError::Failed("no session for this question rejection".to_string())
+                })?;
+            state
+                .questions
+                .reject(&session_id, &request_id)
+                .map_err(|e| RequestError::Failed(e.to_string()))?;
+            Ok(Handled::Reply(ServerMessage::QuestionReplied {
+                id: request.id,
+                session_id,
+                request_id,
+                answers: None,
+            }))
+        }
+
         Op::Steer { text } => {
             let target = request
                 .session_id
@@ -2167,6 +2217,10 @@ async fn start_session_turn(
             if failure.is_some() {
                 drop_dangling_prompt(&mut agent).await;
                 agent.steering().pause();
+                // The aborted tool tasks are dropped asynchronously; remove
+                // their pending questions now so the session leaves no stale
+                // requests behind once the interrupt returns.
+                state.questions.cancel_session(&session.session_id);
             }
             let mut live = live.lock().await;
             let terminal = failure
@@ -2689,6 +2743,8 @@ mod tests {
         Plain,
         /// Ask for one tool call, then (second turn) finish with text.
         ToolCall,
+        /// Ask the user a `question`, then (second turn) finish with text.
+        QuestionCall,
     }
 
     impl TestLlm {
@@ -2702,6 +2758,13 @@ mod tests {
         fn tool_call() -> Arc<Self> {
             Arc::new(Self {
                 behavior: LlmBehavior::ToolCall,
+                delay_ms: 0,
+                calls: AtomicUsize::new(0),
+            })
+        }
+        fn question_call() -> Arc<Self> {
+            Arc::new(Self {
+                behavior: LlmBehavior::QuestionCall,
                 delay_ms: 0,
                 calls: AtomicUsize::new(0),
             })
@@ -2766,6 +2829,37 @@ mod tests {
                 LlmBehavior::ToolCall => vec![
                     gewu_core::types::ProviderEvent::ContentDelta {
                         delta: "Tool answered".to_string(),
+                    },
+                    gewu_core::types::ProviderEvent::Finish {
+                        reason: Some("stop".to_string()),
+                    },
+                ],
+                LlmBehavior::QuestionCall if call == 1 => vec![
+                    gewu_core::types::ProviderEvent::ToolCallStart {
+                        id: "call-q".to_string(),
+                        name: "question".to_string(),
+                    },
+                    gewu_core::types::ProviderEvent::ToolCallDelta {
+                        id: "call-q".to_string(),
+                        delta: serde_json::json!({
+                            "questions": [{
+                                "question": "Which database?",
+                                "header": "Database",
+                                "options": [
+                                    { "label": "Postgres", "description": "Relational" },
+                                    { "label": "SQLite", "description": "Embedded" }
+                                ]
+                            }]
+                        })
+                        .to_string(),
+                    },
+                    gewu_core::types::ProviderEvent::Finish {
+                        reason: Some("tool_calls".to_string()),
+                    },
+                ],
+                LlmBehavior::QuestionCall => vec![
+                    gewu_core::types::ProviderEvent::ContentDelta {
+                        delta: "Question answered".to_string(),
                     },
                     gewu_core::types::ProviderEvent::Finish {
                         reason: Some("stop".to_string()),
@@ -3730,6 +3824,7 @@ mod tests {
             turns: Mutex::new(HashMap::new()),
             workflow_progress: tokio::sync::broadcast::channel(16).0,
             workflows: Mutex::new(HashMap::new()),
+            questions: Arc::new(gewu_core::QuestionBroker::new()),
             lifecycle: Mutex::new(()),
         })
     }
@@ -4660,6 +4755,7 @@ mod tests {
             turns: Mutex::new(HashMap::new()),
             workflow_progress: tokio::sync::broadcast::channel(16).0,
             workflows: Mutex::new(HashMap::new()),
+            questions: Arc::new(gewu_core::QuestionBroker::new()),
             lifecycle: Mutex::new(()),
         });
         let (in_tx, mut out_rx, handle) = spawn_connection(state).await;
@@ -5742,5 +5838,189 @@ mod tests {
 
         drop(in_tx);
         handle.await.unwrap().unwrap();
+    }
+
+    async fn next_question_request(out_rx: &mut mpsc::Receiver<String>) -> String {
+        loop {
+            let frame = recv_json(out_rx).await;
+            assert_ne!(frame["type"], "error", "{frame}");
+            if frame["type"] == "event" && frame["event"]["type"] == "question_asked" {
+                assert!(frame["event"]["questions"][0]["question"].is_string());
+                return frame["event"]["request_id"]
+                    .as_str()
+                    .expect("question request id")
+                    .to_string();
+            }
+            assert_ne!(frame["type"], "result", "turn ended before asking");
+        }
+    }
+
+    #[tokio::test]
+    async fn question_tool_waits_for_answer_and_continues() {
+        let state = server_state_with(TestLlm::question_call());
+        let (input, mut output, connection) = spawn_connection(state.clone()).await;
+        input
+            .send(
+                ClientRequest::ask(1, "pick a database")
+                    .with_session("question-answered")
+                    .to_line(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(recv_json(&mut output).await["type"], "ready");
+
+        let request_id = next_question_request(&mut output).await;
+        assert_eq!(state.questions.pending_count(), 1);
+
+        input
+            .send(
+                ClientRequest::question_reply(2, &request_id, vec![vec!["SQLite".to_string()]])
+                    .to_line(),
+            )
+            .await
+            .unwrap();
+
+        let mut replied = false;
+        let mut resolved = None;
+        loop {
+            let frame = recv_json(&mut output).await;
+            match frame["type"].as_str().expect("message type") {
+                "question_replied" => {
+                    assert_eq!(frame["request_id"], request_id);
+                    assert_eq!(frame["answers"][0][0], "SQLite");
+                    replied = true;
+                }
+                "event" if frame["event"]["type"] == "question_resolved" => {
+                    assert_eq!(frame["event"]["request_id"], request_id);
+                    resolved = Some(frame["event"]["answers"].clone());
+                }
+                "result" => break,
+                "error" => panic!("unexpected error: {frame}"),
+                _ => {}
+            }
+        }
+        assert!(replied, "the reply was not acknowledged");
+        assert_eq!(
+            resolved,
+            Some(serde_json::json!([["SQLite"]])),
+            "the resolved event did not carry the answer"
+        );
+        assert_eq!(state.questions.pending_count(), 0);
+
+        // The model-facing tool result names the selected label.
+        let session = state
+            .sessions
+            .lock()
+            .await
+            .get("question-answered")
+            .cloned()
+            .expect("session");
+        let messages = session.agent.lock().await.memory.messages().to_vec();
+        assert!(messages.iter().any(|message| matches!(
+            message,
+            Message::Tool { content, .. } if content.contains("\"Which database?\"=\"SQLite\"")
+        )));
+
+        drop(input);
+        connection.await.unwrap().unwrap();
+    }
+
+    #[tokio::test]
+    async fn interrupting_a_pending_question_unregisters_it() {
+        let state = server_state_with(TestLlm::question_call());
+        let (input, mut output, connection) = spawn_connection(state.clone()).await;
+        input
+            .send(
+                ClientRequest::ask(1, "pick a database")
+                    .with_session("question-interrupted")
+                    .to_line(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(recv_json(&mut output).await["type"], "ready");
+
+        let _request_id = next_question_request(&mut output).await;
+        assert_eq!(state.questions.pending_count(), 1);
+
+        input
+            .send(ClientRequest::interrupt(2).to_line())
+            .await
+            .unwrap();
+        loop {
+            let frame = recv_json(&mut output).await;
+            if frame["type"] == "interrupted"
+                || (frame["type"] == "error" && frame["error"] == "interrupted")
+            {
+                break;
+            }
+            assert_ne!(frame["type"], "error", "{frame}");
+        }
+        assert_eq!(
+            state.questions.pending_count(),
+            0,
+            "the interrupted tool left its question registered"
+        );
+
+        drop(input);
+        connection.await.unwrap().unwrap();
+    }
+
+    #[tokio::test]
+    async fn dismissed_question_returns_a_normal_tool_result() {
+        let state = server_state_with(TestLlm::question_call());
+        let (input, mut output, connection) = spawn_connection(state.clone()).await;
+        input
+            .send(
+                ClientRequest::ask(1, "pick a database")
+                    .with_session("question-dismissed")
+                    .to_line(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(recv_json(&mut output).await["type"], "ready");
+
+        let request_id = next_question_request(&mut output).await;
+        input
+            .send(ClientRequest::question_reject(2, &request_id).to_line())
+            .await
+            .unwrap();
+
+        let mut resolved = false;
+        loop {
+            let frame = recv_json(&mut output).await;
+            match frame["type"].as_str().expect("message type") {
+                "question_replied" => {
+                    assert_eq!(frame["request_id"], request_id);
+                    assert!(frame.get("answers").is_none(), "{frame}");
+                }
+                "event"
+                    if frame["event"]["type"] == "question_resolved"
+                        && frame["event"]["answers"].is_null() =>
+                {
+                    resolved = true;
+                }
+                "result" => break,
+                "error" => panic!("unexpected error: {frame}"),
+                _ => {}
+            }
+        }
+        assert!(resolved, "no dismissal was reported");
+        assert_eq!(state.questions.pending_count(), 0);
+
+        let session = state
+            .sessions
+            .lock()
+            .await
+            .get("question-dismissed")
+            .cloned()
+            .expect("session");
+        let messages = session.agent.lock().await.memory.messages().to_vec();
+        assert!(messages.iter().any(|message| matches!(
+            message,
+            Message::Tool { content, .. } if content.contains("dismissed this question")
+        )));
+
+        drop(input);
+        connection.await.unwrap().unwrap();
     }
 }

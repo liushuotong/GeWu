@@ -1003,6 +1003,20 @@ body {
   pointer-events: none;
 }
 
+/* Agent questions get their own accent so a waiting form stands out from
+ * ordinary tool calls. The rail and bezel live on the wrapper. */
+.tool-card.question-card {
+  background:
+    linear-gradient(90deg, var(--violet-soft), transparent 60%),
+    linear-gradient(180deg, var(--bg-raised), var(--bg-panel));
+  border-left-color: var(--violet);
+}
+
+.tool-card.question-card::after {
+  border-top-color: var(--violet);
+  border-right-color: var(--violet);
+}
+
 .tool-group {
   margin: 0;
   border: 0;
@@ -1172,6 +1186,251 @@ body {
   white-space: nowrap;
   color: var(--text-dim);
   font-size: 11px;
+  font-style: italic;
+}
+
+/* -- question cards ----------------------------------------------------- */
+
+.tool.question {
+  cursor: default;
+  padding: 8px 10px 10px;
+}
+
+/* Question-specific controls follow the card's violet accent. */
+.question-card .tool-name,
+.question-card .question-tab.active {
+  color: var(--violet);
+}
+
+.question-card .question-tabs {
+  border-bottom-color: rgba(179, 146, 240, 0.25);
+}
+
+.question-card .question-tab.active {
+  border-color: rgba(179, 146, 240, 0.55);
+}
+
+.question-card .question-option input {
+  accent-color: var(--violet);
+}
+
+.question-card .question-custom:focus {
+  border-color: rgba(179, 146, 240, 0.55);
+}
+
+.question-card .question-submit {
+  background: var(--violet);
+  border-color: var(--violet);
+}
+
+.question-head {
+  display: flex;
+  align-items: baseline;
+  gap: 10px;
+  padding: 0 2px 6px;
+}
+
+.question-title {
+  color: var(--text);
+  font-family: var(--mono);
+  font-size: 12.5px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.question-tabs {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 4px;
+  border-bottom: 1px solid var(--line);
+  padding-bottom: 6px;
+  margin-bottom: 8px;
+}
+
+.question-tab {
+  font-family: var(--mono);
+  font-size: 11px;
+  letter-spacing: 0.04em;
+  color: var(--text-dim);
+  background: transparent;
+  border: 1px solid transparent;
+  border-radius: 3px;
+  padding: 3px 9px;
+  cursor: pointer;
+}
+
+.question-tab:hover {
+  background: var(--bg-hover);
+  color: var(--text);
+}
+
+.question-tab.active {
+  color: var(--accent);
+  border-color: var(--accent-dim);
+  background: var(--bg-inset);
+}
+
+.question-panel[hidden] {
+  display: none;
+}
+
+.question-text {
+  margin: 2px 0 8px;
+  color: var(--text);
+  font-size: 13px;
+  line-height: 1.5;
+  white-space: pre-wrap;
+}
+
+.question-option {
+  display: flex;
+  align-items: flex-start;
+  gap: 8px;
+  padding: 5px 7px;
+  border: 1px solid transparent;
+  border-radius: 4px;
+  cursor: pointer;
+}
+
+.question-option:hover {
+  background: var(--bg-hover);
+  border-color: var(--line);
+}
+
+.question-option input {
+  margin-top: 3px;
+  accent-color: var(--accent);
+}
+
+.question-option-text {
+  display: flex;
+  flex-direction: column;
+  gap: 1px;
+  min-width: 0;
+}
+
+.question-label {
+  color: var(--text);
+  font-size: 12.5px;
+  line-height: 1.4;
+}
+
+.question-desc {
+  color: var(--text-dim);
+  font-size: 11px;
+  line-height: 1.4;
+}
+
+.question-custom-row {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin: 8px 0 2px;
+  padding: 2px 7px;
+}
+
+.question-custom-label {
+  flex: 0 0 auto;
+  color: var(--text-dim);
+  font-size: 11px;
+  font-style: italic;
+}
+
+.question-custom {
+  flex: 1 1 auto;
+  min-width: 0;
+  font-family: var(--mono);
+  font-size: 12px;
+  color: var(--text);
+  background: var(--bg-inset);
+  border: 1px solid var(--line);
+  border-radius: 3px;
+  padding: 5px 8px;
+}
+
+.question-custom:focus {
+  outline: none;
+  border-color: var(--accent-dim);
+}
+
+.question-actions {
+  display: flex;
+  gap: 8px;
+  margin-top: 10px;
+}
+
+.question-submit,
+.question-dismiss {
+  font-family: var(--mono);
+  font-size: 11.5px;
+  letter-spacing: 0.04em;
+  padding: 5px 14px;
+  border-radius: 3px;
+  cursor: pointer;
+}
+
+.question-submit {
+  color: var(--bg-panel);
+  background: var(--accent);
+  border: 1px solid var(--accent);
+}
+
+.question-submit:hover {
+  filter: brightness(1.1);
+}
+
+.question-dismiss {
+  color: var(--text-dim);
+  background: transparent;
+  border: 1px solid var(--line-strong);
+}
+
+.question-dismiss:hover {
+  color: var(--text);
+  background: var(--bg-hover);
+}
+
+.question-submit:disabled,
+.question-dismiss:disabled {
+  opacity: 0.5;
+  cursor: default;
+}
+
+.question-answers {
+  display: flex;
+  flex-direction: column;
+  gap: 5px;
+  padding: 2px 6px 2px;
+}
+
+.question-answer {
+  display: flex;
+  align-items: baseline;
+  gap: 10px;
+  font-size: 12.5px;
+}
+
+.question-answer-q {
+  flex: 1 1 auto;
+  color: var(--text-dim);
+  font-size: 12px;
+  line-height: 1.4;
+  white-space: pre-wrap;
+}
+
+.question-answer-a {
+  flex: 0 0 auto;
+  max-width: 55%;
+  color: var(--text);
+  line-height: 1.4;
+  text-align: right;
+}
+
+.question-dismissed {
+  padding: 2px 6px;
+  color: var(--text-dim);
+  font-size: 12px;
   font-style: italic;
 }
 
@@ -2735,6 +2994,7 @@ body {
 .file-context-menu { position: fixed; z-index: 40; min-width: 168px; padding: 5px; border: 1px solid var(--line); border-radius: 8px; background: var(--bg-panel); box-shadow: 0 8px 24px rgba(0,0,0,.4); }
 .file-context-menu[hidden] { display: none; }
 .file-context-menu button { display: block; width: 100%; padding: 7px 10px; border: 0; border-radius: 6px; background: transparent; color: var(--text-dim); font: 12.5px var(--sans); text-align: left; cursor: pointer; }
+.file-context-menu button[hidden] { display: none; }
 .file-context-menu button:hover, .file-context-menu button:focus-visible { background: var(--bg-hover); color: var(--accent); outline: none; }
 .preview-overlay { position: fixed; inset: 0; z-index: 20; display: flex; flex-direction: column; margin-left: 8vw; padding: 0; background: var(--bg-panel); border-left: 1px solid var(--line); box-shadow: -12px 0 32px rgba(0,0,0,.45); }
 .preview-overlay.hidden { display: none; }

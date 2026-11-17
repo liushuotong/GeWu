@@ -624,6 +624,14 @@ impl Agent {
                     }
                 }
 
+                // A tool's final event (e.g. a resolved question) is queued
+                // just before its task returns, and the select above may have
+                // consumed the join result first. Drain what is left so the
+                // terminal event is not lost with the channel.
+                while let Ok(event) = progress_rx.try_recv() {
+                    yield event;
+                }
+
                 // Apply the results in the original call order so the
                 // conversation history stays deterministic regardless of
                 // completion order.

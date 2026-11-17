@@ -26,6 +26,7 @@
 //! | [`WorkflowStatusTool`] | `workflow_status` | Snapshot a workflow run without waiting |
 //! | [`WorkflowCancelTool`] | `workflow_cancel` | Abort a workflow run |
 //! | [`SkillTool`] | `skill` | Load skill instructions into the conversation |
+//! | [`QuestionTool`] | `question` | Ask the user structured questions mid-run |
 //!
 //! # MCP Tools
 //!
@@ -65,6 +66,7 @@ pub mod grep;
 pub mod list;
 pub mod mcp;
 mod media;
+pub mod question;
 pub mod replacers;
 pub mod search;
 pub mod skill;
@@ -79,6 +81,7 @@ pub use fs::{EditFileTool, GlobTool, ReadFileTool, WriteFileTool};
 pub use grep::GrepTool;
 pub use list::ListTool;
 pub use media::{DEFAULT_MAX_BASE64_BYTES, DEFAULT_MAX_DIMENSION, ImageLimits};
+pub use question::QuestionTool;
 pub use search::{CodeSearchTool, WebSearchTool};
 pub use skill::{SkillInfo, SkillTool};
 pub use task::{AgentFactory, AgentOverrides, TaskTool};

@@ -52,6 +52,7 @@
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
+pub use gewu_core::question::{Question, QuestionOption};
 pub use gewu_core::types::{
     AgentEvent, ContentPart, FunctionCall, Message, TokenUsage, ToolCall, summarize_tool_input,
 };
@@ -66,6 +67,16 @@ pub enum Op {
     /// Run an agent turn with the given prompt; events stream back.
     Ask {
         prompt: String,
+    },
+    /// Answer a pending `question` tool call. `answers` holds one label list
+    /// per question, in the order the questions were asked.
+    QuestionReply {
+        request_id: String,
+        answers: Vec<Vec<String>>,
+    },
+    /// Dismiss a pending `question` tool call without answering it.
+    QuestionReject {
+        request_id: String,
     },
     /// Attach to a session, restoring its live turn if one is running.
     SubscribeSession,
@@ -196,7 +207,15 @@ impl Serialize for ClientRequest {
                     | Op::ListFiles { .. }
                     | Op::ReadFile { .. }
                     | Op::WriteFile { .. }
-            ) as usize;
+            ) as usize
+            + if matches!(
+                self.op,
+                Op::QuestionReply { .. } | Op::QuestionReject { .. }
+            ) {
+                2
+            } else {
+                0
+            };
         let mut map = serializer.serialize_map(Some(2 + extra))?;
         map.serialize_entry("id", &self.id)?;
         match &self.op {
@@ -232,6 +251,18 @@ impl Serialize for ClientRequest {
             Op::Ask { prompt } => {
                 map.serialize_entry("op", "ask")?;
                 map.serialize_entry("prompt", prompt)?;
+            }
+            Op::QuestionReply {
+                request_id,
+                answers,
+            } => {
+                map.serialize_entry("op", "question_reply")?;
+                map.serialize_entry("request_id", request_id)?;
+                map.serialize_entry("answers", answers)?;
+            }
+            Op::QuestionReject { request_id } => {
+                map.serialize_entry("op", "question_reject")?;
+                map.serialize_entry("request_id", request_id)?;
             }
             Op::Auth { token } => {
                 map.serialize_entry("op", "auth")?;
@@ -333,6 +364,32 @@ impl ClientRequest {
             agent: None,
             workspace: None,
         }
+    }
+
+    /// Build a `question_reply` request. `answers` holds one label list per
+    /// question, in ask order; an empty list means "Unanswered".
+    pub fn question_reply(
+        id: impl Into<Value>,
+        request_id: impl Into<String>,
+        answers: Vec<Vec<String>>,
+    ) -> Self {
+        Self::simple(
+            id,
+            Op::QuestionReply {
+                request_id: request_id.into(),
+                answers,
+            },
+        )
+    }
+
+    /// Build a `question_reject` request (dismiss the pending form).
+    pub fn question_reject(id: impl Into<Value>, request_id: impl Into<String>) -> Self {
+        Self::simple(
+            id,
+            Op::QuestionReject {
+                request_id: request_id.into(),
+            },
+        )
     }
 
     /// Attach an explicit session id (honored when the connection session is
@@ -509,6 +566,21 @@ impl std::fmt::Display for RequestError {
 
 impl std::error::Error for RequestError {}
 
+/// Parse a `[["label", ...], ...]` answer payload; `None` when malformed.
+fn parse_answers(value: Option<&Value>) -> Option<Vec<Vec<String>>> {
+    let outer = value?.as_array()?;
+    let mut answers = Vec::with_capacity(outer.len());
+    for answer in outer {
+        let labels = answer.as_array()?;
+        let mut parsed = Vec::with_capacity(labels.len());
+        for label in labels {
+            parsed.push(label.as_str()?.to_string());
+        }
+        answers.push(parsed);
+    }
+    Some(answers)
+}
+
 /// Parse one client message (a JSON object) into a [`ClientRequest`].
 pub fn parse_request(line: &str) -> Result<ClientRequest, RequestError> {
     let value: Value = serde_json::from_str(line)
@@ -606,6 +678,38 @@ pub fn parse_request(line: &str) -> Result<ClientRequest, RequestError> {
                 .to_string();
             Op::Ask { prompt }
         }
+        "question_reply" => {
+            let request_id = obj
+                .get("request_id")
+                .and_then(Value::as_str)
+                .ok_or_else(|| {
+                    RequestError::Invalid(
+                        "op 'question_reply' requires a 'request_id' string".to_string(),
+                    )
+                })?
+                .to_string();
+            let answers = parse_answers(obj.get("answers")).ok_or_else(|| {
+                RequestError::Invalid(
+                    "op 'question_reply' requires 'answers' (an array of string arrays)"
+                        .to_string(),
+                )
+            })?;
+            Op::QuestionReply {
+                request_id,
+                answers,
+            }
+        }
+        "question_reject" => Op::QuestionReject {
+            request_id: obj
+                .get("request_id")
+                .and_then(Value::as_str)
+                .ok_or_else(|| {
+                    RequestError::Invalid(
+                        "op 'question_reject' requires a 'request_id' string".to_string(),
+                    )
+                })?
+                .to_string(),
+        },
         "interrupt" => Op::Interrupt,
         "steer" => Op::Steer {
             text: obj
@@ -951,6 +1055,18 @@ pub enum ServerMessage {
         /// The injected text.
         text: String,
     },
+    /// Reply to a `question_reply`/`question_reject` request.
+    QuestionReplied {
+        /// Echo of the client request id.
+        id: Value,
+        /// Session that owns the question.
+        session_id: String,
+        /// The question request that was settled.
+        request_id: String,
+        /// Accepted answers; `None` means the user dismissed the question.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        answers: Option<Vec<Vec<String>>>,
+    },
     /// An error occurred while handling the request.
     Error {
         /// Echo of the client request id, when known.
@@ -1105,6 +1221,7 @@ impl ServerMessage {
             ServerMessage::Result { .. } => "result",
             ServerMessage::Interrupted { .. } => "interrupted",
             ServerMessage::Steered { .. } => "steered",
+            ServerMessage::QuestionReplied { .. } => "question_replied",
             ServerMessage::Error { .. } => "error",
             ServerMessage::Pong { .. } => "pong",
             ServerMessage::Info { .. } => "info",
@@ -1150,6 +1267,7 @@ impl ServerMessage {
             | ServerMessage::Deleted { id, .. } => Some(id),
             ServerMessage::Interrupted { id, .. } | ServerMessage::Error { id, .. } => id.as_ref(),
             ServerMessage::Steered { id, .. } => Some(id),
+            ServerMessage::QuestionReplied { id, .. } => Some(id),
             ServerMessage::Event { .. }
             | ServerMessage::Result { .. }
             | ServerMessage::SessionSnapshot { .. }
@@ -1184,6 +1302,46 @@ mod tests {
             assert_eq!(parse_request(&request.to_line()).unwrap(), request);
         }
         assert!(parse_request(r#"{"id":1,"op":"revert_chat","turn":-1}"#).is_err());
+    }
+
+    #[test]
+    fn question_requests_and_reply_round_trip() {
+        let answers = vec![vec!["Postgres".to_string()], vec![]];
+        let request = ClientRequest::question_reply(4, "que_1", answers.clone()).with_session("s");
+        assert_eq!(parse_request(&request.to_line()).unwrap(), request);
+        assert_eq!(
+            request.to_line(),
+            r#"{"id":4,"op":"question_reply","request_id":"que_1","answers":[["Postgres"],[]],"session_id":"s"}"#
+        );
+
+        let reject = ClientRequest::question_reject(5, "que_1");
+        assert_eq!(parse_request(&reject.to_line()).unwrap(), reject);
+        assert!(parse_request(r#"{"id":1,"op":"question_reply"}"#).is_err());
+        assert!(parse_request(r#"{"id":1,"op":"question_reject"}"#).is_err());
+        assert!(
+            parse_request(r#"{"id":1,"op":"question_reply","request_id":"q","answers":[1]}"#)
+                .is_err()
+        );
+
+        let reply = ServerMessage::QuestionReplied {
+            id: 4.into(),
+            session_id: "s".into(),
+            request_id: "que_1".into(),
+            answers: Some(answers),
+        };
+        let decoded: ServerMessage = serde_json::from_str(&reply.to_line()).unwrap();
+        assert_eq!(decoded, reply);
+        assert_eq!(reply.kind(), "question_replied");
+        assert_eq!(reply.correlation_id(), Some(&4.into()));
+
+        let dismissed = ServerMessage::QuestionReplied {
+            id: 5.into(),
+            session_id: "s".into(),
+            request_id: "que_1".into(),
+            answers: None,
+        };
+        let decoded: ServerMessage = serde_json::from_str(&dismissed.to_line()).unwrap();
+        assert_eq!(decoded, dismissed);
     }
 
     #[test]

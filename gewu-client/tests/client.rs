@@ -26,6 +26,35 @@ async fn ping_round_trip() {
 }
 
 #[tokio::test]
+async fn question_reply_and_reject_round_trip() {
+    let server = fake::spawn(|| {
+        VecDeque::from([
+            Step::Reply(vec![fake::question_replied_line(
+                "1",
+                "s1",
+                "que_1",
+                Some(serde_json::json!([["SQLite"]])),
+            )]),
+            Step::Reply(vec![fake::question_replied_line("2", "s1", "que_1", None)]),
+        ])
+    })
+    .await;
+    let client = connect(&server).await;
+
+    client
+        .reply_question("que_1", vec![vec!["SQLite".to_string()]])
+        .await
+        .expect("question reply");
+    client
+        .reject_question("que_1")
+        .await
+        .expect("question rejection");
+
+    client.close().await;
+    server.stop().await;
+}
+
+#[tokio::test]
 async fn usage_round_trip() {
     let server =
         fake::spawn(|| VecDeque::from([Step::Reply(vec![fake::usage_line("1", 34_000, 128_000)])]))

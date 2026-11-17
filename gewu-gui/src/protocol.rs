@@ -75,6 +75,17 @@ pub enum ClientMsg {
         tab: u64,
         prompt: String,
     },
+    /// Answer the pending `question` form on a tab.
+    AnswerQuestion {
+        tab: u64,
+        request_id: String,
+        answers: Vec<Vec<String>>,
+    },
+    /// Dismiss the pending `question` form on a tab.
+    RejectQuestion {
+        tab: u64,
+        request_id: String,
+    },
     /// Interrupt the running ask on a tab.
     Interrupt {
         tab: u64,
@@ -135,6 +146,10 @@ pub enum ClientMsg {
     },
     /// Prepare a download for a workspace-relative file or folder.
     Download {
+        path: String,
+    },
+    /// Prepare a rendered HTML preview of a workspace-relative file.
+    PreviewFile {
         path: String,
     },
     /// Refresh the file tree.
@@ -234,6 +249,8 @@ pub enum ServerMsg {
     FilePreview { html: String },
     /// A ready-to-use download URL (a short-lived same-origin ticket).
     DownloadReady { url: String },
+    /// A ready-to-use HTML preview URL (a short-lived same-origin ticket).
+    PreviewReady { url: String },
     /// Close the file preview overlay.
     ClosePreview,
     /// Show or refresh the workflow graph zoom panel.
@@ -258,6 +275,27 @@ mod tests {
         assert_eq!(
             serde_json::from_str::<ClientMsg>(r#"{"op":"toggle_tool","tab":1,"block":7}"#).unwrap(),
             ClientMsg::ToggleTool { tab: 1, block: 7 }
+        );
+        assert_eq!(
+            serde_json::from_str::<ClientMsg>(
+                r#"{"op":"answer_question","tab":1,"request_id":"que_1","answers":[["A"],["B","C"]]}"#
+            )
+            .unwrap(),
+            ClientMsg::AnswerQuestion {
+                tab: 1,
+                request_id: "que_1".to_string(),
+                answers: vec![vec!["A".to_string()], vec!["B".to_string(), "C".to_string()]],
+            }
+        );
+        assert_eq!(
+            serde_json::from_str::<ClientMsg>(
+                r#"{"op":"reject_question","tab":1,"request_id":"que_1"}"#
+            )
+            .unwrap(),
+            ClientMsg::RejectQuestion {
+                tab: 1,
+                request_id: "que_1".to_string(),
+            }
         );
         assert_eq!(
             serde_json::from_str::<ClientMsg>(r#"{"op":"toggle_thought","tab":2,"block":5}"#)
@@ -317,6 +355,13 @@ mod tests {
             serde_json::from_str::<ClientMsg>(r#"{"op":"download","path":"src/main.rs"}"#).unwrap(),
             ClientMsg::Download {
                 path: "src/main.rs".into()
+            }
+        );
+        assert_eq!(
+            serde_json::from_str::<ClientMsg>(r#"{"op":"preview_file","path":"docs/a.html"}"#)
+                .unwrap(),
+            ClientMsg::PreviewFile {
+                path: "docs/a.html".into()
             }
         );
     }

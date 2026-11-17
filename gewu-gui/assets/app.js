@@ -62,6 +62,7 @@
     follow: new Map(),
     workflowZoom: { runId: null, scale: 1, x: 0, y: 0 },
     fileMenu: { path: null, entry: null },
+    previewWindow: null,
   };
 
   function loadToken() {
@@ -293,6 +294,7 @@
       state.ready = false;
       state.follow.clear();
       state.loadingEarlier = false;
+      closePendingPreview();
       updateComposer();
       if (state.authRequired && !state.token) {
         setOffline(false);
@@ -414,6 +416,7 @@
         break;
       case "error":
         state.loadingEarlier = false;
+        closePendingPreview();
         if (isUnauthorized(message.message)) {
           handleUnauthorized();
         } else {
@@ -455,6 +458,24 @@
       case "download_ready": {
         if (typeof message.url !== "string" || !message.url.startsWith("/download/")) break;
         void startDownload(message.url);
+        break;
+      }
+      case "preview_ready": {
+        if (typeof message.url !== "string" || !message.url.startsWith("/preview/")) break;
+        const pending = state.previewWindow;
+        state.previewWindow = null;
+        if (pending && !pending.closed) {
+          pending.location.replace(message.url);
+          break;
+        }
+        const opened = window.open(message.url, "_blank");
+        if (!opened) {
+          showAlert("Allow popups for this site to preview HTML files", "error");
+          break;
+        }
+        // The new window starts as a same-origin blank page; drop the opener
+        // before it navigates to the sandboxed preview document.
+        opened.opener = null;
         break;
       }
       case "close_preview":
@@ -862,6 +883,9 @@
   });
 
   document.addEventListener("keydown", (event) => {
+    // Escape inside a question form must not interrupt the ask that is
+    // waiting for it.
+    if (event.key === "Escape" && event.target.closest(".question-form")) return;
     if (event.key === "Escape" && !el.workflowZoom.classList.contains("hidden")) {
       send({ op: "close_workflow_zoom" });
     } else if (event.key === "Escape" && !el.filePreview.classList.contains("hidden")) {
@@ -948,6 +972,43 @@
     // Tool images sit inside a click-to-toggle card; clicking the picture
     // itself should not collapse it (right-click still saves the image).
     if (event.target.closest(".tool-image")) return;
+    const qtab = event.target.closest("[data-qtab]");
+    if (qtab) {
+      const form = qtab.closest(".question-form");
+      if (form) {
+        for (const button of form.querySelectorAll("[data-qtab]")) {
+          const active = button === qtab;
+          button.classList.toggle("active", active);
+          button.setAttribute("aria-selected", String(active));
+        }
+        for (const panel of form.querySelectorAll("[data-qpanel]")) {
+          const active = panel.dataset.qpanel === qtab.dataset.qtab;
+          panel.classList.toggle("active", active);
+          panel.hidden = !active;
+        }
+      }
+      return;
+    }
+    const dismiss = event.target.closest("[data-question-dismiss]");
+    if (dismiss) {
+      const form = dismiss.closest(".question-form");
+      if (form) {
+        const controls = Array.from(form.querySelectorAll("button, input"));
+        for (const control of controls) control.disabled = true;
+        // A rejected dismissal (or a failed send) leaves the form in place;
+        // re-enable it instead of stranding a disabled card.
+        setTimeout(() => {
+          if (!form.isConnected) return;
+          for (const control of controls) control.disabled = false;
+        }, 4000);
+        send({
+          op: "reject_question",
+          tab: Number(form.dataset.tab),
+          request_id: form.dataset.request,
+        });
+      }
+      return;
+    }
     const button = event.target.closest("[data-action]");
     if (!button) return;
     const tab = Number(button.dataset.tab);
@@ -962,6 +1023,60 @@
     } else if (button.dataset.action === "zoom_workflow") {
       send({ op: "zoom_workflow", tab, block });
     }
+  });
+
+  // One answer list per question, in tab order: selected labels plus an
+  // optional typed answer. A single-select question with a typed answer
+  // uses only that answer.
+  function questionAnswers(form) {
+    return Array.from(form.querySelectorAll("[data-qpanel]")).map((panel) => {
+      const selected = Array.from(
+        panel.querySelectorAll("input[type=radio]:checked, input[type=checkbox]:checked"),
+      ).map((input) => input.value);
+      const custom = panel.querySelector("[data-custom]");
+      const typed = custom ? custom.value.trim() : "";
+      if (!typed) return selected;
+      const multiple = !!panel.querySelector("input[type=checkbox]");
+      if (!multiple) return [typed];
+      return selected.includes(typed) ? selected : selected.concat(typed);
+    });
+  }
+
+  el.transcript.addEventListener("submit", (event) => {
+    const form = event.target.closest(".question-form");
+    if (!form) return;
+    event.preventDefault();
+    const submit = form.querySelector(".question-submit");
+    if (submit) {
+      submit.disabled = true;
+      setTimeout(() => {
+        if (submit.isConnected) submit.disabled = false;
+      }, 4000);
+    }
+    send({
+      op: "answer_question",
+      tab: Number(form.dataset.tab),
+      request_id: form.dataset.request,
+      answers: questionAnswers(form),
+    });
+  });
+
+  // Typing a custom answer replaces a single-select radio choice, and
+  // choosing a radio clears the typed answer, so the two never conflict.
+  el.transcript.addEventListener("input", (event) => {
+    const custom = event.target.closest("[data-custom]");
+    if (!custom) return;
+    const panel = custom.closest("[data-qpanel]");
+    if (!panel) return;
+    for (const radio of panel.querySelectorAll("input[type=radio]")) radio.checked = false;
+  });
+
+  el.transcript.addEventListener("change", (event) => {
+    const radio = event.target.closest('input[type="radio"]');
+    if (!radio) return;
+    const panel = radio.closest("[data-qpanel]");
+    const custom = panel && panel.querySelector("[data-custom]");
+    if (custom) custom.value = "";
   });
 
   function closeMessageMenus(restoreFocus = false) {
@@ -984,6 +1099,8 @@
 
   function openFileMenu(entry, x, y) {
     state.fileMenu = { path: entry.dataset.path, entry };
+    const preview = el.fileMenu.querySelector("[data-file-preview]");
+    if (preview) preview.hidden = !isHtmlEntry(entry);
     el.fileMenu.hidden = false;
     el.fileMenu.style.left = "0px";
     el.fileMenu.style.top = "0px";
@@ -992,8 +1109,21 @@
     const top = Math.max(8, Math.min(y, window.innerHeight - rect.height - 8));
     el.fileMenu.style.left = `${left}px`;
     el.fileMenu.style.top = `${top}px`;
-    const item = el.fileMenu.querySelector("button");
+    const item = el.fileMenu.querySelector("button:not([hidden])");
     if (item) item.focus({ preventScroll: true });
+  }
+
+  function isHtmlEntry(entry) {
+    return entry.classList.contains("tree-file") && /\.html?$/i.test(entry.dataset.path || "");
+  }
+
+  // The preview window is opened inside the click gesture because popup
+  // blockers reject opens that follow an async round trip. Navigate it once
+  // the ticket URL arrives; close it if the request fails or the socket drops.
+  function closePendingPreview() {
+    const win = state.previewWindow;
+    state.previewWindow = null;
+    if (win && !win.closed) win.close();
   }
 
   function closeFileMenu(restoreFocus = false) {
@@ -1095,6 +1225,16 @@
   });
 
   el.fileMenu.addEventListener("click", (event) => {
+    if (event.target.closest("[data-file-preview]")) {
+      const path = state.fileMenu.path;
+      closeFileMenu();
+      if (!path) return;
+      const win = window.open("", "_blank");
+      if (win) win.opener = null;
+      state.previewWindow = win;
+      send({ op: "preview_file", path });
+      return;
+    }
     if (!event.target.closest("[data-file-download]")) return;
     const path = state.fileMenu.path;
     closeFileMenu();

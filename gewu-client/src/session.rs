@@ -8,7 +8,47 @@
 //! any I/O.
 
 use gewu_core::agent::extract_media_parts;
+use gewu_core::question::Question;
 use gewu_protocol::{AgentEvent, ContentPart, Message, summarize_tool_input};
+
+/// A structured question attached to an open `question` tool block.
+#[derive(Debug, Clone, PartialEq)]
+pub enum QuestionState {
+    /// Waiting for the user's answer.
+    Pending {
+        request_id: String,
+        questions: Vec<Question>,
+    },
+    /// The user answered; `answers` holds one label list per question.
+    Answered {
+        request_id: String,
+        questions: Vec<Question>,
+        answers: Vec<Vec<String>>,
+    },
+    /// The user dismissed the form.
+    Dismissed {
+        request_id: String,
+        questions: Vec<Question>,
+    },
+}
+
+impl QuestionState {
+    pub fn request_id(&self) -> &str {
+        match self {
+            QuestionState::Pending { request_id, .. }
+            | QuestionState::Answered { request_id, .. }
+            | QuestionState::Dismissed { request_id, .. } => request_id,
+        }
+    }
+
+    pub fn questions(&self) -> &[Question] {
+        match self {
+            QuestionState::Pending { questions, .. }
+            | QuestionState::Answered { questions, .. }
+            | QuestionState::Dismissed { questions, .. } => questions,
+        }
+    }
+}
 
 /// One entry in the conversation transcript.
 #[derive(Debug, Clone, PartialEq)]
@@ -41,6 +81,9 @@ pub enum Block {
         /// Live status from the running tool (`ToolProgress` events);
         /// cleared when the tool finishes. Not part of stored history.
         status: Option<String>,
+        /// Pending or settled form for the `question` tool. Live-only: it
+        /// is rebuilt from the turn's event frames on reconnect.
+        question: Option<QuestionState>,
     },
     /// A non-fatal agent error or a connection error.
     Error(String),
@@ -194,12 +237,21 @@ impl SessionModel {
                     output: None,
                     images: Vec::new(),
                     status: None,
+                    question: None,
                 });
                 Some(self.blocks.len() - 1)
             }
             AgentEvent::ToolProgress { tool, message } => {
                 self.set_tool_status(Some(tool), Some(message.clone()))
             }
+            AgentEvent::QuestionAsked {
+                request_id,
+                questions,
+            } => self.attach_question(request_id, questions.clone()),
+            AgentEvent::QuestionResolved {
+                request_id,
+                answers,
+            } => self.resolve_question(request_id, answers.clone()),
             AgentEvent::ToolFinish { tool, output, .. } => {
                 self.set_tool_status(Some(tool), None);
                 let (text, images) = tool_media(output);
@@ -213,6 +265,7 @@ impl SessionModel {
                     output: Some(text),
                     images,
                     status: None,
+                    question: None,
                 });
                 Some(self.blocks.len() - 1)
             }
@@ -324,6 +377,7 @@ impl SessionModel {
                         output: None,
                         images: Vec::new(),
                         status: None,
+                        question: None,
                     });
                 }
             }
@@ -349,6 +403,7 @@ impl SessionModel {
                         output: Some(output),
                         images,
                         status: None,
+                        question: None,
                     });
                 }
             }
@@ -454,6 +509,85 @@ impl SessionModel {
         None
     }
 
+    /// Attach a newly asked question to its open `question` tool block.
+    ///
+    /// The tool-input summary for `question` is the first question's header,
+    /// so a card is matched by that label first; its fallback is the first
+    /// open question card. Exact matching keeps parallel question calls
+    /// aligned with their form even when the ask events arrive out of call
+    /// order. Each block carries one request id, so resolution is exact.
+    fn attach_question(&mut self, request_id: &str, questions: Vec<Question>) -> Option<usize> {
+        let label = questions
+            .first()
+            .map(|question| question.header.trim())
+            .filter(|header| !header.is_empty());
+        let mut fallback = None;
+        let mut matched = None;
+        for (index, block) in self.blocks.iter().enumerate() {
+            let Block::Tool {
+                tool,
+                input,
+                output: None,
+                question: None,
+                ..
+            } = block
+            else {
+                continue;
+            };
+            if tool != "question" {
+                continue;
+            }
+            fallback.get_or_insert(index);
+            if label.is_none_or(|label| input.as_str() == label) {
+                matched = Some(index);
+                break;
+            }
+        }
+        let index = matched.or(fallback)?;
+        let Block::Tool { question: slot, .. } = &mut self.blocks[index] else {
+            return None;
+        };
+        *slot = Some(QuestionState::Pending {
+            request_id: request_id.to_string(),
+            questions,
+        });
+        Some(index)
+    }
+
+    /// Replace the pending state of the block owning `request_id`.
+    fn resolve_question(
+        &mut self,
+        request_id: &str,
+        answers: Option<Vec<Vec<String>>>,
+    ) -> Option<usize> {
+        for i in 0..self.blocks.len() {
+            let Block::Tool {
+                question: Some(state),
+                ..
+            } = &mut self.blocks[i]
+            else {
+                continue;
+            };
+            if state.request_id() != request_id {
+                continue;
+            }
+            let questions = state.questions().to_vec();
+            *state = match answers.clone() {
+                Some(answers) => QuestionState::Answered {
+                    request_id: request_id.to_string(),
+                    questions,
+                    answers,
+                },
+                None => QuestionState::Dismissed {
+                    request_id: request_id.to_string(),
+                    questions,
+                },
+            };
+            return Some(i);
+        }
+        None
+    }
+
     // -- lifecycle ----------------------------------------------------------
 
     /// Record a user prompt and enter the busy phase.
@@ -465,6 +599,41 @@ impl SessionModel {
     /// An ask finished (success or terminal error).
     pub fn finish_ask(&mut self) {
         self.phase = Phase::Idle;
+        // A question still pending when the turn ends can never be answered:
+        // the request is unregistered server-side (interrupt) or lost with
+        // the turn. Settle the card instead of leaving a dead form. A
+        // `question` block announced without a form (interrupted before the
+        // ask event arrived) is closed too, so a later turn cannot attach its
+        // form to the stale card.
+        for block in &mut self.blocks {
+            let Block::Tool {
+                tool,
+                output,
+                question,
+                ..
+            } = block
+            else {
+                continue;
+            };
+            if tool != "question" {
+                continue;
+            }
+            match question {
+                Some(QuestionState::Pending {
+                    request_id,
+                    questions,
+                }) => {
+                    *question = Some(QuestionState::Dismissed {
+                        request_id: std::mem::take(request_id),
+                        questions: std::mem::take(questions),
+                    });
+                }
+                None if output.is_none() => {
+                    *output = Some("Question not asked (the turn ended).".to_string());
+                }
+                _ => {}
+            }
+        }
     }
 
     /// Record the session id; `None` is ignored so a known id is sticky.
@@ -650,6 +819,7 @@ mod tests {
         assert_eq!(
             m.blocks,
             vec![Block::Tool {
+                question: None,
                 tool: "bash".into(),
                 input: "ls".into(),
                 output: Some("file.rs".into()),
@@ -657,6 +827,234 @@ mod tests {
                 status: None,
             }]
         );
+    }
+
+    fn question() -> Question {
+        Question {
+            question: "Which database?".into(),
+            header: "Database".into(),
+            options: vec![gewu_core::question::QuestionOption {
+                label: "SQLite".into(),
+                description: "Embedded".into(),
+            }],
+            multiple: false,
+            custom: true,
+        }
+    }
+
+    #[test]
+    fn question_events_attach_to_the_question_card_and_resolve() {
+        let mut m = model();
+        let _ = m.apply_event(&AgentEvent::ToolStart {
+            tool: "question".into(),
+            input: r#"{"questions":[{"question":"Which database?","header":"Database"}]}"#.into(),
+        });
+        assert_eq!(
+            m.apply_event(&AgentEvent::QuestionAsked {
+                request_id: "que_1".into(),
+                questions: vec![question()],
+            }),
+            Some(0)
+        );
+        assert!(matches!(
+            &m.blocks[0],
+            Block::Tool {
+                question: Some(QuestionState::Pending { request_id, .. }),
+                ..
+            } if request_id == "que_1"
+        ));
+
+        assert_eq!(
+            m.apply_event(&AgentEvent::QuestionResolved {
+                request_id: "que_1".into(),
+                answers: Some(vec![vec!["SQLite".into()]]),
+            }),
+            Some(0)
+        );
+        assert!(matches!(
+            &m.blocks[0],
+            Block::Tool {
+                question: Some(QuestionState::Answered { answers, .. }),
+                ..
+            } if answers == &vec![vec!["SQLite".to_string()]]
+        ));
+
+        // The tool result still lands in the same card.
+        let _ = m.apply_event(&AgentEvent::ToolFinish {
+            tool: "question".into(),
+            title: "question".into(),
+            output: "answered".into(),
+            metadata: Default::default(),
+        });
+        assert_eq!(m.blocks.len(), 1);
+        assert!(matches!(
+            &m.blocks[0],
+            Block::Tool {
+                output: Some(_),
+                question: Some(QuestionState::Answered { .. }),
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn parallel_questions_resolve_by_request_id() {
+        let mut m = model();
+        for _ in 0..2 {
+            let _ = m.apply_event(&AgentEvent::ToolStart {
+                tool: "question".into(),
+                input: "{}".into(),
+            });
+        }
+        let _ = m.apply_event(&AgentEvent::QuestionAsked {
+            request_id: "que_a".into(),
+            questions: vec![question()],
+        });
+        let _ = m.apply_event(&AgentEvent::QuestionAsked {
+            request_id: "que_b".into(),
+            questions: vec![question()],
+        });
+        // Resolve the second question first: the first card stays pending.
+        let _ = m.apply_event(&AgentEvent::QuestionResolved {
+            request_id: "que_b".into(),
+            answers: Some(vec![vec!["Postgres".into()]]),
+        });
+        assert!(matches!(
+            &m.blocks[0],
+            Block::Tool {
+                question: Some(QuestionState::Pending { request_id, .. }),
+                ..
+            } if request_id == "que_a"
+        ));
+        assert!(matches!(
+            &m.blocks[1],
+            Block::Tool {
+                question: Some(QuestionState::Answered { request_id, .. }),
+                ..
+            } if request_id == "que_b"
+        ));
+    }
+
+    #[test]
+    fn finishing_an_ask_settles_a_still_pending_question() {
+        let mut m = model();
+        let _ = m.apply_event(&AgentEvent::ToolStart {
+            tool: "question".into(),
+            input: "{}".into(),
+        });
+        let _ = m.apply_event(&AgentEvent::QuestionAsked {
+            request_id: "que_1".into(),
+            questions: vec![question()],
+        });
+        m.finish_ask();
+        assert!(matches!(
+            &m.blocks[0],
+            Block::Tool {
+                question: Some(QuestionState::Dismissed { request_id, questions }),
+                ..
+            } if request_id == "que_1" && questions == &vec![question()]
+        ));
+    }
+
+    #[test]
+    fn out_of_order_ask_events_match_cards_by_header() {
+        let mut m = model();
+        for header in ["First", "Second"] {
+            let _ = m.apply_event(&AgentEvent::ToolStart {
+                tool: "question".into(),
+                input: format!(r#"{{"questions":[{{"question":"?","header":"{header}"}}]}}"#),
+            });
+        }
+        let named = |header: &str| Question {
+            header: header.into(),
+            ..question()
+        };
+        // The second call's event arrives first.
+        let _ = m.apply_event(&AgentEvent::QuestionAsked {
+            request_id: "que_b".into(),
+            questions: vec![named("Second")],
+        });
+        let _ = m.apply_event(&AgentEvent::QuestionAsked {
+            request_id: "que_a".into(),
+            questions: vec![named("First")],
+        });
+        assert!(matches!(
+            &m.blocks[0],
+            Block::Tool {
+                question: Some(QuestionState::Pending { request_id, .. }),
+                ..
+            } if request_id == "que_a"
+        ));
+        assert!(matches!(
+            &m.blocks[1],
+            Block::Tool {
+                question: Some(QuestionState::Pending { request_id, .. }),
+                ..
+            } if request_id == "que_b"
+        ));
+    }
+
+    #[test]
+    fn finishing_an_ask_closes_a_question_announced_without_a_form() {
+        let mut m = model();
+        let _ = m.apply_event(&AgentEvent::ToolStart {
+            tool: "question".into(),
+            input: r#"{"questions":[{"question":"?","header":"Stale"}]}"#.into(),
+        });
+        m.finish_ask();
+        assert!(matches!(
+            &m.blocks[0],
+            Block::Tool {
+                question: None,
+                output: Some(output),
+                ..
+            } if output.contains("turn ended")
+        ));
+
+        // A later turn's form attaches to its own card, not the stale one.
+        let _ = m.apply_event(&AgentEvent::ToolStart {
+            tool: "question".into(),
+            input: r#"{"questions":[{"question":"?","header":"Fresh"}]}"#.into(),
+        });
+        let _ = m.apply_event(&AgentEvent::QuestionAsked {
+            request_id: "que_fresh".into(),
+            questions: vec![Question {
+                header: "Fresh".into(),
+                ..question()
+            }],
+        });
+        assert!(matches!(&m.blocks[0], Block::Tool { question: None, .. }));
+        assert!(matches!(
+            &m.blocks[1],
+            Block::Tool {
+                question: Some(QuestionState::Pending { request_id, .. }),
+                ..
+            } if request_id == "que_fresh"
+        ));
+    }
+
+    #[test]
+    fn dismissed_questions_keep_their_questions_for_the_summary() {
+        let mut m = model();
+        let _ = m.apply_event(&AgentEvent::ToolStart {
+            tool: "question".into(),
+            input: "{}".into(),
+        });
+        let _ = m.apply_event(&AgentEvent::QuestionAsked {
+            request_id: "que_1".into(),
+            questions: vec![question()],
+        });
+        let _ = m.apply_event(&AgentEvent::QuestionResolved {
+            request_id: "que_1".into(),
+            answers: None,
+        });
+        assert!(matches!(
+            &m.blocks[0],
+            Block::Tool {
+                question: Some(QuestionState::Dismissed { questions, .. }),
+                ..
+            } if questions == &vec![question()]
+        ));
     }
 
     #[test]
@@ -685,6 +1083,7 @@ mod tests {
         assert_eq!(
             m.blocks[0],
             Block::Tool {
+                question: None,
                 tool: "bash".into(),
                 input: "ls".into(),
                 output: Some("file.rs".into()),
@@ -1071,6 +1470,7 @@ mod tests {
                 Block::User("list files".into()),
                 Block::Assistant("checking".into()),
                 Block::Tool {
+                    question: None,
                     tool: "bash".into(),
                     input: "ls".into(),
                     output: Some("a.rs".into()),
@@ -1143,6 +1543,7 @@ mod tests {
             m.blocks,
             vec![
                 Block::Tool {
+                    question: None,
                     tool: "read_file".into(),
                     input: "{}".into(),
                     output: Some("file".into()),
@@ -1150,6 +1551,7 @@ mod tests {
                     status: None,
                 },
                 Block::Tool {
+                    question: None,
                     tool: "bash".into(),
                     input: "{}".into(),
                     output: Some("cmd".into()),
@@ -1186,6 +1588,7 @@ mod tests {
         assert_eq!(
             m.blocks,
             vec![Block::Tool {
+                question: None,
                 tool: "read_file".into(),
                 input: "shot.png".into(),
                 output: Some("Image read successfully".into()),
@@ -1225,6 +1628,7 @@ mod tests {
         assert_eq!(
             m.blocks[0],
             Block::Tool {
+                question: None,
                 tool: "read_file".into(),
                 input: "shot.png".into(),
                 output: Some("Image read successfully".into()),
@@ -1302,6 +1706,7 @@ mod tests {
         assert_eq!(
             m.blocks[0],
             Block::Tool {
+                question: None,
                 tool: "task".into(),
                 input: "explore".into(),
                 output: None,
@@ -1322,6 +1727,7 @@ mod tests {
         assert_eq!(
             m.blocks[0],
             Block::Tool {
+                question: None,
                 tool: "task".into(),
                 input: "explore".into(),
                 output: None,

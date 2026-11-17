@@ -1142,6 +1142,28 @@ impl GuiSession {
             ClientMsg::Ask { tab, prompt } => {
                 self.handle_ask(tab, prompt, sender, tab_tx).await?;
             }
+            ClientMsg::AnswerQuestion {
+                tab,
+                request_id,
+                answers,
+            } => {
+                let Some(client) = self.client(tab) else {
+                    return self.send_error(sender, "unknown tab").await;
+                };
+                if let Err(e) = client.reply_question(&request_id, answers).await {
+                    self.send_error(sender, format!("could not answer question: {e}"))
+                        .await?;
+                }
+            }
+            ClientMsg::RejectQuestion { tab, request_id } => {
+                let Some(client) = self.client(tab) else {
+                    return self.send_error(sender, "unknown tab").await;
+                };
+                if let Err(e) = client.reject_question(&request_id).await {
+                    self.send_error(sender, format!("could not dismiss question: {e}"))
+                        .await?;
+                }
+            }
             ClientMsg::Interrupt { tab } => {
                 if let Some(client) = self.client(tab)
                     && let Err(e) = client.interrupt().await
@@ -1412,6 +1434,35 @@ impl GuiSession {
                     None => {
                         self.send_error(sender, "no active session to download from")
                             .await?
+                    }
+                }
+            }
+            ClientMsg::PreviewFile { path } => {
+                if !is_html_path(&path) {
+                    self.send_error(sender, format!("'{path}' is not an HTML file"))
+                        .await?
+                } else {
+                    let tab_id = self.workspace.active_id();
+                    self.file_client().await?;
+                    let session_id = self
+                        .workspace
+                        .tab(tab_id)
+                        .and_then(|tab| tab.model.session_id.clone());
+                    match session_id {
+                        Some(session_id) => {
+                            let id = self.downloads.mint_preview(session_id, path);
+                            send_msg(
+                                sender,
+                                &ServerMsg::PreviewReady {
+                                    url: format!("/preview/{id}"),
+                                },
+                            )
+                            .await?
+                        }
+                        None => {
+                            self.send_error(sender, "no active session to preview from")
+                                .await?
+                        }
                     }
                 }
             }
@@ -2140,9 +2191,25 @@ fn sanitize_upload_name(name: &str) -> Option<String> {
     Some(name.to_string())
 }
 
+/// Whether a workspace path names an HTML file the preview route may serve.
+fn is_html_path(path: &str) -> bool {
+    let lower = path.to_ascii_lowercase();
+    lower.ends_with(".html") || lower.ends_with(".htm")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn only_html_paths_are_previewable() {
+        assert!(is_html_path("docs/a.html"));
+        assert!(is_html_path("A.HTM"));
+        assert!(is_html_path("index.HTML"));
+        assert!(!is_html_path("src/main.rs"));
+        assert!(!is_html_path("docs/a.html.bak"));
+        assert!(!is_html_path("html"));
+    }
 
     #[test]
     fn toggle_flips_membership() {
@@ -2180,6 +2247,7 @@ mod tests {
 
     fn tool(tool: &str, output: Option<&str>) -> Block {
         Block::Tool {
+            question: None,
             tool: tool.into(),
             input: String::new(),
             output: output.map(str::to_string),

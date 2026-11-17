@@ -141,6 +141,27 @@ pub(crate) fn error_line(id: Option<&str>, error: &str) -> String {
     obj.to_string()
 }
 
+/// Convenience: a `question_replied` frame line. `answers` is `None` for a
+/// dismissed question (the field is omitted).
+pub(crate) fn question_replied_line(
+    id: &str,
+    session_id: &str,
+    request_id: &str,
+    answers: Option<serde_json::Value>,
+) -> String {
+    let id: serde_json::Value = serde_json::from_str(id).unwrap_or_else(|_| id.into());
+    let mut obj = serde_json::json!({
+        "type": "question_replied",
+        "id": id,
+        "session_id": session_id,
+        "request_id": request_id,
+    });
+    if let Some(answers) = answers {
+        obj["answers"] = answers;
+    }
+    obj.to_string()
+}
+
 /// Convenience: a `pong` frame line.
 pub(crate) fn pong_line(id: &str) -> String {
     let id: serde_json::Value = serde_json::from_str(id).unwrap_or_else(|_| id.into());

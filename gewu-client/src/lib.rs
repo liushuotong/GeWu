@@ -41,7 +41,7 @@ pub mod session;
 mod stream;
 
 pub use gewu_protocol::summarize_tool_input;
-pub use session::{Block, Phase, SessionModel};
+pub use session::{Block, Phase, QuestionState, SessionModel};
 pub use stream::AskStream;
 
 use std::sync::Arc;
@@ -325,6 +325,30 @@ impl Client {
         match self.request(request).await? {
             ServerMessage::Steered { .. } => Ok(()),
             other => Err(unexpected(other, "steered")),
+        }
+    }
+
+    /// Answer a pending `question` tool call. `answers` holds one label list
+    /// per question, in ask order; an empty list means "Unanswered".
+    pub async fn reply_question(
+        &self,
+        request_id: impl Into<String>,
+        answers: Vec<Vec<String>>,
+    ) -> Result<()> {
+        let request =
+            ClientRequest::question_reply(self.next_correlation_id(), request_id, answers);
+        match self.request(request).await? {
+            ServerMessage::QuestionReplied { .. } => Ok(()),
+            other => Err(unexpected(other, "question_replied")),
+        }
+    }
+
+    /// Dismiss a pending `question` tool call without answering it.
+    pub async fn reject_question(&self, request_id: impl Into<String>) -> Result<()> {
+        let request = ClientRequest::question_reject(self.next_correlation_id(), request_id);
+        match self.request(request).await? {
+            ServerMessage::QuestionReplied { .. } => Ok(()),
+            other => Err(unexpected(other, "question_replied")),
         }
     }
 

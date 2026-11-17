@@ -13,6 +13,7 @@
 - **`WebFetchTool`**, **`WebSearchTool`**, and **`CodeSearchTool`**: Fetch and search external information.
 - **`TodoReadTool`** and **`TodoWriteTool`**: Maintain an agent task list.
 - **`TaskTool`**: Launches sub-agents (build/explore/general) for complex tasks; resumable via `task_id`.
+- **`QuestionTool`** (`question`): Asks the user structured multiple-choice questions mid-run. It needs a `QuestionBroker` and an interactive front-end (the server GUI wires one); CLI runs and subagents do not get the tool.
 
 ### MCP (Model Context Protocol)
 

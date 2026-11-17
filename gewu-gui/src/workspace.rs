@@ -394,6 +394,7 @@ mod tests {
     #[test]
     fn window_never_starts_inside_a_tool_run() {
         let tool = || Block::Tool {
+            question: None,
             tool: "bash".into(),
             input: String::new(),
             output: None,

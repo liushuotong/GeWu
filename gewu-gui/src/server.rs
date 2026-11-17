@@ -2,7 +2,8 @@
 //!
 //! A single axum listener serves the embedded single-page app plus the JSON
 //! configuration endpoint, the `/ws` connection that carries [`ClientMsg`]
-//! and [`ServerMsg`] frames, and ticket-authorized `/download` streaming.
+//! and [`ServerMsg`] frames, ticket-authorized `/download` streaming, and
+//! ticket-authorized HTML previews under `/preview`.
 //! When a token is configured, the first WebSocket frame must be
 //! `{"op":"auth","token":"…"}`.
 
@@ -57,6 +58,13 @@ const CSP: &str = "default-src 'self'; script-src 'self'; style-src 'self'; \
                    font-src 'self'; img-src 'self' https: data:; connect-src 'self' ws: wss:; \
                    base-uri 'none'; form-action 'self'; frame-ancestors 'none'";
 
+/// CSP for a previewed HTML page. `sandbox` without `allow-same-origin` gives
+/// the document an opaque origin: its scripts run, but they cannot read the
+/// GUI's `localStorage` token, reuse cookies, or call the authenticated socket.
+/// No fetch directive is set, so pages may still load their own CDN assets.
+const PREVIEW_CSP: &str =
+    "sandbox allow-scripts allow-forms allow-modals allow-popups allow-downloads";
+
 /// How long a client has to send its auth frame.
 const AUTH_TIMEOUT: Duration = Duration::from_secs(30);
 
@@ -101,6 +109,7 @@ pub fn router(state: AppState) -> Router {
         .route("/fonts/{name}", get(font))
         .route("/api/config", get(config))
         .route("/download/{ticket}", get(download).head(download_head))
+        .route("/preview/{ticket}", get(preview))
         .route("/ws", get(ws_handler))
         .with_state(state)
 }
@@ -236,6 +245,61 @@ async fn proxy_download(state: AppState, ticket: String, head_only: bool) -> Res
         )
             .into_response()
     })
+}
+
+async fn preview(State(state): State<AppState>, Path(ticket): Path<String>) -> Response {
+    let Ok(id) = uuid::Uuid::parse_str(&ticket) else {
+        return (StatusCode::NOT_FOUND, "preview link is invalid or expired").into_response();
+    };
+    let Some((session_id, path)) = state.downloads.get_preview(&id) else {
+        return (StatusCode::NOT_FOUND, "preview link is invalid or expired").into_response();
+    };
+
+    let url = format!("{}/download", state.server_http.trim_end_matches('/'));
+    let mut request = state
+        .http_client
+        .get(&url)
+        .query(&[("session_id", session_id.as_str()), ("path", path.as_str())]);
+    if let Some(token) = state.server_token.as_deref() {
+        request = request.bearer_auth(token);
+    }
+    let upstream = match request.send().await {
+        Ok(response) => response,
+        Err(error) => {
+            return (StatusCode::BAD_GATEWAY, format!("preview failed: {error}")).into_response();
+        }
+    };
+    if !upstream.status().is_success() {
+        let status = StatusCode::from_u16(upstream.status().as_u16())
+            .unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
+        let message = upstream
+            .text()
+            .await
+            .unwrap_or_else(|_| "preview failed".to_string());
+        return (status, message).into_response();
+    }
+
+    // The upstream serves every file as an attachment with an opaque type;
+    // override both so the browser renders the page instead of downloading it.
+    let mut builder = Response::builder()
+        .status(StatusCode::OK)
+        .header(header::CONTENT_TYPE, "text/html; charset=utf-8")
+        .header(header::CONTENT_SECURITY_POLICY, PREVIEW_CSP)
+        .header(header::CACHE_CONTROL, "no-store")
+        .header(header::X_CONTENT_TYPE_OPTIONS, "nosniff")
+        .header(header::REFERRER_POLICY, "no-referrer");
+    if let Some(length) = upstream.headers().get(header::CONTENT_LENGTH) {
+        builder = builder.header(header::CONTENT_LENGTH, length);
+    }
+    builder
+        .body(Body::from_stream(upstream.bytes_stream()))
+        .unwrap_or_else(|error| {
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("preview response failed: {error}"),
+            )
+                .into_response()
+        })
 }
 
 async fn ws_handler(ws: WebSocketUpgrade, State(state): State<AppState>) -> Response {
@@ -921,6 +985,78 @@ mod tests {
         let addr = spawn_gui(test_state(None)).await;
         let response = download_client()
             .get(format!("http://{addr}/download/{}", uuid::Uuid::new_v4()))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status(), reqwest::StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn streams_sandboxed_html_previews_from_the_http_endpoint() {
+        let (upstream, mut requests) = spawn_http_upstream("200 OK", "<h1>hi</h1>").await;
+        let state = AppState {
+            server_http: format!("http://{upstream}"),
+            server_token: Some("upstream-secret".to_string()),
+            ..test_state(None)
+        };
+        let id = state
+            .downloads
+            .mint_preview("sess-1".to_string(), "docs/a.html".to_string());
+        let addr = spawn_gui(state).await;
+        let response = download_client()
+            .get(format!("http://{addr}/preview/{id}"))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status(), reqwest::StatusCode::OK);
+        assert_eq!(
+            response.headers()[header::CONTENT_TYPE],
+            "text/html; charset=utf-8"
+        );
+        let csp = response.headers()[header::CONTENT_SECURITY_POLICY]
+            .to_str()
+            .unwrap();
+        assert!(csp.starts_with("sandbox "), "{csp}");
+        assert!(!csp.contains("allow-same-origin"), "{csp}");
+        assert!(
+            !response.headers().contains_key(header::CONTENT_DISPOSITION),
+            "previews must render, not download"
+        );
+        assert_eq!(response.headers()[header::CACHE_CONTROL], "no-store");
+        assert_eq!(response.text().await.unwrap(), "<h1>hi</h1>");
+
+        let request = requests.recv().await.unwrap().to_lowercase();
+        assert!(request.starts_with("get /download?"), "{request}");
+        assert!(
+            request.contains("authorization: bearer upstream-secret"),
+            "{request}"
+        );
+        assert!(request.contains("session_id=sess-1"), "{request}");
+        assert!(request.contains("path=docs%2fa.html"), "{request}");
+    }
+
+    #[tokio::test]
+    async fn preview_routes_reject_other_tickets() {
+        let state = test_state(None);
+        let download = state
+            .downloads
+            .mint("sess-1".to_string(), "docs/a.html".to_string());
+        let addr = spawn_gui(state).await;
+        let client = download_client();
+
+        let response = client
+            .get(format!("http://{addr}/preview/{download}"))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status(), reqwest::StatusCode::NOT_FOUND);
+        assert_eq!(
+            response.text().await.unwrap(),
+            "preview link is invalid or expired"
+        );
+
+        let response = client
+            .get(format!("http://{addr}/preview/{}", uuid::Uuid::new_v4()))
             .send()
             .await
             .unwrap();

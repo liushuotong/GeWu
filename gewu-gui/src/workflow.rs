@@ -1079,6 +1079,7 @@ mod tests {
         let blocks = vec![
             Block::Assistant("before".into()),
             Block::Tool {
+                question: None,
                 tool: "workflow_start".into(),
                 input: SPEC.into(),
                 output: Some("Started workflow run r-1. It executes in the background.".into()),
@@ -1086,6 +1087,7 @@ mod tests {
                 status: None,
             },
             Block::Tool {
+                question: None,
                 tool: "workflow_status".into(),
                 input: "r-1".into(),
                 output: Some(SNAPSHOT.into()),
@@ -1105,6 +1107,7 @@ mod tests {
     fn skill_cards_bound_workflow_run_groups() {
         let blocks = vec![
             Block::Tool {
+                question: None,
                 tool: "skill".into(),
                 input: "demo".into(),
                 output: Some("loaded".into()),
@@ -1112,6 +1115,7 @@ mod tests {
                 status: None,
             },
             Block::Tool {
+                question: None,
                 tool: "workflow_start".into(),
                 input: SPEC.into(),
                 output: Some("Started workflow run r-1. It executes in the background.".into()),
@@ -1119,6 +1123,7 @@ mod tests {
                 status: None,
             },
             Block::Tool {
+                question: None,
                 tool: "workflow_status".into(),
                 input: "r-1".into(),
                 output: Some(SNAPSHOT.into()),
@@ -1212,6 +1217,7 @@ mod tests {
         let id = workspace.open_blank();
         let tab = workspace.tab_mut(id).unwrap();
         tab.model.blocks = vec![Block::Tool {
+            question: None,
             tool: "workflow_start".into(),
             input: SPEC.into(),
             output: Some("Started workflow run r-1. It executes in the background.".into()),
@@ -1242,6 +1248,7 @@ mod tests {
         let tab = workspace.tab_mut(id).unwrap();
         tab.model.blocks = vec![
             Block::Tool {
+                question: None,
                 tool: "workflow_start".into(),
                 input: SPEC.into(),
                 output: Some("Started workflow run r-1. It runs in the background.".into()),
@@ -1249,6 +1256,7 @@ mod tests {
                 status: None,
             },
             Block::Tool {
+                question: None,
                 tool: "workflow_status".into(),
                 input: "r-1".into(),
                 output: Some(SNAPSHOT.into()),

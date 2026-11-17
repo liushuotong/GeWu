@@ -103,6 +103,8 @@ echoed on every reply.
 {"id": "8", "op": "info"}               // model, provider and cwd the server runs with
 {"id": "9", "op": "usage", "session_id": "s1"}  // context tokens vs limit
 {"id": "10", "op": "ping"}
+{"id": "11", "op": "question_reply", "request_id": "que_...", "answers": [["SQLite"]]}
+{"id": "12", "op": "question_reject", "request_id": "que_..."}
 {"id": "0", "op": "auth", "token": "secret"}  // required first on token-protected servers
 ```
 
@@ -124,11 +126,16 @@ echoed on every reply.
 {"type": "sessions", "id": "5", "sessions": [{"session_id": "s1", "message_count": 12, "updated_at": "2026-11-03 10:42:00"}]}
 {"type": "session", "id": "6", "session_id": "s1", "messages": [{"role": "user", "content": [{"type": "text", "text": "hi"}]}]}
 {"type": "deleted", "id": "7", "session_id": "s1"}
+{"type": "question_replied", "id": "11", "session_id": "s1", "request_id": "que_...", "answers": [["SQLite"]]}
 ```
 
 `event` payloads are the agent's own events (`content_delta`,
-`reasoning_delta`, `tool_start`, `tool_finish`, `usage`, `finish`, `error`) as
-serialized JSON. The `usage` event carries the running context estimate
+`reasoning_delta`, `tool_start`, `tool_finish`, `question_asked`,
+`question_resolved`, `usage`, `finish`, `error`) as serialized JSON. A
+`question_asked` event carries the `request_id` to answer and the questions;
+`question_resolved` carries the accepted `answers` (`null` when dismissed).
+Questions are live-only and wait until answered or dismissed; interrupting the
+turn unregisters them. The `usage` event carries the running context estimate
 (`used_tokens`/`context_limit`) and is emitted at each turn boundary so
 clients can update the usage gauge mid-ask. Streamed `event`/`result` frames
 always carry `id: null`

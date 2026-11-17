@@ -51,12 +51,14 @@
 pub mod agent;
 pub mod compaction;
 pub mod middleware;
+pub mod question;
 pub mod traits;
 pub mod types;
 
 pub use agent::{Agent, AgentTemplate, Steering};
 pub use compaction::{estimate_tokens, is_overflow};
 pub use middleware::TruncationService;
+pub use question::{Question, QuestionBroker, QuestionOption};
 pub use traits::{Experiences, LlmProvider, Memory, SessionStateStore, Tool, ToolRegistry};
 pub use types::{
     AgentEvent, ContentPart, Experience, ExperienceQuery, FileAttachment, FunctionCall,

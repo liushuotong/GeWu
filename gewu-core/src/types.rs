@@ -277,6 +277,19 @@ pub enum AgentEvent {
     /// frontends render it on the still-open tool block and clear it when
     /// the tool finishes. Not part of the transcript.
     ToolProgress { tool: String, message: String },
+    /// The agent asked the user a structured question and is waiting for an
+    /// answer. Front-ends render a form on the open `question` tool card.
+    QuestionAsked {
+        /// Server-generated request id (`que_...`), used to reply.
+        request_id: String,
+        /// Questions in display (and answer) order.
+        questions: Vec<crate::question::Question>,
+    },
+    /// A pending question was answered (`answers` set) or dismissed (`None`).
+    QuestionResolved {
+        request_id: String,
+        answers: Option<Vec<Vec<String>>>,
+    },
     /// A steering message was appended to the running conversation.
     ///
     /// Emitted when a message sent through the agent's
@@ -610,6 +623,12 @@ impl ProgressSink {
             message: message.into(),
         });
     }
+
+    /// Sends a raw event on the tool's channel. Used for events tied to the
+    /// tool call that are not plain progress text.
+    pub fn send_event(&self, event: AgentEvent) {
+        let _ = self.sender.send(event);
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -651,6 +670,37 @@ impl ToolContext {
     pub fn report_progress(&self, message: impl Into<String>) {
         if let Some(sink) = &self.progress {
             sink.send(message);
+        }
+    }
+
+    /// Announces a structured question on this tool call's card. The request
+    /// must already be registered with the question broker, so a front-end
+    /// that answers immediately cannot race the registration.
+    pub fn report_question_asked(
+        &self,
+        request_id: impl Into<String>,
+        questions: Vec<crate::question::Question>,
+    ) {
+        if let Some(sink) = &self.progress {
+            sink.send_event(AgentEvent::QuestionAsked {
+                request_id: request_id.into(),
+                questions,
+            });
+        }
+    }
+
+    /// Settles a previously announced question on this tool call's card.
+    /// `None` means the user dismissed it.
+    pub fn report_question_resolved(
+        &self,
+        request_id: impl Into<String>,
+        answers: Option<Vec<Vec<String>>>,
+    ) {
+        if let Some(sink) = &self.progress {
+            sink.send_event(AgentEvent::QuestionResolved {
+                request_id: request_id.into(),
+                answers,
+            });
         }
     }
 
@@ -730,6 +780,19 @@ pub fn summarize_tool_input(tool: &str, input: &str) -> String {
             .get("name")
             .and_then(|n| n.as_str())
             .map(str::to_string),
+        // The card renders the form from the question event, so the summary
+        // only needs the first tab's label.
+        "question" => value
+            .get("questions")
+            .and_then(|questions| questions.as_array())
+            .and_then(|questions| questions.first())
+            .and_then(|question| {
+                question
+                    .get("header")
+                    .or_else(|| question.get("question"))
+                    .and_then(|label| label.as_str())
+            })
+            .map(|label| label.trim().to_string()),
         // The GUI renders the workflow graph from the spec, so keep it whole.
         "workflow_start" => value.get("spec").map(|spec| spec.to_string()),
         "workflow_status" | "workflow_cancel" => value

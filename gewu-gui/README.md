@@ -119,11 +119,13 @@ clickable scrim, and `Esc` closes an open drawer.
 | `×` on a session | Close the session |
 | Tool row / `… +N lines` | Expand or collapse tool output |
 | `+ Explored: …` | Expand or collapse a run of tool calls |
+| Question card tabs | Switch between the agent's questions; Submit answers them all, Dismiss returns "dismissed" |
 | Scroll to top / `Load earlier messages` | Fetch the previous page of the transcript |
 | `⬆` in the file tree | Open a file picker; selected files upload into the working-directory root |
 | Drag files onto the page | Upload the dropped files the same way |
 | `↻` in the file tree | Refresh the file listing |
 | Right-click a tree file or folder | Download it (folders arrive as a ZIP) |
+| Right-click an `.html` file → Preview | Render the page in a sandboxed new window |
 
 The transcript streams assistant text and replaces it with rendered Markdown
 when the reply finishes. The status line shows the phase, `provider/model`, the
@@ -166,6 +168,15 @@ wider than 4 MB of base64 show a text note instead. The CSP therefore allows
 `img-src 'self' https: data:`; Markdown cannot use that allowance because its
 `data:` destinations never reach the page.
 
+**Preview** on an `.html`/`.htm` file renders it in a new window through the
+same kind of short-lived ticket as downloads (one hour, so reloading works).
+The response is `text/html` with a CSP `sandbox` (scripts, forms, popups and
+downloads allowed, no `allow-same-origin`): the page runs its own JavaScript in
+an opaque origin, so it cannot read the GUI token from `localStorage`, reuse
+its cookies, or call the authenticated socket. External CDN assets still load;
+relative files next to the HTML are not resolved, so pages must be
+self-contained.
+
 Assistant Markdown supports LaTeX math: `$…$` and `\(…\)` render inline,
 `$$…$$` and `\[…\]` render as display blocks, converted server-side to MathML
 Core (`math-core`) so no JavaScript or external fonts are needed. Math inside
@@ -178,7 +189,7 @@ its escaped source instead. Prices like `$5 and $10` are left as plain text.
 gewu-gui
   src/cli.rs        flags and upstream endpoint parsing
   src/protocol.rs   browser <-> GUI JSON messages
-  src/download.rs   short-lived HTTP download tickets
+  src/download.rs   short-lived HTTP download and HTML preview tickets
   src/workspace.rs  tabs over the shared SessionModel
   src/session.rs    per-browser workspace, upstream connections, event loop
   src/view.rs       transcript/Markdown/tool/status rendering to HTML

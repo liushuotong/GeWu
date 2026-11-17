@@ -153,6 +153,10 @@ async fn run_agent(agent: &mut gewu_core::Agent, prompt: &str) -> Result<()> {
                             content_started = false;
                             println!("\n{DIM}[steered] you:{RESET} {text}");
                         }
+                        // The CLI runs without a question broker, so this
+                        // tool is not offered here; nothing to render.
+                        AgentEvent::QuestionAsked { .. }
+                        | AgentEvent::QuestionResolved { .. } => {}
                         AgentEvent::Error { error } => {
                             stop_spinner(&mut spinner_active, is_tty)?;
                             error!("Error from agent: {}", error);
@@ -305,6 +309,7 @@ async fn run(cli: RunArgs) -> Result<()> {
             context_limit: boot.context_limit,
             agents: boot.agents.clone(),
             workflow_progress: None,
+            question_broker: None,
             session_id: &session_id,
         },
         boot.log_writer,
