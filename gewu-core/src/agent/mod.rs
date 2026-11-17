@@ -303,13 +303,19 @@ impl Agent {
             }
 
             if let Some(user_message) = user_message {
-                self.memory.add_message(Message::User { content: vec![ContentPart::Text { text: user_message.to_string() }] }).await;
                 self.reminder.on_user_turn();
+                // A due mode reminder becomes part of the message before it is
+                // stored, so it is durable and every request in this turn — and
+                // later turns — still carries it instead of only the first
+                // provider call.
+                let mut message = Message::User {
+                    content: vec![ContentPart::Text {
+                        text: user_message.to_string(),
+                    }],
+                };
+                self.reminder.apply_to(&mut message);
+                self.memory.add_message(message).await;
             }
-            // Due mode reminders become part of conversation history, so
-            // every request in this turn — and later turns — still carries
-            // them instead of only the first provider call.
-            self.reminder.apply(self.memory.messages_mut());
 
             let mut turn = 0;
             let mut doom_loop = DoomLoopDetector::new(3);
@@ -689,17 +695,25 @@ impl Agent {
     async fn ingest_steered(&mut self) -> Vec<AgentEvent> {
         let messages = self.steering.drain_messages();
         let mut events = Vec::new();
-        let mut user_turn = false;
-        for message in messages {
+        // Steered user messages advance the cadence once per drain; a due
+        // reminder attaches to the last of them before it is stored.
+        let last_user = messages
+            .iter()
+            .rposition(|message| matches!(message, InboxMessage::User(_)));
+        if last_user.is_some() {
+            self.reminder.on_user_turn();
+        }
+        for (index, message) in messages.into_iter().enumerate() {
             match message {
                 InboxMessage::User(text) => {
-                    self.memory
-                        .add_message(Message::User {
-                            content: vec![ContentPart::Text { text: text.clone() }],
-                        })
-                        .await;
+                    let mut user = Message::User {
+                        content: vec![ContentPart::Text { text: text.clone() }],
+                    };
+                    if Some(index) == last_user {
+                        self.reminder.apply_to(&mut user);
+                    }
+                    self.memory.add_message(user).await;
                     events.push(AgentEvent::Steered { text });
-                    user_turn = true;
                 }
                 InboxMessage::Background(notification) => {
                     let message = notification.text();
@@ -713,10 +727,6 @@ impl Agent {
                     events.push(AgentEvent::Status { message });
                 }
             }
-        }
-        if user_turn {
-            self.reminder.on_user_turn();
-            self.reminder.apply(self.memory.messages_mut());
         }
         events
     }
@@ -1219,6 +1229,67 @@ mod tests {
             .collect()
     }
 
+    /// Wraps a `Vec<Message>` and records each message at `add_message` time,
+    /// so tests can assert what a persistence backend actually received.
+    #[derive(Default)]
+    struct RecordingMemory {
+        messages: Vec<Message>,
+        added: Arc<Mutex<Vec<Message>>>,
+    }
+
+    #[async_trait]
+    impl Memory for RecordingMemory {
+        fn messages(&self) -> &[Message] {
+            &self.messages
+        }
+
+        async fn add_message(&mut self, message: Message) {
+            self.added.lock().unwrap().push(message.clone());
+            self.messages.push(message);
+        }
+
+        async fn clear(&mut self) {
+            self.messages.clear();
+        }
+
+        async fn replace(&mut self, messages: Vec<Message>) {
+            self.messages = messages;
+        }
+    }
+
+    #[tokio::test]
+    async fn reminders_are_applied_before_messages_are_stored() -> Result<()> {
+        let added = Arc::new(Mutex::new(Vec::new()));
+        let memory = RecordingMemory {
+            messages: Vec::new(),
+            added: added.clone(),
+        };
+        let mut agent = Agent::builder()
+            .llm(Arc::new(MockProvider::single_content("ok")))
+            .with_reminder(Reminder::switch("FULL MODE REMINDER", None))
+            .memory(Box::new(memory))
+            .build()?;
+        for event in agent.ask("hello").collect::<Vec<_>>().await {
+            event?;
+        }
+        let added = added.lock().unwrap();
+        let user = added
+            .iter()
+            .find_map(|message| match message {
+                Message::User { content } => Some(content),
+                _ => None,
+            })
+            .expect("the user message must be stored");
+        assert!(
+            user.iter().any(|part| matches!(
+                part,
+                ContentPart::Reminder { text } if text == "FULL MODE REMINDER"
+            )),
+            "the backend stored an undecorated user message: {user:?}"
+        );
+        Ok(())
+    }
+
     #[tokio::test]
     async fn reminders_persist_in_history_across_requests() -> Result<()> {
         let response = vec![
@@ -1510,7 +1581,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn empty_summary_does_not_append_compaction() -> Result<()> {
+    async fn empty_summary_does_not_add_a_checkpoint() -> Result<()> {
         let mut agent = Agent::builder()
             .llm(Arc::new(MockProvider::single_content("")))
             .context_limit(20_100)

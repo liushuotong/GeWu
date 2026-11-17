@@ -1590,7 +1590,7 @@ pub fn file_preview_html(path: &str, content: &str, truncated: bool) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::workspace::Workspace;
+    use crate::workspace::{TRANSCRIPT_WINDOW_BLOCKS, Workspace};
     use gewu_protocol::AgentEvent;
     use gewu_protocol::TokenUsage;
 
@@ -2085,11 +2085,15 @@ mod tests {
         let (mut ws, id) = tab_with_blocks(blocks);
         let tab = ws.tab_mut(id).unwrap();
         tab.reset_transcript_window();
+        let start = 250 - TRANSCRIPT_WINDOW_BLOCKS;
 
         let html = transcript_html(tab);
 
-        assert!(html.contains("data-block=\"50\""), "{html}");
-        assert!(!html.contains("data-block=\"49\""), "{html}");
+        assert!(html.contains(&format!("data-block=\"{start}\"")), "{html}");
+        assert!(
+            !html.contains(&format!("data-block=\"{}\"", start - 1)),
+            "{html}"
+        );
         assert!(html.contains("data-load-earlier"), "{html}");
         assert!(html.contains("Load earlier messages"), "{html}");
     }

@@ -1159,9 +1159,9 @@ mod tests {
         ] {
             let mut reminder = profile_reminder(previous, target);
             reminder.on_user_turn();
-            let mut messages = vec![Message::User { content: vec![] }];
-            reminder.apply(&mut messages);
-            let Message::User { content } = &messages[0] else {
+            let mut message = Message::User { content: vec![] };
+            reminder.apply_to(&mut message);
+            let Message::User { content } = &message else {
                 unreachable!()
             };
             match expected {
@@ -1171,9 +1171,9 @@ mod tests {
                 None => assert!(content.is_empty()),
             }
             reminder.on_user_turn();
-            let mut next = vec![Message::User { content: vec![] }];
-            reminder.apply(&mut next);
-            assert_eq!(next, vec![Message::User { content: vec![] }]);
+            let mut next = Message::User { content: vec![] };
+            reminder.apply_to(&mut next);
+            assert_eq!(next, Message::User { content: vec![] });
         }
     }
 

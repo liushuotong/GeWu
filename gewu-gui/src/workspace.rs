@@ -18,11 +18,11 @@ use crate::workflow::WfSnapshot;
 const MAX_LABEL: usize = 200;
 
 /// Blocks rendered on first load and after eviction.
-pub const TRANSCRIPT_WINDOW_BLOCKS: usize = 200;
+pub const TRANSCRIPT_WINDOW_BLOCKS: usize = 100;
 /// Older blocks loaded per page.
-pub const TRANSCRIPT_PAGE_BLOCKS: usize = 100;
+pub const TRANSCRIPT_PAGE_BLOCKS: usize = 50;
 /// Rendered-window size that triggers eviction while following output.
-pub const TRANSCRIPT_MAX_BLOCKS: usize = 300;
+pub const TRANSCRIPT_MAX_BLOCKS: usize = 150;
 
 /// One tab: a conversation plus its view state.
 #[derive(Debug)]
@@ -364,7 +364,7 @@ mod tests {
     #[test]
     fn load_earlier_moves_back_a_page_and_stops_at_zero() {
         let mut ws = Workspace::new();
-        let messages: Vec<Message> = (0..250)
+        let messages: Vec<Message> = (0..120)
             .map(|n| user_message(&format!("message {n}")))
             .collect();
         let id = ws.open_session("s1", &messages);
@@ -387,7 +387,7 @@ mod tests {
             .collect();
 
         assert!(tab.evict_overflow());
-        assert_eq!(tab.transcript_start, 200);
+        assert_eq!(tab.transcript_start, 400 - TRANSCRIPT_WINDOW_BLOCKS);
         assert!(!tab.evict_overflow());
     }
 
