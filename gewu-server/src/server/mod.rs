@@ -1671,11 +1671,15 @@ async fn handle_request(
                 }
             };
             let mut entries = Vec::new();
+            // Only dotfiles are hidden here; ignore rules (`.gitignore`,
+            // `.ignore`, git excludes) must not filter the file tree.
             for entry in ignore::WalkBuilder::new(&dir)
                 .max_depth(Some(1))
                 .hidden(true)
-                .git_ignore(true)
-                .require_git(false)
+                .git_ignore(false)
+                .git_global(false)
+                .git_exclude(false)
+                .ignore(false)
                 .build()
                 .skip(1)
             {
@@ -4213,6 +4217,45 @@ mod tests {
             Handled::Reply(ServerMessage::FileContent { ref content, .. })
                 if content == "frontend root"
         ));
+    }
+
+    #[tokio::test]
+    async fn list_files_shows_ignored_entries_but_not_dotfiles() {
+        let cwd = tempfile::tempdir().unwrap();
+        std::fs::write(cwd.path().join(".gitignore"), "ignored.txt\nlogs/\n").unwrap();
+        std::fs::write(cwd.path().join("ignored.txt"), "ignored\n").unwrap();
+        std::fs::write(cwd.path().join(".ignore"), "*.tmp\n").unwrap();
+        std::fs::write(cwd.path().join("scratch.tmp"), "scratch\n").unwrap();
+        std::fs::write(cwd.path().join("visible.txt"), "visible\n").unwrap();
+        std::fs::write(cwd.path().join(".hidden"), "hidden\n").unwrap();
+        std::fs::create_dir(cwd.path().join("logs")).unwrap();
+        std::fs::create_dir(cwd.path().join(".hiddendir")).unwrap();
+
+        let mut state = server_state_with(TestLlm::plain());
+        Arc::get_mut(&mut state)
+            .unwrap()
+            .bootstrap
+            .working_directory = cwd.path().to_string_lossy().to_string();
+        let mut session = None;
+        let mut running = None;
+        let result = handle_request(
+            &state,
+            &mut session,
+            &mut running,
+            ClientRequest::list_files(1, ""),
+        )
+        .await
+        .unwrap();
+        let entries = match result {
+            Handled::Reply(ServerMessage::Files { entries, .. }) => entries,
+            _ => panic!("expected files reply"),
+        };
+        let names: Vec<_> = entries.iter().map(|entry| entry.name.as_str()).collect();
+        assert_eq!(
+            names,
+            ["logs", "ignored.txt", "scratch.tmp", "visible.txt"],
+            "{names:?}"
+        );
     }
 
     #[tokio::test]
