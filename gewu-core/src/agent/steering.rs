@@ -40,7 +40,6 @@ struct Queue {
 struct Inner {
     queue: Mutex<Queue>,
     wake: Notify,
-    watched: std::sync::atomic::AtomicBool,
 }
 
 impl std::fmt::Debug for Steering {
@@ -63,7 +62,6 @@ impl Steering {
             inner: Arc::new(Inner {
                 queue: Mutex::new(Queue::default()),
                 wake: Notify::new(),
-                watched: std::sync::atomic::AtomicBool::new(false),
             }),
         }
     }
@@ -148,13 +146,6 @@ impl Steering {
 
     pub async fn notified(&self) {
         self.inner.wake.notified().await;
-    }
-
-    pub fn claim_watcher(&self) -> bool {
-        !self
-            .inner
-            .watched
-            .swap(true, std::sync::atomic::Ordering::AcqRel)
     }
 }
 

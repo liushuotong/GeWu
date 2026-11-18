@@ -10,7 +10,7 @@ use gewu_tools::workflow::{
     RunProgress, WorkflowCancelTool, WorkflowManager, WorkflowStartTool, WorkflowStatusTool,
 };
 use gewu_tools::{
-    ApplyPatchTool, BashTool, CodeSearchTool, EditFileTool, GlobTool, GrepTool, ImageLimits,
+    ApplyPatchTool, BashTool, EditFileTool, GlobTool, GrepTool, ImageLimits,
     ListTool, QuestionTool, ReadFileTool, SkillInfo, SkillTool, TaskTool, TodoReadTool,
     TodoWriteTool, WebFetchTool, WebSearchTool, WriteFileTool,
 };
@@ -303,7 +303,7 @@ impl SqliteAgentFactory {
                     inherited
                 }
             };
-            let effort = effort.filter(|effort| entry.effort_providers.contains_key(effort));
+            let effort = effort.filter(|effort| entry.supports_effort(effort));
             let provider = entry.provider_for(effort.as_deref()).ok_or_else(|| {
                 format!("reasoning effort is unavailable for subagent model: {selector}")
             })?;
@@ -528,7 +528,6 @@ fn build_tool_registry_and_list(inputs: &ProfileInputs) -> Result<RegistryBundle
                 Box::new(ListTool {
                     working_directory: working_directory.clone(),
                 }),
-                Box::new(CodeSearchTool),
                 Box::new(WebSearchTool),
                 Box::new(TodoWriteTool),
                 Box::new(TodoReadTool),
@@ -595,7 +594,6 @@ fn build_tool_registry_and_list(inputs: &ProfileInputs) -> Result<RegistryBundle
                 Box::new(ListTool {
                     working_directory: working_directory.clone(),
                 }),
-                Box::new(CodeSearchTool),
                 Box::new(WebSearchTool),
             ]
         }
@@ -645,7 +643,6 @@ fn build_tool_registry_and_list(inputs: &ProfileInputs) -> Result<RegistryBundle
                 Box::new(ListTool {
                     working_directory: working_directory.clone(),
                 }),
-                Box::new(CodeSearchTool),
                 Box::new(WebSearchTool),
                 Box::new(TodoWriteTool),
                 Box::new(TodoReadTool),

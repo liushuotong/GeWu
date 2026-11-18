@@ -18,7 +18,6 @@
 //! | [`ListTool`] | `list` | List directory contents |
 //! | [`WebFetchTool`] | `webfetch` | Fetch web pages |
 //! | [`WebSearchTool`] | `websearch` | Search the web |
-//! | [`CodeSearchTool`] | `codesearch` | Search code semantically |
 //! | [`TodoReadTool`] | `todoread` | Read the task list |
 //! | [`TodoWriteTool`] | `todowrite` | Write the task list |
 //! | [`TaskTool`] | `task` | Launch sub-agents for complex tasks |
@@ -82,7 +81,7 @@ pub use grep::GrepTool;
 pub use list::ListTool;
 pub use media::{DEFAULT_MAX_BASE64_BYTES, DEFAULT_MAX_DIMENSION, ImageLimits};
 pub use question::QuestionTool;
-pub use search::{CodeSearchTool, WebSearchTool};
+pub use search::WebSearchTool;
 pub use skill::{SkillInfo, SkillTool};
 pub use task::{AgentFactory, AgentOverrides, TaskTool};
 pub use todo::{TodoItem, TodoReadTool, TodoWriteTool};

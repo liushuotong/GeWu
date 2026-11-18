@@ -921,7 +921,7 @@
     if (effort && !state.busy) send({
       op: "switch_reasoning_effort",
       tab: Number(effort.dataset.tab),
-      effort: effort.value === "default" ? null : effort.value,
+      effort: effort.value,
     });
   });
 

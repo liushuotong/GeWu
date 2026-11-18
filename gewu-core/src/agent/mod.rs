@@ -115,8 +115,6 @@ pub struct Agent {
     reminder: Reminder,
     /// Per-session key/value state shared with tools on every [`ToolContext`].
     session_state: SessionState,
-    /// Buffer for steering messages injected while the agent runs.
-    steering: Steering,
     /// Session-selected filesystem root, when supplied by the host.
     working_directory: Option<PathBuf>,
 }
@@ -249,7 +247,7 @@ impl Agent {
         }
     }
 
-    /// Processes a user message and returns a stream of agent events.
+    /// Processes a user message with a fresh inbox and returns a stream of agent events.
     ///
     /// This method implements the main agent loop:
     ///
@@ -277,28 +275,41 @@ impl Agent {
         &'a mut self,
         user_message: &'a str,
     ) -> impl Stream<Item = Result<AgentEvent>> + 'a {
-        self.run(Some(user_message))
+        self.ask_with_inbox(user_message, Steering::new())
+    }
+
+    pub fn ask_with_inbox<'a>(
+        &'a mut self,
+        user_message: &'a str,
+        inbox: Steering,
+    ) -> impl Stream<Item = Result<AgentEvent>> + 'a {
+        self.run(Some(user_message), inbox)
     }
 
     pub fn resume(&mut self) -> impl Stream<Item = Result<AgentEvent>> + '_ {
-        self.run(None)
+        self.resume_with_inbox(Steering::new())
+    }
+
+    pub fn resume_with_inbox(
+        &mut self,
+        inbox: Steering,
+    ) -> impl Stream<Item = Result<AgentEvent>> + '_ {
+        self.run(None, inbox)
     }
 
     fn run<'a>(
         &'a mut self,
         user_message: Option<&'a str>,
+        inbox: Steering,
     ) -> impl Stream<Item = Result<AgentEvent>> + 'a {
         async_stream::try_stream! {
-            if user_message.is_some() {
-                self.steering.unpause();
-            }
             if self.memory.messages().is_empty() && !self.system_prompt.is_empty() {
                 self.memory.add_message(Message::System { content: self.system_prompt.clone() }).await;
             }
 
             // Messages steered while the agent was idle join the transcript
             // ahead of this run's own prompt, preserving send order.
-            for event in self.ingest_steered().await {
+            for event in self.ingest_steered(&inbox).await {
                 yield event;
             }
 
@@ -335,7 +346,7 @@ impl Agent {
                 // the only safe spot: all tool results of the previous
                 // round are in history, so a user message never lands
                 // between an assistant turn and its tool results.
-                for event in self.ingest_steered().await {
+                for event in self.ingest_steered(&inbox).await {
                     yield event;
                 }
 
@@ -482,7 +493,7 @@ impl Agent {
                     tool_calls: if tool_calls.is_empty() { None } else { Some(tool_calls.clone()) },
                 }).await;
 
-                let turn_disposition = classify_turn(&tool_calls, self.steering.is_pending());
+                let turn_disposition = classify_turn(&tool_calls, inbox.is_pending());
                 if turn_disposition != TurnDisposition::Tools {
                     // A steer arriving while the model streams its final
                     // answer must still be answered in this run: continue
@@ -582,7 +593,7 @@ impl Agent {
                     let enforcement = self.enforcement;
                     let truncation = self.truncation.clone();
                     let semaphore = semaphore.clone();
-                    let inbox = self.steering.clone();
+                    let inbox = inbox.clone();
                     let working_directory = self.working_directory.clone();
                     let progress_tx = progress_tx.clone();
                     executing += 1;
@@ -680,20 +691,10 @@ impl Agent {
         &self.session_state
     }
 
-    /// Handle for queuing steering messages into this agent's runs.
-    ///
-    /// Clone it before calling [`ask`](Agent::ask) (the ask stream borrows
-    /// the agent exclusively) and send from any task while the run is in
-    /// progress. Messages queued while the agent is idle are delivered at
-    /// the start of the next ask.
-    pub fn steering(&self) -> &Steering {
-        &self.steering
-    }
-
     /// Drains queued steering messages into conversation history as user
     /// messages, applying the same reminder treatment as an ordinary prompt.
-    async fn ingest_steered(&mut self) -> Vec<AgentEvent> {
-        let messages = self.steering.drain_messages();
+    async fn ingest_steered(&mut self, inbox: &Steering) -> Vec<AgentEvent> {
+        let messages = inbox.drain_messages();
         let mut events = Vec::new();
         // Steered user messages advance the cadence once per drain; a due
         // reminder attaches to the last of them before it is stored.
@@ -846,7 +847,6 @@ impl AgentTemplate {
             session_state: self.session_state,
             provider_usage: TokenUsage::default(),
             reminder,
-            steering: Steering::new(),
             working_directory: self.working_directory,
         }
     }
@@ -1012,7 +1012,6 @@ impl AgentBuilder {
             provider_usage: TokenUsage::default(),
             reminder: self.reminder,
             session_state: self.session_state.unwrap_or_else(SessionState::in_memory),
-            steering: Steering::new(),
             working_directory: self.working_directory,
         };
         Ok(agent)

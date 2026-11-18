@@ -141,6 +141,7 @@ impl Tab {
             id: self.id,
             label: tab_title(self),
             busy: self.busy(),
+            waiting: self.busy() && self.model.has_pending_question(),
             session_id: self.model.session_id.clone(),
             workspace: self.workspace.clone(),
         }
@@ -304,7 +305,7 @@ pub fn short_id(session_id: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use gewu_protocol::ContentPart;
+    use gewu_protocol::{AgentEvent, ContentPart};
 
     fn user_message(text: &str) -> Message {
         Message::User {
@@ -501,6 +502,29 @@ mod tests {
         let info = tab.info();
         assert_eq!(info.id, id);
         assert!(info.busy);
+        assert!(!info.waiting);
         assert_eq!(info.session_id.as_deref(), Some("s1"));
+
+        let _ = tab.model.apply_event(&AgentEvent::ToolStart {
+            tool: "question".into(),
+            input: "{}".into(),
+        });
+        let _ = tab.model.apply_event(&AgentEvent::QuestionAsked {
+            request_id: "que_1".into(),
+            questions: vec![gewu_protocol::Question {
+                question: "Which database?".into(),
+                header: "Database".into(),
+                options: Vec::new(),
+                multiple: false,
+                custom: true,
+            }],
+        });
+        assert!(tab.info().waiting);
+
+        let _ = tab.model.apply_event(&AgentEvent::QuestionResolved {
+            request_id: "que_1".into(),
+            answers: None,
+        });
+        assert!(!tab.info().waiting);
     }
 }

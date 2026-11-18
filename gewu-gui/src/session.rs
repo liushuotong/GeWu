@@ -1706,6 +1706,9 @@ impl GuiSession {
         // A transient status (LLM retry backoff, compaction) arrived: only
         // the status line re-renders, not the transcript.
         let mut status_updated = false;
+        // A question form opened or settled: the sidebar's waiting pulse and
+        // per-tab state changed.
+        let mut sidebar_updated = false;
         // An error to surface in the floating alert box, collected while
         // the tab is borrowed and sent once it is released. The optional
         // key lets the browser update an existing entry (repeats of one
@@ -1887,6 +1890,18 @@ impl GuiSession {
                             ));
                         }
                         Ok(agent_event) => {
+                            // A pending `question` form flips the status line
+                            // to its waiting phase and the sidebar pulse to
+                            // amber, so form events need those pushes in
+                            // addition to the card update.
+                            if matches!(
+                                agent_event,
+                                AgentEvent::QuestionAsked { .. }
+                                    | AgentEvent::QuestionResolved { .. }
+                            ) {
+                                status_updated = true;
+                                sidebar_updated = true;
+                            }
                             // ToolStart / ToolFinish: update just the run's card.
                             let affected = tab.model.apply_event(&agent_event);
                             collapsed = tab.model.take_collapsed();
@@ -2100,6 +2115,15 @@ impl GuiSession {
         // their own status push.
         if (usage_updated || status_updated) && active {
             self.send_status(sender).await?;
+        }
+        if sidebar_updated {
+            send_msg(
+                sender,
+                &ServerMsg::SessionSidebar {
+                    html: self.session_sidebar(),
+                },
+            )
+            .await?;
         }
         Ok(())
     }
