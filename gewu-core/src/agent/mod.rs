@@ -49,7 +49,7 @@ mod tools;
 pub use compaction::CompactionError;
 pub use experiences::SearchExperiencesTool;
 pub use media::extract_media_parts;
-pub use steering::{BackgroundNotification, InboxMessage, Steering};
+pub use steering::{BackgroundJob, BackgroundNotification, IdleAction, InboxMessage, Steering};
 pub use tools::execute_tool_with_panic_recovery;
 
 use crate::middleware::TruncationService;

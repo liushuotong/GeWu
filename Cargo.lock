@@ -1122,6 +1122,21 @@ dependencies = [
 [[package]]
 name = "gewu-lab"
 version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "async-trait",
+ "axum",
+ "clap",
+ "futures",
+ "gewu-core",
+ "gewu-server",
+ "schemars",
+ "serde",
+ "serde_json",
+ "subtle",
+ "tokio",
+ "tokio-tungstenite 0.28.0",
+]
 
 [[package]]
 name = "gewu-protocol"
