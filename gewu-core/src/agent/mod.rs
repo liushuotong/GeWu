@@ -43,12 +43,14 @@ pub use reminder::Reminder;
 mod execution;
 mod experiences;
 mod media;
+mod policy;
 mod steering;
 mod tools;
 
 pub use compaction::CompactionError;
 pub use experiences::SearchExperiencesTool;
 pub use media::extract_media_parts;
+pub use policy::ToolPolicy;
 pub use steering::{BackgroundJob, BackgroundNotification, IdleAction, InboxMessage, Steering};
 pub use tools::execute_tool_with_panic_recovery;
 
@@ -113,6 +115,8 @@ pub struct Agent {
     /// (every completed LLM request, including compaction requests).
     provider_usage: TokenUsage,
     reminder: Reminder,
+    /// Tools that stay advertised but must not execute in this mode.
+    tool_policy: ToolPolicy,
     /// Per-session key/value state shared with tools on every [`ToolContext`].
     session_state: SessionState,
     /// Session-selected filesystem root, when supplied by the host.
@@ -128,6 +132,8 @@ pub struct AgentBuilder {
     /// System prompt (defaults to empty).
     system_prompt: String,
     reminder: Reminder,
+    /// Advertised tools that must not execute (defaults to allow-all).
+    tool_policy: ToolPolicy,
     /// Maximum turns limit (optional).
     max_turns: Option<usize>,
     /// Memory store (defaults to in-memory Vec).
@@ -180,6 +186,7 @@ impl Default for AgentBuilder {
             tools: Arc::new(Vec::new()),
             system_prompt: String::new(),
             reminder: Reminder::default(),
+            tool_policy: ToolPolicy::allow_all(),
             max_turns: None,
             memory: None,
             context_limit: 256_000,
@@ -201,10 +208,12 @@ impl Agent {
         system_prompt: String,
         tools: Vec<Arc<dyn Tool>>,
         reminder: Reminder,
+        tool_policy: ToolPolicy,
     ) {
         self.system_prompt = system_prompt;
         self.tools = Arc::new(tools);
         self.reminder = reminder;
+        self.tool_policy = tool_policy;
     }
 
     /// Swap the LLM provider while retaining memory and all other runtime
@@ -227,6 +236,17 @@ impl Agent {
     /// Replace the mode reminder state (restored from persistence).
     pub fn set_reminder(&mut self, reminder: Reminder) {
         self.reminder = reminder;
+    }
+
+    /// The execution policy applied to the advertised tools.
+    pub fn tool_policy(&self) -> &ToolPolicy {
+        &self.tool_policy
+    }
+
+    /// Replace the tool execution policy. The caller must ensure the agent
+    /// is idle.
+    pub fn set_tool_policy(&mut self, tool_policy: ToolPolicy) {
+        self.tool_policy = tool_policy;
     }
     /// Creates a new `AgentBuilder` for constructing `Agent` instances.
     pub fn builder() -> AgentBuilder {
@@ -583,6 +603,9 @@ impl Agent {
                     tokio::sync::mpsc::unbounded_channel::<AgentEvent>();
                 let mut executing = 0usize;
                 for (index, call, message_id) in pending {
+                    // Advertised tools can be refused per mode; check before
+                    // dispatching so the tool never runs.
+                    let denied = self.tool_policy.check(&call.function.name).err();
                     let tool = self
                         .tools
                         .iter()
@@ -608,7 +631,9 @@ impl Agent {
                         if let Some(working_directory) = working_directory {
                             ctx = ctx.with_working_directory(working_directory);
                         }
-                        let result = if let Some(t) = tool {
+                        let result = if let Some(reason) = denied {
+                            Err(anyhow::anyhow!(reason))
+                        } else if let Some(t) = tool {
                             execute_tool_call(t, call, ctx, &truncation).await
                         } else {
                             Ok(ToolResult::new(
@@ -749,6 +774,7 @@ impl Agent {
             llm: Arc::clone(&self.llm),
             tools: Arc::clone(&self.tools),
             system_prompt: self.system_prompt.clone(),
+            tool_policy: self.tool_policy.clone(),
             max_turns: self.max_turns,
             context_limit: self.context_limit,
             truncation: self.truncation.clone(),
@@ -772,6 +798,7 @@ pub struct AgentTemplate {
     llm: Arc<dyn LlmProvider>,
     tools: Arc<Vec<Arc<dyn Tool>>>,
     system_prompt: String,
+    tool_policy: ToolPolicy,
     max_turns: Option<usize>,
     context_limit: usize,
     truncation: TruncationService,
@@ -811,6 +838,17 @@ impl AgentTemplate {
         self
     }
 
+    /// Replaces the tool execution policy of spawned agents.
+    pub fn with_tool_policy(mut self, tool_policy: ToolPolicy) -> Self {
+        self.tool_policy = tool_policy;
+        self
+    }
+
+    /// The tool execution policy spawned agents run with.
+    pub fn tool_policy(&self) -> &ToolPolicy {
+        &self.tool_policy
+    }
+
     /// Replaces the context limit of spawned agents.
     pub fn with_context_limit(mut self, context_limit: usize) -> Self {
         self.context_limit = context_limit;
@@ -836,6 +874,7 @@ impl AgentTemplate {
             llm: self.llm,
             tools: self.tools,
             system_prompt: self.system_prompt,
+            tool_policy: self.tool_policy,
             max_turns: self.max_turns,
             memory,
             context_limit: self.context_limit,
@@ -860,6 +899,9 @@ impl ToolRegistry for Agent {
         args: serde_json::Value,
         ctx: &ToolContext,
     ) -> Result<ToolResult, Box<dyn Error + Send + Sync>> {
+        self.tool_policy
+            .check(name)
+            .map_err(|reason| -> Box<dyn Error + Send + Sync> { reason.into() })?;
         let tool = self.tools.iter().find(|t| t.name() == name);
         match tool {
             Some(t) => t.execute(args, ctx).await,
@@ -901,6 +943,16 @@ impl AgentBuilder {
     /// Configure mode reminders for a newly created agent.
     pub fn with_reminder(mut self, reminder: Reminder) -> Self {
         self.reminder = reminder;
+        self
+    }
+
+    /// Configure which advertised tools may not execute.
+    ///
+    /// Denied tools stay in the tool list — so request prefixes remain stable
+    /// across modes — but calls to them fail with the policy's message.
+    /// Defaults to [`ToolPolicy::allow_all`].
+    pub fn with_tool_policy(mut self, tool_policy: ToolPolicy) -> Self {
+        self.tool_policy = tool_policy;
         self
     }
 
@@ -1011,6 +1063,7 @@ impl AgentBuilder {
             enforcement: self.enforcement,
             provider_usage: TokenUsage::default(),
             reminder: self.reminder,
+            tool_policy: self.tool_policy,
             session_state: self.session_state.unwrap_or_else(SessionState::in_memory),
             working_directory: self.working_directory,
         };
@@ -1320,7 +1373,12 @@ mod tests {
         let memory = serde_json::to_string(agent.memory.messages())?;
         assert!(memory.contains("FULL MODE REMINDER"));
         assert!(memory.contains("SPARSE MODE REMINDER"));
-        agent.set_profile(String::new(), Vec::new(), Reminder::default());
+        agent.set_profile(
+            String::new(),
+            Vec::new(),
+            Reminder::default(),
+            ToolPolicy::allow_all(),
+        );
         Ok(())
     }
 
@@ -1510,6 +1568,7 @@ mod tests {
             "new profile".into(),
             vec![],
             Reminder::switch("NEW MODE REMINDER", None),
+            ToolPolicy::allow_all(),
         );
         {
             let events = agent.ask("next step");
@@ -2072,6 +2131,79 @@ mod tests {
                 .read::<Vec<String>>("sess-2", "probe")
                 .await?,
             None
+        );
+        Ok(())
+    }
+
+    /// A tool can stay advertised (stable request prefix) while the agent's
+    /// policy refuses to execute it.
+    #[tokio::test]
+    async fn tool_policy_refuses_execution_without_hiding_the_tool() -> Result<()> {
+        let provider = MockProvider::new(vec![
+            vec![
+                ProviderEvent::ToolCallStart {
+                    id: "call_1".to_string(),
+                    name: "state_probe".to_string(),
+                },
+                ProviderEvent::ToolCallDelta {
+                    id: "call_1".to_string(),
+                    delta: r#"{"value":"one"}"#.to_string(),
+                },
+                ProviderEvent::Finish {
+                    reason: Some("tool_calls".to_string()),
+                },
+            ],
+            vec![
+                ProviderEvent::ContentDelta {
+                    delta: "done".to_string(),
+                },
+                ProviderEvent::Finish {
+                    reason: Some("end_turn".to_string()),
+                },
+            ],
+        ]);
+        let mut agent = Agent::builder()
+            .llm(Arc::new(provider))
+            .with_tools(vec![Arc::new(StateProbeTool)])
+            .session_id("sess-1")
+            .with_tool_policy(ToolPolicy::deny(["state_probe"], "read-only mode"))
+            .build()?;
+
+        assert!(agent.list_tools().iter().any(|name| name == "state_probe"));
+
+        let ctx = ToolContext::new("sess-1", "msg");
+        let error = ToolRegistry::execute(
+            &agent,
+            "state_probe",
+            serde_json::json!({"value": "one"}),
+            &ctx,
+        )
+        .await
+        .expect_err("the policy must refuse the call");
+        assert!(error.to_string().contains("read-only mode"), "{error}");
+
+        let events = agent.ask("probe please").collect::<Vec<_>>().await;
+        assert!(
+            events.iter().any(|event| matches!(
+                event,
+                Ok(AgentEvent::Error { error }) if error.contains("read-only mode")
+            )),
+            "{events:?}"
+        );
+        assert!(
+            agent.memory.messages().iter().any(|message| matches!(
+                message,
+                Message::Tool { content, .. } if content.contains("Error: read-only mode")
+            )),
+            "the model must see the refusal"
+        );
+        assert_eq!(
+            agent
+                .session_state()
+                .read::<Vec<String>>("sess-1", "probe")
+                .await?,
+            None,
+            "the refused tool must not run"
         );
         Ok(())
     }

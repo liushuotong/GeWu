@@ -4,6 +4,7 @@ pub mod config;
 pub mod mcp_loader;
 pub mod registry;
 pub mod server;
+pub mod tool_policy;
 
 pub use bootstrap::Bootstrap;
 pub use config::LoadedConfig;

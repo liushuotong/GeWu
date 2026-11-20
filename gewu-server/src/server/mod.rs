@@ -1219,7 +1219,12 @@ async fn handle_request(
                         let mut agent = current.agent.lock().await;
                         let reminder =
                             registry::profile_reminder(Some(&current.agent_name), &target);
-                        agent.set_profile(prompt, tools, reminder);
+                        let policy = registry::profile_tool_policy(
+                            &target,
+                            &state.bootstrap.agents,
+                            &state.bootstrap.mcp_tools,
+                        );
+                        agent.set_profile(prompt, tools, reminder, policy);
                         if let Err(e) = gewu_storage::set_reminder(
                             &state.bootstrap.pool,
                             &current.session_id,
@@ -4649,11 +4654,12 @@ mod tests {
                 .any(|t| t == "task")
         );
         assert!(
-            !plan["tools"]
+            plan["tools"]
                 .as_array()
                 .unwrap()
                 .iter()
-                .any(|t| t == "write_file")
+                .any(|t| t == "write_file"),
+            "plan advertises editing tools and refuses them at execution"
         );
         assert_eq!(
             gewu_storage::session_agent(&state.bootstrap.pool, &id)
@@ -4673,6 +4679,10 @@ mod tests {
                 .unwrap()
                 .iter()
                 .any(|t| t == "bash")
+        );
+        assert_eq!(
+            build["tools"], plan["tools"],
+            "mode switches must keep the tool prefix identical"
         );
         tx.send(ClientRequest::switch_agent(3, "unknown").to_line())
             .await

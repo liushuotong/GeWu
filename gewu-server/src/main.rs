@@ -5,6 +5,7 @@ pub mod mcp_loader;
 mod memory_view;
 pub mod registry;
 pub mod server;
+pub mod tool_policy;
 
 use anyhow::Result;
 use clap::{Args, Parser, Subcommand};
