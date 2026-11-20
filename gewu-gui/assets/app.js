@@ -175,8 +175,15 @@
   }
 
   function setSessionSidebarHtml(html) {
+    // The sidebar is server-rendered and swaps the whole subtree; carry the
+    // session list's scroll position across so switching tabs (which resends
+    // the active highlight) does not jump the reader back to the top.
+    const scroller = el.sessionSidebar.querySelector(".session-workspace-groups");
+    const scrollTop = scroller ? scroller.scrollTop : 0;
     el.sessionSidebar.innerHTML = html || "";
     applyWorkspaceCollapseState();
+    const replaced = el.sessionSidebar.querySelector(".session-workspace-groups");
+    if (replaced) replaced.scrollTop = scrollTop;
   }
 
   function toggleWorkspaceGroup(id) {

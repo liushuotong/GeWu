@@ -896,16 +896,14 @@ pub fn agent_profile(inputs: ProfileInputs) -> Result<ProfileBundle> {
     Ok((tools_arc, system_prompt, registry))
 }
 
-/// The built-in system prompt for a profile name. `build` and `general`
-/// extend the shared base with the background-workflow note (their profiles
-/// carry the workflow tools; `plan` does not).
+/// The built-in system prompt for a profile name. `build` and `plan` share
+/// one prompt so switching modes keeps the system prefix stable; workflow
+/// guidance lives in the `workflow_start` tool description instead.
 fn base_profile_prompt(name: &str) -> Result<String> {
-    const WORKFLOW_NOTE: &str = include_str!("prompts/workflow-note.txt");
     Ok(match name {
-        "build" => format!("{}\n\n{WORKFLOW_NOTE}", include_str!("prompts/build.txt")),
-        "plan" => include_str!("prompts/build.txt").to_string(),
+        "build" | "plan" => include_str!("prompts/build.txt").to_string(),
         "explore" => include_str!("prompts/explore.txt").to_string(),
-        "general" => format!("{}\n\n{WORKFLOW_NOTE}", include_str!("prompts/general.txt")),
+        "general" => include_str!("prompts/general.txt").to_string(),
         _ => return Err(anyhow!("Unknown agent type: {}", name)),
     })
 }
@@ -1125,7 +1123,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn build_and_plan_share_base_prompt() {
+    async fn build_and_plan_share_the_same_prompt() {
         let pool = SqlitePool::connect_lazy("sqlite::memory:").unwrap();
         let dir = tempfile::tempdir().unwrap();
         let mut prompts = Vec::new();
@@ -1142,7 +1140,7 @@ mod tests {
             .unwrap();
             prompts.push(prompt);
         }
-        assert!(prompts[0].starts_with(prompts[1].as_str()));
+        assert_eq!(prompts[0], prompts[1]);
     }
 
     #[test]
