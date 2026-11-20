@@ -10,9 +10,9 @@ use gewu_tools::workflow::{
     RunProgress, WorkflowCancelTool, WorkflowManager, WorkflowStartTool, WorkflowStatusTool,
 };
 use gewu_tools::{
-    ApplyPatchTool, BashTool, EditFileTool, GlobTool, GrepTool, ImageLimits, ListTool,
-    QuestionTool, ReadFileTool, SkillInfo, SkillTool, TaskTool, TodoReadTool, TodoWriteTool,
-    WebFetchTool, WebSearchTool, WriteFileTool,
+    ApplyPatchTool, BashTool, EditFileTool, GlobTool, GrepTool, ImageLimits, QuestionTool,
+    ReadFileTool, SkillInfo, SkillTool, TaskTool, TodoReadTool, TodoWriteTool, WebFetchTool,
+    WebSearchTool, WriteFileTool,
 };
 use serde_json::Value;
 use sqlx::SqlitePool;
@@ -549,9 +549,6 @@ fn build_tool_registry_and_list(inputs: &ProfileInputs) -> Result<RegistryBundle
                     working_directory: working_directory.clone(),
                 }),
                 Box::new(WebFetchTool),
-                Box::new(ListTool {
-                    working_directory: working_directory.clone(),
-                }),
                 Box::new(WebSearchTool),
                 Box::new(TodoWriteTool),
                 Box::new(TodoReadTool),
@@ -574,9 +571,6 @@ fn build_tool_registry_and_list(inputs: &ProfileInputs) -> Result<RegistryBundle
                     working_directory: working_directory.clone(),
                 }),
                 Box::new(WebFetchTool),
-                Box::new(ListTool {
-                    working_directory: working_directory.clone(),
-                }),
                 Box::new(WebSearchTool),
             ]
         }

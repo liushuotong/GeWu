@@ -15,7 +15,6 @@
 //! | [`EditFileTool`] | `edit_file` | Edit files by replacing text |
 //! | [`GlobTool`] | `glob` | Find files by glob patterns |
 //! | [`GrepTool`] | `grep` | Search file contents |
-//! | [`ListTool`] | `list` | List directory contents |
 //! | [`WebFetchTool`] | `webfetch` | Fetch web pages |
 //! | [`WebSearchTool`] | `websearch` | Search the web |
 //! | [`TodoReadTool`] | `todoread` | Read the task list |
@@ -62,7 +61,6 @@ pub mod bash;
 pub mod fs;
 pub mod fs_utils;
 pub mod grep;
-pub mod list;
 pub mod mcp;
 mod media;
 pub mod question;
@@ -78,7 +76,6 @@ pub use apply_patch::ApplyPatchTool;
 pub use bash::BashTool;
 pub use fs::{EditFileTool, GlobTool, ReadFileTool, WriteFileTool};
 pub use grep::GrepTool;
-pub use list::ListTool;
 pub use media::{DEFAULT_MAX_BASE64_BYTES, DEFAULT_MAX_DIMENSION, ImageLimits};
 pub use question::QuestionTool;
 pub use search::WebSearchTool;
