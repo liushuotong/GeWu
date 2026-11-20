@@ -303,7 +303,19 @@ impl Agent {
         user_message: &'a str,
         inbox: Steering,
     ) -> impl Stream<Item = Result<AgentEvent>> + 'a {
-        self.run(Some(user_message), inbox)
+        self.ask_parts_with_inbox(user_message, Vec::new(), inbox)
+    }
+
+    /// Run an agent turn with a prompt plus attached media parts (inline
+    /// images or PDFs). The parts join the prompt text in one user message;
+    /// `media` may be non-empty while `user_message` is empty.
+    pub fn ask_parts_with_inbox<'a>(
+        &'a mut self,
+        user_message: &'a str,
+        media: Vec<ContentPart>,
+        inbox: Steering,
+    ) -> impl Stream<Item = Result<AgentEvent>> + 'a {
+        self.run_parts(Some(user_message), media, inbox)
     }
 
     pub fn resume(&mut self) -> impl Stream<Item = Result<AgentEvent>> + '_ {
@@ -322,6 +334,15 @@ impl Agent {
         user_message: Option<&'a str>,
         inbox: Steering,
     ) -> impl Stream<Item = Result<AgentEvent>> + 'a {
+        self.run_parts(user_message, Vec::new(), inbox)
+    }
+
+    fn run_parts<'a>(
+        &'a mut self,
+        user_message: Option<&'a str>,
+        media: Vec<ContentPart>,
+        inbox: Steering,
+    ) -> impl Stream<Item = Result<AgentEvent>> + 'a {
         async_stream::try_stream! {
             if self.memory.messages().is_empty() && !self.system_prompt.is_empty() {
                 self.memory.add_message(Message::System { content: self.system_prompt.clone() }).await;
@@ -333,17 +354,20 @@ impl Agent {
                 yield event;
             }
 
-            if let Some(user_message) = user_message {
+            if user_message.is_some() || !media.is_empty() {
                 self.reminder.on_user_turn();
                 // A due mode reminder becomes part of the message before it is
                 // stored, so it is durable and every request in this turn — and
                 // later turns — still carries it instead of only the first
                 // provider call.
-                let mut message = Message::User {
-                    content: vec![ContentPart::Text {
-                        text: user_message.to_string(),
-                    }],
-                };
+                let mut content = Vec::with_capacity(media.len() + 1);
+                if let Some(text) = user_message.filter(|text| !text.is_empty()) {
+                    content.push(ContentPart::Text {
+                        text: text.to_string(),
+                    });
+                }
+                content.extend(media);
+                let mut message = Message::User { content };
                 self.reminder.apply_to(&mut message);
                 self.memory.add_message(message).await;
             }
@@ -1339,6 +1363,94 @@ mod tests {
             )),
             "the backend stored an undecorated user message: {user:?}"
         );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn attachments_join_the_user_message() -> Result<()> {
+        let added = Arc::new(Mutex::new(Vec::new()));
+        let memory = RecordingMemory {
+            messages: Vec::new(),
+            added: added.clone(),
+        };
+        let mut agent = Agent::builder()
+            .llm(Arc::new(MockProvider::single_content("ok")))
+            .memory(Box::new(memory))
+            .build()?;
+        let media = vec![
+            ContentPart::Image {
+                data: "aGk=".into(),
+                mime_type: "image/png".into(),
+            },
+            ContentPart::File {
+                data: "aGk=".into(),
+                mime_type: "application/pdf".into(),
+            },
+        ];
+        for event in agent
+            .ask_parts_with_inbox("describe this", media.clone(), Steering::new())
+            .collect::<Vec<_>>()
+            .await
+        {
+            event?;
+        }
+        let added = added.lock().unwrap();
+        let user = added
+            .iter()
+            .find_map(|message| match message {
+                Message::User { content } => Some(content),
+                _ => None,
+            })
+            .expect("the user message must be stored");
+        assert_eq!(
+            user,
+            &vec![
+                ContentPart::Text {
+                    text: "describe this".into()
+                },
+                media[0].clone(),
+                media[1].clone(),
+            ],
+            "the prompt text must precede the media parts: {user:?}"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn attachments_without_prompt_still_start_a_turn() -> Result<()> {
+        let added = Arc::new(Mutex::new(Vec::new()));
+        let memory = RecordingMemory {
+            messages: Vec::new(),
+            added: added.clone(),
+        };
+        let mut agent = Agent::builder()
+            .llm(Arc::new(MockProvider::single_content("ok")))
+            .memory(Box::new(memory))
+            .build()?;
+        for event in agent
+            .ask_parts_with_inbox(
+                "",
+                vec![ContentPart::Image {
+                    data: "aGk=".into(),
+                    mime_type: "image/png".into(),
+                }],
+                Steering::new(),
+            )
+            .collect::<Vec<_>>()
+            .await
+        {
+            event?;
+        }
+        let added = added.lock().unwrap();
+        let user = added
+            .iter()
+            .find_map(|message| match message {
+                Message::User { content } => Some(content),
+                _ => None,
+            })
+            .expect("the user message must be stored");
+        assert_eq!(user.len(), 1, "no empty text part is stored: {user:?}");
+        assert!(matches!(&user[0], ContentPart::Image { .. }));
         Ok(())
     }
 
