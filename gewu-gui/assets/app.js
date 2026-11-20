@@ -995,18 +995,7 @@
     const qtab = event.target.closest("[data-qtab]");
     if (qtab) {
       const form = qtab.closest(".question-form");
-      if (form) {
-        for (const button of form.querySelectorAll("[data-qtab]")) {
-          const active = button === qtab;
-          button.classList.toggle("active", active);
-          button.setAttribute("aria-selected", String(active));
-        }
-        for (const panel of form.querySelectorAll("[data-qpanel]")) {
-          const active = panel.dataset.qpanel === qtab.dataset.qtab;
-          panel.classList.toggle("active", active);
-          panel.hidden = !active;
-        }
-      }
+      if (form) activateQuestionTab(form, qtab.dataset.qtab);
       return;
     }
     const dismiss = event.target.closest("[data-question-dismiss]");
@@ -1062,6 +1051,36 @@
     });
   }
 
+  // Applies the same tab/panel switch as a manual question-tab click.
+  function activateQuestionTab(form, number) {
+    for (const button of form.querySelectorAll("[data-qtab]")) {
+      const active = button.dataset.qtab === number;
+      button.classList.toggle("active", active);
+      button.setAttribute("aria-selected", String(active));
+    }
+    for (const panel of form.querySelectorAll("[data-qpanel]")) {
+      const active = panel.dataset.qpanel === number;
+      panel.classList.toggle("active", active);
+      panel.hidden = !active;
+    }
+  }
+
+  function panelAnswered(panel) {
+    if (panel.querySelector("input[type=radio]:checked, input[type=checkbox]:checked")) return true;
+    const custom = panel.querySelector("[data-custom]");
+    return !!custom && custom.value.trim() !== "";
+  }
+
+  // First panel after `current` (a question number) still missing an
+  // answer, or null when every later panel is answered.
+  function nextUnansweredPanel(form, current) {
+    for (const panel of form.querySelectorAll("[data-qpanel]")) {
+      if (Number(panel.dataset.qpanel) <= current) continue;
+      if (!panelAnswered(panel)) return panel.dataset.qpanel;
+    }
+    return null;
+  }
+
   el.transcript.addEventListener("submit", (event) => {
     const form = event.target.closest(".question-form");
     if (!form) return;
@@ -1097,6 +1116,13 @@
     const panel = radio.closest("[data-qpanel]");
     const custom = panel && panel.querySelector("[data-custom]");
     if (custom) custom.value = "";
+    // A radio pick completes a single-select question, so move on to the
+    // next tab that still needs an answer (multi-select checkboxes do not
+    // advance: the user may want to tick several).
+    const form = radio.closest(".question-form");
+    if (!form || !panel) return;
+    const next = nextUnansweredPanel(form, Number(panel.dataset.qpanel));
+    if (next != null) activateQuestionTab(form, next);
   });
 
   function closeMessageMenus(restoreFocus = false) {

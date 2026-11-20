@@ -2083,10 +2083,6 @@ body {
   outline-offset: -2px;
 }
 
-.composer .icon-button.stop {
-  align-self: center;
-}
-
 .prompt-glyph {
   align-self: flex-start;
   padding: 5px 0;
