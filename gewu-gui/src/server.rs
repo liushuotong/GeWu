@@ -465,6 +465,58 @@ mod tests {
         (addr, rx)
     }
 
+    /// A recorded fake upstream whose live connections can be dropped the
+    /// way an agent-server restart drops its clients' sockets.
+    struct DroppableUpstream {
+        port: u16,
+        connections: Arc<std::sync::Mutex<Vec<tokio::task::JoinHandle<()>>>>,
+    }
+
+    impl DroppableUpstream {
+        fn port(&self) -> u16 {
+            self.port
+        }
+
+        /// Abort every live connection task, closing their sockets.
+        async fn drop_connections(&self) {
+            let tasks: Vec<_> = self
+                .connections
+                .lock()
+                .expect("connection list poisoned")
+                .drain(..)
+                .collect();
+            for task in tasks {
+                task.abort();
+            }
+            // Give the sockets a moment to close so client actors observe
+            // EOF before the GUI reconnects.
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+    }
+
+    async fn spawn_droppable_fake_upstream() -> DroppableUpstream {
+        let (tx, _ops) = tokio::sync::mpsc::unbounded_channel();
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let connections: Arc<std::sync::Mutex<Vec<tokio::task::JoinHandle<()>>>> =
+            Arc::new(std::sync::Mutex::new(Vec::new()));
+        let tracked = Arc::clone(&connections);
+        tokio::spawn(async move {
+            loop {
+                let Ok((stream, _)) = listener.accept().await else {
+                    break;
+                };
+                let tx = tx.clone();
+                let handle = tokio::spawn(handle_fake_connection(stream, tx, None, false));
+                tracked
+                    .lock()
+                    .expect("connection list poisoned")
+                    .push(handle);
+            }
+        });
+        DroppableUpstream { port, connections }
+    }
+
     async fn handle_fake_connection(
         stream: tokio::net::TcpStream,
         ops: tokio::sync::mpsc::UnboundedSender<String>,
@@ -566,6 +618,12 @@ mod tests {
                     "type": "files", "id": id,
                     "path": request.get("path").and_then(Value::as_str).unwrap_or(""),
                     "entries": if records.is_some() { vec![json!({"name":format!("{workspace}.txt"),"is_dir":false,"size":1})] } else { vec![] },
+                })],
+                "browse_workspace" => vec![json!({
+                    "type": "directories", "id": id,
+                    "path": request.get("path").cloned().unwrap_or(Value::Null),
+                    "parent": Value::Null,
+                    "entries": [],
                 })],
                 "read_file" => vec![
                     json!({"type":"file_content","id":id,"path":request["path"],"content":workspace,"truncated":false}),
@@ -1152,6 +1210,85 @@ mod tests {
         // Passing auth must lead to a normal session snapshot.
         let value = next_json(&mut ws).await;
         assert_eq!(value["type"], "snapshot");
+    }
+
+    /// Regression test for GH issue #15: after the upstream server restarts
+    /// (its live sockets drop), the GUI must replace its cached clients and
+    /// re-observe instead of answering every request with
+    /// "connection error: client is closed".
+    #[tokio::test]
+    async fn gui_reconnects_after_upstream_restart() {
+        timeout(Duration::from_secs(15), async {
+            let upstream = spawn_droppable_fake_upstream().await;
+            let addr = spawn_gui(AppState {
+                endpoint: Endpoint::Tcp {
+                    host: "127.0.0.1".into(),
+                    port: upstream.port(),
+                },
+                ..test_state(None)
+            })
+            .await;
+            let (mut ws, _) = tokio_tungstenite::connect_async(format!("ws://{addr}/ws"))
+                .await
+                .unwrap();
+            let initial = next_json(&mut ws).await["active"].as_u64().unwrap();
+
+            // Bind the tab's upstream session so it has a cached client.
+            ws.send(WsMessage::text(
+                json!({"op":"ask","tab":initial,"prompt":"hello"}).to_string(),
+            ))
+            .await
+            .unwrap();
+            loop {
+                let value = next_json(&mut ws).await;
+                if value["type"] == "tabs"
+                    && value["tabs"][0]["session_id"] == "sess-1"
+                    && value["tabs"][0]["busy"] == false
+                {
+                    break;
+                }
+            }
+
+            // Simulate the agent server restarting: every live socket drops.
+            upstream.drop_connections().await;
+
+            // Workspace browsing rides the admin connection; it must heal.
+            ws.send(WsMessage::text(r#"{"op":"browse_workspace","path":""}"#))
+                .await
+                .unwrap();
+            loop {
+                let value = next_json(&mut ws).await;
+                assert_ne!(
+                    value["type"], "error",
+                    "browse after upstream restart failed: {value}"
+                );
+                if value["type"] == "workspace_browser" {
+                    break;
+                }
+            }
+
+            // A new ask must reconnect the tab client and re-observe.
+            ws.send(WsMessage::text(
+                json!({"op":"ask","tab":initial,"prompt":"hello"}).to_string(),
+            ))
+            .await
+            .unwrap();
+            loop {
+                let value = next_json(&mut ws).await;
+                assert_ne!(
+                    value["type"], "error",
+                    "ask after upstream restart failed: {value}"
+                );
+                if value["type"] == "tabs"
+                    && value["tabs"][0]["session_id"] == "sess-1"
+                    && value["tabs"][0]["busy"] == false
+                {
+                    break;
+                }
+            }
+        })
+        .await
+        .unwrap();
     }
 
     #[tokio::test]

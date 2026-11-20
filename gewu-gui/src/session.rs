@@ -42,10 +42,21 @@ struct Conn {
 /// Minimum time between full Markdown re-renders of a streaming block.
 const STREAM_INTERVAL: Duration = Duration::from_millis(100);
 
-/// A frame forwarded from a tab's ask stream; `None` marks the stream's end.
+/// Which upstream stream a tab event rode in on. Connection failures on the
+/// observer stream are background noise (the watch is rebuilt on the next
+/// terminal ask); failures on the ask stream end the visible turn.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum TabSource {
+    Ask,
+    Observer,
+}
+
+/// A frame forwarded from a tab's ask or observer stream; `None` marks the
+/// ask stream's end.
 struct TabEvent {
     tab_id: u64,
     frame: Option<gewu_client::Result<ServerMessage>>,
+    source: TabSource,
 }
 
 /// What one tab event changed, driving the browser update. Targeted updates
@@ -717,15 +728,35 @@ impl GuiSession {
         self.workspace.active_tab().model.fail(message);
     }
 
-    /// The focused tab's own connection, created on first use.
+    /// The focused tab's own connection, created on first use and replaced
+    /// when the upstream restarted underneath it.
     async fn ensure_client(&mut self, tab_id: u64) -> Result<(), ClientError> {
         if self
             .conns
             .get(&tab_id)
             .and_then(|conn| conn.client.as_ref())
-            .is_some()
+            .is_some_and(|client| !client.is_closed())
         {
             return Ok(());
+        }
+        if let Some(conn) = self.conns.get_mut(&tab_id)
+            && conn
+                .client
+                .as_ref()
+                .is_some_and(|client| client.is_closed())
+        {
+            // The upstream restarted (or the socket dropped): the tab's
+            // observer and ask-forwarding task died with the same
+            // connection. Drop them so the terminal-frame path re-observes.
+            conn.client = None;
+            conn.observer = None;
+            conn.observing = false;
+            if let Some(task) = conn.task.take() {
+                task.abort();
+            }
+            if let Some(tab) = self.workspace.tab_mut(tab_id) {
+                tab.model.note("reconnected to server");
+            }
         }
         let endpoint = self.endpoint.clone();
         let client = endpoint
@@ -733,6 +764,20 @@ impl GuiSession {
             .await?;
         self.conns.entry(tab_id).or_default().client = Some(client);
         Ok(())
+    }
+
+    /// The admin connection, reconnected when the upstream restarted since
+    /// it was created. Workspace browsing and session deletion ride this
+    /// connection, so it must heal across upstream restarts.
+    async fn admin_client(&mut self) -> Result<Client, ClientError> {
+        if self.admin.is_closed() {
+            let endpoint = self.endpoint.clone();
+            self.admin = endpoint
+                .connect_with_token(self.server_token.as_deref())
+                .await?;
+            self.note_active("reconnected to server");
+        }
+        Ok(self.admin.clone())
     }
 
     fn client(&self, tab_id: u64) -> Option<Client> {
@@ -798,6 +843,7 @@ impl GuiSession {
                     .send(TabEvent {
                         tab_id,
                         frame: Some(frame),
+                        source: TabSource::Observer,
                     })
                     .is_err()
                 {
@@ -1045,35 +1091,51 @@ impl GuiSession {
                     Err(e) => self.send_error(sender, e.to_string()).await?,
                 }
             }
-            ClientMsg::BrowseWorkspace { path } => match self.admin.browse_workspace(path).await {
-                Ok((path, parent, entries)) => {
-                    send_msg(
-                        sender,
-                        &ServerMsg::WorkspaceBrowser {
-                            html: view::workspace_browser_html(&path, parent.as_deref(), &entries),
-                        },
-                    )
-                    .await?;
-                }
+            ClientMsg::BrowseWorkspace { path } => match self.admin_client().await {
+                Ok(admin) => match admin.browse_workspace(path).await {
+                    Ok((path, parent, entries)) => {
+                        send_msg(
+                            sender,
+                            &ServerMsg::WorkspaceBrowser {
+                                html: view::workspace_browser_html(
+                                    &path,
+                                    parent.as_deref(),
+                                    &entries,
+                                ),
+                            },
+                        )
+                        .await?;
+                    }
+                    Err(e) => {
+                        self.send_error(sender, format!("could not browse directory: {e}"))
+                            .await?
+                    }
+                },
                 Err(e) => {
                     self.send_error(sender, format!("could not browse directory: {e}"))
                         .await?
                 }
             },
-            ClientMsg::BrowseNewSession { path } => match self.admin.browse_workspace(path).await {
-                Ok((path, parent, entries)) => {
-                    send_msg(
-                        sender,
-                        &ServerMsg::WorkspacePicker {
-                            html: view::new_session_browser_html(
-                                &path,
-                                parent.as_deref(),
-                                &entries,
-                            ),
-                        },
-                    )
-                    .await?;
-                }
+            ClientMsg::BrowseNewSession { path } => match self.admin_client().await {
+                Ok(admin) => match admin.browse_workspace(path).await {
+                    Ok((path, parent, entries)) => {
+                        send_msg(
+                            sender,
+                            &ServerMsg::WorkspacePicker {
+                                html: view::new_session_browser_html(
+                                    &path,
+                                    parent.as_deref(),
+                                    &entries,
+                                ),
+                            },
+                        )
+                        .await?;
+                    }
+                    Err(e) => {
+                        self.send_error(sender, format!("could not browse directory: {e}"))
+                            .await?
+                    }
+                },
                 Err(e) => {
                     self.send_error(sender, format!("could not browse directory: {e}"))
                         .await?
@@ -1648,13 +1710,17 @@ impl GuiSession {
             .workspace
             .tab(tab_id)
             .and_then(|tab| tab.model.session_id.clone());
-        if let Some(session_id) = session_id
-            && let Err(e) = self.admin.delete_session(&session_id).await
-        {
-            if let Some(tab) = self.workspace.tab_mut(tab_id) {
-                tab.model.note(format!("could not delete session: {e}"));
+        if let Some(session_id) = session_id {
+            let deleted = match self.admin_client().await {
+                Ok(admin) => admin.delete_session(&session_id).await,
+                Err(e) => Err(e),
+            };
+            if let Err(e) = deleted {
+                if let Some(tab) = self.workspace.tab_mut(tab_id) {
+                    tab.model.note(format!("could not delete session: {e}"));
+                }
+                return;
             }
-            return;
         }
 
         self.workspace.close(tab_id);
@@ -1952,6 +2018,20 @@ impl GuiSession {
                     terminal = true;
                     update = TabUpdate::Full;
                 }
+                Some(Err(_e)) if event.source == TabSource::Observer => {
+                    // The background watch died — e.g. the upstream restarted
+                    // while the tab was idle. Nothing visible was lost: the
+                    // next client use reconnects, and the next terminal ask
+                    // re-observes. Surface it quietly instead of failing the
+                    // tab.
+                    if let Some(conn) = self.conns.get_mut(&event.tab_id) {
+                        conn.observing = false;
+                        conn.observer = None;
+                    }
+                    tab.model
+                        .note("connection lost; will reconnect on next use");
+                    update = TabUpdate::Full;
+                }
                 Some(Err(e)) => {
                     let text = e.to_string();
                     alert = Some((text.clone(), Some(format!("error:{text}"))));
@@ -2181,6 +2261,7 @@ fn spawn_ask_forwarder(
                 .send(TabEvent {
                     tab_id,
                     frame: Some(frame),
+                    source: TabSource::Ask,
                 })
                 .is_err()
             {
@@ -2193,6 +2274,7 @@ fn spawn_ask_forwarder(
         let _ = tx.send(TabEvent {
             tab_id,
             frame: None,
+            source: TabSource::Ask,
         });
     })
 }

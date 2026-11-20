@@ -561,6 +561,13 @@ impl Client {
         rx.await.ok().flatten()
     }
 
+    /// Whether the connection actor has stopped — e.g. the upstream server
+    /// restarted or the socket dropped. Calls on a closed client fail with
+    /// [`Error::Connection`]; drop the handle and reconnect.
+    pub fn is_closed(&self) -> bool {
+        self.commands.is_closed()
+    }
+
     /// Close the connection, detaching from any server-owned turn. Other `Client`
     /// clones become unusable too; in-flight calls fail with
     /// [`Error::Connection`].
