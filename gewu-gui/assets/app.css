@@ -2041,10 +2041,6 @@ body {
   color: var(--text);
 }
 
-.composer .icon-button {
-  align-self: center;
-}
-
 /* Attachments above the message text inside a user block: a column so the
    media stacks above the bubble even though `.block.user` is a row. The
    bubble's width constraint moves to the group. */
