@@ -1,1 +1,10 @@
-Lists files and directories in a given path. The path parameter must be absolute; omit it to use the current workspace directory. You can optionally provide an array of glob patterns to ignore with the ignore parameter. You should generally prefer the Glob and Grep tools, if you know which directories to search.
+Lists files and directories in a given path, similar to `ls`. The path parameter must be absolute; omit it to use the current workspace directory.
+
+Usage:
+- By default the listing is shallow: only the direct children of the path are returned, with a trailing `/` on directories. This keeps the output representative of the whole workspace instead of a sample of one subtree.
+- Pass recursive: true to descend into subdirectories, up to max_depth levels deep (default 3).
+- Hidden files and dot-directories are excluded by default; pass hidden: true to include them. The `.git` directory is always skipped.
+- Results are sorted; at most limit entries (default 500) are returned, and the output states the total when truncated.
+- You can optionally provide an array of glob patterns to ignore with the ignore parameter.
+- Use the read tool on a directory to page through a large directory with offset/limit.
+- You should generally prefer the Glob and Grep tools, if you know which directories to search.
