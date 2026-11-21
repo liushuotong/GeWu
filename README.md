@@ -91,8 +91,8 @@ gewu serve --host 0.0.0.0 --token "$(openssl rand -hex 16)"
 The same binary supports interactive chat and one-shot jobs:
 
 ```bash
-gewu cli                       # new terminal session in this directory
-gewu cli "Explain this repo"    # send the first message and keep chatting
+gewu cli                       # new chat without a workspace
+gewu cli "Hello"                # send the first message and keep chatting
 gewu cli --resume              # pick a saved session
 gewu cli --resume SESSION_ID
 gewu cli --last                # latest saved session for this workspace
@@ -146,8 +146,8 @@ in `/plan` for a GeWu workflow in a JSON code block, then use
 Run progress appears in `/tasks`.
 
 For simultaneous web and terminal use on one Mac, start the web launcher
-with `gewu --web --ws-port 8431`, then use
-`gewu --server ws://127.0.0.1:8431 --resume` from a second terminal.
+with `gewu --ws-port 8431`, then use
+`gewu cli --server ws://127.0.0.1:8431 --resume` from a second terminal.
 Choose the same saved session in both clients. The browser's Workflow button
 opens the shared draft. Both frontends accept `/build`, `/plan`, `/workflow`, and `/settings` directly. Each session stores one draft in SQLite. Clean
 editors follow saves, and a stale editor retains its edits until reloaded.
