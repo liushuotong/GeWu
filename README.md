@@ -137,6 +137,15 @@ are shortcuts; keep scrolling or typing to discover the rest.
 | Workflow design | `/workflow`, `/workflow import` (from the last assistant reply) |
 | Inspection | `/tasks`, `/subagents`, `/todos`, `/skills`, `/mcp` |
 
+On builds with the application plugin host, open `/plugins` (also in
+`/settings`) to install a local package directory, list installed versions,
+check a package, or change its installation default. Reopen the local CLI
+after installing or toggling a plugin, then select a workspace with `/cd`
+to use its tools. Packages with browser views use the web GUI for Preview.
+For a signed release, run `gewu plugin search NAME --refresh` and
+`gewu plugin marketplace-install ID` on the machine running the host.
+When connected with `--server`, installation is managed on that server.
+
 Open `/workflow` to edit the session's workflow JSON and preview its edges.
 Ctrl+E loads a BUSCO example into an empty graph. Ctrl+N appends a step,
 Ctrl+V checks the graph, Ctrl+S saves the shared draft, and Ctrl+R runs

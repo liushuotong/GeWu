@@ -58,8 +58,12 @@ impl Endpoint {
         })
     }
 
+    pub fn is_local(&self) -> bool {
+        self.owned.is_some()
+    }
+
     pub fn lifecycle_label(&self) -> &'static str {
-        if self.owned.is_some() {
+        if self.is_local() {
             "Local · stops on CLI exit"
         } else {
             "External · stays running on CLI exit"

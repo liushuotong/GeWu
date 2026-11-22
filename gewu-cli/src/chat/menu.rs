@@ -1,3 +1,5 @@
+mod plugins;
+
 use super::*;
 use crate::commands::{COMMANDS, Cmd};
 use gewu_protocol::{AskAttachment, InspectSection, InspectionEntry};
@@ -6,6 +8,7 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
 #[derive(Clone)]
 enum Action {
+    CheckPlugin(String, String),
     EditKey,
     CustomModel(Vec<String>),
     SaveModel(Vec<String>, &'static str),
@@ -208,6 +211,8 @@ impl Chat {
                 .get(menu.selected)
                 .map(|row| row.1.clone())
                 .unwrap_or(Action::Close)
+        } else if menu.input == Some(Cmd::Plugins) {
+            run(Cmd::Plugins, &format!("install {text}"))
         } else if let Ok(index) = text.parse::<usize>() {
             menu.choices
                 .get(index.wrapping_sub(1))
@@ -283,6 +288,7 @@ impl Chat {
                 self.key_entry = Some(endpoint.keys.entry(&self.model_name)?);
                 self.editor = editor();
             }
+            Action::CheckPlugin(id, version) => self.check_plugin(&id, &version).await?,
             Action::ClearAttachments => {
                 self.attachments.clear();
                 self.end_form();
@@ -472,6 +478,7 @@ impl Chat {
             ),
             ("Skills".into(), run(Cmd::Skills, "")),
             ("MCP tools".into(), run(Cmd::Mcp, "")),
+            ("Plugins".into(), run(Cmd::Plugins, "")),
         ]);
         let details = format!(
             "Provider  {}\nServer default model  {}\nContext window  {} tokens\nFile path checks  {}\nSession server  {}\n\nCurrent session",
@@ -646,6 +653,7 @@ impl Chat {
                 self.end_form();
                 self.notice = format!("Active agent: {name}");
             }
+            Cmd::Plugins => self.plugins(endpoint, arg).await?,
             Cmd::Settings => self.show_settings(endpoint).await?,
             Cmd::Status | Cmd::Context | Cmd::Usage => {
                 self.refresh_context().await;

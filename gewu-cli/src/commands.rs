@@ -39,6 +39,7 @@ commands! {
     Subagents,"/subagents","Show this session's child agents",false,[];
     Todos,"/todos","Inspect this session's task checklist",false,[];
     Skills,"/skills","List loaded skills and their sources",false,[];
+    Plugins,"/plugins","Install and manage local application plugins",false,[];
     Mcp,"/mcp","List loaded MCP tools and their servers",false,[];
     New,"/new","Start a chat without a workspace",false,[];
     Delete,"/delete","Select a saved conversation to delete",true,[];
